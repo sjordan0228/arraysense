@@ -30,7 +30,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/arraysense"]
-artifacts = ["src/arraysense/web/*.html"]
+artifacts = ["src/arraysense/web/*.html", "src/arraysense/web/uPlot.*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

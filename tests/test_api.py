@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from arraysense.api.app import create_app
+from arraysense.api.app import PAGES, SHARED_SCRIPT, _file_route, create_app
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
@@ -314,8 +315,14 @@ def test_calibration_separates_a_wiring_fault_from_a_drifting_counter(tmp_path: 
     assert body["severity"] == "alert"
     assert body["wiring_suspect"] is True
     assert body["voltage_spread_mv"] == 300.0
-    # A wiring fault must not also tell the owner to go and charge the bank.
-    assert "charge" not in body["detail"].lower()
+    # A wiring fault must not offer charging as the remedy — that is the whole
+    # point of separating the two. It may still mention a missed full charge,
+    # because this bank has one as well and both are true at once.
+    assert "Charging will not fix it" in body["detail"]
+    assert "Charge to 100%" not in body["detail"]
+    # And the drift verdict survives alongside the alert rather than being
+    # replaced by it.
+    assert body["drift_severity"] == "elevated"
 
 
 def test_calibration_never_turns_a_silent_pack_into_zero_percent(tmp_path: Path) -> None:
@@ -404,3 +411,137 @@ def test_posting_a_mask_back_does_not_overwrite_the_real_serial(client: Any) -> 
 def test_changing_a_connection_setting_asks_for_a_restart(client: Any) -> None:
     r = client.put("/api/settings", json={"collector.poll_interval": 20.0})
     assert r.json()["restart_required"] is True
+
+
+# --- the pages ----------------------------------------------------------------
+
+
+def test_the_dashboard_is_served(client: Any) -> None:
+    r = client.get("/")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    assert "Solar ArraySense" in r.text
+
+
+def test_the_shared_front_end_is_served(client: Any) -> None:
+    # One copy of the palette, the formatters and the chart factory. A page that
+    # carried its own would drift, and the drift arrives as two pages disagreeing
+    # about what the same reading means.
+    r = client.get("/common.js")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/javascript")
+    assert "numOrNull" in r.text
+
+
+def test_every_page_in_the_allow_list_has_a_route(client: Any) -> None:
+    routed = {getattr(route, "path", None) for route in client.app.routes}
+    assert set(PAGES) <= routed
+    assert f"/{SHARED_SCRIPT}" in routed
+
+
+@pytest.mark.parametrize("path", ["/graphs", "/history", "/costs"])
+def test_a_page_route_answers_rather_than_raising(client: Any, path: str) -> None:
+    # These pages are written separately, so this asserts what holds either way:
+    # before the file exists the route is a 404, afterwards it is HTML, and at no
+    # point is it a traceback out of the response.
+    r = client.get(path)
+    assert r.status_code in (200, 404), r.status_code
+    if r.status_code == 200:
+        assert r.headers["content-type"].startswith("text/html")
+
+
+async def test_a_page_whose_file_is_missing_is_a_404(tmp_path: Path) -> None:
+    # Reached through the route builder rather than the client because the three
+    # new pages will exist soon and this contract has to keep being tested after
+    # they do. Starlette raises from inside the response for an absent file,
+    # which the browser sees as a 500; a page nobody has written yet is missing,
+    # not broken.
+    serve = _file_route(tmp_path / "not_written_yet.html", "text/html")
+    with pytest.raises(HTTPException) as raised:
+        await serve()
+    assert raised.value.status_code == 404
+
+
+def test_a_file_in_web_is_not_served_just_because_it_is_there(client: Any) -> None:
+    # The allow-list is the whole point: the dashboard lives at "/" and nothing
+    # answers to the name of a file on disk.
+    for attempt in ("/index.html", "/graphs.html", "/costs.html", "/uPlot.LICENSE", "/nope"):
+        assert client.get(attempt).status_code == 404, attempt
+
+
+@pytest.mark.parametrize(
+    "attempt",
+    [
+        "../config/config.toml",
+        "../../config/config.toml",
+        "..%2Fconfig%2Fconfig.toml",
+        "%2e%2e%2fconfig%2fconfig.toml",
+    ],
+)
+def test_a_traversal_against_the_pages_cannot_reach_the_configuration(
+    client: Any, attempt: str
+) -> None:
+    # None of the page routes takes a path parameter at all, which is what makes
+    # this unroutable rather than a filesystem read that has to be sanitised.
+    for prefix in ("/", "/graphs/", "/common.js/"):
+        r = client.get(prefix + attempt)
+        assert r.status_code == 404, (prefix, attempt)
+        assert "dongle_serial" not in r.text
+
+
+# --- vendored front-end files ------------------------------------------------
+
+
+def test_the_vendored_chart_library_is_served(client: Any) -> None:
+    r = client.get("/vendor/uPlot.iife.min.js")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/javascript")
+    assert b"uPlot" in r.content
+
+
+def test_the_vendored_licence_ships_with_it(client: Any) -> None:
+    # uPlot is MIT inside an AGPL project. Shipping the code without the
+    # licence is the one thing that turns vendoring into a problem.
+    r = client.get("/vendor/uPlot.LICENSE")
+    assert r.status_code == 200
+    assert "MIT" in r.text
+
+
+def test_an_unknown_vendored_name_is_a_404(client: Any) -> None:
+    assert client.get("/vendor/anything.js").status_code == 404
+
+
+def test_a_path_traversal_cannot_reach_the_configuration(client: Any) -> None:
+    # The route takes a name, not a path. An allow-list rather than a directory
+    # mount is what makes this a 404 instead of somebody's serial numbers.
+    for attempt in (
+        "../config/config.toml",
+        "../../config/config.toml",
+        "..%2Fconfig%2Fconfig.toml",
+        "%2e%2e%2fconfig%2fconfig.toml",
+    ):
+        r = client.get(f"/vendor/{attempt}")
+        assert r.status_code == 404, attempt
+        assert "dongle_serial" not in r.text
+
+
+def test_the_calibration_endpoint_asks_for_the_current_it_needs(client: Any) -> None:
+    # full_charge_windows rejects a window still pushing charge current. The
+    # endpoint was not requesting the column, so that safeguard was inert in
+    # production while passing every direct test of the function.
+    import inspect
+
+    from arraysense.api import routes
+
+    src = inspect.getsource(routes.calibration)
+    assert "battery_current_a" in src
+
+
+def test_a_non_finite_setting_is_a_400_not_a_500(client: Any) -> None:
+    # Posted as a raw JSON NaN, which json.loads accepts by default.
+    r = client.put(
+        "/api/settings",
+        content='{"collector.poll_interval": NaN}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 400, r.text

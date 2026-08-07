@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
+from arraysense.energy import Period, energy_totals, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SettingsStore, describe, lookup_setting
 from arraysense.store.schema import module_metric_columns
@@ -163,7 +164,10 @@ async def calibration(request: Request) -> dict[str, Any]:
     start = now - timedelta(days=CALIBRATION_SEARCH_DAYS)
 
     history = store.query(
-        ["battery_voltage_v", "bms_charge_voltage_ref_v"],
+        # battery_current_a is not decoration: full_charge_windows rejects a
+        # window still pushing charge current, and without the column that
+        # safeguard is silently inert — every absorb looks settled.
+        ["battery_voltage_v", "bms_charge_voltage_ref_v", "battery_current_a"],
         start,
         now,
         tier=_CALIBRATION_TIER,
@@ -228,7 +232,9 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
+        # OverflowError rather than ValueError comes back from converting a
+        # number too large for its type, and it was escaping as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "changed": changed,
@@ -289,6 +295,51 @@ async def battery_history(
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
     rows = request.app.state.store.query_modules(names, start, end, tier=tier, serial=serial)
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
+
+
+@router.get("/energy")
+async def energy(
+    request: Request,
+    start: datetime,
+    end: datetime,
+    period: Period = "day",
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """Energy per calendar day or month, in kWh, over the owner's own calendar.
+
+    Read off the inverter's lifetime counters rather than integrated from
+    stored power, so a period containing a collection outage still totals what
+    actually happened. Each bucket says whether it is whole: the one in
+    progress is not, nor is the first one if collection started partway into
+    it, and a bucket that reads low for that reason must not be presented as a
+    quiet day.
+
+    ``tz`` is an IANA zone name and decides where midnight falls, defaulting to
+    the machine's own zone. Naive timestamps in ``start`` and ``end`` are read
+    in that same zone rather than the server's, since otherwise the answer
+    depends on where the service happens to be installed. A bucket nothing was
+    recorded for is left out of the reply rather than returned as zero.
+    """
+    try:
+        zone = resolve_zone(tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    start, end = with_zone(start, zone), with_zone(end, zone)
+    _check_range(start, end)
+    buckets = energy_totals(request.app.state.store, start, end, period=period, zone=zone)
+    return {
+        "period": period,
+        "timezone": str(zone),
+        "buckets": [
+            {
+                "start": bucket.start.isoformat(),
+                "end": bucket.end.isoformat(),
+                "complete": bucket.complete,
+                **bucket.totals,
+            }
+            for bucket in buckets
+        ],
+    }
 
 
 @router.post("/yield")

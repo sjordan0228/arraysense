@@ -172,3 +172,41 @@ def test_clearing_a_setting_removes_its_override(settings: SettingsStore) -> Non
     settings.set("display.temperature_unit", "C")
     settings.clear("display.temperature_unit")
     assert settings.overrides() == {}
+
+
+# --- findings from an independent review -------------------------------------
+
+
+def test_a_non_finite_number_is_refused(settings: SettingsStore) -> None:
+    # NaN passes every bounds check, because each comparison against it is
+    # false. It was accepted, stored, and then killed the collector when it
+    # reached the event loop — with the HTTP API still up, so the service
+    # looked healthy while collecting nothing.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            settings.set("collector.poll_interval", bad)
+
+
+def test_an_invisible_character_cannot_override_a_working_value(
+    settings: SettingsStore,
+) -> None:
+    # A zero-width space is not whitespace to str.strip(), so a value made of
+    # one counts as set and would replace a real serial with nothing visible.
+    with pytest.raises(ValueError, match="control or invisible"):
+        settings.set("connection.dongle_serial", "BA​12345678")
+
+
+def test_a_control_character_is_refused(settings: SettingsStore) -> None:
+    # These reach a wire protocol and a socket.
+    with pytest.raises(ValueError, match="control or invisible"):
+        settings.set("connection.dongle_host", "192.168.1.50\r\nEvil")
+
+
+def test_an_absurdly_long_value_is_refused(settings: SettingsStore) -> None:
+    with pytest.raises(ValueError, match="too long"):
+        settings.set("connection.dongle_serial", "x" * 500)
+
+
+def test_an_ordinary_serial_is_still_accepted(settings: SettingsStore) -> None:
+    settings.set("connection.dongle_serial", "BA12345678")
+    assert settings.get("connection.dongle_serial") == "BA12345678"

@@ -140,3 +140,32 @@ async def test_an_implausible_counter_is_still_captured_for_the_store_to_flag(
     s = PylxpSource(CFG, transport=t, energy_interval=0.0)
     sample = await s.read()
     assert sample.readings["pv_energy_today_kwh"] == value
+
+
+async def test_a_counter_cached_before_midnight_is_not_used_after_it() -> None:
+    # The daily counters reset at the turn of the day and roll up with max, so a
+    # 23:59 total attached to a 00:00 sample becomes the new day's high-water
+    # mark and stays there for the rest of it.
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/Chicago")
+    t = FakeTransport(energy=_energy())
+    s = PylxpSource(CFG, transport=t, energy_interval=3600.0)
+    before = datetime(2026, 8, 6, 23, 59, tzinfo=tz)
+    after = datetime(2026, 8, 7, 0, 1, tzinfo=tz)
+    assert await s._read_energy(before)
+    carried = await s._read_energy(after)
+    assert "pv_energy_today_kwh" not in carried
+    # The lifetime counters are monotonic and cross the boundary safely.
+    assert carried["pv_energy_total_kwh"] == 36246.4
+
+
+async def test_a_counter_cached_earlier_the_same_day_is_still_used() -> None:
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo("America/Chicago")
+    t = FakeTransport(energy=_energy())
+    s = PylxpSource(CFG, transport=t, energy_interval=3600.0)
+    await s._read_energy(datetime(2026, 8, 6, 14, 0, tzinfo=tz))
+    carried = await s._read_energy(datetime(2026, 8, 6, 14, 30, tzinfo=tz))
+    assert carried["pv_energy_today_kwh"] == 75.6

@@ -4,41 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Solar ArraySense</title>
+<!-- uPlot is vendored and served from this app, never fetched from a CDN. The
+     collector runs on a home network that may have no route to the internet at
+     all, and a chart library that silently fails to load is a blank panel with
+     nothing on screen to say why. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<script src="/vendor/uPlot.iife.min.js"></script>
+<!-- The shared front end — palette, formatters, nav and the chart factory. It
+     injects the base stylesheet as it runs, so it has to load above this page's
+     own <style>: the page's rules then come second in the cascade and win. -->
+<script src="/common.js"></script>
 <style>
-  :root {
-    /* Validated against protanopia, deuteranopia and tritanopia across every
-       pair, not just adjacent ones — the previous grid violet and home blue sat
-       ΔE 1.9 apart under protan, which is indistinguishable, and 9.8 apart even
-       with full colour vision. These four are worst-pair ΔE 9.0 under CVD and
-       16.1 with normal vision, against this panel's own surface.
-       Charge and discharge deliberately share one hue: they are one series with
-       a sign, separated by the zero line, and position carries that far better
-       than a fifth colour could. */
-    --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
-    --batt-dis:#14625f;
-    --ink:#fff; --ink2:#c8cbd9; --ink3:#8d92a8;
-    --grid-line:rgba(255,255,255,.08);
-    --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
-    --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
-  }
-  * { box-sizing:border-box; }
-  body {
-    margin:0; min-height:100vh; color:var(--ink);
-    font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
-    background:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
-    background-attachment:fixed;
-  }
-  .sunglow{position:fixed;width:420px;height:420px;border-radius:50%;right:-140px;top:-160px;
-    background:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);filter:blur(16px);pointer-events:none}
-  main{position:relative;max-width:1180px;margin:0 auto;padding:22px 20px 40px}
-  header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
-  h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
-  .conn{font-size:11.5px;color:var(--ink3)}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
-  .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
-  .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
-     backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
-  .lbl{font-size:9.5px;letter-spacing:.17em;text-transform:uppercase;color:var(--ink3)}
   .toprow{display:grid;grid-template-columns:230px 1fr;gap:12px;margin-bottom:12px}
   @media(max-width:760px){.toprow{grid-template-columns:1fr}}
   .hero .v{font-size:46px;font-weight:250;letter-spacing:-.03em;line-height:1.05;margin-top:4px}
@@ -48,31 +24,6 @@
   .hero .today b{font-size:17px;font-weight:400;font-variant-numeric:tabular-nums}
   .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
   .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
-  section{margin-bottom:12px}
-  .chead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;flex-wrap:wrap;gap:8px}
-  .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
-  .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
-  .rng{display:flex;gap:6px}
-  .rng button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
-    border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
-  .rng button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink)}
-  svg{display:block;width:100%;height:auto;overflow:visible}
-  .tick{fill:var(--ink3);font-size:9.5px}
-  /* Hover readout. The tooltip is HTML rather than SVG so it can wrap, use the
-     page's own type, and sit above everything without fighting the viewBox. */
-  .chart{position:relative}
-  .chart svg{touch-action:pan-y}
-  .tipdot{pointer-events:none}
-  .tip{position:absolute;pointer-events:none;opacity:0;transition:opacity .09s;
-    background:rgba(6,8,18,.94);border:1px solid var(--panel-b);border-radius:9px;
-    padding:8px 10px;font-size:11.5px;line-height:1.5;white-space:nowrap;z-index:5;
-    box-shadow:0 6px 22px rgba(0,0,0,.45)}
-  .tip.on{opacity:1}
-  .tip .when{color:var(--ink3);font-size:10px;letter-spacing:.03em;margin-bottom:4px}
-  .tip .row{display:flex;justify-content:space-between;gap:14px;
-    font-variant-numeric:tabular-nums}
-  .tip .row u{text-decoration:none;color:var(--ink2)}
-  .tip .row b{font-weight:500;color:var(--ink)}
   .mods{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
   @media(max-width:860px){.mods{grid-template-columns:repeat(2,1fr)}}
   .mod .top{display:flex;justify-content:space-between;align-items:baseline}
@@ -80,20 +31,6 @@
   .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em}
   .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
   .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
-  .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
-  .kv u{text-decoration:none;color:var(--ink3)}
-  .warn{color:var(--warn);font-weight:600}
-  .muted{color:var(--ink3)}
-  /* Tabs. Two views of the same poll: what is happening now, and where the
-     day's energy went. Both read from /api/live, so switching costs nothing. */
-  .tabs{display:flex;gap:4px;margin-bottom:14px}
-  .tabs button{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
-    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
-    cursor:pointer;transition:background .12s,color .12s}
-  .tabs button:hover{color:var(--ink2)}
-  .tabs button[aria-selected="true"]{background:rgba(255,255,255,.17);color:var(--ink);font-weight:500}
-  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
-  .view[hidden]{display:none}
   .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
   .sank .nv{fill:var(--ink3);font:11px system-ui;font-variant-numeric:tabular-nums}
   .sankwait{color:var(--ink3);font-size:12.5px;padding:26px 0;text-align:center}
@@ -158,20 +95,9 @@
   .track i.odd{background:var(--warn)}
   .mod.est .track i{background:repeating-linear-gradient(112deg,var(--batt) 0 6px,rgba(25,158,112,.3) 6px 12px)}
   .mod.est .track i.odd{background:repeating-linear-gradient(112deg,var(--warn) 0 6px,rgba(250,178,25,.3) 6px 12px)}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid-line)}
-  th:first-child,td:first-child{text-align:left}
-  th{color:var(--ink3);font-weight:600;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
-  .iconbtn{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
-    border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.4}
-  .iconbtn:hover{background:rgba(255,255,255,.14);color:var(--ink)}
-  .iconbtn.wide{font-size:11px;flex:1}
   .setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
   .set select{margin-top:5px;width:100%;background:rgba(9,11,24,.7);color:var(--ink);
     border:1px solid var(--panel-b);border-radius:8px;padding:5px 8px;font-family:inherit;font-size:12.5px}
-  details{margin-top:10px}
-  summary{cursor:pointer;font-size:11px;color:var(--ink3)}
-  .kv b{font-weight:500;font-variant-numeric:tabular-nums}
   /* Extended telemetry. The panels are organised around the comparisons that
      diagnose something — string against string, leg against leg, the BMS
      voltage against the inverter's — because two numbers side by side say
@@ -235,6 +161,11 @@
     </div>
   </header>
 
+  <!-- Filled by drawNav(). It sits directly under the header on every page so
+       the marker is always in the same place, and above the advisory so a
+       warning appearing does not push the navigation down the screen. -->
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
   <div class="p cal" id="cal" hidden></div>
 
   <div class="p" id="settings" hidden>
@@ -269,12 +200,7 @@
     </div>
   </div>
 
-  <div class="tabs" role="tablist">
-    <button role="tab" id="tabNow" aria-selected="true" aria-controls="viewNow">Now</button>
-    <button role="tab" id="tabFlow" aria-selected="false" aria-controls="viewFlow">Energy flow</button>
-  </div>
-
-  <div class="view" id="viewFlow" role="tabpanel" hidden>
+  <div class="view" id="viewFlow" hidden>
     <section class="p">
       <div class="chead"><h2>Where today's energy went</h2>
         <span class="legend"><span class="muted" id="flowTotal"></span></span>
@@ -288,7 +214,7 @@
     </section>
   </div>
 
-  <div class="view" id="viewNow" role="tabpanel">
+  <div class="view" id="viewNow">
   <div class="toprow">
     <div class="p hero">
       <div class="lbl">Producing now</div>
@@ -306,6 +232,12 @@
     </div>
   </div>
 
+  <div class="chartbar">
+    <span class="note" id="chartNote" hidden></span>
+    <button id="zoomReset" hidden>Reset zoom</button>
+    <span class="zoomhint">drag across a chart to zoom</span>
+  </div>
+
   <section class="p">
     <div class="chead">
       <h2>Power flow</h2>
@@ -321,7 +253,7 @@
       </div>
       <div class="rng" id="ranges"></div>
     </div>
-    <div class="chart" id="powerWrap"><svg id="power" viewBox="0 0 900 230" role="img" aria-label="Power flow over the selected range"></svg><div class="tip" id="powerTip"></div></div>
+    <div class="chart" id="powerWrap" role="img" aria-label="Power flow over the selected range"></div>
     <details>
       <summary>Show as a table</summary>
       <div style="max-height:220px;overflow:auto;margin-top:8px">
@@ -337,12 +269,12 @@
         <span class="muted" id="battNow"></span>
       </div>
     </div>
-    <div class="chart" id="battpowerWrap"><svg id="battpower" viewBox="0 0 900 150" role="img" aria-label="Battery charge and discharge over the selected range"></svg><div class="tip" id="battpowerTip"></div></div>
+    <div class="chart" id="battpowerWrap" role="img" aria-label="Battery charge and discharge over the selected range"></div>
   </section>
 
   <section class="p">
     <div class="chead"><h2>Battery state of charge</h2><span class="legend" id="bankInfo"></span></div>
-    <div class="chart" id="socWrap"><svg id="soc" viewBox="0 0 900 130" role="img" aria-label="Battery state of charge over the selected range"></svg><div class="tip" id="socTip"></div></div>
+    <div class="chart" id="socWrap" role="img" aria-label="Battery state of charge over the selected range"></div>
   </section>
 
   </div><!-- /viewNow -->
@@ -376,39 +308,18 @@
 </main>
 
 <script>
-const PALETTE = { pv:'#c98500', load:'#3987e5', batt:'#199e70', grid:'#9085e9' };
-const RANGES = [
-  { key:'6h',  label:'6h',  seconds:6*3600 },
-  { key:'24h', label:'24h', seconds:24*3600 },
-  { key:'7d',  label:'7d',  seconds:7*86400 },
-  { key:'30d', label:'30d', seconds:30*86400 },
-];
+// Everything shared with the other pages — $, esc, numOrNull, DASH, the
+// formatters, the settings, the palette resolver and the chart factory — comes
+// from /common.js, which is loaded above. This file is only what is particular
+// to the dashboard.
+
 let range = RANGES[1];
 const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
 // Held between polls because it changes how the per-module cards draw, not just
 // what the badge says.
 let calibration = null;
 
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
-  (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-// A reading is a number or it is absent. Anything else — null, undefined, a
-// string, a NaN — is unknown, and unknown must never fall through to zero.
-const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 const trim = (v) => v.toFixed(v % 1 === 0 ? 0 : 1);
-
-// Readings are stored and served in Celsius because that is what the hardware
-// reports; converting only on display means changing this never rewrites data.
-const settings = {
-  tempUnit: localStorage.getItem('as.tempUnit') || 'F',
-  refreshSecs: Number(localStorage.getItem('as.refreshSecs') || 5),
-};
-const tempOf = (c) => c === null || c === undefined ? null
-  : (settings.tempUnit === 'F' ? c * 9/5 + 32 : c);
-const tempStr = (c) => {
-  const v = tempOf(c);
-  return v === null ? '—' : `${v.toFixed(1)} °${settings.tempUnit}`;
-};
 
 let liveTimer = null;
 function scheduleLive() {
@@ -421,13 +332,11 @@ function wireSettings() {
   $('refreshSecs').value = String(settings.refreshSecs);
   $('settingsBtn').onclick = () => { $('settings').hidden = !$('settings').hidden; };
   $('tempUnit').onchange = (e) => {
-    settings.tempUnit = e.target.value;
-    localStorage.setItem('as.tempUnit', settings.tempUnit);
+    saveSetting('tempUnit', e.target.value);
     loadLive();
   };
   $('refreshSecs').onchange = (e) => {
-    settings.refreshSecs = Number(e.target.value);
-    localStorage.setItem('as.refreshSecs', String(settings.refreshSecs));
+    saveSetting('refreshSecs', Number(e.target.value));
     scheduleLive();
   };
   $('yieldBtn').onclick = async () => {
@@ -440,13 +349,16 @@ function wireSettings() {
     loadLive();
   };
 }
-const kw = (w) => w === null || w === undefined ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W');
 
-function drawRanges() {
-  $('ranges').innerHTML = RANGES.map(r =>
-    `<button data-k="${r.key}" aria-pressed="${r.key===range.key}">${r.label}</button>`).join('');
-  $('ranges').querySelectorAll('button').forEach(b =>
-    b.onclick = () => { range = RANGES.find(r => r.key === b.dataset.k); drawRanges(); loadHistory(); });
+// Redrawn on every pick so the pressed state follows, which is also why this
+// is a named function rather than a closure passed straight to drawRanges.
+function showRanges() {
+  drawRanges($('ranges'), range, (picked) => {
+    range = picked;
+    rangeChanged = true;
+    showRanges();
+    loadHistory();
+  });
 }
 
 async function loadLive() {
@@ -669,23 +581,6 @@ function moduleDetail(m) {
 // data is not zero cannot afford a derived claim resting on an absent number.
 // ---------------------------------------------------------------------------
 
-const DASH = '—';
-// Fixed digit counts, so a column of readings does not change width as the
-// values move. Grouping separators come from the browser's own locale.
-const gnum = (v, d) => v.toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d});
-const wStr = (v) => v === null ? DASH : gnum(Math.round(v), 0) + ' W';
-const uStr = (v, d, unit) => v === null ? DASH : gnum(v, d) + (unit ? ' ' + unit : '');
-// A quantity shown to a tenth only when it has one, so a 200 A limit is not
-// dressed up as 200.0 and a 7.5 A one is not rounded away to 8.
-const qty = (v, unit) => v === null ? DASH
-  : gnum(v, Number.isInteger(v) ? 0 : 1) + (unit ? ' ' + unit : '');
-
-// A temperature difference is not a temperature. Three degrees Celsius apart
-// is 5.4 °F apart, not 37.4 — putting a delta through tempOf() is the version
-// of this bug that looks right until someone switches units.
-const tempDeltaStr = (dc) => dc === null ? DASH
-  : `${(settings.tempUnit === 'F' ? dc * 9/5 : dc).toFixed(1)} °${settings.tempUnit}`;
-
 const runtimeStr = (s) => {
   const t = Math.floor(s);
   return `${gnum(Math.floor(t / 86400), 0)} d ${Math.floor((t % 86400) / 3600)} h`;
@@ -697,9 +592,6 @@ function median(xs) {
   const m = Math.floor(a.length / 2);
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
-
-const kvRow = (label, value, cls) =>
-  `<div class="kv"><u>${label}</u><b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
 
 // A caption with nothing to say is no caption. Returning an empty string here
 // rather than a placeholder is what keeps a missing input from becoming a
@@ -1075,164 +967,48 @@ function wireDetail() {
   });
 }
 
-function line(pts, colour, dash) {
-  if (pts.length < 2) return '';
-  return `<polyline fill="none" stroke="${colour}" stroke-width="2" stroke-linejoin="round"
-    stroke-linecap="round"${dash?` stroke-dasharray="${dash}"`:''} points="${pts.join(' ')}"/>`;
-}
-
-// What each chart is currently showing, so the hover can answer without
-// refetching. Replaced wholesale on every redraw rather than mutated, so a
-// pointer moving during a redraw reads one consistent set of points.
-const hovering = {};
-
-// Map a pointer position to the nearest sample. The SVG scales to its
-// container, so client pixels have to be converted back into viewBox units
-// before they mean anything — reading clientX directly is right only at one
-// window width, which is the sort of bug that looks like a rounding error.
-function attachHover(id, points, rows, geom) {
-  hovering[id] = { points, rows, geom };
-  const svg = $(id);
-  if (svg.dataset.hoverWired) return;
-  svg.dataset.hoverWired = '1';
-
-  const move = (ev) => {
-    const st = hovering[id];
-    const tip = $(`${id}Tip`);
-    if (!st || !st.points.length) { tip.classList.remove('on'); return; }
-    const box = svg.getBoundingClientRect();
-    if (!box.width) return;
-    const touch = ev.touches && ev.touches[0];
-    const vx = ((touch ? touch.clientX : ev.clientX) - box.left) / box.width * st.geom.W;
-    const { L, R, W } = st.geom;
-    const frac = (vx - L) / Math.max(W - L - R, 1);
-    const n = st.points.length;
-    const idx = Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
-    const pt = st.points[idx];
-
-    const parts = st.rows
-      .map(([label, key, fmt]) => {
-        const v = numOrNull(pt[key]);
-        return `<div class="row"><u>${esc(label)}</u><b>${v === null ? DASH : fmt(v)}</b></div>`;
-      }).join('');
-    const when = pt.timestamp ? new Date(pt.timestamp) : null;
-    tip.innerHTML = `<div class="when">${when ? esc(when.toLocaleString()) : ''}</div>${parts}`;
-    tip.classList.add('on');
-
-    // Keep the tooltip inside the chart rather than letting it push the page
-    // sideways — a wall tablet has no horizontal scrollbar to rescue it.
-    const px = (idx / Math.max(n - 1, 1)) * (box.width - (L + R) / st.geom.W * box.width)
-      + L / st.geom.W * box.width;
-    const tw = tip.offsetWidth || 150;
-    tip.style.left = `${Math.max(2, Math.min(box.width - tw - 2, px + 12))}px`;
-    tip.style.top = '6px';
-
-    const x = (L + (W - L - R) * idx / Math.max(n - 1, 1)).toFixed(1);
-    const g = svg.querySelector('#' + id + 'Cross');
-    if (g) g.innerHTML = `<line x1="${x}" y1="0" x2="${x}" y2="${st.geom.H}" `
-      + `stroke="rgba(255,255,255,.34)" stroke-width="1" class="tipdot"/>`;
-  };
-  const leave = () => {
-    $(`${id}Tip`).classList.remove('on');
-    const g = svg.querySelector('#' + id + 'Cross');
-    if (g) g.innerHTML = '';
-  };
-  svg.addEventListener('mousemove', move);
-  svg.addEventListener('mouseleave', leave);
-  svg.addEventListener('touchstart', move, { passive: true });
-  svg.addEventListener('touchmove', move, { passive: true });
-  svg.addEventListener('touchend', leave);
+// The same readings the chart is showing, for anyone who would rather read a
+// number than a pixel. Drawn whether or not the chart has anything to plot,
+// because a range with one lonely reading in it still has that reading.
+function powerTable(rows) {
+  $('powerTable').querySelector('tbody').innerHTML = rows.slice(-200).reverse().map((p) => `<tr>
+    <td>${esc(new Date(p.timestamp).toLocaleString())}</td>
+    <td>${kw(p.pv_total_power_w)}</td><td>${kw(p.load_power_w)}</td>
+    <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
 }
 
 function drawPower(points) {
-  const W=900,H=230,L=48,R=14,T=12,B=26;
-  const series = [
-    ['pv_total_power_w', PALETTE.pv, null],
-    ['load_power_w', PALETTE.load, null],
-    ['grid_power_w', PALETTE.grid, '4 3'],
-  ];
-  const vals = points.flatMap(p => series.map(([k]) => p[k]).filter(v => v !== null && v !== undefined));
-  if (!vals.length) { $('power').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`; return; }
-  const hi = Math.max(1000, ...vals), lo = Math.min(0, ...vals);
-  const pad = (hi-lo)*0.08 || 500;
-  const top = hi+pad, bot = lo-pad;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
-
-  let s = '';
-  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top-bot,1)))) / 2;
-  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
-    const y = sy(g);
-    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"
-      stroke="${Math.abs(g)<1e-9?'rgba(255,255,255,.28)':'var(--grid-line)'}" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">${(g/1000).toFixed(g%1000?1:0)}</text>`;
-  }
-  s += `<text class="tick" x="${L-8}" y="${T+8}" text-anchor="end">kW</text>`;
-  const ticks = Math.min(6, points.length);
-  for (let t = 0; t < ticks; t++) {
-    const idx = Math.round(t*(points.length-1)/Math.max(ticks-1,1));
-    const when = new Date(points[idx].timestamp);
-    const label = range.seconds > 3*86400
-      ? when.toLocaleDateString(undefined,{month:'short',day:'numeric'})
-      : when.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
-    s += `<text class="tick" x="${sx(idx).toFixed(1)}" y="${H-8}" text-anchor="middle">${label}</text>`;
-  }
-  // Three series at equal weight is three things competing, and where they
-  // cross you lose which is which. So identity is carried by form as well as
-  // by hue — solar a filled area, home the heaviest line, grid a thin dashed
-  // trace — which also means the chart still reads when the colours do not.
-  s += `<defs><linearGradient id="pvfill" x1="0" y1="0" x2="0" y2="1">`
-    + `<stop offset="0%" stop-color="var(--pv)" stop-opacity="0.5"/>`
-    + `<stop offset="100%" stop-color="var(--pv)" stop-opacity="0.04"/></linearGradient></defs>`;
-
-  // Runs of consecutive readings. A gap is a break, never bridged: a comms
-  // outage has to look like one rather than a straight line across the hole.
-  const runsOf = (key) => {
-    const out = []; let run = [];
-    points.forEach((p, n) => {
-      const v = p[key];
-      if (v === null || v === undefined || p.is_gap) { if (run.length > 1) out.push(run); run = []; }
-      else run.push([sx(n), sy(v)]);
-    });
-    if (run.length > 1) out.push(run);
-    return out;
-  };
-
-  // Solar is what the array harvested, so it reads as volume rather than as a
-  // line. Filled to the zero line, not to the bottom of the chart, or a
-  // negative axis would put the fill on the wrong side of nothing.
-  const baseY = sy(Math.max(0, bot));
-  for (const run of runsOf('pv_total_power_w')) {
-    const d = run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-    s += `<polygon points="${run[0][0].toFixed(1)},${baseY.toFixed(1)} ${d} `
-      + `${run[run.length-1][0].toFixed(1)},${baseY.toFixed(1)}" fill="url(#pvfill)"/>`;
-  }
-
-  // Drawn last to first in importance: grid recedes, solar outlines its own
-  // fill, home sits on top because it is the one the owner acts on.
-  const stroke = (key, colour, width, dash) => {
-    for (const run of runsOf(key)) {
-      s += `<polyline points="${run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')}" `
-        + `fill="none" stroke="${colour}" stroke-width="${width}" stroke-linejoin="round"`
-        + `${dash ? ` stroke-dasharray="${dash}"` : ''}/>`;
-    }
-  };
-  stroke('grid_power_w', 'var(--grid)', 1.2, '4 3');
-  stroke('pv_total_power_w', 'var(--pv)', 1.6, null);
-  stroke('load_power_w', 'var(--load)', 2.1, null);
-  s += `<g id="powerCross"></g>`;
-  $('power').innerHTML = s;
-  attachHover('power', points, [
-    ['Solar', 'pv_total_power_w', kw],
-    ['Home', 'load_power_w', kw],
-    ['Grid', 'grid_power_w', kw],
-  ], { W, H, L, R });
-
-  const rows = points.slice(-200).reverse().map(p => `<tr>
-    <td>${new Date(p.timestamp).toLocaleString()}</td>
-    <td>${kw(p.pv_total_power_w)}</td><td>${kw(p.load_power_w)}</td>
-    <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
-  $('powerTable').querySelector('tbody').innerHTML = rows;
+  const f = frame(points);
+  const pv = f.of('pv_total_power_w');
+  const grid = f.of('grid_power_w');
+  const load = f.of('load_power_w');
+  powerTable(f.rows);
+  if (!anyReading(pv, grid, load)) { chartMessage('power', 'no data in this range'); return; }
+  paint('power', {
+    height: 230,
+    unit: 'kW',
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: powerRange } },
+      axes: [timeAxis(), kwAxis()],
+      // Three series at equal weight is three things competing, and where they
+      // cross you lose which is which. So identity is carried by form as well
+      // as by hue — solar a filled area because it is volume the array
+      // harvested, home the heaviest line because it is the one the owner
+      // acts on, grid a thin dashed trace because it is usually zero and only
+      // matters when it is not. The chart still reads when the colours do not.
+      // Ordered so the solar fill lies under the grid dashes and home is drawn
+      // over both: it is the line that must never be the one obscured.
+      series: [
+        {},
+        trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
+        trace('Grid', '--grid', 1.2, { dash: [4, 3] }),
+        trace('Home', '--load', 2.1),
+      ],
+      plugins: [zeroRule(), readout('power', [
+        ['Solar', 1, kw], ['Home', 3, kw], ['Grid', 2, kw],
+      ])],
+    }),
+  }, [f.xs, pv, grid, load]);
 }
 
 // Battery power is the one series with a meaningful zero: above it the bank is
@@ -1241,62 +1017,30 @@ function drawPower(points) {
 // production and share a direction, while this one changes sign several times a
 // day — which is what made the combined chart hard to read.
 function drawBattery(points) {
-  const W=900,H=150,L=48,R=14,T=12,B=24;
-  const vals = points.map(p => p.battery_power_w).filter(v => v !== null && v !== undefined);
-  if (!vals.length) {
-    $('battpower').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`;
-    return;
-  }
-  // The scale is symmetric about zero on purpose. An asymmetric one would make
-  // a 3 kW charge and a 3 kW discharge draw different heights.
-  const mag = Math.max(1000, ...vals.map(Math.abs));
-  const top = mag * 1.08, bot = -top;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
-
-  let s = '';
-  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top, 1)))) / 2;
-  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
-    const y = sy(g);
-    const zero = Math.abs(g) < 1e-9;
-    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}" `
-      + `stroke="${zero ? 'rgba(255,255,255,.28)' : 'var(--grid-line)'}" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">`
-      + `${(g/1000).toFixed(Math.abs(g) >= 1000 || g === 0 ? 0 : 1)}</text>`;
-  }
-  s += `<text class="tick" x="${L}" y="9">kW</text>`;
-
-  // Filled to the zero line so the direction reads without consulting the
-  // legend, and split at the crossing so charge and discharge carry different
-  // colours. A gap breaks the fill rather than being bridged across.
-  let run = [];
-  const flush = () => {
-    if (run.length > 1) {
-      for (const [sign, colour] of [[1, PALETTE.batt], [-1, 'var(--batt-dis)']]) {
-        const clipped = run.map(([x, v]) => [x, sign > 0 ? Math.max(0, v) : Math.min(0, v)]);
-        if (!clipped.some(([, v]) => v !== 0)) continue;
-        const d = clipped.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
-        s += `<polygon points="${clipped[0][0].toFixed(1)},${sy(0).toFixed(1)} ${d} `
-          + `${clipped[clipped.length-1][0].toFixed(1)},${sy(0).toFixed(1)}" `
-          + `fill="${colour}" fill-opacity="0.30"/>`;
-      }
-      s += `<polyline points="${run.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" `
-        + `fill="none" stroke="var(--batt)" stroke-width="1.6" stroke-linejoin="round"/>`;
-    }
-    run = [];
-  };
-  points.forEach((p, n) => {
-    const v = p.battery_power_w;
-    if (v === null || v === undefined || p.is_gap) flush();
-    else run.push([sx(n), v]);
-  });
-  flush();
-  s += `<g id="battpowerCross"></g>`;
-  $('battpower').innerHTML = s;
-  attachHover('battpower', points, [
-    ['Battery', 'battery_power_w', (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v))],
-    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
-  ], { W, H, L, R });
+  const f = frame(points);
+  const batt = f.of('battery_power_w');
+  const soc = f.of('battery_soc_pct');
+  if (!anyReading(batt)) { chartMessage('battpower', 'no data in this range'); return; }
+  paint('battpower', {
+    height: 150,
+    unit: 'kW',
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: batteryRange } },
+      axes: [timeAxis(), kwAxis()],
+      // Filled to the zero line so the direction reads without consulting the
+      // legend, and split at the crossing so charging and discharging carry
+      // different shades of the one hue.
+      series: [
+        {},
+        trace('Battery', '--batt', 1.6, { fill: battFill, fillTo: () => 0 }),
+        carried(),
+      ],
+      plugins: [zeroRule(), readout('battpower', [
+        ['Battery', 1, (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v))],
+        ['State of charge', 2, (v) => `${v.toFixed(0)}%`],
+      ])],
+    }),
+  }, [f.xs, batt, soc]);
 }
 
 // Today's energy as a flow diagram, from the inverter's own counters. The two
@@ -1376,46 +1120,57 @@ function drawSankey(i) {
   $('sankey').innerHTML = `<g class="sank">${out}</g>`;
 }
 
+// Two views of the same poll: what is happening now, and where the day's energy
+// went. Both read from /api/live, so switching between them costs nothing and
+// they stay one document — which is why the nav reaches them by hash rather
+// than by path. The hash is authoritative when there is one, so a link from
+// another page lands on the view it named; the remembered choice only decides
+// what a bare "/" opens on.
 function wireTabs() {
-  const tabs = [['tabNow', 'viewNow'], ['tabFlow', 'viewFlow']];
+  const views = { now: 'viewNow', flow: 'viewFlow' };
   const show = (want) => {
-    for (const [t, v] of tabs) {
-      const on = v === want;
-      $(t).setAttribute('aria-selected', String(on));
-      $(v).hidden = !on;
-    }
+    for (const [key, id] of Object.entries(views)) $(id).hidden = key !== want;
+    drawNav(want);
     localStorage.setItem('as.tab', want);
     // The charts size themselves from the container, which is zero-width while
     // hidden, so anything revealed has to be redrawn rather than left stretched.
-    if (want === 'viewNow') loadHistory();
+    if (want === 'now') loadHistory();
   };
-  for (const [t, v] of tabs) $(t).onclick = () => show(v);
-  show(localStorage.getItem('as.tab') === 'viewFlow' ? 'viewFlow' : 'viewNow');
+  const wanted = () => {
+    const hash = location.hash.replace('#', '');
+    if (hash in views) return hash;
+    const held = localStorage.getItem('as.tab');
+    return held === 'flow' || held === 'viewFlow' ? 'flow' : 'now';
+  };
+  window.addEventListener('hashchange', () => show(wanted()));
+  show(wanted());
 }
 
 function drawSoc(points) {
-  const W=900,H=130,L=48,R=14,T=10,B=24;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (100 - v) / 100;
-  let s = '';
-  for (const g of [0,25,50,75,100]) {
-    const y = sy(g);
-    s += `<line x1="${L}" y1="${y}" x2="${W-R}" y2="${y}" stroke="var(--grid-line)" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${y+3}" text-anchor="end">${g}%</text>`;
-  }
-  let run = [];
-  points.forEach((p, n) => {
-    const v = p.battery_soc_pct;
-    if (v === null || v === undefined || p.is_gap) { s += line(run, PALETTE.batt); run = []; }
-    else run.push(`${sx(n).toFixed(1)},${sy(v).toFixed(1)}`);
-  });
-  s += line(run, PALETTE.batt);
-  s += `<g id="socCross"></g>`;
-  $('soc').innerHTML = s;
-  attachHover('soc', points, [
-    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
-    ['Battery', 'battery_power_w', kw],
-  ], { W, H, L, R });
+  const f = frame(points);
+  const soc = f.of('battery_soc_pct');
+  const batt = f.of('battery_power_w');
+  if (!anyReading(soc)) { chartMessage('soc', 'no data in this range'); return; }
+  paint('soc', {
+    height: 130,
+    unit: '',
+    opts: chartBase({
+      // Nailed to nought and a hundred. Autoscaling this would draw a bank
+      // that sat between 61% and 64% all day as a dramatic climb up the full
+      // height of the panel, and the y axis is the whole reading here.
+      scales: { x: { time: true }, y: { range: () => [0, 100] } },
+      axes: [timeAxis(), axis({
+        size: 48, gap: 6,
+        splits: () => [0, 25, 50, 75, 100],
+        values: (u, splits) => splits.map((v) => `${v}%`),
+      })],
+      series: [{}, trace('State of charge', '--batt', 1.8), carried()],
+      plugins: [readout('soc', [
+        ['State of charge', 1, (v) => `${v.toFixed(0)}%`],
+        ['Battery', 2, kw],
+      ])],
+    }),
+  }, [f.xs, soc, batt]);
 }
 
 async function loadHistory() {
@@ -1429,15 +1184,24 @@ async function loadHistory() {
     drawPower(body.points || []);
     drawBattery(body.points || []);
     drawSoc(body.points || []);
+    rangeChanged = false;
+    refreshZoomState();
   } catch (e) {
-    $('power').innerHTML = `<text class="tick" x="48" y="40">history unavailable</text>`;
+    // A transient poll failure must not tear the charts down. Destroying them
+    // takes the owner's zoom with it, and the readings already on screen are
+    // still the last ones the inverter gave us — better a stale chart with a
+    // note than a blank panel every time the network hiccups.
+    note('history unavailable — showing the last successful read');
   }
 }
 
+// Boot. Everything above is definitions; nothing runs until here.
 wireSettings();
 wireDetail();
 wireTabs();
-drawRanges();
+$('zoomReset').onclick = resetZoom;
+setInterval(refreshZoomState, 900);
+showRanges();
 loadLive();
 loadHistory();
 scheduleLive();

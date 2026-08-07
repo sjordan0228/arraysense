@@ -1,0 +1,1174 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Costs · Solar ArraySense</title>
+<!-- The shared front end — palette, formatters, nav. It injects the base
+     stylesheet as it runs, so it has to load above this page's own <style>:
+     the page's rules then come second in the cascade and win.
+     No uPlot here. Nothing on this page is drawn against a time axis; the one
+     picture is a Sankey, which is hand-written SVG for the reason the History
+     page uses uPlot — each tool where it is the clearest answer. -->
+<script src="/common.js"></script>
+<style>
+  /* The month strip. One line saying which month is being priced and how much
+     of it has happened, because a mid-month figure read as a whole bill is the
+     single easiest way for this page to mislead. */
+  .monthbar{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}
+  .monthbar h2{margin:2px 0 0;font-size:22px;font-weight:300;letter-spacing:-.025em}
+  .mstat{font-size:11.5px;color:var(--ink3);text-align:right;line-height:1.6}
+  .mprog{height:4px;border-radius:3px;background:rgba(255,255,255,.12);margin-top:12px;overflow:hidden}
+  .mprog i{display:block;height:100%;width:0;border-radius:3px;
+    background:linear-gradient(90deg,rgba(207,123,38,.85),rgba(207,123,38,.35))}
+  /* An unmeasurable elapsed fraction gets the hatch the rest of the site uses
+     for an unknown, never an empty bar that would read as "nothing yet". */
+  .mprog.none{background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+  .pn{margin-bottom:12px;font-size:12px;color:var(--warn);border-left:3px solid var(--warn)}
+  .pn[hidden]{display:none}
+  /* No tariff. This is not an error state and must not look like one: nothing
+     is broken, the owner simply has not said what they pay. */
+  .tno{margin-bottom:12px;border-left:3px solid var(--ink3)}
+  .tno h2{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .tno p{margin:7px 0 0;font-size:12.5px;line-height:1.6;color:var(--ink2);max-width:78ch}
+  .tno .why{color:var(--warn)}
+  .tno a{display:inline-block;margin-top:11px;text-decoration:none}
+  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px}
+  @media(max-width:860px){.cards{grid-template-columns:1fr}}
+  .cards[hidden]{display:none}
+  .card .v{font-size:40px;font-weight:250;letter-spacing:-.03em;line-height:1.06;margin-top:5px;
+    font-variant-numeric:tabular-nums}
+  .card .v .cur{font-size:18px;opacity:.6;font-weight:400;margin-right:1px;letter-spacing:0}
+  .card .sub{margin-top:10px;padding-top:9px;border-top:1px solid var(--panel-b);
+    font-size:11px;line-height:1.6;color:var(--ink3)}
+  .card .sub b{font-weight:500;color:var(--ink2);font-variant-numeric:tabular-nums}
+  /* The saving is the number the whole system exists to produce, so it carries
+     the array's own colour rather than a generic accent. */
+  .card.save .v{color:var(--pv)}
+  .card.save .v.neg{color:var(--warn)}
+  .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
+  .sank .nv{fill:var(--ink3);font:11px system-ui;font-variant-numeric:tabular-nums}
+  .sankwait{color:var(--ink3);font-size:12.5px;padding:26px 0;text-align:center;line-height:1.6}
+  /* Peak against off-peak, as two bars over the same width: the point is that
+     a band's share of the cost is not its share of the energy. One hue for all
+     bands — they are the same grid supply at different hours — separated by
+     lightness and by the label, never by a fifth colour. */
+  .split{margin:2px 0 14px}
+  .splitrow{display:flex;align-items:center;gap:9px;margin-top:7px}
+  .splitrow .sl{flex:0 0 74px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3)}
+  .splitbar{flex:1;display:flex;height:19px;border-radius:5px;overflow:hidden;background:rgba(255,255,255,.07)}
+  .splitbar span{display:flex;align-items:center;justify-content:center;min-width:0;overflow:hidden;
+    font-size:10px;color:rgba(255,255,255,.95);white-space:nowrap;font-variant-numeric:tabular-nums}
+  .splitbar.none{background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+  .tw{overflow-x:auto}
+  .hours{font-size:9.5px;color:var(--ink3);letter-spacing:.03em;margin-top:2px}
+  .bandbar{height:4px;border-radius:2px;background:rgba(255,255,255,.09);margin-top:5px;overflow:hidden}
+  .bandbar i{display:block;height:100%;width:0;border-radius:2px;background:var(--grid)}
+  td.part{position:relative}
+  td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
+  /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
+     it — uppercase at .17em tracking turns an explanation into shouting. */
+  .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
+  .egrid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+  @media(max-width:900px){.egrid{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:520px){.egrid{grid-template-columns:repeat(2,1fr)}}
+  .egrid b{display:block;margin-top:4px;font-size:18px;font-weight:400;font-variant-numeric:tabular-nums}
+  .egrid b span{font-size:11px;opacity:.6;margin-left:3px}
+  .assume{font-size:11.5px;line-height:1.65;color:var(--ink3);max-width:86ch;margin-top:8px}
+  .assume li{margin-bottom:6px}
+  .assume ul{margin:0;padding-left:17px}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div class="conn" id="stamp"></div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="p pn" id="pnote" hidden></div>
+
+  <section class="p">
+    <div class="monthbar">
+      <div>
+        <span class="lbl">Billing month</span>
+        <h2 id="monthName">—</h2>
+      </div>
+      <div class="mstat" id="monthStat"></div>
+    </div>
+    <div class="mprog" id="mprog"><i></i></div>
+  </section>
+
+  <div class="p tno" id="notariff" hidden>
+    <h2>No tariff entered, so nothing here is priced</h2>
+    <p id="notariffWhy"></p>
+    <a class="iconbtn" href="/#settings">Enter a tariff in settings</a>
+  </div>
+
+  <div class="cards" id="cards" hidden>
+    <div class="p card">
+      <span class="lbl">Cost so far</span>
+      <div class="v" id="costV">—</div>
+      <div class="sub" id="costSub"></div>
+    </div>
+    <div class="p card">
+      <span class="lbl">Estimated bill</span>
+      <div class="v" id="billV">—</div>
+      <div class="sub" id="billSub"></div>
+    </div>
+    <div class="p card save">
+      <span class="lbl">Saved by solar and battery</span>
+      <div class="v" id="saveV">—</div>
+      <div class="sub" id="saveSub"></div>
+    </div>
+  </div>
+
+  <section class="p" id="sankeySec" hidden>
+    <div class="chead">
+      <h2>Where the month's money went</h2>
+      <span class="legend muted" id="sankeyTotal"></span>
+    </div>
+    <!-- The same diagram the dashboard draws in kilowatt-hours, in money: the
+         house's demand priced at the tariff on the left, and on the right the
+         part that was actually paid for against the part the system covered. -->
+    <svg id="sankey" viewBox="0 0 900 400" role="img"
+         aria-label="What the month's electricity would have cost at grid rates, and how much of it was paid"></svg>
+    <div class="sankwait" id="sankeyWait" hidden></div>
+  </section>
+
+  <section class="p" id="bandSec" hidden>
+    <div class="chead">
+      <h2>By rate band</h2>
+      <span class="legend muted" id="bandTier"></span>
+    </div>
+    <div class="split" id="bandSplit"></div>
+    <div class="tw">
+      <table id="bandTable">
+        <thead><tr>
+          <th>Band</th><th>Rate</th><th>Grid import</th><th>Cost</th>
+          <th>House used</th><th>At grid rates</th><th>Saved</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <span class="cap" id="bandCap"></span>
+  </section>
+
+  <section class="p">
+    <div class="chead">
+      <h2>Energy this month</h2>
+      <span class="legend muted">the inverter's own counters, not integrated power</span>
+    </div>
+    <div class="egrid" id="egrid"></div>
+    <span class="cap" id="energyCap"></span>
+  </section>
+
+  <section>
+    <details>
+      <summary>What these figures assume</summary>
+      <div class="assume" id="assume"></div>
+    </details>
+  </section>
+</main>
+
+<script>
+// Everything shared with the other pages — $, esc, numOrNull, DASH, uStr, the
+// palette and the nav — comes from /common.js, loaded above. This file is only
+// what is particular to costs.
+//
+// Two things here look like duplication and are not quite.
+//
+// The rate bands are parsed in the browser because there is no endpoint that
+// serves a priced answer: /api/settings hands out the band text the owner
+// typed, and this page turns it into money. src/arraysense/tariff.py is the
+// same model in Python and is the authority on the format — the grammar below
+// mirrors it deliberately, and if the two ever disagree the Python one is
+// right. The moment a /api/cost endpoint exists, everything between here and
+// the fetch section should be deleted in favour of it.
+//
+// Energy per rate band is likewise derived here, from the inverter's lifetime
+// counters rather than from integrated power. Integration agrees on a clean
+// day and quietly undercounts after any gap in collection; a counter kept
+// counting while we were not watching, so the difference between two readings
+// of it is right even across an outage.
+
+// ---------------------------------------------------------------------------
+// Money on screen.
+// ---------------------------------------------------------------------------
+
+// The currency is a setting. A hard-coded dollar sign is wrong for most of the
+// planet, and this is published software.
+function money(v, cur) {
+  if (v === null || v === undefined || !isFinite(v)) return DASH;
+  const sym = String(cur || '$');
+  // "USD 12.34" but "$12.34" — a code needs the space and a symbol does not.
+  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
+  const digits = Math.abs(v).toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (v < 0 ? '−' : '') + sym + gap + digits;
+}
+
+// The big numerals set the currency smaller than the figure, the way the rest
+// of the page sets units.
+function bigMoney(v, cur) {
+  if (v === null || v === undefined || !isFinite(v)) return DASH;
+  const whole = money(v, cur);
+  const digits = Math.abs(v).toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const lead = whole.slice(0, whole.length - digits.length);
+  return `<span class="cur">${esc(lead)}</span>${esc(digits)}`;
+}
+
+// A price per kWh carries more places than a total does: a tariff written as
+// 0.1105 is not 0.11, and rounding it here would misprice every figure below.
+function rateStr(v, cur) {
+  if (v === null || v === undefined || !isFinite(v)) return DASH;
+  const sym = String(cur || '$');
+  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
+  return sym + gap + v.toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 5 });
+}
+
+const pctStr = (v) => v === null || v === undefined || !isFinite(v)
+  ? DASH : `${(v * 100).toFixed(0)}%`;
+
+const clock = (minutes) =>
+  `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
+
+// ---------------------------------------------------------------------------
+// The tariff, as the settings page stores it. Mirrors tariff.parse_bands.
+// ---------------------------------------------------------------------------
+
+const MINUTES_PER_DAY = 24 * 60;
+
+// Accepts 16, 16:00 and 24:00, because that is how tariffs are written down:
+// midnight at the far end of a range is 24:00 on most bills and 00:00 on a
+// clock, and both mean the same instant.
+function parseClock(token, entry) {
+  const text = String(token).trim();
+  const cut = text.indexOf(':');
+  const hourText = cut < 0 ? text : text.slice(0, cut);
+  const minuteText = cut < 0 ? '' : text.slice(cut + 1).trim();
+  const hour = Number(hourText);
+  const minute = minuteText === '' ? 0 : Number(minuteText);
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) {
+    throw new Error(`${entry}: “${text}” is not a time like 16:00`);
+  }
+  if (hour === 24 && minute === 0) return 0;
+  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    throw new Error(`${entry}: “${text}” is not a time of day`);
+  }
+  return hour * 60 + minute;
+}
+
+// 24 at the end of a range closes the day; 16:00-16:00 is somebody having
+// written something they did not mean.
+const endsTheDay = (token) => String(token).trim().split(':')[0].trim() === '24';
+
+function parseHours(text, entry) {
+  const ranges = [];
+  for (const chunk of String(text).split(',')) {
+    const span = chunk.trim();
+    if (!span) continue;
+    const cut = span.indexOf('-');
+    if (cut < 0) throw new Error(`${entry}: “${span}” is not a range like 16:00-21:00`);
+    const start = parseClock(span.slice(0, cut), entry);
+    const endText = span.slice(cut + 1);
+    const end = parseClock(endText, entry);
+    if (start === end && !endsTheDay(endText)) {
+      throw new Error(`${entry}: “${span}” starts and ends at the same time. `
+        + 'Write 00:00-24:00 for a band that applies all day.');
+    }
+    ranges.push({ start, end });
+  }
+  if (!ranges.length) throw new Error(`${entry}: a band needs at least one time range`);
+  return ranges;
+}
+
+// end is exclusive so two adjacent bands do not both claim the instant between
+// them, and a range whose start is at or after its end wraps: 21:00-06:00 is
+// the night, not an empty set. Getting that wrong puts every overnight
+// kilowatt-hour in no band at all.
+const inRange = (r, minute) =>
+  r.start < r.end ? minute >= r.start && minute < r.end : minute >= r.start || minute < r.end;
+
+// Refuses rather than guesses, for the same reason the Python does: a
+// half-understood tariff prices a bill wrongly and says nothing about it,
+// while one that was refused gets fixed.
+function parseBands(text) {
+  const bands = [];
+  const seen = new Map();
+  // Semicolons and newlines both separate bands, so a one-line field and a
+  // textarea each work without the owner being told which.
+  for (const raw of String(text).replace(/\n/g, ';').split(';')) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    const parts = entry.split('|').map((p) => p.trim());
+    if (parts.length !== 3) {
+      throw new Error(`${entry}: a band is “name | price | hours”, three fields separated by |`);
+    }
+    const [name, priceText, hoursText] = parts;
+    if (!name) throw new Error(`${entry}: a band needs a name; energy is reported against it`);
+    const price = Number(priceText);
+    if (priceText === '' || !isFinite(price) || price < 0) {
+      throw new Error(`${entry}: “${priceText}” is not a price per kWh`);
+    }
+    const key = name.toLowerCase();
+    if (seen.has(key)) {
+      throw new Error(`two rate bands are both called “${name}”; energy is reported per band `
+        + 'by name, so the names have to differ');
+    }
+    seen.set(key, name);
+    bands.push({ name, key, price, ranges: parseHours(hoursText, entry) });
+  }
+  if (!bands.length) throw new Error('no rate bands in that text');
+  return bands;
+}
+
+// Bands are wall-clock hours in the owner's zone, which is this browser's
+// zone: reading a stored UTC instant as a wall clock prices four in the
+// afternoon as nine at night. Date does the daylight-saving arithmetic, so the
+// 23-hour day has 23 hours of bands in it and the 25-hour day has 25.
+//
+// Bands are tried in the order they were written and the first match wins, so
+// an overlap resolves predictably. An hour no band claims has no price at all.
+function bandAt(bands, ms) {
+  const when = new Date(ms);
+  const minute = when.getHours() * 60 + when.getMinutes();
+  for (const band of bands) {
+    for (const r of band.ranges) if (inRange(r, minute)) return band;
+  }
+  return null;
+}
+
+// How many minutes of a stretch of the calendar belong to each band. Stepping
+// a minute at a time rather than multiplying five hours by the number of days:
+// a clock change makes one day 23 hours long and another 25, and one of them
+// loses an hour of peak that a multiplication would still charge for.
+function bandMinutes(bands, fromMs, toMs) {
+  const held = new Map();
+  for (const band of bands) held.set(band.key, 0);
+  for (let t = fromMs; t < toMs; t += 60000) {
+    const band = bandAt(bands, t);
+    if (band) held.set(band.key, held.get(band.key) + 1);
+  }
+  return held;
+}
+
+// How many minutes of an ordinary day no band prices at all. Anything above
+// zero means energy used in those hours belongs to no band, so a cost built
+// from per-band totals quietly comes out low — worth saying on the page rather
+// than discovering as a bill that never matches.
+function uncoveredMinutes(bands) {
+  let count = 0;
+  for (let minute = 0; minute < MINUTES_PER_DAY; minute++) {
+    if (!bands.some((b) => b.ranges.some((r) => inRange(r, minute)))) count += 1;
+  }
+  return count;
+}
+
+// ---------------------------------------------------------------------------
+// Energy per band, from the lifetime counters.
+// ---------------------------------------------------------------------------
+
+// How far a counter must fall before the fall is read as a reset rather than a
+// bad reading. Mirrors energy.RESET_MAX_REMAINING: a counter that restarts
+// comes back near zero, and a lifetime total of 36,246 that dips to 36,245 is
+// noise, not thirty-six thousand kilowatt-hours of new energy.
+const RESET_MAX_REMAINING = 0.5;
+
+// Lifetime counters are monotonic, so the energy between two readings is the
+// difference — right even if the collector was down for half of it. Two cases
+// give no answer rather than a wrong one: a counter that restarted, since what
+// it held before the restart is unknowable, and one that slipped backwards
+// without restarting, which is a bad read.
+function counterDelta(previous, current) {
+  if (current >= previous) return { kwh: current - previous, lost: false };
+  if (current <= previous * RESET_MAX_REMAINING) return { kwh: current, lost: true };
+  return { kwh: null, lost: true };
+}
+
+// Whether a stretch of time belongs to exactly one band, or to none at all.
+//
+// Walked rather than judged by its two ends, because a gap that opens at one
+// in the afternoon and closes at ten at night opens and closes off-peak with
+// the whole evening peak hidden inside it. Five-minute steps resolve any band
+// a person would write down, and the walk is bounded by the read itself: the
+// spans it is called on do not overlap.
+//
+// Returns the band, boxed so that "one band, and it is the unpriced hours"
+// stays distinguishable from "more than one band". Null is the second.
+function spanBand(bands, from, to) {
+  const STEP = 5 * 60000;
+  const found = bandAt(bands, from);
+  const key = found ? found.key : '';
+  for (let t = from + STEP; t < to; t += STEP) {
+    const here = bandAt(bands, t);
+    if ((here ? here.key : '') !== key) return null;
+  }
+  const last = bandAt(bands, to - 1);
+  return (last ? last.key : '') === key ? { band: found } : null;
+}
+
+function readings(points, metric) {
+  const out = [];
+  for (const p of points || []) {
+    if (!p) continue;
+    const value = numOrNull(p[metric]);
+    const at = Date.parse(p.timestamp);
+    if (value === null || !Number.isFinite(at)) continue;
+    out.push([at, value]);
+  }
+  out.sort((a, b) => a[0] - b[0]);
+  return out;
+}
+
+// Split one counter's energy across the rate bands.
+//
+// The subtle part is which instants a pair of readings describes. At full
+// cadence a row is a reading, so the pair (t0, t1] is energy that happened
+// between them. On a rollup tier a row is a bucket, timestamped at its start
+// and holding the *highest* value seen inside it — which for a monotonic
+// counter is the value at the bucket's end. So a pair of rolled rows describes
+// energy over [t0 + bucket, t1 + bucket): one bucket later than the timestamps
+// suggest, and exactly the bucket that begins at t1. Attributing by the
+// timestamps alone would price the 15:00 hour at the 14:00 rate.
+//
+// A pair whose span lies inside one band is that band's. A pair that straddles
+// a boundary by no more than a sample or two is attributed by its midpoint,
+// which is wrong by at most one sampling interval. A pair that straddles a
+// boundary because collection stopped for hours is attributed to nothing: the
+// energy is real, but which side of the boundary it happened on is not
+// knowable, and guessing would misprice exactly the hours this page exists to
+// separate.
+function bandEnergy(points, metric, bands, resolutionMs, fromMs, toMs) {
+  const kwh = new Map();
+  const covered = new Map();
+  for (const band of bands) { kwh.set(band.key, 0); covered.set(band.key, 0); }
+  const tolerance = Math.max(resolutionMs * 1.5, 90000);
+  const series = readings(points, metric);
+  let unplaced = 0;
+  let unpriced = 0;
+  let gaps = false;
+  let measuredMs = 0;
+
+  for (let i = 1; i < series.length; i++) {
+    const [t0, v0] = series[i - 1];
+    const [t1, v1] = series[i];
+    const from = t0 + resolutionMs;
+    const to = t1 + resolutionMs;
+    if (to <= from) continue;
+    // Half an interval either side of a month boundary is the finest cut that
+    // can be made without inventing a distribution inside it.
+    const middle = (from + to) / 2;
+    if (middle < fromMs || middle >= toMs) continue;
+    const step = counterDelta(v0, v1);
+    if (step.lost) gaps = true;
+    if (step.kwh === null) continue;
+
+    let band = null;
+    if (to - from <= tolerance) {
+      // One sampling interval. It may straddle a boundary by a few seconds,
+      // and the midpoint decides which side — wrong by at most that interval.
+      band = bandAt(bands, middle);
+    } else {
+      // Longer than a sample: collection stopped. The energy is real and the
+      // counter caught up, but where inside the hole it happened is not
+      // knowable, so it counts only if the whole hole sits in one band.
+      const uniform = spanBand(bands, from, to);
+      if (!uniform) {
+        unplaced += step.kwh;
+        gaps = true;
+        continue;
+      }
+      band = uniform.band;
+    }
+    measuredMs += to - from;
+    if (!band) { unpriced += step.kwh; continue; }
+    kwh.set(band.key, kwh.get(band.key) + step.kwh);
+    covered.set(band.key, covered.get(band.key) + (to - from));
+  }
+  return { kwh, covered, unplaced, unpriced, gaps, measuredMs };
+}
+
+// A band with no energy reported is one of two entirely different things, and
+// the difference decides whether a figure exists at all.
+//
+// A band whose hours have not come round yet this month imported nothing,
+// which is a measurement: zero. A band whose hours did pass with nothing
+// recorded across them is unknown, and unknown propagates — a total that
+// quietly leaves a band out is worse than no total.
+function bandReading(band, split, elapsedMinutes) {
+  const coveredMs = split.covered.get(band.key) || 0;
+  if (elapsedMinutes <= 0) return { kwh: 0, coverage: 1, minutes: 0 };
+  if (coveredMs <= 0) return { kwh: null, coverage: 0, minutes: 0 };
+  return {
+    kwh: split.kwh.get(band.key) || 0,
+    coverage: Math.min(1, coveredMs / (elapsedMinutes * 60000)),
+    minutes: coveredMs / 60000,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Reading the API.
+// ---------------------------------------------------------------------------
+
+// Which lifetime counters the pricing needs. Grid import is what was paid for,
+// house load is the counterfactual it is priced against, and discharge is how
+// much of the expensive hours the bank carried.
+const COUNTERS = {
+  imported: 'grid_import_energy_total_kwh',
+  house: 'load_energy_total_kwh',
+  discharged: 'battery_discharge_energy_total_kwh',
+};
+
+// Read back before the month starts so the first interval of the month has a
+// reading to be measured from, rather than starting at whatever the first row
+// inside it happens to be. Two hours matches the widening the energy endpoint
+// does for the same reason.
+const LEAD_MS = 2 * 3600 * 1000;
+
+// The poll interval if the settings read failed; only used to size a straddle
+// tolerance, never to price anything.
+const FALLBACK_CADENCE = 11;
+
+async function getJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  return response.json();
+}
+
+const localZone = () => {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
+};
+
+// The owner's month, in the owner's zone: local midnight on the first, to local
+// midnight on the first of the next. Never now minus thirty days, and never an
+// epoch divided by 86400 — one month a year is 23 hours short of that and one
+// is an hour long, and both look like a data bug.
+function monthWindow(now) {
+  const start = new Date(now.getFullYear(), now.getMonth(), 1);
+  const end = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+  // A page opened in the first second of the month still has to ask for a
+  // range the API will accept.
+  const cursor = new Date(Math.max(now.getTime(), start.getTime() + 1000));
+  return { start, end, now: cursor };
+}
+
+async function monthEnergy(win) {
+  const zone = localZone();
+  const url = `/api/energy?start=${encodeURIComponent(win.start.toISOString())}`
+    + `&end=${encodeURIComponent(win.now.toISOString())}&period=month`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : '');
+  const body = await getJSON(url);
+  const buckets = Array.isArray(body.buckets) ? body.buckets : [];
+  return buckets.length ? buckets[buckets.length - 1] : null;
+}
+
+// The coarsest resolution that still resolves every band boundary. Hour-long
+// buckets answer a month in 744 rows and put every boundary of an hour-aligned
+// tariff exactly on a bucket edge; a tariff with a boundary at half past needs
+// minutes, and pays for them in rows.
+function wantedResolution(bands, spanMs) {
+  const aligned = bands.every((b) => b.ranges.every((r) => r.start % 60 === 0 && r.end % 60 === 0));
+  return aligned && spanMs >= 3 * 86400000 ? 3600 : 60;
+}
+
+// What one row of the tier the server chose actually covers. The full tier's
+// resolution is the polling interval, which only the settings know.
+const tierResolution = (tier, cadence) =>
+  tier === 'hourly' ? 3600 : tier === 'minute' ? 60 : cadence;
+
+async function counterHistory(win, bands, cadence) {
+  const start = new Date(win.start.getTime() - LEAD_MS);
+  const spanSeconds = (win.now.getTime() - start.getTime()) / 1000;
+  const wanted = wantedResolution(bands, win.now.getTime() - win.start.getTime());
+  // The endpoint picks a tier from the span and the width it is given, so
+  // asking for one point per wanted-resolution period asks for that tier.
+  const width = Math.max(1, Math.min(10000, Math.round(spanSeconds / wanted)));
+  const metrics = Object.values(COUNTERS).join(',');
+  const body = await getJSON(`/api/history?start=${encodeURIComponent(start.toISOString())}`
+    + `&end=${encodeURIComponent(win.now.toISOString())}&metrics=${metrics}&width=${width}`);
+  return {
+    points: body.points || [],
+    tier: body.tier || 'full',
+    resolution: tierResolution(body.tier, cadence),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pricing.
+// ---------------------------------------------------------------------------
+
+// Real elapsed time, never a difference of calendar fields. One month a year
+// is 721 hours long and one is 743, and apportioning a connection charge by
+// the wrong one is out by an hour twice a year.
+const elapsed = (a, b) => b.getTime() - a.getTime();
+
+// Every money figure is absent rather than zero when one of its inputs was not
+// reported. A caption with a hole in it does not appear at all.
+function price(tariff, history, win, exportedKwh) {
+  const monthMs = elapsed(win.start, win.end);
+  const soFarMs = Math.max(0, elapsed(win.start, win.now));
+  const elapsedBands = bandMinutes(tariff.bands, win.start.getTime(), win.now.getTime());
+  const wholeBands = bandMinutes(tariff.bands, win.start.getTime(), win.end.getTime());
+
+  const splits = {};
+  for (const [key, metric] of Object.entries(COUNTERS)) {
+    splits[key] = history
+      ? bandEnergy(history.points, metric, tariff.bands, history.resolution * 1000,
+          win.start.getTime(), win.now.getTime())
+      : null;
+  }
+
+  const rows = [];
+  let energyCost = 0;
+  let noSolarCost = 0;
+  let projectedCost = 0;
+  let measuredMinutes = 0;
+  let wholeMinutes = 0;
+  for (const band of tariff.bands) {
+    const minutes = elapsedBands.get(band.key) || 0;
+    const imported = splits.imported ? bandReading(band, splits.imported, minutes) : null;
+    const house = splits.house ? bandReading(band, splits.house, minutes) : null;
+    const battery = splits.discharged ? bandReading(band, splits.discharged, minutes) : null;
+    const importKwh = imported ? imported.kwh : null;
+    const houseKwh = house ? house.kwh : null;
+    const row = {
+      band,
+      hours: band.ranges.map((r) => `${clock(r.start)}–${clock(r.end)}`).join(', '),
+      importKwh,
+      houseKwh,
+      batteryKwh: battery ? battery.kwh : null,
+      coverage: imported ? imported.coverage : 0,
+      cost: importKwh === null ? null : importKwh * band.price,
+      houseCost: houseKwh === null ? null : houseKwh * band.price,
+      batteryValue: battery && battery.kwh !== null ? battery.kwh * band.price : null,
+    };
+    row.saved = row.houseCost === null || row.cost === null ? null : row.houseCost - row.cost;
+    rows.push(row);
+
+    if (row.cost === null) energyCost = null;
+    else if (energyCost !== null) energyCost += row.cost;
+    if (row.houseCost === null) noSolarCost = null;
+    else if (noSolarCost !== null) noSolarCost += row.houseCost;
+
+    // Projecting the month means projecting each band from its own measured
+    // rate. One blended factor would price the hours nobody has lived through
+    // yet at the average of the ones they have, and on a tariff whose whole
+    // point is that five hours cost triple, that is the wrong average.
+    const whole = wholeBands.get(band.key) || 0;
+    const seen = imported ? imported.minutes : 0;
+    if (importKwh === null || seen <= 0) projectedCost = null;
+    else if (projectedCost !== null) projectedCost += (importKwh / seen) * whole * band.price;
+    measuredMinutes += seen;
+    wholeMinutes += whole;
+  }
+
+  // The connection charge is payable whatever the usage: it belongs in the
+  // bill and never in the saving, since counting it against the array would
+  // make the solar look worse the more it saved.
+  const fixedSoFar = monthMs > 0 ? tariff.fixedMonthly * (soFarMs / monthMs) : 0;
+
+  const credit = tariff.exportPerKwh > 0 && exportedKwh !== null && exportedKwh !== undefined
+    ? exportedKwh * tariff.exportPerKwh : null;
+  const projectedShare = measuredMinutes > 0 ? wholeMinutes / measuredMinutes : null;
+  const projectedCredit = credit === null || projectedShare === null
+    ? null : credit * Math.max(1, projectedShare);
+
+  const unplaced = splits.imported ? splits.imported.unplaced : 0;
+  const unpriced = splits.imported ? splits.imported.unpriced : 0;
+  return {
+    currency: tariff.currency,
+    rows,
+    energyCost,
+    noSolarCost,
+    savings: energyCost === null || noSolarCost === null ? null : noSolarCost - energyCost,
+    fixedMonthly: tariff.fixedMonthly,
+    fixedSoFar,
+    costSoFar: energyCost === null ? null : energyCost + fixedSoFar,
+    projectedCost,
+    estimatedTotal: projectedCost === null
+      ? null : projectedCost + tariff.fixedMonthly - (projectedCredit || 0),
+    credit,
+    projectedCredit,
+    fractionElapsed: monthMs > 0 ? Math.min(1, soFarMs / monthMs) : null,
+    coverage: soFarMs > 0 ? Math.min(1, (measuredMinutes * 60000) / soFarMs) : null,
+    unplacedKwh: unplaced,
+    unpricedKwh: unpriced,
+    unpricedMinutes: uncoveredMinutes(tariff.bands),
+    gaps: splits.imported ? splits.imported.gaps : false,
+    tier: history ? history.tier : null,
+    resolution: history ? history.resolution : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Drawing.
+// ---------------------------------------------------------------------------
+
+function pageNote(text) {
+  const box = $('pnote');
+  box.textContent = text || '';
+  box.hidden = !text;
+}
+
+const MONTH_FMT = { month: 'long', year: 'numeric' };
+
+function renderMonth(win, priced) {
+  $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
+  const days = Math.round(elapsed(win.start, win.end) / 86400000);
+  const done = elapsed(win.start, win.now) / 86400000;
+  const fraction = priced ? priced.fractionElapsed : Math.min(1, done / days);
+  // Within the last three-quarters of an hour of a month, calling it a part
+  // month is pedantry rather than honesty; before that, saying so is the whole
+  // point — a mid-month figure read as the finished bill is this page's
+  // easiest way to mislead.
+  const partial = fraction !== null && fraction < 0.999;
+  const parts = [
+    partial
+      ? `<b>${done.toFixed(1)}</b> of ${days} days — this is a part month, not a bill`
+      : `all ${days} days`,
+  ];
+  if (priced && priced.coverage !== null && priced.coverage < 0.98) {
+    parts.push(`the collector recorded ${pctStr(priced.coverage)} of it`);
+  }
+  $('monthStat').innerHTML = parts.join(' · ');
+  const bar = $('mprog');
+  bar.className = fraction === null ? 'mprog none' : 'mprog';
+  bar.querySelector('i').style.width = fraction === null ? '0' : `${fraction * 100}%`;
+}
+
+function renderNoTariff(reason) {
+  const why = reason
+    ? `The rate bands in settings could not be read: ${reason} Until that is fixed nothing is priced.`
+    : 'A rate the owner did not enter is a rate this page would be inventing, and an invented '
+      + 'rate produces a savings figure that reads as though it were measured. So there is no '
+      + 'money anywhere on this page — not zero, not an average — only the energy below.';
+  $('notariffWhy').innerHTML = reason ? `<span class="why">${esc(why)}</span>` : esc(why);
+  $('notariff').hidden = false;
+  $('cards').hidden = true;
+  $('sankeySec').hidden = true;
+  $('bandSec').hidden = true;
+}
+
+function renderCards(p) {
+  const cur = p.currency;
+  $('cards').hidden = false;
+  $('costV').innerHTML = bigMoney(p.costSoFar, cur);
+  const costBits = [`Grid energy <b>${esc(money(p.energyCost, cur))}</b>`];
+  costBits.push(p.fixedMonthly > 0
+    ? `connection charge <b>${esc(money(p.fixedSoFar, cur))}</b> of `
+      + `${esc(money(p.fixedMonthly, cur))} so far`
+    : 'no connection charge on this tariff');
+  $('costSub').innerHTML = `${costBits.join(' · ')}.`;
+
+  $('billV').innerHTML = bigMoney(p.estimatedTotal, cur);
+  if (p.estimatedTotal === null) {
+    // An estimate needs every band to have been seen at least once. On the
+    // second of the month the evening rate has been measured for one evening
+    // or none, and projecting a month from nothing is the invented number this
+    // page most has to avoid.
+    $('billSub').innerHTML = p.energyCost === null
+      ? 'Not enough has been recorded this month to price it, let alone project it.'
+      : 'Every rate band has to have been measured at least once before a month can be '
+        + 'projected from it. Come back after the first full day.';
+  } else {
+    const bits = [`Energy <b>${esc(money(p.projectedCost, cur))}</b>`];
+    if (p.fixedMonthly > 0) bits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
+    if (p.projectedCredit) bits.push(`less export credit <b>${esc(money(p.projectedCredit, cur))}</b>`);
+    $('billSub').innerHTML = `${bits.join(' · ')}. An estimate: it assumes the rest of the `
+      + 'month uses each rate band at the rate this one has so far.';
+  }
+
+  const saved = $('saveV');
+  saved.innerHTML = bigMoney(p.savings, cur);
+  saved.className = p.savings !== null && p.savings < 0 ? 'v neg' : 'v';
+  if (p.savings === null) {
+    $('saveSub').innerHTML = 'Absent until both the house and the grid counters have been '
+      + 'recorded across every rate band.';
+  } else if (p.savings < 0) {
+    $('saveSub').innerHTML = 'The grid supplied more than the house used: the bank was charged '
+      + `from it. The same use would have cost <b>${esc(money(p.noSolarCost, cur))}</b> with no `
+      + 'system at all.';
+  } else {
+    const share = p.noSolarCost > 0 ? p.savings / p.noSolarCost : null;
+    const bits = [`The same use from the grid alone would have cost `
+      + `<b>${esc(money(p.noSolarCost, cur))}</b>`];
+    if (share !== null) bits.push(`the system covered <b>${esc(pctStr(share))}</b> of it`);
+    $('saveSub').innerHTML = `${bits.join(' · ')}. The connection charge is payable either way, `
+      + 'so it is not counted here.';
+  }
+}
+
+// The dashboard's energy Sankey, in currency. Same geometry: a stack of
+// sources, one hub, a stack of sinks, bezier ribbons between them.
+//
+// Left is the house's own demand priced at the tariff, split by the band it
+// fell in — the bill that would have arrived with no system at all. Right is
+// what became of that bill: the part paid to the grid, and the part the array
+// and the bank covered. The two sides balance by construction, which is why
+// there is no loss ribbon here as there is in the kilowatt-hour version.
+function drawSankey(p) {
+  const svg = $('sankey');
+  const wait = $('sankeyWait');
+  const cur = p.currency;
+  const hold = (message) => {
+    svg.innerHTML = '';
+    wait.innerHTML = message;
+    wait.hidden = false;
+    $('sankeyTotal').textContent = '';
+  };
+
+  if (p.noSolarCost === null || p.energyCost === null || p.savings === null) {
+    hold('waiting for the inverter’s energy counters across every rate band');
+    return;
+  }
+  if (p.noSolarCost <= 0) {
+    hold('nothing has been used this month yet');
+    return;
+  }
+  if (p.savings < 0) {
+    hold('The grid supplied more than the house used this month, so there is no saving to '
+      + `draw: <b>${esc(money(p.energyCost, cur))}</b> was paid against `
+      + `<b>${esc(money(p.noSolarCost, cur))}</b> the house would have cost. The bank was `
+      + 'charged from the grid.');
+    return;
+  }
+  wait.hidden = true;
+  $('sankeyTotal').textContent =
+    `${money(p.noSolarCost, cur)} of electricity at grid rates this month`;
+
+  const total = p.noSolarCost;
+  const XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
+  const scale = (BOT - TOP) / total;
+  // A sliver too thin to draw is left out rather than rendered as a hairline;
+  // the table below carries every figure exactly.
+  const floor = Math.max(0.005, total * 0.002);
+  const stack = (items, x) => {
+    let y = TOP;
+    const out = items.filter((n) => n.v > floor).map((n) => {
+      const node = Object.assign({ x, y, h: n.v * scale }, n);
+      y += node.h + 10;
+      return node;
+    });
+    const shift = (BOT - (y - 10)) / 2;
+    out.forEach((n) => { n.y += shift; });
+    return out;
+  };
+
+  const src = stack(p.rows
+    .filter((r) => r.houseCost !== null)
+    .map((r) => ({ name: r.band.name, v: r.houseCost, col: 'var(--load)' })), X1);
+  const hub = stack([{ name: 'House at grid rates', v: total, col: 'var(--load)' }], X2 - 60);
+  const snk = stack([
+    { name: 'Paid to the grid', v: p.energyCost, col: 'var(--grid)' },
+    // Money that never left the house is drawn as an outline rather than a
+    // solid: it is the one quantity here that was not spent, and a fifth
+    // colour would be a hue the palette was never checked for.
+    { name: 'Kept — solar and battery', v: p.savings, col: 'var(--ink)', hollow: true },
+  ], X3);
+  if (!hub.length || !src.length) { hold('nothing to draw yet'); return; }
+
+  const ribbon = (x0, y0, x1, y1, h, col, op) => {
+    const mx = (x0 + x1) / 2;
+    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
+      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
+      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
+      + `fill="${col}" fill-opacity="${op}"/>`;
+  };
+  let out = '';
+  let hy = hub[0].y;
+  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col, 0.34); hy += n.h; }
+  hy = hub[0].y;
+  for (const n of snk) {
+    out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col, n.hollow ? 0.09 : 0.34);
+    hy += n.h;
+  }
+  for (const n of [...src, ...hub, ...snk]) {
+    const shape = n.hollow
+      ? `fill="${n.col}" fill-opacity="0.13" stroke="${n.col}" stroke-opacity="0.55" `
+        + 'stroke-dasharray="4 3"'
+      : `fill="${n.col}"`;
+    out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
+      + `rx="3" ${shape}/>`;
+    const right = n.x > 500;
+    const isHub = n.x > X1 && n.x < X3;
+    const tx = isHub ? n.x + XW / 2 : right ? n.x - 9 : n.x + XW + 9;
+    const anchor = isHub ? 'middle' : right ? 'end' : 'start';
+    const ty = n.y + n.h / 2;
+    out += isHub
+      ? `<text x="${tx}" y="${(n.y - 12).toFixed(1)}" text-anchor="middle" class="nn">`
+        + `${esc(n.name)}</text>`
+        + `<text x="${tx}" y="${(n.y + n.h + 20).toFixed(1)}" text-anchor="middle" class="nv">`
+        + `${esc(money(n.v, cur))}</text>`
+      : `<text x="${tx}" y="${(ty - 2).toFixed(1)}" text-anchor="${anchor}" class="nn">`
+        + `${esc(n.name)}</text>`
+        + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
+        + `${esc(money(n.v, cur))}</text>`;
+  }
+  svg.innerHTML = `<g class="sank">${out}</g>`;
+}
+
+// Two bars over the same width: the share of the energy each band took, and
+// the share of the cost it carried. On a time-of-use tariff those two are not
+// the same shape, and that difference is the entire argument for the battery.
+function renderSplit(p) {
+  const box = $('bandSplit');
+  const shades = [0.9, 0.62, 0.42, 0.28];
+  const bar = (label, values) => {
+    const total = values.reduce((a, b) => a + (b.v === null ? 0 : b.v), 0);
+    if (!values.length || values.some((v) => v.v === null) || total <= 0) {
+      return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
+        + '<div class="splitbar none"></div></div>';
+    }
+    const cells = values.map((v, i) => {
+      const share = v.v / total;
+      const shade = shades[Math.min(i, shades.length - 1)];
+      return `<span style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+        + ` title="${esc(v.name)} ${esc(pctStr(share))}">`
+        + `${share > 0.13 ? esc(pctStr(share)) : ''}</span>`;
+    }).join('');
+    return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
+      + `<div class="splitbar">${cells}</div></div>`;
+  };
+  box.innerHTML =
+    bar('Energy', p.rows.map((r) => ({ name: r.band.name, v: r.importKwh })))
+    + bar('Cost', p.rows.map((r) => ({ name: r.band.name, v: r.cost })));
+}
+
+function renderBands(p) {
+  $('bandSec').hidden = false;
+  const cur = p.currency;
+  const costs = p.rows.map((r) => (r.cost === null ? 0 : r.cost));
+  const widest = Math.max(...costs, 0);
+  const body = p.rows.map((r) => {
+    const part = r.coverage > 0 && r.coverage < 0.98 ? ' class="part"' : '';
+    const bar = widest > 0 && r.cost !== null
+      ? `<div class="bandbar"><i style="width:${Math.max(2, (r.cost / widest) * 100).toFixed(1)}%">`
+        + '</i></div>'
+      : '';
+    return `<tr>
+      <td>${esc(r.band.name)}<div class="hours">${esc(r.hours)}</div></td>
+      <td>${esc(rateStr(r.band.price, cur))}</td>
+      <td${part}>${esc(uStr(r.importKwh, 1, 'kWh'))}</td>
+      <td>${esc(money(r.cost, cur))}${bar}</td>
+      <td${part}>${esc(uStr(r.houseKwh, 1, 'kWh'))}</td>
+      <td>${esc(money(r.houseCost, cur))}</td>
+      <td>${esc(money(r.saved, cur))}</td>
+    </tr>`;
+  }).join('');
+  const totals = `<tr>
+      <td><b>Month to date</b></td><td></td>
+      <td>${esc(uStr(sumOrNull(p.rows.map((r) => r.importKwh)), 1, 'kWh'))}</td>
+      <td><b>${esc(money(p.energyCost, cur))}</b></td>
+      <td>${esc(uStr(sumOrNull(p.rows.map((r) => r.houseKwh)), 1, 'kWh'))}</td>
+      <td>${esc(money(p.noSolarCost, cur))}</td>
+      <td><b>${esc(money(p.savings, cur))}</b></td>
+    </tr>`;
+  $('bandTable').querySelector('tbody').innerHTML = body + totals;
+  renderSplit(p);
+
+  $('bandTier').textContent = p.resolution
+    ? `counter differences at ${p.resolution >= 3600 ? 'hourly' : 'minute'} resolution`
+    : '';
+
+  // Captions state only what was measured. One whose inputs are missing does
+  // not appear at all rather than appearing with a dash in the middle.
+  const notes = [];
+  const carried = p.rows
+    .filter((r) => r.batteryKwh !== null && r.batteryKwh > 0.05 && r.batteryValue !== null)
+    .sort((a, b) => b.batteryValue - a.batteryValue)[0];
+  if (carried) {
+    notes.push(`The bank supplied ${esc(uStr(carried.batteryKwh, 1, 'kWh'))} during `
+      + `${esc(carried.band.name)}, which would have cost `
+      + `${esc(money(carried.batteryValue, cur))} at that band’s rate.`);
+  }
+  const dearest = p.rows
+    .filter((r) => r.cost !== null && r.importKwh !== null)
+    .sort((a, b) => b.band.price - a.band.price)[0];
+  const importTotal = sumOrNull(p.rows.map((r) => r.importKwh));
+  if (dearest && importTotal !== null && importTotal > 0 && p.energyCost > 0) {
+    const ofEnergy = dearest.importKwh / importTotal;
+    const ofCost = dearest.cost / p.energyCost;
+    if (ofCost - ofEnergy > 0.02) {
+      notes.push(`${esc(dearest.band.name)} took ${esc(pctStr(ofEnergy))} of the imported energy `
+        + `and ${esc(pctStr(ofCost))} of the cost.`);
+    }
+  }
+  if (p.unpricedMinutes > 0) {
+    const fell = p.unpricedKwh > 0.05
+      ? ` ${esc(uStr(p.unpricedKwh, 1, 'kWh'))} was imported in them, and is missing from every `
+        + 'figure here.'
+      : '';
+    notes.push(`<span class="warn">The bands leave ${p.unpricedMinutes} minutes of the day `
+      + `unpriced</span>, so energy used in those hours belongs to no band.${fell}`);
+  }
+  if (p.unplacedKwh > 0.05) {
+    notes.push(`<span class="warn">${esc(uStr(p.unplacedKwh, 1, 'kWh'))} could not be placed in a `
+      + 'band</span> — collection stopped across a band boundary, and which side of it that '
+      + 'energy fell on is not knowable. The cost above is short by that much.');
+  }
+  if (p.rows.some((r) => r.coverage > 0 && r.coverage < 0.98)) {
+    notes.push('A dot marks a band the collector was not running through all of.');
+  }
+  $('bandCap').innerHTML = notes.join(' ');
+}
+
+// Absent propagates: a total that leaves out a band nobody measured is not a
+// total, it is a smaller number that looks like one.
+function sumOrNull(values) {
+  let total = 0;
+  for (const v of values) {
+    if (v === null || v === undefined) return null;
+    total += v;
+  }
+  return total;
+}
+
+const ENERGY_FIELDS = [
+  ['Solar', 'solar_kwh'],
+  ['House', 'load_kwh'],
+  ['Grid in', 'grid_imported_kwh'],
+  ['Grid out', 'grid_exported_kwh'],
+  ['Battery in', 'battery_charged_kwh'],
+  ['Battery out', 'battery_discharged_kwh'],
+];
+
+// Shown whether or not a tariff exists — with none, this is the whole page.
+function renderEnergy(bucket) {
+  $('egrid').innerHTML = ENERGY_FIELDS.map(([label, key]) => {
+    const value = bucket ? numOrNull(bucket[key]) : null;
+    const shown = value === null ? DASH : `${value.toFixed(1)}<span>kWh</span>`;
+    return `<div><span class="lbl">${esc(label)}</span><b>${shown}</b></div>`;
+  }).join('');
+  $('energyCap').textContent = bucket
+    ? 'Month to date, read off the inverter’s lifetime counters as end minus start, so a '
+      + 'gap in collection costs nothing: the counters kept counting while we were not watching.'
+    : 'Nothing has been recorded this month yet, so there is nothing to total. A missing '
+      + 'reading is not a reading of zero.';
+}
+
+function renderAssumptions(p, tariff) {
+  const bits = [];
+  if (tariff) {
+    bits.push('Energy comes from the inverter’s own lifetime kWh counters, differenced '
+      + 'across each rate band. Integrating stored power instead would agree on a clean day and '
+      + 'quietly undercount after any gap in collection.');
+    bits.push('A band is a wall-clock range in this device’s timezone, and a month runs '
+      + 'from local midnight on the first. Daylight saving makes one day 23 hours long and '
+      + 'another 25, and both are counted as they fall.');
+    bits.push('The saving is what the same house load would have cost at the same tariff, less '
+      + 'what the grid actually cost. It excludes the connection charge, which is payable '
+      + 'whatever the roof does.');
+    bits.push('The estimated bill projects each rate band from its own measured rate, adds the '
+      + 'whole connection charge once, and nets off any export credit. It assumes the rest of '
+      + 'the month behaves like the part already measured.');
+    bits.push('Every figure is rounded once, where it is shown. A breakdown can therefore be a '
+      + 'cent away from its total — pricing the total is exact, and summing rounded parts '
+      + 'drifts from it.');
+    if (p && p.tier) {
+      bits.push(`This month was read at the ${esc(p.tier)} tier: one point per `
+        + `${p.resolution >= 3600 ? 'hour' : 'minute'}, which is fine enough to resolve every `
+        + 'boundary in the tariff as entered.');
+    }
+  } else {
+    bits.push('With no tariff entered there is nothing to price against, so this page shows '
+      + 'energy only. Enter the rate bands, the connection charge and your currency in settings '
+      + 'and every figure above appears.');
+  }
+  $('assume').innerHTML = `<ul>${bits.map((b) => `<li>${b}</li>`).join('')}</ul>`;
+}
+
+// ---------------------------------------------------------------------------
+// Loading.
+// ---------------------------------------------------------------------------
+
+function readTariff(values) {
+  const currency = String(values['tariff.currency'] || '$');
+  const text = String(values['tariff.bands'] || '');
+  if (!text.trim()) return { tariff: null, reason: '', currency };
+  try {
+    return {
+      currency,
+      reason: '',
+      tariff: {
+        bands: parseBands(text),
+        fixedMonthly: Math.max(0, numOrNull(values['tariff.fixed_monthly']) || 0),
+        exportPerKwh: Math.max(0, numOrNull(values['tariff.export_per_kwh']) || 0),
+        currency,
+      },
+    };
+  } catch (e) {
+    return { tariff: null, reason: `${e.message}.`, currency };
+  }
+}
+
+async function refresh() {
+  const win = monthWindow(new Date());
+  pageNote('');
+
+  let values = {};
+  let settingsFailed = false;
+  try {
+    const body = await getJSON('/api/settings');
+    values = (body && body.values) || {};
+  } catch (e) {
+    settingsFailed = true;
+    pageNote('Settings could not be read, so the tariff is unknown and nothing is priced.');
+  }
+  const { tariff, reason } = readTariff(values);
+  const cadence = numOrNull(values['collector.poll_interval']) || FALLBACK_CADENCE;
+
+  let bucket = null;
+  try {
+    bucket = await monthEnergy(win);
+  } catch (e) {
+    pageNote(`The month’s energy could not be read: ${e.message}.`);
+  }
+  renderEnergy(bucket);
+  renderMonth(win, null);
+
+  if (!tariff) {
+    if (!settingsFailed) renderNoTariff(reason);
+    renderAssumptions(null, null);
+    stamp();
+    return;
+  }
+  $('notariff').hidden = true;
+
+  let history = null;
+  try {
+    history = await counterHistory(win, tariff.bands, cadence);
+  } catch (e) {
+    pageNote(`The energy counters could not be read: ${e.message}. `
+      + 'No money is shown rather than a figure built from part of the month.');
+  }
+  const exported = bucket ? numOrNull(bucket.grid_exported_kwh) : null;
+  const priced = price(tariff, history, win, exported);
+  renderMonth(win, priced);
+  renderCards(priced);
+  drawSankey(priced);
+  renderBands(priced);
+  renderAssumptions(priced, tariff);
+  stamp();
+}
+
+function stamp() {
+  $('stamp').textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+// Boot. Everything above is definitions; nothing runs until here. Costs move
+// by the hour at most, so this refreshes far more slowly than the dashboard —
+// the month's counter history is a bigger read than a live poll.
+drawNav('costs');
+refresh();
+setInterval(refresh, 5 * 60 * 1000);
+</script>
+</body>
+</html>

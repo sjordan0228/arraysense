@@ -197,11 +197,16 @@ _ENERGY_METRICS: tuple[tuple[str, str], ...] = (
     ("inverter_energy_total_kwh", "inverter_energy_total"),
 )
 
-# How long a cached energy read stays usable when a later one fails. A daily
-# counter moves by hundredths of a kWh a minute, so a value a couple of minutes
-# old is still today's total; one nobody has managed to read for an hour is not,
-# and reporting it as current would be a stale number wearing a fresh timestamp.
-ENERGY_MAX_AGE = timedelta(minutes=5)
+# How long past its due refresh a cached energy read stays usable. Measured from
+# when the next read *should* have happened, not from the last successful one —
+# otherwise any interval longer than this expires its own cache before it ever
+# refreshes, and the counters vanish from every sample in between.
+#
+# A daily counter moves by hundredths of a kWh a minute, so a value a few
+# minutes past due is still today's total. One nobody has managed to read for
+# an hour is not, and serving it would be a stale number wearing a fresh
+# timestamp.
+ENERGY_STALE_AFTER_DUE = timedelta(minutes=5)
 
 # Directional register pairs that collapse into one signed reading, as
 # (metric name, positive attribute, negative attribute).
@@ -343,6 +348,29 @@ def _collect_signed(
             into[metric] = value
 
 
+def _bms_is_answering(source: object) -> bool:
+    """Whether the BMS block holds real readings or a CAN-down block of zeroes.
+
+    This is the guard the project's central rule depends on. The library's data
+    classes default to None, but the decoder does not: it reads registers, and
+    a BMS whose CAN link is down leaves those registers zero-filled, so a bank
+    arrives with ``soc=0``, ``soh=100``, zero capacities and zero cell voltages
+    — a full set of numbers, all of them false. Emitted as-is that renders a
+    healthy bank at 0% state of charge, which is precisely the failure this
+    project was built to avoid.
+
+    Cell voltage is the discriminator. A lithium cell that is connected and
+    measurable is never 0.000 V; the bank's own reported capacity is the same
+    kind of witness. If neither says anything, nothing in the block is a
+    measurement and all of it is dropped rather than any of it being trusted.
+    """
+    for attribute in ("max_cell_voltage", "min_cell_voltage", "max_capacity", "current_capacity"):
+        value = _reading(source, attribute)
+        if value is not None and value > 0:
+            return True
+    return False
+
+
 def _module_sample(module: object) -> BatteryModuleSample | None:
     """Convert one library battery record into a BatteryModuleSample.
 
@@ -362,6 +390,12 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     serial = getattr(module, "serial_number", None)
     index = _int_reading(module, "battery_index")
     if not isinstance(serial, str) or not serial or index is None:
+        return None
+    # A slot can carry a serial from a previous read and still hold nothing but
+    # zeroes once its CAN link drops. A pack reading 0.000 V per cell is not a
+    # flat pack, it is a pack that is not answering.
+    if not _bms_is_answering(module):
+        logger.debug("module %s reports no cell data; treating the block as absent", serial)
         return None
 
     # The library indexes modules from zero; slots are 1-based to match the
@@ -435,11 +469,15 @@ def sample_from_pylxp(
     modules: tuple[BatteryModuleSample, ...] = ()
 
     if bank is not None:
-        _collect(bank, _BANK_METRICS, readings)
-        _collect_flags(bank, _BANK_FLAGS, readings)
-        bank_power = _signed_pair(bank, "charge_power", "discharge_power")
-        if bank_power is not None:
-            battery_power = bank_power
+        # The bank block and the per-module blocks fail independently: the CAN
+        # link can drop the summary while the modules still answer, or the
+        # reverse. Each is judged on its own rather than one vetoing the other.
+        if _bms_is_answering(bank):
+            _collect(bank, _BANK_METRICS, readings)
+            _collect_flags(bank, _BANK_FLAGS, readings)
+            bank_power = _signed_pair(bank, "charge_power", "discharge_power")
+            if bank_power is not None:
+                battery_power = bank_power
         records = getattr(bank, "batteries", None) or ()
         modules = tuple(
             sample for sample in (_module_sample(record) for record in records) if sample
@@ -589,6 +627,15 @@ class PylxpSource:
                 fresh: dict[str, float] = {}
                 _collect(data, _ENERGY_METRICS, fresh)
                 self._energy, self._energy_at = fresh, now
-        if self._energy_at is None or now - self._energy_at > ENERGY_MAX_AGE:
+        if self._energy_at is None or now - self._energy_at > (
+            self._energy_interval + ENERGY_STALE_AFTER_DUE
+        ):
             return {}
+        # A cached read from before midnight must not be attached to a sample
+        # after it. The daily counters reset at the turn of the day, and the
+        # daily metrics roll up with max — so a 23:59 total carried into 00:00
+        # becomes the new day's high-water mark and stays there. The lifetime
+        # counters are monotonic and cross the boundary safely.
+        if self._energy_at.date() != now.date():
+            return {k: v for k, v in self._energy.items() if k.endswith("_total_kwh")}
         return self._energy

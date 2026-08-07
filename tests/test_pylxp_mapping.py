@@ -163,3 +163,57 @@ def test_module_capacity_and_limits_are_carried_through() -> None:
     assert module.full_capacity_ah == 280.0
     assert module.charge_current_limit_a == 200.0
     assert module.status_code == 49156
+
+
+def test_a_can_down_bank_does_not_report_zero_percent() -> None:
+    # The library's decoder reads registers, and a BMS whose CAN link is down
+    # leaves them zero-filled — so the bank arrives with soc=0, soh=100 and
+    # zero capacities. A full set of numbers, all of them false.
+    dead = SimpleNamespace(
+        voltage=53.7,
+        soc=0,
+        soh=100,
+        max_capacity=0.0,
+        current_capacity=0.0,
+        max_cell_voltage=0.0,
+        min_cell_voltage=0.0,
+        battery_count=0,
+        charge_power=0.0,
+        discharge_power=0.0,
+        batteries=[],
+    )
+    readings = sample_from_pylxp(_runtime(), dead).readings
+    assert "battery_soc_pct" not in readings
+    assert "battery_module_count" not in readings
+    # The inverter's own readings are unaffected — only the BMS block is dropped.
+    assert readings["pv1_power_w"] == 2253.0
+
+
+def test_a_module_holding_only_zeroes_is_dropped_even_with_a_serial() -> None:
+    # A slot keeps its serial from an earlier read after its link drops. A pack
+    # reading 0.000 V per cell is not flat, it is silent.
+    bank = SimpleNamespace(
+        max_cell_voltage=3.36,
+        min_cell_voltage=3.35,
+        max_capacity=1120.0,
+        batteries=[
+            SimpleNamespace(
+                serial_number="Battery_ID_01",
+                battery_index=0,
+                soc=64,
+                max_cell_voltage=3.364,
+                min_cell_voltage=3.358,
+                max_capacity=280.0,
+            ),
+            SimpleNamespace(
+                serial_number="Battery_ID_02",
+                battery_index=1,
+                soc=0,
+                max_cell_voltage=0.0,
+                min_cell_voltage=0.0,
+                max_capacity=0.0,
+            ),
+        ],
+    )
+    modules = sample_from_pylxp(_runtime(), bank).battery_modules
+    assert [m.serial for m in modules] == ["Battery_ID_01"]

@@ -19,6 +19,7 @@ they remain command-line arguments. Nothing sensitive lives in that set.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -78,11 +79,25 @@ class SettingSpec:
         if self.kind == "str":
             if not isinstance(value, str):
                 raise ValueError(f"{self.key} must be text, got {value!r}")
+            # These reach a wire protocol and a socket. A control character or
+            # a zero-width space is not a hostname or a serial, and a value
+            # that only looks blank would override a working one.
+            if any(ch.isspace() or not ch.isprintable() for ch in value if ch != " "):
+                raise ValueError(f"{self.key} must not contain control or invisible characters")
+            if len(value) > 128:
+                raise ValueError(f"{self.key} is too long at {len(value)} characters")
             return value
         # Booleans are integers in Python, so they have to be excluded before
         # the numeric check or `true` would quietly become 1.
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"{self.key} must be a number, got {value!r}")
+        # NaN and the infinities pass every bounds check, because each
+        # comparison against NaN is false and infinity is only caught on one
+        # side. A NaN poll interval was accepted here, stored, and then killed
+        # the collector when it reached the event loop — with the HTTP API
+        # still up, so the service looked healthy while collecting nothing.
+        if not math.isfinite(value):
+            raise ValueError(f"{self.key} must be a finite number, got {value!r}")
         number = int(value) if self.kind == "int" else float(value)
         if self.lower is not None and number < self.lower:
             raise ValueError(f"{self.key} must be at least {self.lower}, got {number}")
@@ -136,6 +151,59 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "Seconds between reads of the inverter. The dongle answers at its "
             "own pace, so asking faster than about ten seconds mostly produces "
             "reads that overlap the previous one."
+        ),
+    ),
+    # --- Tariff -------------------------------------------------------------
+    # What the owner pays. Nothing here has a default that prices anything: an
+    # install that has entered no tariff shows energy and no money at all,
+    # because a guessed rate produces a savings figure that reads as measured.
+    SettingSpec(
+        key="tariff.bands",
+        kind="str",
+        default="",
+        label="Rate bands",
+        help=(
+            "One band per line, or separated by semicolons: name, price per "
+            "kWh, and the hours it applies to, separated by pipes. A band may "
+            "list several ranges separated by commas, and a range may run "
+            "through midnight. For example: "
+            "Peak | 0.34 | 16:00-21:00; Off-peak | 0.11 | 21:00-16:00 — "
+            "leave it empty and no money is shown anywhere."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.fixed_monthly",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=100000.0,
+        label="Fixed monthly charge",
+        help=(
+            "The connection or supply charge, payable whatever the usage. It "
+            "is shared across whatever period is being shown and added once to "
+            "an estimated bill. It never appears in the savings figure, since "
+            "no amount of solar avoids it."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.export_per_kwh",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=1000.0,
+        label="Export credit",
+        help=(
+            "What the supplier pays for a kWh sent back. Leave it at zero if "
+            "yours pays nothing, and no credit is shown rather than a zero one."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.currency",
+        kind="str",
+        default="$",
+        label="Currency",
+        help=(
+            "Written in front of every money figure. A symbol or a code — whatever your bill uses."
         ),
     ),
     # --- Connection ---------------------------------------------------------
@@ -328,6 +396,14 @@ class SettingsStore:
         Masking rather than blanking keeps the page usable: the owner can see
         which serial is configured and confirm it is the right one, without the
         value being readable by someone who did not already know it.
+
+        **This is form safety, not confidentiality, and the difference matters.**
+        The same unauthenticated endpoint accepts writes, so a client on the
+        network can point ``connection.dongle_host`` at a listener it controls
+        and read both serials off the wire at the next poll — the protocol
+        carries them in clear ASCII. Masking stops a serial being read off the
+        page; only authentication stops it being taken. Nothing here should be
+        described to an owner as protecting the value.
         """
         out: dict[str, object] = {}
         for spec in SETTINGS:
