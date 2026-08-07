@@ -107,7 +107,10 @@
   <div class="p tno" id="notariff" hidden>
     <h2>No tariff entered, so nothing here is priced</h2>
     <p id="notariffWhy"></p>
-    <a class="iconbtn" href="/#settings">Enter a tariff in settings</a>
+    <!-- Where the tariff is entered: the rate bands, the connection charge,
+         the export rate and the currency are settings on the service, served
+         by /api/settings, not preferences held in this browser. -->
+    <a class="iconbtn" href="/#settings">Open settings — the ⚙ on the dashboard</a>
   </div>
 
   <div class="cards" id="cards" hidden>
@@ -139,6 +142,12 @@
     <svg id="sankey" viewBox="0 0 900 400" role="img"
          aria-label="What the month's electricity would have cost at grid rates, and how much of it was paid"></svg>
     <div class="sankwait" id="sankeyWait" hidden></div>
+    <span class="cap" id="sankeyCap" hidden>
+      On the left, what the house used priced at each band — the bill that would have arrived
+      with no system at all. On the right, the part of it that was paid to the grid, and the
+      part the array and the bank covered. The connection charge is not in either: it is
+      payable whatever the roof does.
+    </span>
   </section>
 
   <section class="p" id="bandSec" hidden>
@@ -246,19 +255,26 @@ const clock = (minutes) =>
 
 const MINUTES_PER_DAY = 24 * 60;
 
+// Digits only, deliberately. Number() reads "0x10" as sixteen and "" as zero,
+// so a typed range of ":30" or "0x10-20" would parse into a time nobody meant
+// — where Python's int() refuses both, and the two parsers have to agree about
+// what a tariff says.
+const CLOCK_PART = /^\d{1,2}$/;
+const PRICE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
+
 // Accepts 16, 16:00 and 24:00, because that is how tariffs are written down:
 // midnight at the far end of a range is 24:00 on most bills and 00:00 on a
 // clock, and both mean the same instant.
 function parseClock(token, entry) {
   const text = String(token).trim();
   const cut = text.indexOf(':');
-  const hourText = cut < 0 ? text : text.slice(0, cut);
+  const hourText = (cut < 0 ? text : text.slice(0, cut)).trim();
   const minuteText = cut < 0 ? '' : text.slice(cut + 1).trim();
-  const hour = Number(hourText);
-  const minute = minuteText === '' ? 0 : Number(minuteText);
-  if (!Number.isInteger(hour) || !Number.isInteger(minute)) {
+  if (!CLOCK_PART.test(hourText) || (minuteText !== '' && !CLOCK_PART.test(minuteText))) {
     throw new Error(`${entry}: “${text}” is not a time like 16:00`);
   }
+  const hour = Number(hourText);
+  const minute = minuteText === '' ? 0 : Number(minuteText);
   if (hour === 24 && minute === 0) return 0;
   if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
     throw new Error(`${entry}: “${text}” is not a time of day`);
@@ -314,9 +330,12 @@ function parseBands(text) {
     }
     const [name, priceText, hoursText] = parts;
     if (!name) throw new Error(`${entry}: a band needs a name; energy is reported against it`);
-    const price = Number(priceText);
-    if (priceText === '' || !isFinite(price) || price < 0) {
+    if (!PRICE.test(priceText)) {
       throw new Error(`${entry}: “${priceText}” is not a price per kWh`);
+    }
+    const price = Number(priceText);
+    if (!isFinite(price) || price < 0) {
+      throw new Error(`${entry}: a price per kWh cannot be “${priceText}”`);
     }
     const key = name.toLowerCase();
     if (seen.has(key)) {
@@ -598,8 +617,14 @@ async function counterHistory(win, bands, cadence) {
     points: body.points || [],
     tier: body.tier || 'full',
     resolution: tierResolution(body.tier, cadence),
+    // Kept so the page can say when it was handed something coarser than the
+    // tariff needs, rather than quietly pricing across a boundary.
+    wanted,
   };
 }
+
+// What to call a tier in a sentence.
+const tierWord = (tier) => (tier === 'hourly' ? 'hour' : tier === 'minute' ? 'minute' : 'reading');
 
 // ---------------------------------------------------------------------------
 // Pricing.
@@ -705,6 +730,7 @@ function price(tariff, history, win, exportedKwh) {
     gaps: splits.imported ? splits.imported.gaps : false,
     tier: history ? history.tier : null,
     resolution: history ? history.resolution : null,
+    coarse: history ? history.resolution > history.wanted : false,
   };
 }
 
@@ -747,9 +773,10 @@ function renderMonth(win, priced) {
 function renderNoTariff(reason) {
   const why = reason
     ? `The rate bands in settings could not be read: ${reason} Until that is fixed nothing is priced.`
-    : 'A rate the owner did not enter is a rate this page would be inventing, and an invented '
-      + 'rate produces a savings figure that reads as though it were measured. So there is no '
-      + 'money anywhere on this page — not zero, not an average — only the energy below.';
+    : 'A rate nobody entered is a rate this page would be inventing, and an invented rate '
+      + 'produces a savings figure that reads as though it were measured. So there is no money '
+      + 'anywhere on this page — not zero, not a national average — only the energy below. '
+      + 'Enter the rate bands, the connection charge and your currency and every figure appears.';
   $('notariffWhy').innerHTML = reason ? `<span class="why">${esc(why)}</span>` : esc(why);
   $('notariff').hidden = false;
   $('cards').hidden = true;
@@ -818,10 +845,14 @@ function drawSankey(p) {
   const svg = $('sankey');
   const wait = $('sankeyWait');
   const cur = p.currency;
+  $('sankeySec').hidden = false;
+  // Nothing drawn means nothing to explain either: a caption describing two
+  // sides of a diagram that is not there is furniture, not information.
   const hold = (message) => {
     svg.innerHTML = '';
     wait.innerHTML = message;
     wait.hidden = false;
+    $('sankeyCap').hidden = true;
     $('sankeyTotal').textContent = '';
   };
 
@@ -841,6 +872,7 @@ function drawSankey(p) {
     return;
   }
   wait.hidden = true;
+  $('sankeyCap').hidden = false;
   $('sankeyTotal').textContent =
     `${money(p.noSolarCost, cur)} of electricity at grid rates this month`;
 
@@ -865,7 +897,10 @@ function drawSankey(p) {
   const src = stack(p.rows
     .filter((r) => r.houseCost !== null)
     .map((r) => ({ name: r.band.name, v: r.houseCost, col: 'var(--load)' })), X1);
-  const hub = stack([{ name: 'House at grid rates', v: total, col: 'var(--load)' }], X2 - 60);
+  // The hub is a junction rather than a category — the same neutral the
+  // dashboard's diagram gives the inverter — so the two columns either side of
+  // it are what carries colour.
+  const hub = stack([{ name: 'House at grid rates', v: total, col: 'var(--ink3)' }], X2 - 60);
   const snk = stack([
     { name: 'Paid to the grid', v: p.energyCost, col: 'var(--grid)' },
     // Money that never left the house is drawn as an outline rather than a
@@ -974,9 +1009,7 @@ function renderBands(p) {
   $('bandTable').querySelector('tbody').innerHTML = body + totals;
   renderSplit(p);
 
-  $('bandTier').textContent = p.resolution
-    ? `counter differences at ${p.resolution >= 3600 ? 'hourly' : 'minute'} resolution`
-    : '';
+  $('bandTier').textContent = p.tier ? `counter differences, one point per ${tierWord(p.tier)}` : '';
 
   // Captions state only what was measured. One whose inputs are missing does
   // not appear at all rather than appearing with a dash in the middle.
@@ -1054,7 +1087,7 @@ function renderEnergy(bucket) {
       + 'reading is not a reading of zero.';
 }
 
-function renderAssumptions(p, tariff) {
+function renderAssumptions(p, tariff, unreadable) {
   const bits = [];
   if (tariff) {
     bits.push('Energy comes from the inverter’s own lifetime kWh counters, differenced '
@@ -1073,10 +1106,15 @@ function renderAssumptions(p, tariff) {
       + 'cent away from its total — pricing the total is exact, and summing rounded parts '
       + 'drifts from it.');
     if (p && p.tier) {
-      bits.push(`This month was read at the ${esc(p.tier)} tier: one point per `
-        + `${p.resolution >= 3600 ? 'hour' : 'minute'}, which is fine enough to resolve every `
-        + 'boundary in the tariff as entered.');
+      bits.push(`This month was read one point per ${tierWord(p.tier)}, which is `
+        + (p.coarse
+          ? 'coarser than this tariff’s band boundaries: energy either side of a boundary can '
+            + 'land in the neighbouring band.'
+          : 'fine enough to resolve every boundary in the tariff as entered.'));
     }
+  } else if (unreadable) {
+    bits.push('The tariff could not be read from the service just now, so nothing is priced. '
+      + 'The energy below comes from a different endpoint and is unaffected.');
   } else {
     bits.push('With no tariff entered there is nothing to price against, so this page shows '
       + 'energy only. Enter the rate bands, the connection charge and your currency in settings '
@@ -1111,7 +1149,10 @@ function readTariff(values) {
 
 async function refresh() {
   const win = monthWindow(new Date());
-  pageNote('');
+  // Collected rather than set as they happen: three reads can fail in one
+  // pass, and a second failure overwriting the first would leave the page
+  // explaining only half of what went wrong.
+  const trouble = [];
 
   let values = {};
   let settingsFailed = false;
@@ -1120,7 +1161,11 @@ async function refresh() {
     values = (body && body.values) || {};
   } catch (e) {
     settingsFailed = true;
-    pageNote('Settings could not be read, so the tariff is unknown and nothing is priced.');
+    // The money already on screen is left where it is, the way the dashboard
+    // leaves its charts up through a failed poll — but it is now of unknown
+    // vintage, and the note has to say so rather than let it read as current.
+    trouble.push('Settings could not be read, so the tariff is unknown. Any money still on '
+      + 'screen is from the last successful read.');
   }
   const { tariff, reason } = readTariff(values);
   const cadence = numOrNull(values['collector.poll_interval']) || FALLBACK_CADENCE;
@@ -1129,14 +1174,15 @@ async function refresh() {
   try {
     bucket = await monthEnergy(win);
   } catch (e) {
-    pageNote(`The month’s energy could not be read: ${e.message}.`);
+    trouble.push(`The month’s energy could not be read: ${e.message}.`);
   }
   renderEnergy(bucket);
   renderMonth(win, null);
 
   if (!tariff) {
     if (!settingsFailed) renderNoTariff(reason);
-    renderAssumptions(null, null);
+    renderAssumptions(null, null, settingsFailed);
+    pageNote(trouble.join(' '));
     stamp();
     return;
   }
@@ -1146,7 +1192,7 @@ async function refresh() {
   try {
     history = await counterHistory(win, tariff.bands, cadence);
   } catch (e) {
-    pageNote(`The energy counters could not be read: ${e.message}. `
+    trouble.push(`The energy counters could not be read: ${e.message}. `
       + 'No money is shown rather than a figure built from part of the month.');
   }
   const exported = bucket ? numOrNull(bucket.grid_exported_kwh) : null;
@@ -1155,7 +1201,8 @@ async function refresh() {
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
-  renderAssumptions(priced, tariff);
+  renderAssumptions(priced, tariff, false);
+  pageNote(trouble.join(' '));
   stamp();
 }
 

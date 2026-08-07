@@ -17,14 +17,32 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from arraysense.collector.source import InverterSource
 from arraysense.models import Sample
+from arraysense.store.rollup import (
+    rebuild_inverter_hourly,
+    rebuild_inverter_minute,
+    rebuild_module_hourly,
+)
 from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
+
+# How much of the recent past each maintenance pass rebuilds. The builders
+# delete and reinsert whatever they cover, so a window only has to be wide
+# enough to include any bucket still open when the last pass ran — a few hours
+# covers a restart, and everything older is already final.
+MINUTE_REBUILD_WINDOW = 3 * 3600
+HOURLY_REBUILD_WINDOW = 48 * 3600
+
+# How often maintenance runs, in seconds. Not on every poll: at an eleven-second
+# cadence that would rebuild the same buckets three hundred times an hour for a
+# minute bucket that changes five times.
+ROLLUP_INTERVAL = 60.0
 
 # Backoff doubles from the poll interval up to this. Five minutes is long
 # enough to stop pestering a dongle that has been unplugged, short enough that
@@ -151,6 +169,36 @@ class CollectorService:
         self.status.yield_until = None
         logger.info("resumed early")
 
+    async def maintain_rollups(self, now: datetime | None = None) -> None:
+        """Rebuild the recent coarse tiers from raw.
+
+        Without this the tiers exist and stay empty forever, which is not a
+        cosmetic problem: ``/api/history`` serves the minute tier for anything
+        over about six hours, and the calibration endpoint reads it
+        exclusively. An unscheduled rollup means blank history charts and a
+        drift warning permanently stuck at "no full charge found" — all of it
+        looking like a data problem rather than a missing cron.
+
+        Only a recent window is rebuilt. The builders delete and reinsert the
+        buckets they cover, so this is idempotent and cheap, and anything older
+        than the window is already final. The minute window is short because
+        minute buckets close quickly; the hourly one reaches back far enough to
+        pick up a bucket that was still open when the service last stopped.
+
+        Never raises. This is housekeeping running beside the poll loop, and
+        the poll is the thing that cannot be caught up on later — a rollup can
+        always be rebuilt from raw on the next pass.
+        """
+        moment = now or datetime.now(tz=UTC)
+        end = int(moment.timestamp()) + 60
+        try:
+            with self._store._conn:
+                rebuild_inverter_minute(self._store._conn, end - MINUTE_REBUILD_WINDOW, end)
+                rebuild_inverter_hourly(self._store._conn, end - HOURLY_REBUILD_WINDOW, end)
+                rebuild_module_hourly(self._store._conn, end - HOURLY_REBUILD_WINDOW, end)
+        except sqlite3.Error as exc:
+            logger.warning("rollup maintenance failed, will retry: %s", exc)
+
     async def poll_once(self) -> Sample | None:
         """Read once and store the result, returning what was stored.
 
@@ -206,10 +254,20 @@ class CollectorService:
         logger.info("yield elapsed, resuming polling")
 
     async def _loop(self) -> None:
-        """Poll forever, backing off while the inverter is unreachable."""
+        """Poll forever, backing off while the inverter is unreachable.
+
+        Rollup maintenance rides along on its own timer rather than getting a
+        task of its own: it shares the store with the poll, and interleaving
+        the two here means they never write at the same moment.
+        """
+        last_rollup = 0.0
         try:
             while True:
                 await self.poll_once()
+                now = asyncio.get_running_loop().time()
+                if now - last_rollup >= ROLLUP_INTERVAL:
+                    last_rollup = now
+                    await self.maintain_rollups()
                 await asyncio.sleep(self._backoff())
         except asyncio.CancelledError:
             raise
