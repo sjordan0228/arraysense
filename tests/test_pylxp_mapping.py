@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from arraysense.collector.pylxp_source import sample_from_pylxp
+import pytest
+from pylxpweb.transports.exceptions import TransportError
+
+from arraysense.collector.pylxp_source import PylxpSource, sample_from_pylxp
+from arraysense.config import Config
 from arraysense.metrics import lookup
 
 
@@ -217,3 +221,87 @@ def test_a_module_holding_only_zeroes_is_dropped_even_with_a_serial() -> None:
     )
     modules = sample_from_pylxp(_runtime(), bank).battery_modules
     assert [m.serial for m in modules] == ["Battery_ID_01"]
+
+
+class _CrossedTransport:
+    """A dongle that answers the wrong register a fixed number of times first.
+
+    This is the real behaviour of the reference hardware, not an invention: it
+    serves its vendor's cloud on the same socket and the replies cross, so a
+    read of register 32 comes back carrying 127.
+    """
+
+    def __init__(self, misroutes: int, then: object = None) -> None:
+        self.misroutes = misroutes
+        self.then = then if then is not None else _runtime()
+        self.calls = 0
+
+    async def _answer(self) -> object:
+        self.calls += 1
+        if self.misroutes > 0:
+            self.misroutes -= 1
+            raise TransportError(
+                "Failed to read register group 'status_energy': [1234567890] Response "
+                "register mismatch: expected [tcp_func=0xc2 func=0x04 register=32], "
+                "received [func=0x04 register=127] — likely a misrouted cloud response"
+            )
+        return self.then
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+
+    async def read_runtime(self) -> object:
+        return await self._answer()
+
+    async def read_battery(self) -> object:
+        return None
+
+    async def read_energy(self) -> object:
+        return None
+
+
+def _source(transport: object) -> PylxpSource:
+    return PylxpSource(
+        Config(
+            dongle_host="127.0.0.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path=":memory:",
+        ),
+        transport=transport,  # type: ignore[arg-type]
+    )
+
+
+async def test_a_crossed_reply_is_retried_rather_than_losing_the_sample() -> None:
+    # A misrouted reply is not a broken connection. Treating it as one cost
+    # 5.5% of polls in the first hour of live collection, against the 0.01%
+    # the tool this replaced lost on the same dongle.
+    transport = _CrossedTransport(misroutes=1)
+    sample = await _source(transport).read()
+    assert transport.calls == 2
+    assert sample.readings["pv1_power_w"] == 2253.0
+
+
+async def test_a_second_crossed_reply_is_not_retried_again() -> None:
+    # Once is transient; twice is a fault, and the caller's backoff is the
+    # right answer to a fault. Retrying harder here is how a poll loop turns an
+    # unhappy inverter into a busy wait.
+    transport = _CrossedTransport(misroutes=5)
+    with pytest.raises(ConnectionError, match="reading from inverter failed"):
+        await _source(transport).read()
+    assert transport.calls == 2
+
+
+async def test_a_closed_socket_is_not_retried_at_all() -> None:
+    # Only the crossed-reply case is worth an immediate second attempt. A dead
+    # connection retried immediately is a busy wait against an inverter that is
+    # not there.
+    class _Dead(_CrossedTransport):
+        async def _answer(self) -> object:
+            self.calls += 1
+            raise TransportError("connection reset by peer")
+
+    transport = _Dead(misroutes=0)
+    with pytest.raises(ConnectionError):
+        await _source(transport).read()
+    assert transport.calls == 1

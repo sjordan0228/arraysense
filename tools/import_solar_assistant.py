@@ -120,7 +120,15 @@ SOURCES: tuple[Source, ...] = (
     Source("Battery voltage", "inverter_0", "battery_voltage_v"),
     Source("Battery current", "inverter_0", "battery_current_a"),
     Source("Battery state of charge", "combined", "battery_soc_pct"),
-    Source("Inverter temperature", "inverter_0", "inverter_temperature_c", convert=_fahrenheit),
+    # The heatsink, not the internal sensor, and the distinction is thirteen
+    # degrees. At 2026-08-06T20:44:56Z SolarAssistant read 157.7 °F — 69.9 °C —
+    # while this project's own read of the same inverter reported radiator 1 at
+    # 68.0, radiator 2 at 71.0, and the internal sensor at 59.0. Live now, the
+    # gap is the same shape: radiator 1 at 56 °C against an internal 45.
+    # inverter_temperature_c is fed by the internal register from cutover
+    # onwards, so putting the heatsink into it would leave a thirteen degree
+    # step at the seam and present it as the inverter warming up.
+    Source("Inverter temperature", "inverter_0", "radiator1_temperature_c", convert=_fahrenheit),
     Source("Generator power", "inverter_0", "generator_power_w"),
 )
 
@@ -160,6 +168,9 @@ DROPPED: dict[str, str] = {
     # onwards, so importing a different sensor into it would put a seventeen
     # degree step in the chart at the seam and call it a temperature change.
     "Battery temperature": "an ambient sensor, not the cells; see the note above",
+    # There is no SolarAssistant series for it. The internal sensor reads about
+    # thirteen degrees below the heatsink, so nothing here can stand in for it.
+    "(inverter_temperature_c)": "no source; SA's Inverter temperature is the heatsink",
 }
 
 

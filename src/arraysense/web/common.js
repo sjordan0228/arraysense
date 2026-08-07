@@ -157,6 +157,22 @@ const uStr = (v, d, unit) => v === null ? DASH : gnum(v, d) + (unit ? ' ' + unit
 const qty = (v, unit) => v === null ? DASH
   : gnum(v, Number.isInteger(v) ? 0 : 1) + (unit ? ' ' + unit : '');
 
+// The currency is a setting on the service, never a hard-coded dollar sign:
+// this is published software and most of the planet does not pay in dollars.
+// Shared rather than kept on the page that first needed it, because Costs and
+// History now both draw money and a figure that reads "$8.08" on one page and
+// "8.08" on the other is the same drift in miniature that put two tariff
+// parsers in this project.
+function money(v, cur) {
+  if (v === null || v === undefined || !isFinite(v)) return DASH;
+  const sym = String(cur || '$');
+  // "USD 12.34" but "$12.34" — a code needs the space and a symbol does not.
+  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
+  const digits = Math.abs(v).toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (v < 0 ? '−' : '') + sym + gap + digits;
+}
+
 const kvRow = (label, value, cls) =>
   `<div class="kv"><u>${label}</u><b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
 

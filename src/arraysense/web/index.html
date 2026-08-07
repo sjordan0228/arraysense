@@ -22,13 +22,30 @@
   .hero .today{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
     margin-top:11px;padding-top:9px;border-top:1px solid var(--panel-b)}
   .hero .today b{font-size:17px;font-weight:400;font-variant-numeric:tabular-nums}
-  .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  /* Tracks are minmax(0,1fr) and never a bare 1fr. A bare 1fr means
+     minmax(auto,1fr), and that auto floor is the widest the content refuses to
+     shrink below — which a grid honours by growing past its own container
+     rather than by narrowing the track. The state of charge, the EST badge and
+     the serial sat on one unbreakable 150px line, which with the card's padding
+     floors a module at 184px, so on a 390px phone the two tracks resolved to
+     184px and 197px inside a 316px panel and the right-hand column ran off the
+     screen edge, cutting "100%" to "1" and "52.24 V" to "52.". A zero floor
+     lets the track win instead, and the card is then made to cope with the
+     width it is given. */
+  .flow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
   .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
-  .mods{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-  @media(max-width:860px){.mods{grid-template-columns:repeat(2,1fr)}}
-  .mod .top{display:flex;justify-content:space-between;align-items:baseline}
+  .mods{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  @media(max-width:860px){.mods{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  /* Coping with it: the serial drops to a line of its own when the head row
+     cannot hold it beside the charge figure, because a serial is the one value
+     on the card nobody can infer from the others and truncating it loses the
+     only thing that names the pack. It stays right-aligned on whichever line it
+     lands on, and may break inside itself if some other vendor's pack reports a
+     serial longer than anything an EG4 does. */
+  .mod .top{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap}
   .mod .soc{font-size:22px;font-weight:300}
-  .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em}
+  .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em;
+    min-width:0;margin-left:auto;text-align:right;overflow-wrap:anywhere}
   /* Eight readings on a quarter-width card. Two columns of four keeps the pack
      legible at a glance without the card growing taller than the panels beside
      it; below the breakpoint the cards are half-width and the rows go single
@@ -37,7 +54,7 @@
   .mod .kv{font-size:11px}
   .mod .kv u{font-size:10px}
   @media(min-width:861px){
-    .mod .face{display:grid;grid-template-columns:1fr 1fr;column-gap:12px}
+    .mod .face{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
     .mod .face .kv{margin-top:4px}
   }
   .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
@@ -84,7 +101,7 @@
   .agree{margin-bottom:11px;padding:11px 13px;border:1px solid var(--panel-b);
     border-radius:11px;background:rgba(255,255,255,.045)}
   .agree[hidden]{display:none}
-  .agree .pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  .agree .pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:8px}
   .agree .v{font-size:21px;font-weight:300;letter-spacing:-.02em;margin-top:2px}
   .agree .v span{font-size:11px;opacity:.6;font-weight:400;margin-left:4px}
   .agree .bar{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin-top:7px;overflow:hidden}
@@ -542,7 +559,11 @@ function drawModules(mods) {
     const est = estimate && soc !== null;
     return `<div class="p mod${est ? ' est' : ''}">
       <div class="top"><span class="soc">${soc === null ? '—' : (est ? '≈' : '') + soc.toFixed(0) + '%'}${
-        est ? '<abbr class="est-tag" title="estimate">est</abbr>' : ''}</span>
+        // The badge is glued to the figure with no space between them, so on a
+        // narrow card there is nowhere for the line to break and the pair
+        // pushes out through the side. <wbr> offers the break and draws
+        // nothing, leaving the spacing on a wide card exactly as it was.
+        est ? '<wbr><abbr class="est-tag" title="estimate">est</abbr>' : ''}</span>
         <span class="sn">${esc(m.serial)}</span></div>
       <div class="track${soc === null ? ' unknown' : ''}">${soc === null ? ''
         : `<i class="${odd ? 'odd' : ''}" style="width:${Math.max(0,Math.min(100,soc))}%"></i>`}</div>

@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import time as clock
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from arraysense.costs import band_intervals, period_energy
+from arraysense.costs import (
+    BandInterval,
+    band_intervals,
+    bucket_energy,
+    period_energy,
+    price_period,
+)
+from arraysense.energy import bucket_edges
 from arraysense.tariff import (
     PeriodEnergy,
     Tariff,
@@ -388,3 +396,189 @@ def test_an_unknown_export_credit_leaves_the_bill_absent_rather_than_larger() ->
     known = estimate_bill(paying, replace(energy, grid_export_kwh=40.0))
     assert known is not None
     assert known.estimated_total is not None
+
+
+# --- the band scan itself -----------------------------------------------------
+
+
+def _asked_minute_by_minute(
+    tariff: Tariff, start: datetime, end: datetime, zone: ZoneInfo
+) -> list[tuple[datetime, str | None]]:
+    """The band in force at every real minute, asked one minute at a time.
+
+    Stepped through UTC so the repeated autumn hour is visited twice and the
+    spring hour that never happened is not visited at all.
+    """
+    out: list[tuple[datetime, str | None]] = []
+    instant = start.astimezone(UTC)
+    finish = end.astimezone(UTC)
+    while instant < finish:
+        band = tariff.band_at(instant.astimezone(zone))
+        out.append((instant, None if band is None else band.name))
+        instant += timedelta(minutes=1)
+    return out
+
+
+def _read_from(intervals: list[BandInterval], moment: datetime) -> str | None:
+    """The band the returned intervals put this instant in."""
+    for interval in intervals:
+        if interval.start.astimezone(UTC) <= moment < interval.end.astimezone(UTC):
+            return interval.band
+    raise AssertionError(f"{moment} falls in no interval at all")
+
+
+@pytest.mark.parametrize(
+    ("first", "last"),
+    [
+        # An ordinary summer day, a winter day with no peak, the day the season
+        # turns, and both days a year the clocks move.
+        (_day(2026, 7, 15), _day(2026, 7, 16)),
+        (_day(2027, 1, 15), _day(2027, 1, 16)),
+        (_day(2026, 10, 31), _day(2026, 11, 2)),
+        (datetime(2026, 3, 8, 6, 0, tzinfo=UTC), datetime(2026, 3, 9, 6, 0, tzinfo=UTC)),
+        (datetime(2026, 11, 1, 5, 0, tzinfo=UTC), datetime(2026, 11, 2, 6, 0, tzinfo=UTC)),
+    ],
+)
+def test_the_intervals_agree_with_asking_every_minute(first: datetime, last: datetime) -> None:
+    # The scan no longer walks a minute at a time — it jumps to the clock times
+    # a band can turn on, which is what makes thirteen months affordable — so
+    # the thing that has to keep holding is that it says the same about every
+    # minute as asking the tariff directly does. Without this the speed-up
+    # could skip a boundary and nothing else in the suite would notice.
+    intervals = band_intervals(COSERV, first, last, TZ)
+    for moment, expected in _asked_minute_by_minute(COSERV, first, last, TZ):
+        assert _read_from(intervals, moment) == expected, moment
+
+
+def test_no_interval_is_empty_across_a_midnight_clock_change() -> None:
+    # Santiago moves its clocks at midnight, so local midnight is a time that
+    # never happened and the zone resolves it to the instant before the change.
+    # Comparing the period's own start against a candidate boundary as wall
+    # clock — which is what Python does to two datetimes sharing a tzinfo —
+    # put a boundary exactly on the start and handed the caller an interval of
+    # zero length to divide by.
+    santiago = ZoneInfo("America/Santiago")
+    tariff = Tariff(bands=parse_bands("Late | 0.2 | 23:00-01:00; Rest | 0.1 | 01:00-23:00"))
+    start = datetime(2026, 9, 6, tzinfo=santiago)
+    intervals = band_intervals(tariff, start, datetime(2026, 9, 7, tzinfo=santiago), santiago)
+    assert all(i.end.astimezone(UTC) > i.start.astimezone(UTC) for i in intervals)
+
+
+# --- many buckets at once -----------------------------------------------------
+
+
+def test_each_bucket_is_split_exactly_as_it_would_be_on_its_own() -> None:
+    # The History page prices thirty days and thirteen months at once, and the
+    # only reason to do that in one pass rather than thirty is speed. A pass
+    # that answers something different from the single-period path would put a
+    # different number on the History page than on the Costs page for the same
+    # day, which is the disagreement this whole module exists to prevent.
+    start, end = _day(2026, 7, 14), _day(2026, 7, 17)
+    rows = _rows(start, 72, 1.0)
+    edges = bucket_edges(start, end, "day", TZ)
+    together = bucket_energy(COSERV, rows, edges, TZ)
+    assert len(together) == 3
+    for index, split in enumerate(together):
+        alone = period_energy(COSERV, rows, edges[index], edges[index + 1], TZ)
+        assert dict(split.grid_import_kwh) == dict(alone.grid_import_kwh), index
+        assert dict(split.load_kwh or {}) == dict(alone.load_kwh or {}), index
+
+
+def test_a_bucket_nobody_measured_is_absent_rather_than_free() -> None:
+    # The collector was down for the middle day. Its bands have to come back
+    # unknown so the cost does too — a day priced at nothing is a day the owner
+    # reads as a day they used nothing.
+    start, end = _day(2026, 7, 14), _day(2026, 7, 17)
+    rows = _rows(start, 24, 1.0) + _rows(_day(2026, 7, 16), 24, 1.0)
+    edges = bucket_edges(start, end, "day", TZ)
+    middle = bucket_energy(COSERV, rows, edges, TZ)[1]
+    assert compute_cost(COSERV, middle) is not None
+    assert compute_cost(COSERV, middle).cost is None  # type: ignore[union-attr]
+
+
+def test_the_months_priced_together_add_up_to_the_range_priced_whole() -> None:
+    # Thirteen monthly buckets is far past the seventy days one costed period
+    # may cover, so this is the path that has to work at that length. Summing
+    # them must land on what the same energy costs when it is split once over
+    # the whole span, or the History page's column of months would not agree
+    # with any other view of the same electricity.
+    start = _day(2026, 6, 1)
+    end = _day(2026, 8, 1)
+    rows = _rows(start, 24 * 61, 0.5)
+    edges = bucket_edges(start, end, "month", TZ)
+    by_month = bucket_energy(COSERV, rows, edges, TZ)
+    assert len(by_month) == 2
+
+    summed: dict[str, float] = {}
+    for split in by_month:
+        for name, kwh in split.grid_import_kwh.items():
+            assert kwh is not None, name
+            summed[name] = summed.get(name, 0.0) + kwh
+    whole = period_energy(COSERV, rows, start, end, TZ)
+    for name, kwh in whole.grid_import_kwh.items():
+        assert summed[name] == pytest.approx(kwh, abs=0.2), name
+
+
+def test_thirteen_months_of_buckets_do_not_take_a_minute_each() -> None:
+    # Priced by walking every minute this is well over half a million steps and
+    # blocks the event loop the collector polls on. The scan is proportional to
+    # the days in the range instead, so this is milliseconds; the bound is
+    # loose enough not to fail on a slow machine and tight enough to catch a
+    # return to the minute walk, which measured 100x this.
+    start, end = _day(2025, 8, 1), _day(2026, 9, 1)
+    edges = bucket_edges(start, end, "month", TZ)
+    began = clock.perf_counter()
+    priced = bucket_energy(COSERV, _rows(start, 24, 1.0), edges, TZ)
+    assert len(priced) == 13
+    assert clock.perf_counter() - began < 1.0
+
+
+# --- pricing a period against the bands it entered ----------------------------
+
+
+def test_a_morning_is_priced_before_its_peak_window_arrives() -> None:
+    # Asked at nine in the morning, the day has not reached its peak window, so
+    # the peak band has no interval and no reading. That is not an unmeasured
+    # band, it is one that has not happened, and treating the two alike made
+    # the day's cost a dash for the first fifteen hours of every day.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 15, 9)
+    energy = period_energy(COSERV, _rows(start, 9, 1.0), start, end, TZ)
+    assert "On-peak" not in energy.grid_import_kwh
+    result = price_period(COSERV, energy)
+    assert result is not None
+    assert result.cost is not None
+    assert result.energy_cost == pytest.approx(9 * 0.086709, abs=0.01)
+
+
+def test_a_peak_window_that_happened_and_went_unmeasured_still_reads_unknown() -> None:
+    # The distinction that has to survive. Readings stop at two in the
+    # afternoon and resume at nine, so the whole peak window happened with
+    # nobody watching. Its energy is unknown, and a day priced without it would
+    # read as cheap — which is a missing reading rendered as zero, in the one
+    # place where it becomes money.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    rows = _rows(start, 14, 1.0) + _rows(_day(2026, 7, 15, 21), 3, 1.0)
+    energy = period_energy(COSERV, rows, start, end, TZ)
+    assert energy.grid_import_kwh["On-peak"] is None
+    result = price_period(COSERV, energy)
+    assert result is not None
+    assert result.cost is None
+
+
+def test_a_period_that_entered_no_band_at_all_is_still_not_free() -> None:
+    # A tariff whose only band covers the afternoon, asked about the morning.
+    # Nothing was entered, so there is nothing to narrow to — and narrowing to
+    # an empty band list would price nothing, total zero and call it a bill.
+    sparse = Tariff(bands=parse_bands("Peak | 0.30 | 15:00-20:00"))
+    start, end = _day(2026, 7, 15), _day(2026, 7, 15, 9)
+    energy = period_energy(sparse, _rows(start, 9, 1.0), start, end, TZ)
+    assert dict(energy.grid_import_kwh) == {}
+    result = price_period(sparse, energy)
+    assert result is not None
+    assert result.cost is None
+
+
+def test_without_a_tariff_there_is_no_priced_period_at_all() -> None:
+    # Not zero, and not an empty breakdown either.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    assert price_period(None, period_energy(COSERV, [], start, end, TZ)) is None

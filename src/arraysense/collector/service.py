@@ -246,6 +246,31 @@ class CollectorService:
         grown = self._interval * float(2**self.status.consecutive_failures)
         return float(min(grown, self._max_backoff))
 
+    def _wait_from(self, started: float) -> float:
+        """How long to sleep so that polls land one interval apart.
+
+        The interval is a *cadence*, not a pause between polls, and the
+        difference is most of the sampling rate. Sleeping the full interval
+        after each read makes the real spacing read time plus interval: on the
+        reference dongle a read takes twelve to seventeen seconds, so an eleven
+        second interval produced samples twenty-five seconds apart — less than
+        half the rate the setting asks for, and well behind what the tool this
+        replaced managed on the same hardware.
+
+        A read that overruns its own interval gets no sleep at all rather than a
+        negative one, which makes the cadence ``max(interval, read time)``. That
+        is the honest floor: the dongle cannot be asked faster than it answers.
+
+        Backoff still wins while the inverter is unreachable. A failing read
+        returns quickly, so scheduling by cadence would otherwise retry a dead
+        connection at full speed, and the point of backing off is to stop that.
+        """
+        wait = self._backoff()
+        if self.status.consecutive_failures:
+            return wait
+        elapsed = asyncio.get_running_loop().time() - started
+        return max(0.0, wait - elapsed)
+
     async def _resume_after(self, seconds: float) -> None:
         """Sleep out a yield and then let polling continue."""
         await asyncio.sleep(seconds)
@@ -263,12 +288,13 @@ class CollectorService:
         last_rollup = 0.0
         try:
             while True:
+                started = asyncio.get_running_loop().time()
                 await self.poll_once()
                 now = asyncio.get_running_loop().time()
                 if now - last_rollup >= ROLLUP_INTERVAL:
                     last_rollup = now
                     await self.maintain_rollups()
-                await asyncio.sleep(self._backoff())
+                await asyncio.sleep(self._wait_from(started))
         except asyncio.CancelledError:
             raise
         except Exception:

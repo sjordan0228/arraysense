@@ -171,3 +171,43 @@ async def test_status_reports_what_happened(tmp_path: Path) -> None:
     store.close()
     assert svc.status.last_success is not None
     assert svc.status.last_error is None
+
+
+async def test_the_interval_is_a_cadence_not_a_pause_between_polls(tmp_path: Path) -> None:
+    # Sleeping the whole interval after each read makes the real spacing read
+    # time plus interval. On the reference dongle a read takes twelve to
+    # seventeen seconds, so an eleven second interval produced samples
+    # twenty-five seconds apart — under half the rate the setting asks for.
+    svc, store = _service(tmp_path)
+    loop = asyncio.get_running_loop()
+    interval = svc._backoff()
+
+    # A read that took two thirds of the interval leaves a third to wait.
+    started = loop.time() - interval * (2 / 3)
+    assert svc._wait_from(started) == pytest.approx(interval / 3, abs=interval / 20)
+
+    # One that took no time at all waits the whole interval.
+    assert svc._wait_from(loop.time()) == pytest.approx(interval, abs=interval / 20)
+    store.close()
+
+
+async def test_a_read_slower_than_its_interval_gets_no_sleep_rather_than_a_negative_one(
+    tmp_path: Path,
+) -> None:
+    # The cadence floor is what the dongle can answer at. Asking for eleven
+    # seconds when a read takes fourteen means fourteen, not a negative sleep.
+    svc, store = _service(tmp_path)
+    loop = asyncio.get_running_loop()
+    assert svc._wait_from(loop.time() - 10.0) == 0.0
+    store.close()
+
+
+async def test_backoff_still_wins_while_the_inverter_is_unreachable(tmp_path: Path) -> None:
+    # A failing read returns fast, so scheduling by cadence would retry a dead
+    # connection at full speed — which is the one thing backing off exists to
+    # prevent.
+    svc, store = _service(tmp_path)
+    svc.status.consecutive_failures = 3
+    loop = asyncio.get_running_loop()
+    assert svc._wait_from(loop.time() - 5.0) == pytest.approx(svc._backoff())
+    store.close()

@@ -24,18 +24,18 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
-from arraysense.costs import period_energy, unpriced_minutes
-from arraysense.energy import ENERGY_FIELDS, Period, energy_totals, resolve_zone, with_zone
+from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
+from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SettingsStore, describe, lookup_setting
 from arraysense.store.schema import module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
 from arraysense.tariff import (
+    SETTING_BANDS,
     CostResult,
     PeriodEnergy,
     Tariff,
-    compute_cost,
     estimate_bill,
     load_tariff,
 )
@@ -309,7 +309,7 @@ async def costs(
         # at the tariff they just typed that they have not entered one. Text
         # is stored but unusable only for a value saved before the grammar was
         # checked at write time, which is why the reason is worth carrying.
-        stored = str(settings.all().get("tariff.bands") or "").strip()
+        stored = str(settings.all().get(SETTING_BANDS) or "").strip()
         return {
             "currency": None,
             "configured": False,
@@ -339,7 +339,7 @@ async def costs(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    result = compute_cost(tariff, energy)
+    result = price_period(tariff, energy)
     bill = estimate_bill(tariff, energy)
 
     # The page needs more than the priced totals to be honest about them: the
@@ -457,6 +457,7 @@ async def energy(
     end: datetime,
     period: Period = "day",
     tz: str | None = None,
+    priced: bool = False,
 ) -> dict[str, Any]:
     """Energy per calendar day or month, in kWh, over the owner's own calendar.
 
@@ -472,6 +473,18 @@ async def energy(
     in that same zone rather than the server's, since otherwise the answer
     depends on where the service happens to be installed. A bucket nothing was
     recorded for is left out of the reply rather than returned as zero.
+
+    ``priced`` asks for what each bucket cost as well as what it used. The
+    money rides on the bucket it belongs to rather than arriving from a second
+    endpoint, because a page holding two lists of buckets has to line them up
+    by date to draw one row — and lining up two lists that each omit what they
+    had nothing to report for is the mistake that once billed seven off-peak
+    kilowatt-hours at the peak rate. It also means one read of the counters
+    answers both questions instead of two reads that have to agree.
+
+    With no tariff entered the reply carries no money at all: no currency, no
+    cost on any bucket, and ``configured`` false. Not zero — an install that
+    has never entered a tariff shows its energy and says so.
     """
     try:
         zone = resolve_zone(tz)
@@ -479,8 +492,32 @@ async def energy(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     start, end = with_zone(start, zone), with_zone(end, zone)
     _check_range(start, end)
-    buckets = energy_totals(request.app.state.store, start, end, period=period, zone=zone)
-    return {
+
+    store = request.app.state.store
+    read = read_energy(store, start, end, period=period, zone=zone)
+
+    tariff, stored = (None, "")
+    if priced:
+        values = SettingsStore(store).all()
+        tariff, stored = load_tariff(values), str(values.get(SETTING_BANDS) or "").strip()
+
+    money: dict[datetime, CostResult | None] = {}
+    if tariff is not None:
+        # Keyed by the bucket's own opening edge, so money reaches the bucket
+        # it belongs to by identity rather than by counting: the reply leaves
+        # out a bucket the counters said nothing about, and a cost matched by
+        # position would then slide onto that bucket's neighbour.
+        #
+        # ``end`` goes with it so the bucket in progress is priced over the
+        # part of itself that has happened. A calendar month runs to the first
+        # of the next, and pricing hours still in the future leaves the whole
+        # month unmeasured and shows a dash beside a month that plainly used
+        # electricity.
+        priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
+        for index, split in enumerate(priced_buckets):
+            money[read.edges[index]] = price_period(tariff, split)
+
+    payload: dict[str, Any] = {
         "period": period,
         "timezone": str(zone),
         "buckets": [
@@ -489,9 +526,45 @@ async def energy(
                 "end": bucket.end.isoformat(),
                 "complete": bucket.complete,
                 **bucket.totals,
+                **_bucket_money(tariff, money.get(bucket.start)),
             }
-            for bucket in buckets
+            for bucket in read.buckets
         ],
+    }
+    if priced:
+        payload |= {
+            "currency": tariff.currency if tariff else None,
+            "configured": tariff is not None,
+            # Nothing entered and something entered that cannot be read call
+            # for opposite actions, and conflating them tells somebody staring
+            # at the tariff they just typed that they have not entered one.
+            "unreadable": tariff is None and bool(stored),
+        }
+    return payload
+
+
+def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str, Any]:
+    """What one bucket cost, or nothing at all when there is no tariff.
+
+    The keys are absent rather than null without a tariff, so a page cannot
+    draw a column of dashes over an install that simply has no rates entered.
+    With a tariff they are present and may be null, which means something else
+    entirely: those bands happened and nobody measured all of them.
+
+    ``fixed_charge`` is this bucket's share of the monthly connection charge,
+    apportioned by how much of that month it covers. It is inside ``cost``
+    because it is money owed for that day, and it is broken out because a
+    reader adding up a column of days should be able to see that the standing
+    charge is in there once per month rather than once per row.
+    """
+    if tariff is None:
+        return {}
+    if result is None:
+        return {"cost": None, "energy_cost": None, "fixed_charge": None}
+    return {
+        "cost": result.cost,
+        "energy_cost": result.energy_cost,
+        "fixed_charge": result.fixed_charge,
     }
 
 

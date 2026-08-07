@@ -31,10 +31,6 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
   .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
-  /* A range raw cannot answer is shown out of reach rather than removed. The
-     owner who wants thirty days should be told why this page will not, not
-     left hunting for a button that is simply gone. */
-  .rng button:disabled{opacity:.4;cursor:not-allowed}
   .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
 </style>
 </head>
@@ -106,35 +102,40 @@
 // what is particular to the graphs page.
 
 // ---------------------------------------------------------------------------
-// What the API can serve at the raw poll cadence.
+// How much of the store this page is prepared to ask for.
 // ---------------------------------------------------------------------------
 
 // /api/history has no tier parameter: it picks the tier whose point count best
-// fits the width the caller asks for. So asking for exactly as many pixels as
-// the span holds raw samples scores a perfect fit, and the full tier wins
-// outright — that is how this page asks for raw rather than hoping for it.
+// fits the width the caller asks for. The width is therefore less a statement
+// about pixels than a request for a resolution, and asking for exactly as many
+// as the span holds raw samples is how a short range lands on raw rather than
+// hoping for it.
 //
-// The catch is the API's own ceiling on that width. Past ten thousand the ask
-// cannot be made, the fit stops favouring raw, and the minute rollup comes
-// back instead — which looks like a chart either way, which is exactly the
-// problem. That ceiling, and not the thirty-day raw retention, is what caps
-// the ranges this page offers.
-const MAX_WIDTH = 10000;
+// Past a few thousand that ask stops making sense. Thirty days holds 235,636
+// raw samples at an eleven-second cadence, and asking for a width to match —
+// or for the ten thousand the endpoint accepts as its maximum — makes the
+// minute rollup the closest fit: 43,154 rows and 26 MB of JSON across
+// twenty-odd bands, measured against this installation. Capping the ask lets
+// the endpoint answer thirty days from the hourly tier instead, 720 rows and
+// 0.4 MB, which is the whole reason it chooses rather than being told.
+//
+// This caps the ask, not the range. Every span the store retains stays
+// selectable; what the cap changes is the resolution that comes back, and the
+// readout in the header says which one did.
+const MAX_POINTS = 4000;
 
 // Only reached when /api/settings cannot be read. The interval is configurable
-// and every width below is computed from it, so guessing wrong here would ask
+// and the width below is computed from it, so guessing wrong here would ask
 // for a width that lands on the wrong tier.
 const DEFAULT_CADENCE = 11;
 let cadence = DEFAULT_CADENCE;
 
-// True when the span's raw samples fit inside that ceiling, which is the only
-// condition under which the full tier can be asked for. The one span this
-// misses is a poll interval of exactly sixty seconds, where raw and the minute
-// rollup score identically and the tie goes to the rollup — harmless, since at
-// that cadence they are the same resolution, and the readout says which
-// arrived either way.
-const rawFits = (seconds) => seconds / cadence <= MAX_WIDTH;
-const widthFor = (seconds) => Math.max(1, Math.min(MAX_WIDTH, Math.round(seconds / cadence)));
+// The span's own raw sample count while that is under the cap, the cap once it
+// is not. The cap sits well clear of where raw stops winning: at this cadence
+// a width of four thousand against a day still scores the full tier ahead of
+// the minute rollup, so a day comes back raw despite asking for half as many
+// points as it holds.
+const widthFor = (seconds) => Math.max(1, Math.round(Math.min(seconds / cadence, MAX_POINTS)));
 
 // Short enough that twenty-odd of them fit on a screen, tall enough that a
 // swing is a shape rather than a smudge. The last band in each section carries
@@ -528,9 +529,10 @@ async function load() {
   // what is on screen is still the last thing the inverter actually said.
   if (!inv) problems.push('history unavailable — showing the last successful read');
   if (!packs) problems.push('per-pack temperature unavailable');
-  if (inv && inv.tier !== 'full') {
-    problems.push(`served the ${inv.tier} rollup rather than raw samples`);
-  }
+  // A rollup is not among them. On the longer spans it is exactly what this
+  // page asked to have chosen for it, and the header states which tier arrived
+  // on every load, so a warning about one would be noise where it was not
+  // simply wrong.
   note(problems.join(' · '));
   resolution(inv);
   drawInverter(inv);
@@ -539,23 +541,16 @@ async function load() {
   refreshZoomState();
 }
 
-// The shared four spans, with the ones raw cannot answer visibly out of reach
-// rather than quietly missing.
+// All four shared spans. None of them is out of reach: the store keeps a month
+// of raw samples, a year of minutes and every hour it has ever recorded, so
+// each of these has something behind it, and which tier answers is the
+// endpoint's choice rather than this page's business.
 function showRanges() {
-  const el = $('ranges');
-  drawRanges(el, range, pick);
-  for (const btn of el.querySelectorAll('button')) {
-    const r = RANGES.find((x) => x.key === btn.dataset.k);
-    if (r && !rawFits(r.seconds)) {
-      btn.disabled = true;
-      btn.title = `${r.label} is more than ${MAX_WIDTH.toLocaleString()} samples at this poll `
-        + 'interval, so /api/history would answer with the minute rollup instead';
-    }
-  }
+  drawRanges($('ranges'), range, pick);
 }
 
 function pick(r) {
-  if (!r || !rawFits(r.seconds)) return;
+  if (!r) return;
   range = r;
   // Tells the chart factory to drop any zoom on the next paint. Without it the
   // fetch runs, the button lights up, and nothing on screen changes.
@@ -584,7 +579,6 @@ async function boot() {
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
   cadence = await pollInterval();
-  range = RANGES.find((r) => rawFits(r.seconds)) || RANGES[0];
   showRanges();
   await load();
   setInterval(load, REFRESH_MS);

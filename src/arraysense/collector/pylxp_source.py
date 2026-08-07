@@ -23,6 +23,7 @@ dropped.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -34,6 +35,14 @@ from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
 
 logger = logging.getLogger(__name__)
+
+# What the library says when the dongle hands back an answer to a question
+# nobody asked. It serves its vendor's cloud on the same socket, and the replies
+# cross: a read of register 32 comes back carrying 127. The message is matched
+# rather than an exception type because pylxpweb raises the same TransportError
+# for a closed socket, and the two need opposite handling — one is worth
+# retrying immediately, the other is what backing off is for.
+_MISROUTED = "register mismatch"
 
 # Inverter-level readings, as (metric name, library attribute).
 #
@@ -561,6 +570,10 @@ class PylxpSource:
             port=config.dongle_port,
             timeout=config.poll_interval,
         )
+        # How many times the dongle has answered the wrong register. Counted
+        # rather than only logged, because the rate is the thing worth watching:
+        # one in thirty is the dongle being itself, one in three is a fault.
+        self._misroutes = 0
 
     async def connect(self) -> None:
         """Claim the inverter's single client slot.
@@ -583,6 +596,40 @@ class PylxpSource:
         """Release the connection and the client slot it holds."""
         await self._transport.disconnect()
 
+    @staticmethod
+    def _is_misrouted(exc: Exception) -> bool:
+        """Whether this failure is the dongle answering the wrong question."""
+        return _MISROUTED in str(exc)
+
+    async def _retrying[T](self, read: Callable[[], Awaitable[T]]) -> T:
+        """Run one transport read, trying again once if the dongle misanswers.
+
+        The dongle serves its vendor's cloud while it serves us, and about one
+        read in thirty comes back carrying a different register than the one
+        asked for — requesting 32 and receiving 127, or 170 and receiving 254.
+        pylxpweb names it a misrouted cloud response and raises, which cost the
+        whole sample: measured over the first hour of live collection, 5.5% of
+        polls were lost this way against the 0.01% the tool this replaced lost
+        on the same hardware.
+
+        A crossed reply is not a broken connection, and the distinction is the
+        whole point of retrying here rather than backing off. Exactly one
+        retry, immediately: if the second answer is wrong too the fault is not
+        transient, and the caller's backoff is the right response to that.
+
+        Anything that is not a register mismatch — a closed socket, a timeout —
+        propagates untouched on the first failure, because retrying those is
+        how a poll loop turns an unreachable inverter into a busy wait.
+        """
+        try:
+            return await read()
+        except TransportError as exc:
+            if not self._is_misrouted(exc):
+                raise
+            logger.debug("dongle answered the wrong register, retrying once: %s", exc)
+            self._misroutes += 1
+            return await read()
+
     async def read(self) -> Sample:
         """Read one sample of inverter and battery state.
 
@@ -593,8 +640,8 @@ class PylxpSource:
         as a break in the chart rather than smoothed over.
         """
         try:
-            runtime = await self._transport.read_runtime()
-            bank = await self._transport.read_battery()
+            runtime = await self._retrying(self._transport.read_runtime)
+            bank = await self._retrying(self._transport.read_battery)
         except (TransportError, OSError) as exc:
             raise ConnectionError(f"reading from inverter failed: {exc}") from exc
         sample = sample_from_pylxp(runtime, bank)

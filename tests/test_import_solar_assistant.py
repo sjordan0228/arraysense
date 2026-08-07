@@ -89,8 +89,19 @@ def test_the_inverter_temperature_is_fahrenheit() -> None:
     # moment: radiators at 68.0 and 71.0 °C while SolarAssistant recorded 157.7.
     assert _fahrenheit(157.7) == pytest.approx(69.8, abs=0.2)
     # Left raw it is an inverter at 158 °C, which the registry rejects.
-    assert not lookup("inverter_temperature_c").within_bounds(157.7)
-    assert lookup("inverter_temperature_c").within_bounds(_fahrenheit(157.7))
+    assert not lookup("radiator1_temperature_c").within_bounds(157.7)
+    assert lookup("radiator1_temperature_c").within_bounds(_fahrenheit(157.7))
+
+
+def test_solar_assistants_inverter_temperature_is_the_heatsink() -> None:
+    # It lands in radiator1_temperature_c, not inverter_temperature_c. The two
+    # sensors sit about thirteen degrees apart — 157.7 °F is 69.9 °C, against
+    # radiators at 68.0 and 71.0 and an internal sensor at 59.0 at the same
+    # instant — so importing one into the other's column would put a step at
+    # the cutover seam and present it as the inverter warming up.
+    target = {s.metric for s in SOURCES if s.measurement == "Inverter temperature"}
+    assert target == {"radiator1_temperature_c"}
+    assert "inverter_temperature_c" not in {s.metric for s in SOURCES}
 
 
 def test_the_battery_temperature_is_not_imported() -> None:

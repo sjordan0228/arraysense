@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import HTTPException
@@ -717,3 +718,268 @@ def test_the_settings_page_is_served(client: Any) -> None:
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
     assert "/api/settings" in r.text
+
+
+# --- energy with money on it ---------------------------------------------------
+
+# The reference installation's own tariff: time-of-use May to October, one flat
+# rate the rest of the year, and a connection charge every month regardless.
+COSERV_BANDS = (
+    "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+    "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+    "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+)
+CHICAGO = ZoneInfo("America/Chicago")
+JULY = datetime(2026, 7, 1, tzinfo=CHICAGO)
+AUGUST = datetime(2026, 8, 1, tzinfo=CHICAGO)
+
+
+def _counters(store: SqliteStore, first: datetime, last: datetime, skip: Any = None) -> None:
+    """Hourly lifetime counters climbing between two instants.
+
+    Import climbs faster during the afternoon so the peak band carries real
+    money rather than the same rate everywhere, which would make a
+    misattributed hour invisible in the total.
+    """
+    when = first
+    imported, load = 1000.0, 4000.0
+    while when < last:
+        peak = 15 <= when.astimezone(CHICAGO).hour < 20
+        imported += 2.5 if peak else 0.8
+        load += 4.0 if peak else 1.5
+        if skip is None or not skip(when):
+            store.append(
+                Sample(
+                    timestamp=when,
+                    readings={
+                        "grid_import_energy_total_kwh": round(imported, 1),
+                        "load_energy_total_kwh": round(load, 1),
+                        "grid_export_energy_total_kwh": 5.0,
+                    },
+                )
+            )
+        when += timedelta(hours=1)
+
+
+def _energy_client(tmp_path: Path, build: Any, bands: str | None = COSERV_BANDS) -> Any:
+    store = SqliteStore(str(tmp_path / "energy.db"))
+    build(store)
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "energy.db"),
+        poll_interval=11.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    client = TestClient(create_app(store=store, service=service, config=config))
+    if bands is not None:
+        client.put("/api/settings", json={"tariff.bands": bands, "tariff.fixed_monthly": 15.0})
+    return client
+
+
+def _july(client: Any, **extra: Any) -> Any:
+    params = {
+        "start": JULY.isoformat(),
+        "end": AUGUST.isoformat(),
+        "tz": "America/Chicago",
+        **extra,
+    }
+    return client.get("/api/energy", params=params).json()
+
+
+def test_a_priced_month_matches_what_the_costs_page_reports_for_it(tmp_path: Path) -> None:
+    # The one number that has to agree. The Costs page and the History page
+    # answer the same question about the same July, and if they answer it
+    # differently the owner has two bills and no way to tell which is theirs.
+    with _energy_client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        history = _july(c, period="month", priced=True)
+        costs = c.get(
+            "/api/costs",
+            params={
+                "start": JULY.isoformat(),
+                "end": AUGUST.isoformat(),
+                "tz": "America/Chicago",
+            },
+        ).json()
+    assert len(history["buckets"]) == 1
+    assert history["currency"] == costs["currency"] == "$"
+    assert history["buckets"][0]["cost"] == costs["cost"]["cost"]
+    assert history["buckets"][0]["energy_cost"] == costs["cost"]["energy_cost"]
+    assert history["buckets"][0]["fixed_charge"] == costs["cost"]["fixed_charge"]
+    assert history["buckets"][0]["cost"] > 0
+
+
+def test_the_days_of_a_month_add_up_to_the_month(tmp_path: Path) -> None:
+    # Thirty-one daily rows and one monthly row are two views of one bill. They
+    # are rounded separately, so they may differ by pennies and must not differ
+    # by more: a systematic gap would mean a band's energy is landing in a
+    # different place depending on how the question is asked.
+    with _energy_client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        daily = _july(c, period="day", priced=True)
+        monthly = _july(c, period="month", priced=True)
+    total = sum(b["cost"] for b in daily["buckets"])
+    assert len(daily["buckets"]) == 31
+    assert total == pytest.approx(monthly["buckets"][0]["cost"], abs=0.25)
+    # The connection charge is in there once, not thirty-one times. It comes
+    # back a few cents under fifteen because a thirty-first of it is 0.4838 and
+    # every row is rounded to the cent it is displayed at; the alternative is a
+    # column whose figures do not add up to themselves.
+    assert sum(b["fixed_charge"] for b in daily["buckets"]) == pytest.approx(15.0, abs=0.2)
+
+
+def test_energy_carries_no_money_unless_money_is_asked_for(tmp_path: Path) -> None:
+    # The Costs page reads this endpoint too, for its energy grid. Pricing
+    # every bucket for a caller that wanted kilowatt-hours would make it do the
+    # band scan for nothing on every load.
+    with _energy_client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        body = _july(c, period="month")
+    assert "currency" not in body
+    assert "cost" not in body["buckets"][0]
+
+
+def test_an_install_with_no_tariff_gets_energy_and_no_money_at_all(tmp_path: Path) -> None:
+    # Not zero, and not a column of dashes either. There is nothing to say
+    # about money here, so the buckets carry no money key at all and the page
+    # has nothing to draw a column from.
+    build = lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)  # noqa: E731
+    with _energy_client(tmp_path, build, bands=None) as c:
+        body = _july(c, period="month", priced=True)
+    assert body["configured"] is False
+    assert body["unreadable"] is False
+    assert body["currency"] is None
+    assert body["buckets"][0]["load_kwh"] is not None
+    for key in ("cost", "energy_cost", "fixed_charge"):
+        assert key not in body["buckets"][0], key
+
+
+def test_a_day_whose_peak_hours_were_never_recorded_is_priced_as_absent(tmp_path: Path) -> None:
+    # The collector was down across the peak window on the 15th. That day's
+    # cost is unknown, and unknown has to arrive as null rather than as the
+    # off-peak part of it — which would read as a cheap day and be wrong by
+    # every peak kilowatt-hour nobody saw.
+    def build(store: SqliteStore) -> None:
+        _counters(
+            store,
+            JULY - timedelta(hours=2),
+            AUGUST,
+            skip=lambda w: (
+                w.astimezone(CHICAGO).day == 15 and 14 <= w.astimezone(CHICAGO).hour < 21
+            ),
+        )
+
+    with _energy_client(tmp_path, build) as c:
+        body = _july(c, period="day", priced=True)
+    by_day = {b["start"][:10]: b for b in body["buckets"]}
+    assert by_day["2026-07-15"]["cost"] is None
+    assert by_day["2026-07-14"]["cost"] is not None
+    # The energy that was recorded is still reported; only the money is absent.
+    assert by_day["2026-07-15"]["grid_imported_kwh"] is not None
+
+
+def test_the_month_in_progress_is_priced_over_the_part_that_has_happened(tmp_path: Path) -> None:
+    # A calendar month runs to the first of the next one, so most of the month
+    # the owner is living through is hours nobody has readings for. Pricing the
+    # whole bucket leaves the peak band unmeasured and the row shows a dash
+    # beside a month that plainly used electricity. The bucket is priced to the
+    # moment asked about instead, which is what the Costs page does with the
+    # same bound — so the two agree on the month to date as well as on a whole
+    # one.
+    part = datetime(2026, 7, 18, 9, 0, tzinfo=CHICAGO)
+    build = lambda s: _counters(s, JULY - timedelta(hours=2), part)  # noqa: E731
+    with _energy_client(tmp_path, build) as c:
+        history = c.get(
+            "/api/energy",
+            params={
+                "start": JULY.isoformat(),
+                "end": part.isoformat(),
+                "period": "month",
+                "tz": "America/Chicago",
+                "priced": True,
+            },
+        ).json()
+        costs = c.get(
+            "/api/costs",
+            params={
+                "start": JULY.isoformat(),
+                "end": part.isoformat(),
+                "tz": "America/Chicago",
+            },
+        ).json()
+    bucket = history["buckets"][0]
+    assert bucket["complete"] is False
+    assert bucket["cost"] == costs["cost"]["cost"]
+    assert bucket["cost"] > 0
+    # And the standing charge is only the part of the month that has run.
+    assert bucket["fixed_charge"] == pytest.approx(15.0 * 17.375 / 31, abs=0.02)
+
+
+def test_a_whole_month_asked_about_beyond_its_end_is_unchanged(tmp_path: Path) -> None:
+    # Capping the last bucket must not move a bucket that has already closed.
+    # A range that runs past a completed month still prices that month over the
+    # whole of it.
+    with _energy_client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        exact = _july(c, period="month", priced=True)["buckets"][0]
+        beyond = c.get(
+            "/api/energy",
+            params={
+                "start": JULY.isoformat(),
+                "end": (AUGUST + timedelta(days=3)).isoformat(),
+                "period": "month",
+                "tz": "America/Chicago",
+                "priced": True,
+            },
+        ).json()["buckets"][0]
+    assert beyond["cost"] == exact["cost"]
+    assert beyond["fixed_charge"] == 15.0
+
+
+def test_the_day_in_progress_is_priced_and_both_endpoints_say_the_same(tmp_path: Path) -> None:
+    # Nine in the morning on a summer day. The peak window is still six hours
+    # off, so it has no reading and never had one to miss — and treating that
+    # as an unmeasured band made the top row of the History table, the row the
+    # owner actually looks at, a dash for most of every day. Both endpoints go
+    # through one pricing path, so whatever they say they say together.
+    morning = datetime(2026, 7, 15, 9, 0, tzinfo=CHICAGO)
+    build = lambda s: _counters(s, JULY - timedelta(hours=2), morning)  # noqa: E731
+    with _energy_client(tmp_path, build) as c:
+        day = c.get(
+            "/api/energy",
+            params={
+                "start": datetime(2026, 7, 15, tzinfo=CHICAGO).isoformat(),
+                "end": morning.isoformat(),
+                "period": "day",
+                "tz": "America/Chicago",
+                "priced": True,
+            },
+        ).json()["buckets"][-1]
+        costs = c.get(
+            "/api/costs",
+            params={
+                "start": datetime(2026, 7, 15, tzinfo=CHICAGO).isoformat(),
+                "end": morning.isoformat(),
+                "tz": "America/Chicago",
+            },
+        ).json()
+    assert day["cost"] is not None
+    assert day["cost"] == costs["cost"]["cost"]
+
+
+def test_a_completed_day_whose_peak_went_unwatched_is_still_a_dash(tmp_path: Path) -> None:
+    # The other half of the same rule. This peak window did happen and nobody
+    # recorded it, so the day cannot be priced — and pricing it anyway would
+    # bill only the cheap hours and read as a bargain.
+    def build(store: SqliteStore) -> None:
+        _counters(
+            store,
+            JULY - timedelta(hours=2),
+            AUGUST,
+            skip=lambda w: (
+                w.astimezone(CHICAGO).day == 20 and 14 <= w.astimezone(CHICAGO).hour < 21
+            ),
+        )
+
+    with _energy_client(tmp_path, build) as c:
+        body = _july(c, period="day", priced=True)
+    by_day = {b["start"][:10]: b for b in body["buckets"]}
+    assert by_day["2026-07-20"]["cost"] is None

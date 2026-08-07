@@ -34,8 +34,12 @@
   .tno p{margin:7px 0 0;font-size:12.5px;line-height:1.6;color:var(--ink2);max-width:78ch}
   .tno .why{color:var(--warn)}
   .tno a{display:inline-block;margin-top:11px;text-decoration:none}
-  .cards{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px}
-  @media(max-width:860px){.cards{grid-template-columns:1fr}}
+  /* minmax(0,1fr), not a bare 1fr, for the reason spelled out on the dashboard:
+     a bare 1fr floors the track at the content's minimum width and a grid meets
+     that floor by overflowing its container. A 40px currency figure is exactly
+     the kind of content that sets a floor wider than a phone's half-screen. */
+  .cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:12px}
+  @media(max-width:860px){.cards{grid-template-columns:minmax(0,1fr)}}
   .cards[hidden]{display:none}
   .card .v{font-size:40px;font-weight:250;letter-spacing:-.03em;line-height:1.06;margin-top:5px;
     font-variant-numeric:tabular-nums}
@@ -71,9 +75,9 @@
   /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
      it — uppercase at .17em tracking turns an explanation into shouting. */
   .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
-  .egrid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
-  @media(max-width:900px){.egrid{grid-template-columns:repeat(3,1fr)}}
-  @media(max-width:520px){.egrid{grid-template-columns:repeat(2,1fr)}}
+  .egrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}
+  @media(max-width:900px){.egrid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+  @media(max-width:520px){.egrid{grid-template-columns:repeat(2,minmax(0,1fr))}}
   .egrid b{display:block;margin-top:4px;font-size:18px;font-weight:400;font-variant-numeric:tabular-nums}
   .egrid b span{font-size:11px;opacity:.6;margin-left:3px}
   .assume{font-size:11.5px;line-height:1.65;color:var(--ink3);max-width:86ch;margin-top:8px}
@@ -213,17 +217,8 @@
 // Money on screen.
 // ---------------------------------------------------------------------------
 
-// The currency is a setting. A hard-coded dollar sign is wrong for most of the
-// planet, and this is published software.
-function money(v, cur) {
-  if (v === null || v === undefined || !isFinite(v)) return DASH;
-  const sym = String(cur || '$');
-  // "USD 12.34" but "$12.34" — a code needs the space and a symbol does not.
-  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
-  const digits = Math.abs(v).toLocaleString(undefined,
-    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  return (v < 0 ? '−' : '') + sym + gap + digits;
-}
+// money() itself lives in /common.js, because the History page draws money
+// now too and the two must render the same figure the same way.
 
 // The big numerals set the currency smaller than the figure, the way the rest
 // of the page sets units.

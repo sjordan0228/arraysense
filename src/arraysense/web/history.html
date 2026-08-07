@@ -15,13 +15,16 @@
      own <style>: the page's rules then come second in the cascade and win. -->
 <script src="/common.js"></script>
 <style>
-  /* Seven columns do not fit a phone. They scroll sideways inside the panel
+  /* Eight columns do not fit a phone. They scroll sideways inside the panel
      rather than being dropped or stacked: every one of them is a quantity the
      owner came here to read, and a column hidden below a breakpoint is a column
      nobody knows exists. */
   .tablewrap{overflow-x:auto}
-  #hist{min-width:700px}
+  #hist{min-width:790px}
   #hist td{font-variant-numeric:tabular-nums}
+  /* Money is the one column here that is not kilowatt-hours, so it is set
+     apart by weight and a rule rather than by a colour the owner cannot see. */
+  #hist td.cost,#hist th.cost{border-left:1px solid var(--panel-b);font-weight:600}
   /* A bucket nothing was recorded for is drawn dim and dashed, never as a row
      of zeros. A month the house used nothing did not happen; a month we were
      not collecting did, and the two must not look alike. */
@@ -90,12 +93,10 @@
            the backup panel. Until that is explained it is not a number to put
            in front of anyone. -->
       <table id="hist">
-        <thead><tr>
-          <th id="whenHead">Day</th>
-          <th>Load</th><th>Solar PV</th>
-          <th>Battery charged</th><th>Battery discharged</th>
-          <th>Grid used</th><th>Grid exported</th>
-        </tr></thead>
+        <!-- The header is written by drawTable from the same list the body
+             loops over, so a column added to one cannot go missing from the
+             other and leave the table labelling the wrong number. -->
+        <thead><tr id="headRow"></tr></thead>
         <tbody></tbody>
         <tfoot></tfoot>
       </table>
@@ -123,12 +124,14 @@ const SPANS = [
     chartTitle: 'Energy, last 30 days', tableTitle: 'Day by day',
     whenHeading: 'Day', unitName: 'days',
     tableNote: 'kWh · newest first',
+    costNote: 'cost includes each day’s share of the monthly connection charge',
   },
   {
     key: '13m', label: '13 months', period: 'month', count: 13,
     chartTitle: 'Energy, last 13 months', tableTitle: 'Month by month',
     whenHeading: 'Month', unitName: 'months',
     tableNote: 'kWh · newest first · thirteen, so this month has the same month last year beside it',
+    costNote: 'cost includes the monthly connection charge',
   },
 ];
 
@@ -149,6 +152,19 @@ const COLUMNS = [
 // information. A month runs to thousands, where the decimal is noise; a quiet
 // day runs to fractions, where it is the reading.
 const WHOLE_NUMBER_ABOVE = 100;
+
+// What the service says about money, from the last reply. Nothing on this page
+// prices anything: the endpoint is handed the same buckets it reports energy
+// for and sends back what each one cost, already in the owner's currency. The
+// Costs page once carried its own copy of the tariff grammar and the two
+// disagreed within a day — a real seasonal tariff priced nothing at all, and
+// the syntax the browser did accept charged a January evening at the summer
+// peak rate. A second implementation of money is not worth a round trip.
+//
+// `configured` false means no tariff has been entered, and then the column is
+// not drawn at all. Not a column of dashes, and certainly not zeroes: there is
+// nothing to say about money on an install that has never entered a rate.
+let priced = { configured: false, currency: null };
 
 // Which span is on screen. Module scope rather than passed around because the
 // chart is built once and updated in place — uPlot keeps the axis formatters
@@ -238,6 +254,11 @@ function buildRows(span, buckets) {
       // half-collected day read as a quiet one.
       partial: reported && got.complete !== true,
       totals,
+      // Straight off the bucket, never worked out here. A bucket the service
+      // priced carries a number; one whose bands it could not measure carries
+      // null, which is a different thing from a cheap day and has to stay that
+      // way all the way to the cell.
+      cost: got ? numOrNull(got.cost) : null,
     });
   }
   return rows;
@@ -274,9 +295,18 @@ const cell = (v, places) => (v === null
   ? `<td class="muted">${DASH}</td>`
   : `<td>${esc(gnum(v, places))}</td>`);
 
+// The money cell. A bucket the service could not price is a dash and never a
+// zero — a day whose peak hours nobody recorded did not cost nothing, it cost
+// an amount no one can state — and the currency comes from the reply rather
+// than from anything written here.
+const costCell = (v) => `<td class="cost${v === null ? ' muted' : ''}">`
+  + `${esc(money(v, priced.currency))}</td>`;
+
 function drawTable(span, rows) {
-  $('whenHead').textContent = span.whenHeading;
   const places = decimals(rows);
+  $('headRow').innerHTML = `<th>${esc(span.whenHeading)}</th>`
+    + COLUMNS.map((c) => `<th>${esc(c.label)}</th>`).join('')
+    + (priced.configured ? '<th class="cost">Cost</th>' : '');
   // Newest first: the row the owner came to look at is today's, and it should
   // not be thirty rows down. The chart runs the other way because time reads
   // left to right; the table reads top down.
@@ -288,6 +318,7 @@ function drawTable(span, rows) {
         : '';
     return `<tr${r.reported ? '' : ' class="absent"'}><td>${esc(r.label)}${tag}</td>`
       + COLUMNS.map((c) => cell(r.totals[c.key], places[c.key])).join('')
+      + (priced.configured ? costCell(r.cost) : '')
       + '</tr>';
   }).join('');
   drawTotals(span, rows, places);
@@ -315,8 +346,22 @@ function drawTotals(span, rows, places) {
   const notes = [`${reported.length} of ${rows.length} ${span.unitName}`];
   if (missing) notes.push(`${missing} with no data`);
   if (partial) notes.push(`${partial} partial`);
+  const unpriced = priced.configured ? reported.filter((r) => r.cost === null).length : 0;
+  if (unpriced) notes.push(`${unpriced} not priced`);
   $('hist').querySelector('tfoot').innerHTML =
-    `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}</tr>`;
+    `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}`
+    + (priced.configured ? costCell(costTotal(reported)) : '') + '</tr>';
+}
+
+// The sum of the money actually on screen. A row nobody could price is left
+// out of it rather than counted as nothing, and the footer says how many were
+// left out — a total that quietly skips a day is the same lie as a missing day
+// drawn as zero, only in currency. Every row unpriced means there is no total
+// to give at all.
+function costTotal(reported) {
+  const priceable = reported.filter((r) => r.cost !== null);
+  if (!priceable.length) return null;
+  return Math.round(priceable.reduce((sum, r) => sum + r.cost, 0) * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,7 +501,10 @@ function bucketReadout() {
           const text = v === null
             ? DASH : `${gnum(v, v >= WHOLE_NUMBER_ABOVE ? 0 : 1)} kWh`;
           return `<div class="row"><u>${esc(c.label)}</u><b>${esc(text)}</b></div>`;
-        }).join('');
+        }).join('')
+          + (priced.configured
+            ? `<div class="row"><u>Cost</u><b>${esc(money(row.cost, priced.currency))}</b></div>`
+            : '');
         tip.innerHTML = `<div class="when">${esc(row.label)}${row.partial ? ' · partial' : ''}</div>${body}`;
         tip.classList.add('on');
         // Kept inside the plot rather than allowed to push the page sideways —
@@ -563,14 +611,26 @@ function stamp(body) {
 async function load() {
   const span = current;
   const starts = calendarStarts(span);
+  // priced=1 asks the service to price each bucket as well as total it. The
+  // money rides on the bucket it belongs to rather than arriving from a second
+  // request, so there are never two lists of buckets here to line up by date —
+  // and each reply omits the buckets it had nothing to report for, so lining
+  // two of them up by position is exactly how energy ends up in the wrong row.
   const base = `/api/energy?start=${encodeURIComponent(starts[0].toISOString())}`
-    + `&end=${encodeURIComponent(new Date().toISOString())}&period=${span.period}`;
+    + `&end=${encodeURIComponent(new Date().toISOString())}&period=${span.period}&priced=1`;
   try {
     const body = await fetchEnergy(base, timeZone());
     // The owner can switch span while this is in flight, and painting the reply
     // for the span they left would put thirteen months of buckets in a table
     // headed Day.
     if (span !== current) return;
+    priced = {
+      configured: body.configured === true,
+      currency: typeof body.currency === 'string' ? body.currency : null,
+    };
+    // The note below the table depends on whether there is a cost column, and
+    // that is not known until the first reply arrives.
+    applyTitles();
     const rows = buildRows(span, body.buckets);
     drawChart(rows);
     drawTable(span, rows);
@@ -594,8 +654,12 @@ async function load() {
 function applyTitles() {
   $('chartTitle').textContent = current.chartTitle;
   $('tableTitle').textContent = current.tableTitle;
-  $('tableNote').textContent = current.tableNote;
-  $('whenHead').textContent = current.whenHeading;
+  // The standing charge is spread over the month it belongs to, so a daily row
+  // carries a thirty-first of it. Saying so is the difference between a reader
+  // trusting the column and one wondering why a day with no import still cost
+  // half a dollar.
+  $('tableNote').textContent = current.tableNote
+    + (priced.configured ? ` · ${current.costNote}` : '');
 }
 
 // Drawn as .rng buttons so the switch looks like the range picker on every

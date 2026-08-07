@@ -439,20 +439,17 @@ def _reported_moments(ordered: Sequence[Mapping[str, object]]) -> list[datetime]
     ]
 
 
-def energy_totals(
+def _counter_rows(
     store: SqliteStore,
-    start: datetime,
-    end: datetime,
-    period: Period = "day",
-    zone: ZoneInfo | None = None,
-    max_gap: timedelta = MAX_EDGE_GAP,
-) -> list[EnergyBucket]:
-    """Return the energy in each calendar day or month between ``start`` and ``end``.
+    edges: Sequence[datetime],
+    period: Period,
+    max_gap: timedelta,
+) -> list[dict[str, object]]:
+    """Read the counter values covering these bucket boundaries, cheapest tier first.
 
-    The range is widened outward to whole buckets in ``zone``, defaulting to
-    the machine's own, and the read is widened again by ``max_gap`` at both
-    ends so the first and last buckets have something to be measured from
-    rather than starting at whatever reading happens to fall inside them.
+    The read is widened by ``max_gap`` at both ends so the first and last
+    buckets have something to be measured *from*, rather than starting at
+    whatever reading happens to fall inside them.
 
     Which tier answers depends on the period, for cost rather than accuracy:
     thirty days of raw readings is a quarter of a million rows to produce
@@ -462,15 +459,66 @@ def energy_totals(
     or that the range is older than that tier is kept for, so the read falls
     back through the coarser ones rather than reporting a year of nothing.
     """
-    zone = zone or host_zone()
-    start, end = with_zone(start, zone), with_zone(end, zone)
-    edges = bucket_edges(start, end, period, zone)
     metrics = list(ENERGY_FIELDS.values())
+    lo, hi = edges[0] - max_gap, edges[-1] + max_gap
     tier = _PERIOD_TIER[period]
-    rows = store.query(metrics, edges[0] - max_gap, edges[-1] + max_gap, tier=tier)
+    rows = store.query(metrics, lo, hi, tier=tier)
     for coarser in _FALLBACK_TIERS[period]:
         if rows or coarser == tier:
             break
         logger.debug("%s tier empty over the range; trying %s", tier, coarser)
-        rows = store.query(metrics, edges[0] - max_gap, edges[-1] + max_gap, tier=coarser)
-    return bucket_totals(rows, edges, max_gap)
+        rows = store.query(metrics, lo, hi, tier=coarser)
+    return rows
+
+
+@dataclass(frozen=True)
+class EnergyRead:
+    """One read of the counters: the calendar it was cut on, the rows, the buckets.
+
+    The rows come back with the buckets because the same readings answer two
+    questions — how much energy a day held, and what that day cost — and the
+    second is worked out from the band boundaries inside the day rather than
+    from the day's total. Reading them twice would be a second trip through a
+    month of rows to produce a figure that has to agree with the first, which
+    is the shape of every disagreement this codebase has had.
+    """
+
+    edges: tuple[datetime, ...]
+    rows: list[dict[str, object]]
+    buckets: list[EnergyBucket]
+
+
+def read_energy(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    period: Period = "day",
+    zone: ZoneInfo | None = None,
+    max_gap: timedelta = MAX_EDGE_GAP,
+) -> EnergyRead:
+    """Read the energy in each calendar day or month between ``start`` and ``end``.
+
+    The range is widened outward to whole buckets in ``zone``, defaulting to
+    the machine's own, and the counters are read across them.
+    """
+    zone = zone or host_zone()
+    start, end = with_zone(start, zone), with_zone(end, zone)
+    edges = bucket_edges(start, end, period, zone)
+    rows = _counter_rows(store, edges, period, max_gap)
+    return EnergyRead(
+        edges=tuple(edges),
+        rows=rows,
+        buckets=bucket_totals(rows, edges, max_gap),
+    )
+
+
+def energy_totals(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    period: Period = "day",
+    zone: ZoneInfo | None = None,
+    max_gap: timedelta = MAX_EDGE_GAP,
+) -> list[EnergyBucket]:
+    """Return just the buckets from a ``read_energy``, for a caller wanting no more."""
+    return read_energy(store, start, end, period, zone, max_gap).buckets
