@@ -29,6 +29,17 @@
   .mod .top{display:flex;justify-content:space-between;align-items:baseline}
   .mod .soc{font-size:22px;font-weight:300}
   .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em}
+  /* Eight readings on a quarter-width card. Two columns of four keeps the pack
+     legible at a glance without the card growing taller than the panels beside
+     it; below the breakpoint the cards are half-width and the rows go single
+     file, because two columns of a 150px card wraps every value onto its own
+     line anyway. */
+  .mod .kv{font-size:11px}
+  .mod .kv u{font-size:10px}
+  @media(min-width:861px){
+    .mod .face{display:grid;grid-template-columns:1fr 1fr;column-gap:12px}
+    .mod .face .kv{margin-top:4px}
+  }
   .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
   .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
   .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
@@ -535,11 +546,17 @@ function drawModules(mods) {
         <span class="sn">${esc(m.serial)}</span></div>
       <div class="track${soc === null ? ' unknown' : ''}">${soc === null ? ''
         : `<i class="${odd ? 'odd' : ''}" style="width:${Math.max(0,Math.min(100,soc))}%"></i>`}</div>
-      <div class="kv"><u>Cell &Delta;</u><span class="${odd?'warn':''}">${
-        d === null ? '—' : d.toFixed(3)+' V'+(odd?' ⚠':'')}</span></div>
+      <div class="face">
+      <div class="kv"><u>Health</u><span>${soh === null ? DASH : soh.toFixed(0) + '%'}</span></div>
+      <div class="kv"><u>Voltage</u><span>${uStr(numOrNull(m.voltage_v), 2, 'V')}</span></div>
+      <div class="kv"><u>Current</u><span>${uStr(numOrNull(m.current_a), 1, 'A')}</span></div>
       <div class="kv"><u>Temp</u><span>${tempStr(m.temperature_c)}</span></div>
-      <div class="kv"><u>SOH / cycles</u><span>${soh === null ? '—' : soh.toFixed(0)+'%'} / ${
-        cycles === null ? '—' : Math.round(cycles)}</span></div>
+      <div class="kv"><u>Cell high</u><span>${uStr(numOrNull(m.cell_max_voltage_v), 3, 'V')}</span></div>
+      <div class="kv"><u>Cell low</u><span>${uStr(numOrNull(m.cell_min_voltage_v), 3, 'V')}</span></div>
+      <div class="kv"><u>Cell &Delta;</u><span class="${odd ? 'warn' : ''}">${
+        d === null ? DASH : d.toFixed(3) + ' V' + (odd ? ' ⚠' : '')}</span></div>
+      <div class="kv"><u>Cycles</u><span>${cycles === null ? DASH : gnum(Math.round(cycles), 0)}</span></div>
+      </div>
       ${moduleDetail(m)}
     </div>`;
   }).join('');
@@ -562,14 +579,23 @@ function moduleDetail(m) {
     const k = numOrNull(index);
     return k === null ? value : `${value} · cell ${Math.round(k)}`;
   };
+  // Which cell, on its own. The voltages are on the card face now, so this
+  // answers the only question left once one of them looks wrong: which cell to
+  // open the pack and look at.
+  const cellNumber = (index) => {
+    const k = numOrNull(index);
+    return k === null ? DASH : `cell ${Math.round(k)}`;
+  };
   const status = numOrNull(m.status_code);
+  // Health, voltage, current, temperature and the cell extremes are on the card
+  // face now, so what is left here is the part that only matters once something
+  // is already wrong: which cell is the outlier, how hard the pack is throttling
+  // itself, and the codes.
   return `<div class="more">
-    ${kvRow('Voltage', uStr(numOrNull(m.voltage_v), 2, 'V'))}
     ${kvRow('Charge', charge)}
-    ${kvRow('Current', uStr(numOrNull(m.current_a), 1, 'A'))}
     ${kvRow('Limits chg / dis', limits)}
-    ${kvRow('Cell high', cell(uStr(numOrNull(m.cell_max_voltage_v), 3, 'V'), m.cell_max_voltage_num))}
-    ${kvRow('Cell low', cell(uStr(numOrNull(m.cell_min_voltage_v), 3, 'V'), m.cell_min_voltage_num))}
+    ${kvRow('Highest cell is', cellNumber(m.cell_max_voltage_num))}
+    ${kvRow('Lowest cell is', cellNumber(m.cell_min_voltage_num))}
     ${kvRow('Cell hottest', cell(tempStr(m.cell_max_temperature_c), m.cell_max_temperature_num))}
     ${kvRow('Cell coldest', cell(tempStr(m.cell_min_temperature_c), m.cell_min_temperature_num))}
     ${kvRow('Status', status === null ? DASH : gnum(Math.round(status), 0))}

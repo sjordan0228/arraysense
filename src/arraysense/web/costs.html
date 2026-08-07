@@ -153,14 +153,20 @@
   <section class="p" id="bandSec" hidden>
     <div class="chead">
       <h2>By rate band</h2>
-      <span class="legend muted" id="bandTier"></span>
+      <!-- Naming the counterfactual in the heading rather than only in the
+           column. "At grid rates" read as a charge, and the owner reasonably
+           asked why they were being billed thirty-three dollars in a window
+           they had imported nothing in — the figure was the saving. -->
+      <span class="legend muted"><b>Cost</b> is what you paid ·
+        <b>Would have cost</b> is the same use with no solar or battery
+        <span id="bandTier"></span></span>
     </div>
     <div class="split" id="bandSplit"></div>
     <div class="tw">
       <table id="bandTable">
         <thead><tr>
           <th>Band</th><th>Rate</th><th>Grid import</th><th>Cost</th>
-          <th>House used</th><th>At grid rates</th><th>Saved</th>
+          <th>House used</th><th>Would have cost</th><th>Saved</th>
         </tr></thead>
         <tbody></tbody>
       </table>
