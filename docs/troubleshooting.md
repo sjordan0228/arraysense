@@ -42,6 +42,25 @@ can this software.
 Missing battery data is recorded as absent, not as zero. A module reading `0%` is a
 real measurement; a module with no data will be shown as unavailable.
 
+## The pages load but the numbers stopped moving
+
+The web server and the collector run in one process, so the pages can serve
+perfectly while collection has stopped. Check what the collector says about
+itself rather than trusting that the site is up:
+
+```bash
+curl -s http://<host>/api/status
+```
+
+`last_success` is the thing to read. If it is minutes old while `last_failure`
+is not moving either, the poll loop is stuck rather than failing, and the
+watchdog will restart the service within twenty minutes. If `last_failure` *is*
+moving, the inverter is not answering and the loop is doing its job — see the
+connection sections above.
+
+`total_samples` resetting to a small number means the service restarted; that is
+expected after a deploy and after a watchdog stall.
+
 ## Gaps in the charts
 
 Gaps are recorded deliberately when the inverter could not be reached, and rendered

@@ -361,15 +361,20 @@ def bucket_totals(
     count = len(edges) - 1
     totals: list[dict[str, float | None]] = [dict.fromkeys(ENERGY_FIELDS) for _ in range(count)]
     lost = [False] * count
+    series, moments = _counter_series(ordered)
 
-    for field, metric in ENERGY_FIELDS.items():
-        readings = [
-            (_row_time(row), float(value))
-            for row in ordered
-            if isinstance(value := row.get(metric), int | float)
-        ]
-        for (before, previous), (after, current) in pairwise(readings):
-            index = bisect_left(edges, after) - 1
+    for field in ENERGY_FIELDS:
+        # Which bucket a reading lands in is found by walking the edges
+        # alongside the readings rather than searching for each one. Both are
+        # in time order, so the edge pointer only ever moves forward — and a
+        # binary search per reading was measured at 0.8 s of the second this
+        # took over a month of minute readings on the reference machine,
+        # because every step of it compares two zone-aware datetimes.
+        passed = 0
+        for (before, previous), (after, current) in pairwise(series[field]):
+            while passed < len(edges) and edges[passed] < after:
+                passed += 1
+            index = passed - 1
             if not 0 <= index < count:
                 continue
             # An interval that stays inside one bucket is attributable however
@@ -389,7 +394,6 @@ def bucket_totals(
             running = totals[index][field]
             totals[index][field] = energy if running is None else running + energy
 
-    moments = _reported_moments(ordered)
     return [
         EnergyBucket(
             start=edges[index],
@@ -423,20 +427,41 @@ def _row_time(row: Mapping[str, object]) -> datetime:
     return when
 
 
-def _reported_moments(ordered: Sequence[Mapping[str, object]]) -> list[datetime]:
-    """Return the instants at which any energy counter was actually reported.
+def _counter_series(
+    ordered: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, list[tuple[datetime, float]]], list[datetime]]:
+    """Pull every counter's readings, and the instants any of them arrived, out of the rows.
+
+    Each counter is followed independently, so one going absent for an hour
+    does not disturb the others, and the instants are collected alongside them
+    because a bucket boundary is only usable if something was recorded either
+    side of it.
 
     A failed poll is stored as a row carrying its reason and no readings, and
     an inverter can answer a poll without answering the energy registers.
-    Neither is evidence that a bucket boundary is covered, so both are dropped
-    here — counting them would let an outage's own gap markers certify the very
-    boundary they are a gap in.
+    Neither is evidence that a boundary is covered, so a row with nothing on it
+    contributes no instant — counting them would let an outage's own gap
+    markers certify the very boundary they are a gap in.
+
+    One pass rather than one per counter and another for the instants. That is
+    seven walks of the same rows collapsed to one, and it is worth the shape of
+    this function: the History page bucketed a month of minute readings twice,
+    once for the energy and once for the bands the cost is split across, and
+    the two passes cost a full second each on the reference machine.
     """
-    return [
-        _row_time(row)
-        for row in ordered
-        if any(isinstance(row.get(metric), int | float) for metric in ENERGY_FIELDS.values())
-    ]
+    series: dict[str, list[tuple[datetime, float]]] = {field: [] for field in ENERGY_FIELDS}
+    moments: list[datetime] = []
+    for row in ordered:
+        when = _row_time(row)
+        reported = False
+        for field, metric in ENERGY_FIELDS.items():
+            value = row.get(metric)
+            if isinstance(value, int | float):
+                series[field].append((when, float(value)))
+                reported = True
+        if reported:
+            moments.append(when)
+    return series, moments
 
 
 def _counter_rows(

@@ -211,3 +211,56 @@ async def test_backoff_still_wins_while_the_inverter_is_unreachable(tmp_path: Pa
     loop = asyncio.get_running_loop()
     assert svc._wait_from(loop.time() - 5.0) == pytest.approx(svc._backoff())
     store.close()
+
+
+async def test_a_loop_that_stops_running_is_reported_as_stalled(tmp_path: Path) -> None:
+    # Restart=always covers a process that exits. It cannot see this process
+    # serving pages perfectly while collecting nothing, which is what a dead
+    # poll task or a read that never returns both look like from outside.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(minutes=90)
+
+    # Nothing at all since startup, well past the threshold.
+    assert svc.stalled_for(now) is not None
+
+    # A poll that succeeded a moment ago is fine.
+    svc.status.last_success = now - timedelta(seconds=30)
+    assert svc.stalled_for(now) is None
+    store.close()
+
+
+async def test_an_inverter_that_is_simply_absent_is_not_a_stall(tmp_path: Path) -> None:
+    # Every poll failing is the loop working: it records the gap and backs off.
+    # Restarting over that loses the backoff and thrashes for as long as the
+    # inverter is away, which is the opposite of what a watchdog is for.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(hours=6)
+    svc.status.last_success = now - timedelta(hours=5)
+    svc.status.last_failure = now - timedelta(seconds=20)
+    assert svc.stalled_for(now) is None
+    store.close()
+
+
+async def test_a_yielded_dongle_is_not_a_stall(tmp_path: Path) -> None:
+    # Polling has been handed over deliberately so the vendor's app can push a
+    # firmware update. Restarting mid-update would take the dongle back.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    svc.status.yielding = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(hours=2)
+    assert svc.stalled_for(now) is None
+    store.close()

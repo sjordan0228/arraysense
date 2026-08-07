@@ -135,6 +135,56 @@ run as root. To use port 80, add `--port 80` to `ExecStart` and uncomment
 and nothing else — running the whole service as root to get a shorter URL is the
 wrong trade.
 
+## Keeping it running
+
+Two layers, because they catch different failures and neither catches both.
+
+**systemd restarts a process that exits.** `Restart=always` with `RestartSec=10`
+is in the shipped unit and covers a crash, an out-of-memory kill, or a
+deliberate stop.
+
+**The service restarts itself if it stops collecting.** This is the failure
+systemd cannot see: the process alive and serving pages perfectly while the poll
+loop has died or hung. Every chart keeps drawing, quietly growing staler, and
+nothing anywhere reports a problem. It happens two ways — a poll task that
+raised and was never awaited, so its exception went to the asyncio log and the
+web server carried on; or a read that never returns, which produces the same
+silence with no exception at all.
+
+A watchdog task checks every thirty seconds whether the loop has produced
+*either* a reading or an error recently. If it has produced neither for twenty
+minutes it logs the fact and sends the process SIGTERM, which runs the normal
+shutdown — releasing the dongle's single TCP slot — and lets systemd bring
+everything back.
+
+What it deliberately does **not** trigger on is an inverter that is simply not
+answering. Those polls fail, and a failure is the loop working correctly: it
+records the gap and backs off. Restarting over that would throw away the backoff
+and thrash for as long as the inverter was away. The distinction is between a
+loop that is failing and a loop that is not running.
+
+Twenty minutes is the most data a stall can cost. It is set well above the
+five-minute maximum backoff so that a healthy but struggling service can never
+reach it.
+
+### Deploying without interrupting collection
+
+The pages are read from disk on every request, so **changing HTML, CSS or
+JavaScript needs no restart at all** — copy the files into place and reload the
+browser. Only a change to the Python requires restarting the service.
+
+That distinction is worth respecting, because a restart is not free. The dongle
+takes time to start serving a new client after the previous one drops, measured
+at around 55 seconds on the reference hardware before the first sample comes
+back. Restarting to deploy a stylesheet costs a minute of readings for nothing.
+
+If you need Python deploys that never interrupt collection, the collector and
+the web server can be split into two units sharing the database — nothing in
+`api/` is allowed to touch the inverter, and SQLite in WAL mode handles two
+processes. The one thing that needs care is the yield endpoint, which reaches
+into the running collector to hand the dongle over for a firmware update; across
+processes that needs a control channel rather than a method call.
+
 ## Next
 
 Configuration options are described in [configuration.md](configuration.md).

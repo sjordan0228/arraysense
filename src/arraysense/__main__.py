@@ -14,8 +14,11 @@ stops the collector before the socket closes.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 import logging
+import os
+import signal
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -90,9 +93,13 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await service.start()
+        watchdog = asyncio.create_task(_watch(service))
         try:
             yield
         finally:
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
             # Release the dongle's single slot before the process goes away,
             # or the next start — and the vendor's app — find it occupied.
             await service.stop()
@@ -100,6 +107,53 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
 
     app.router.lifespan_context = lifespan
     return app, store, service
+
+
+# How often the watchdog looks. Frequent enough that a stall is caught within a
+# minute of the threshold, cheap enough to be invisible: it reads two timestamps.
+WATCH_INTERVAL = 30.0
+
+
+async def _watch(service: CollectorService) -> None:
+    """Kill the process if the poll loop stops running, so systemd restarts it.
+
+    Restart=always covers a process that exits. What it cannot see is this
+    process still serving pages perfectly while collecting nothing — which is
+    what happens when the poll task dies, because it is created with
+    ``create_task`` and nobody awaits it, so its exception is logged to asyncio
+    and the web server carries on. Every chart would keep drawing, growing
+    quietly staler, and the service would look healthy throughout.
+
+    A read that never returns produces the same silence without any exception at
+    all, and neither is distinguishable from outside.
+
+    Exiting is the blunt answer and the right one here: this process holds the
+    dongle's single TCP slot, so there is no restarting the loop in place
+    without first letting go of the socket, and systemd already knows how to
+    bring the whole thing back in ten seconds. Twenty minutes of data is the
+    most this can cost, against an unbounded outage nobody notices.
+
+    Note what this deliberately does *not* trigger on: an inverter that is
+    simply not answering. Those polls fail, and a failure is the loop working —
+    it records the gap and backs off. Restarting over that would lose the
+    backoff and thrash for as long as the inverter was away.
+    """
+    while True:
+        await asyncio.sleep(WATCH_INTERVAL)
+        stalled = service.stalled_for()
+        if stalled is None:
+            continue
+        logger.error(
+            "collector has produced neither a reading nor an error for %.0f minutes; "
+            "exiting so the supervisor restarts it",
+            stalled.total_seconds() / 60,
+        )
+        # SIGTERM rather than sys.exit: this is a background task, and raising
+        # here would be swallowed exactly the way the dead poll loop was. The
+        # signal runs uvicorn's own shutdown, so the lifespan hook still gets to
+        # release the dongle before the process goes.
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
 
 
 def main(argv: list[str] | None = None) -> int:

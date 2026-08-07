@@ -44,6 +44,13 @@ HOURLY_REBUILD_WINDOW = 48 * 3600
 # minute bucket that changes five times.
 ROLLUP_INTERVAL = 60.0
 
+# How long the loop may produce neither a success nor a failure before it is
+# judged stuck rather than slow. Well above the maximum backoff, because a
+# backing-off loop is working and still marks each attempt; this catches only a
+# read that never returns or a task that died. Twenty minutes costs at most
+# twenty minutes of data and cannot be reached by any healthy cadence.
+STALL_AFTER = timedelta(minutes=20)
+
 # Backoff doubles from the poll interval up to this. Five minutes is long
 # enough to stop pestering a dongle that has been unplugged, short enough that
 # recovery after a blip is not noticeable.
@@ -91,6 +98,7 @@ class CollectorService:
         store: SqliteStore,
         interval: float = 10.0,
         max_backoff: float = MAX_BACKOFF_SECONDS,
+        stall_after: timedelta = STALL_AFTER,
     ) -> None:
         """Wire a source to a store, polling every *interval* seconds."""
         if interval <= 0:
@@ -99,6 +107,7 @@ class CollectorService:
         self._store = store
         self._interval = interval
         self._max_backoff = max_backoff
+        self._stall_after = stall_after
         self._task: asyncio.Task[None] | None = None
         self._yield_task: asyncio.Task[None] | None = None
         self.status = ServiceStatus()
@@ -245,6 +254,35 @@ class CollectorService:
             return self._interval
         grown = self._interval * float(2**self.status.consecutive_failures)
         return float(min(grown, self._max_backoff))
+
+    def stalled_for(self, now: datetime | None = None) -> timedelta | None:
+        """How long since the poll loop last did anything at all, or None if it is fine.
+
+        The question is deliberately not "is the inverter answering". A dongle
+        that has been unplugged makes every poll fail, and that is the loop
+        working correctly — it records each gap, backs off, and keeps trying. A
+        service that restarted itself over that would restart every few minutes
+        for as long as the inverter was away, and would lose the backoff each
+        time.
+
+        What this detects is the loop not *running*: a read that never returns,
+        or a task that died and left the web server serving stale pages over a
+        collector that stopped. Either shows up the same way — neither the
+        success nor the failure timestamp has moved for far longer than a poll
+        should ever take.
+
+        Returns None while yielding, when the dongle has been handed over
+        deliberately and no polling is expected.
+        """
+        if not self.status.running or self.status.yielding:
+            return None
+        now = now or datetime.now(tz=UTC)
+        marks = [t for t in (self.status.last_success, self.status.last_failure) if t is not None]
+        since = max(marks) if marks else self.status.started_at
+        if since is None:
+            return None
+        idle = now - since
+        return idle if idle > self._stall_after else None
 
     def _wait_from(self, started: float) -> float:
         """How long to sleep so that polls land one interval apart.
