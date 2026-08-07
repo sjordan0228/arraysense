@@ -444,7 +444,7 @@ def assess(
     )
 
     if days is None:
-        headline = "State of charge may be drifting"
+        headline = "State of charge maybe drifting"
         detail = (
             f"No full charge found in the last {searched_days:.0f} days of history. "
             "Charging the bank to 100% resets each pack's counter."

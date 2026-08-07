@@ -71,6 +71,12 @@
   .cal h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--ink2)}
   .cal p{margin:5px 0 0;font-size:12px;line-height:1.5;color:var(--ink3);max-width:82ch}
   .cal .calbody{min-width:0}
+  /* The dismiss control sits with the message rather than floating over it, so
+     it cannot land on the text at a narrow width. */
+  .cal .calhide{align-self:flex-start;flex:0 0 auto;background:rgba(255,255,255,.09);
+    border:1px solid var(--panel-b);color:var(--ink2);border-radius:7px;
+    padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
+  .cal .calhide:hover{background:rgba(255,255,255,.17);color:var(--ink)}
   .cal .calwhen{margin-top:7px;font-size:10px;letter-spacing:.02em}
   .cal .calmark{flex:0 0 auto;font-size:13px;line-height:1.65;color:var(--ink3)}
   .cal.sev-warning{border-left-color:var(--warn)}
@@ -463,12 +469,41 @@ async function fetchCalibration() {
   }
 }
 
+// How long a dismissal lasts. The condition it reports takes weeks to change —
+// the only cure is charging the bank to full — so a banner that returned the
+// next morning would be nagging rather than informing, and one that never
+// returned would let a drifting bank quietly become a forgotten one.
+const CAL_SNOOZE_DAYS = 7;
+const CAL_SNOOZE_KEY = 'as.calDismissed';
+
+// A dismissal is per device and remembers *what* was dismissed, not merely
+// when. Something getting worse is news even inside the seven days: an owner
+// who waved away "may be drifting" has not thereby agreed to be told nothing
+// about a wiring fault. So a higher severity than the one dismissed comes back
+// immediately, and only the same or a milder one stays hidden.
+function calDismissed(sev) {
+  let held;
+  try { held = JSON.parse(localStorage.getItem(CAL_SNOOZE_KEY) || 'null'); } catch (e) { held = null; }
+  if (!held || typeof held !== 'object') return false;
+  if (!(Date.now() < held.until)) return false;
+  return CAL_SEVERITIES.indexOf(sev) <= CAL_SEVERITIES.indexOf(held.severity);
+}
+
+function dismissCal(sev) {
+  localStorage.setItem(CAL_SNOOZE_KEY, JSON.stringify({
+    severity: sev,
+    until: Date.now() + CAL_SNOOZE_DAYS * 86400000,
+  }));
+  $('cal').hidden = true;
+}
+
 function renderCalibration(cal) {
   const box = $('cal');
   const sev = cal && typeof cal === 'object' ? cal.severity : null;
   // "none" is not a quiet badge, it is no badge: a calibrated bank has nothing
   // to say and the slot should be empty.
   if (!CAL_SEVERITIES.includes(sev)) { box.hidden = true; box.className = 'p cal'; return; }
+  if (calDismissed(sev)) { box.hidden = true; return; }
   // The charge date belongs to the drift story only. Under a wiring alert the
   // detail text says charging will not fix this, and handing the owner a
   // charging date on the very next line folds back together the two conditions
@@ -480,7 +515,10 @@ function renderCalibration(cal) {
   // failing battery, and rephrasing it here would undo that.
   box.className = `p cal sev-${sev}`;
   box.innerHTML = `<div class="calmark">${sev === 'alert' ? '⚠' : '●'}</div>
-    <div class="calbody"><h2>${esc(cal.headline)}</h2><p>${esc(cal.detail)}</p>${stamp}</div>`;
+    <div class="calbody"><h2>${esc(cal.headline)}</h2><p>${esc(cal.detail)}</p>${stamp}</div>
+    <button class="calhide" id="calHide" type="button"
+      title="Hide this for ${CAL_SNOOZE_DAYS} days">Dismiss</button>`;
+  $('calHide').onclick = () => dismissCal(sev);
   box.hidden = false;
 }
 
@@ -1292,19 +1330,32 @@ async function loadHistory() {
   const metrics = 'pv_total_power_w,load_power_w,battery_power_w,grid_power_w,battery_soc_pct';
   const width = Math.max(300, Math.min(4000, Math.round(document.body.clientWidth)));
   const url = `/api/history?start=${start.toISOString()}&end=${end.toISOString()}&metrics=${metrics}&width=${width}`;
+  // The read and the drawing are caught separately, and that separation is the
+  // whole point. With one try around both, an exception thrown while drawing —
+  // a renamed helper, a stale cached common.js against a fresh page — reported
+  // itself as "history unavailable". The fetch had succeeded; the note sent the
+  // reader to look at the network while the charts stayed blank for a reason
+  // sitting in the console.
+  let body;
   try {
-    const body = await fetch(url).then(r => r.json());
-    drawPower(body.points || []);
-    drawBattery(body.points || []);
-    drawSoc(body.points || []);
-    rangeChanged = false;
-    refreshZoomState();
+    body = await fetch(url).then(r => r.json());
   } catch (e) {
     // A transient poll failure must not tear the charts down. Destroying them
     // takes the owner's zoom with it, and the readings already on screen are
     // still the last ones the inverter gave us — better a stale chart with a
     // note than a blank panel every time the network hiccups.
     note('history unavailable — showing the last successful read');
+    return;
+  }
+  try {
+    drawPower(body.points || []);
+    drawBattery(body.points || []);
+    drawSoc(body.points || []);
+    rangeChanged = false;
+    refreshZoomState();
+  } catch (e) {
+    note(`the charts could not be drawn: ${e && e.message ? e.message : e}`);
+    console.error('drawing failed', e);
   }
 }
 

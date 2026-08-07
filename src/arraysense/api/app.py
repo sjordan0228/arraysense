@@ -44,6 +44,13 @@ PAGES = {
 # the chart factory. Served once so the pages cannot drift apart.
 SHARED_SCRIPT = "common.js"
 
+# Revalidate rather than re-download. The pages and the shared script change
+# together and are cached separately, so a browser is free to pair a fresh page
+# with a stale script unless told to check. The vendored chart library is
+# deliberately not in this set: it is versioned by its filename and never
+# changes under the same name.
+NO_CACHE = {"Cache-Control": "no-cache"}
+
 # uPlot is vendored rather than fetched from a CDN. The service runs on a home
 # network that may have no route to the internet at all, and a chart library
 # that silently fails to load leaves a blank panel with no clue why. Named
@@ -66,13 +73,21 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     reaches the browser as a 500 and the log as a traceback — but a page nobody
     has written yet, or one left out of a deployment, is a missing page and not
     a broken server.
+
+    Every page and the shared script are sent ``no-cache``, which asks the
+    browser to revalidate rather than forbidding it to store anything: the file
+    still comes back 304 and unchanged most of the time, so the cost is one
+    conditional request. Without it the pages and common.js are cached
+    independently, and a browser holding yesterday's common.js against today's
+    page calls a helper that does not exist yet. That happened: the chart threw,
+    and the page reported it as the history being unavailable.
     """
 
     async def serve() -> FileResponse:
         if not path.is_file():
             logger.debug("no file at %s", path)
             raise HTTPException(status_code=404, detail=f"no file {path.name!r}")
-        return FileResponse(path, media_type=media_type)
+        return FileResponse(path, media_type=media_type, headers=NO_CACHE)
 
     return serve
 

@@ -1071,3 +1071,23 @@ def test_without_a_tariff_a_bucket_carries_no_saving_key_at_all(client: Any) -> 
     for bucket in body["buckets"]:
         assert "saved" not in bucket
         assert "cost" not in bucket
+
+
+def test_pages_and_the_shared_script_are_revalidated(client: Any) -> None:
+    # The pages and common.js change together and are cached separately, so a
+    # browser left to its own heuristics will happily pair a fresh page with
+    # yesterday's script. When that happened the page called a helper that did
+    # not exist yet, the chart threw, and the failure surfaced as "history
+    # unavailable" — pointing at the network for a fault in the cache.
+    for path in ("/", "/graphs", "/history", "/costs", "/settings", "/common.js"):
+        r = client.get(path)
+        assert r.status_code == 200, path
+        assert "no-cache" in r.headers.get("cache-control", ""), path
+
+
+def test_the_vendored_library_is_still_cacheable(client: Any) -> None:
+    # It is versioned by its filename and never changes under the same name, so
+    # revalidating it every load would buy nothing and cost a request.
+    r = client.get("/vendor/uPlot.min.css")
+    assert r.status_code == 200
+    assert "no-cache" not in r.headers.get("cache-control", "")
