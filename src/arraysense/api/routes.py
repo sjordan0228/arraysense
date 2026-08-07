@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from arraysense import __version__
+from arraysense import mode as operating_mode
 from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
 from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
@@ -140,9 +141,20 @@ async def live(request: Request) -> dict[str, Any]:
     store = request.app.state.store
     inverter = store.latest(list(_LIVE_INVERTER))
     modules = store.latest_modules(list(module_metric_columns()))
+    # Named here rather than in the browser. Which flow is powering the house
+    # is an interpretation of five readings, and an interpretation computed in
+    # two places drifts — the Costs page already proved that with money. The
+    # page prints what this says.
+    status = operating_mode.assess(inverter or {})
     return {
         "inverter": _isoformat_row(inverter) if inverter else None,
         "modules": [_isoformat_row(m) for m in modules],
+        "mode": {
+            "mode": status.mode.value,
+            "battery": status.battery.value,
+            "why": status.why,
+            "known": status.known,
+        },
     }
 
 

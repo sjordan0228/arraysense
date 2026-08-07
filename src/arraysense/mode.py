@@ -124,12 +124,28 @@ def assess(live: Mapping[str, object]) -> Status:
     solar = _reading(live, "pv_total_power_w")
     battery = battery_state(live)
 
-    if load is None and solar is None and grid is None:
+    # Every mode below names what is powering the house, so every one of them
+    # is a claim about the house. Made without a house reading it is the same
+    # error as rendering a missing value as zero — an assertion nobody
+    # measured. The battery is measured directly and travels separately, so a
+    # device that reports no load still lights the battery card.
+    if load is None:
+        return Status(Mode.UNKNOWN, battery, "the house's draw was not reported")
+
+    if solar is None and grid is None:
         return Status(Mode.UNKNOWN, battery, "nothing was reported")
 
     # The inverter has handed the loads to the grid: its own output port is
     # carrying nothing while the house is plainly drawing.
-    if eps is not None and load is not None and eps < BYPASS_W and load > BYPASS_W:
+    #
+    # The house is compared against the port rather than against the same
+    # threshold that decided the port was silent. Two readings of the same
+    # magnitude are not evidence of a flow between them, and using one constant
+    # for both meant a 40 W house beside a 0 W port satisfied the test and was
+    # announced as running on the grid. The reference system never draws under
+    # 740 W so it could not happen there; a cabin or a single-circuit install
+    # is exactly what the driver work invites.
+    if eps is not None and eps < BYPASS_W and load - eps > IDLE_W:
         return Status(
             Mode.ON_GRID,
             battery,

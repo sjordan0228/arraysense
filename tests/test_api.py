@@ -65,6 +65,24 @@ def client(tmp_path: Path) -> Any:
     store.close()
 
 
+@pytest.fixture
+def empty_client(tmp_path: Path) -> Any:
+    """A store with no readings at all — a service that has never polled."""
+    store = SqliteStore(str(tmp_path / "empty.db"))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "empty.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        yield c
+    store.close()
+
+
 def test_status_reports_the_collector(client: Any) -> None:
     body = client.get("/api/status").json()
     assert body["running"] is True
@@ -84,6 +102,23 @@ def test_live_keeps_absent_values_null(client: Any) -> None:
     # A battery block empty because CAN is down must not arrive as 0.
     body = client.get("/api/live").json()
     assert body["inverter"]["grid_power_w"] is None
+
+
+def test_live_names_the_operating_mode(client: Any) -> None:
+    # Judged in arraysense.mode and shipped with the reading it was judged
+    # from, so the page prints a verdict rather than reaching its own. The
+    # Costs page already showed what happens when a browser recomputes what
+    # Python has decided.
+    body = client.get("/api/live").json()
+    assert set(body["mode"]) == {"mode", "battery", "why", "known"}
+    assert body["mode"]["why"], "a mode with no stated reason cannot be checked"
+
+
+def test_live_names_no_mode_when_nothing_was_measured(empty_client: Any) -> None:
+    # An empty store has no reading to interpret. Saying "on grid" from that
+    # is the same error as drawing a missing value as zero.
+    body = empty_client.get("/api/live").json()
+    assert body["mode"]["known"] is False
 
 
 def test_history_returns_points_in_range(client: Any) -> None:

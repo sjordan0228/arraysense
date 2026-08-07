@@ -34,6 +34,21 @@
      width it is given. */
   .flow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
   .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
+  /* The second line under each flow. Deliberately quieter than the number it
+     sits beneath: today's total is context for the reading, not a rival to it. */
+  .flow .sub{display:block;margin-top:5px;font-size:12px;opacity:.72;
+    font-variant-numeric:tabular-nums}
+  /* The state of the system, above everything it is inferred from. A row rather
+     than a badge, because the sentence is the point and a pill would crop it. */
+  .mode{display:flex;align-items:center;gap:9px;margin-bottom:12px;font-size:14px}
+  .mode b{font-weight:500}
+  .mode span:last-child{opacity:.72}
+  .mode .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--muted)}
+  /* Colour repeats the flow the words already name, so it is never the only
+     carrier — the palette is CVD-validated and the label stands without it. */
+  .mode.pv .dot{background:var(--pv)}
+  .mode.batt .dot{background:var(--batt)}
+  .mode.grid .dot{background:var(--grid)}
   .mods{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
   @media(max-width:860px){.mods{grid-template-columns:repeat(2,minmax(0,1fr))}}
   /* Coping with it: the serial drops to a line of its own when the head row
@@ -260,6 +275,11 @@
   </div>
 
   <div class="view" id="viewNow">
+  <!-- What the system is doing, in words, above the numbers that show it. The
+       judgement is made once in arraysense.mode and arrives with /api/live;
+       the title carries the readings it turned on, because a mode a reader
+       cannot check is one they have to take on trust. -->
+  <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span></div>
   <div class="toprow">
     <div class="p hero">
       <div class="lbl">Producing now</div>
@@ -271,9 +291,12 @@
       <div class="today"><span class="lbl">Today</span><b id="pvToday">—</b></div>
     </div>
     <div class="flow">
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b></div>
+      <!-- Today beside each flow comes from the inverter's own daily counters
+           for the same reason the solar one does, and it is why there is no
+           second request: /api/live already carries every column. -->
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b><span class="sub" id="battState">—</span></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
   </div>
 
@@ -401,6 +424,49 @@ function showRanges() {
   });
 }
 
+// Today's total beside a flow, from the inverter's own daily counter. A
+// counter that has not been read yet, or has gone stale, shows a dash — zero
+// would read as a day on which the house used nothing.
+function showToday(id, value) {
+  const kwh = numOrNull(value);
+  $(id).textContent = kwh === null ? DASH : `${kwh.toFixed(1)} kWh`;
+}
+
+// Which flow the mode is about, for the dot. The words carry the meaning on
+// their own; this only repeats what they already say, because the palette is
+// CVD-validated and colour is never the sole encoding.
+const MODE_TINT = {
+  'Solar': 'pv',
+  'Solar and battery': 'pv',
+  'Battery discharging': 'batt',
+  'On grid': 'grid',
+  'Importing': 'grid',
+};
+
+// The system's state in words. Both halves come from /api/live, judged once in
+// arraysense.mode — the page prints the verdict and never recomputes it.
+function showMode(m, i) {
+  const row = $('mode');
+  if (!m || !m.known) {
+    // Nothing measured is not a state. Hiding the row is honest; naming a mode
+    // from an incomplete poll is the same error as drawing a missing reading
+    // as zero.
+    row.hidden = true;
+    $('battState').textContent = DASH;
+    return;
+  }
+  row.hidden = false;
+  row.className = 'mode ' + (MODE_TINT[m.mode] || '');
+  $('modeText').textContent = m.mode;
+  // The reason the mode was judged that way, on hover. It names the readings
+  // the decision turned on, so a reader can check it against the numbers
+  // directly below rather than take it on trust.
+  row.title = m.why;
+  const soc = numOrNull(i.battery_soc_pct);
+  $('modeBatt').textContent = soc === null ? '' : `· bank ${soc.toFixed(0)}%`;
+  $('battState').textContent = m.battery;
+}
+
 async function loadLive() {
   try {
     const [live, status, cal] = await Promise.all([
@@ -420,6 +486,9 @@ async function loadLive() {
     // counters go stale — never a zero, which would read as a day with no sun.
     const made = numOrNull(i.pv_energy_today_kwh);
     $('pvToday').textContent = made === null ? DASH : `${made.toFixed(1)} kWh`;
+    showToday('loadToday', i.load_energy_today_kwh);
+    showToday('gridToday', i.grid_import_energy_today_kwh);
+    showMode(live.mode, i);
 
     const ok = status.connected && status.running;
     const colour = status.yielding ? 'var(--warn)' : ok ? 'var(--good)' : 'var(--bad)';

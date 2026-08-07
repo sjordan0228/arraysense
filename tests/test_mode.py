@@ -132,3 +132,42 @@ def test_the_reason_names_the_readings_it_turned_on() -> None:
         }
     )
     assert "2596" in got.why and "0 W" in got.why
+
+
+def test_a_tiny_house_with_a_quiet_port_is_not_called_bypass() -> None:
+    # The bypass test compared the house against the same threshold that
+    # decides the port is silent, so a 40 W house beside a 0 W port satisfied
+    # both and was announced as running on the grid. Two readings of the same
+    # magnitude are not evidence of a flow between them. The reference system
+    # never draws under 740 W so this could not happen there, but a cabin or a
+    # single-circuit install is exactly the case the driver work invites.
+    status = assess(
+        {"load_power_w": 40.0, "eps_power_w": 0.0, "pv_total_power_w": 0.0, "grid_power_w": 0.0}
+    )
+    assert status.mode is not Mode.ON_GRID
+
+
+def test_a_real_house_with_a_quiet_port_still_reads_as_bypass() -> None:
+    # The other side of the same change: the reference system spends about a
+    # third of its minutes here, and the measured floor is 740 W against an EPS
+    # port whose floor when it is carrying anything at all is 420 W.
+    status = assess(
+        {"load_power_w": 740.0, "eps_power_w": 0.0, "pv_total_power_w": 0.0, "grid_power_w": 0.0}
+    )
+    assert status.mode is Mode.ON_GRID
+
+
+def test_solar_alone_does_not_say_what_is_powering_an_unmeasured_house() -> None:
+    # "The array covers the house" is a claim about the house. Made from an
+    # array reading with no house reading, it is the same error as rendering a
+    # missing value as zero: an assertion nobody measured.
+    status = assess({"pv_total_power_w": 5000.0, "battery_power_w": 0.0})
+    assert status.mode is Mode.UNKNOWN
+
+
+def test_the_battery_is_still_reported_when_the_mode_is_not() -> None:
+    # The bank is measured directly and does not depend on knowing the house,
+    # so the battery card keeps working on a device that reports no load.
+    status = assess({"pv_total_power_w": 5000.0, "battery_power_w": -3000.0})
+    assert status.mode is Mode.UNKNOWN
+    assert status.battery is Battery.DISCHARGING
