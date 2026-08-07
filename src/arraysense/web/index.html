@@ -1,0 +1,1447 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar ArraySense</title>
+<style>
+  :root {
+    /* Validated against protanopia, deuteranopia and tritanopia across every
+       pair, not just adjacent ones — the previous grid violet and home blue sat
+       ΔE 1.9 apart under protan, which is indistinguishable, and 9.8 apart even
+       with full colour vision. These four are worst-pair ΔE 9.0 under CVD and
+       16.1 with normal vision, against this panel's own surface.
+       Charge and discharge deliberately share one hue: they are one series with
+       a sign, separated by the zero line, and position carries that far better
+       than a fifth colour could. */
+    --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
+    --batt-dis:#14625f;
+    --ink:#fff; --ink2:#c8cbd9; --ink3:#8d92a8;
+    --grid-line:rgba(255,255,255,.08);
+    --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
+    --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; min-height:100vh; color:var(--ink);
+    font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
+    background:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
+    background-attachment:fixed;
+  }
+  .sunglow{position:fixed;width:420px;height:420px;border-radius:50%;right:-140px;top:-160px;
+    background:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);filter:blur(16px);pointer-events:none}
+  main{position:relative;max-width:1180px;margin:0 auto;padding:22px 20px 40px}
+  header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
+  h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
+  .conn{font-size:11.5px;color:var(--ink3)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
+  .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
+  .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
+     backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+  .lbl{font-size:9.5px;letter-spacing:.17em;text-transform:uppercase;color:var(--ink3)}
+  .toprow{display:grid;grid-template-columns:230px 1fr;gap:12px;margin-bottom:12px}
+  @media(max-width:760px){.toprow{grid-template-columns:1fr}}
+  .hero .v{font-size:46px;font-weight:250;letter-spacing:-.03em;line-height:1.05;margin-top:4px}
+  .hero .v span{font-size:15px;opacity:.66;font-weight:400}
+  .hero .today{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+    margin-top:11px;padding-top:9px;border-top:1px solid var(--panel-b)}
+  .hero .today b{font-size:17px;font-weight:400;font-variant-numeric:tabular-nums}
+  .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
+  section{margin-bottom:12px}
+  .chead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;flex-wrap:wrap;gap:8px}
+  .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
+  .rng{display:flex;gap:6px}
+  .rng button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
+  .rng button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink)}
+  svg{display:block;width:100%;height:auto;overflow:visible}
+  .tick{fill:var(--ink3);font-size:9.5px}
+  /* Hover readout. The tooltip is HTML rather than SVG so it can wrap, use the
+     page's own type, and sit above everything without fighting the viewBox. */
+  .chart{position:relative}
+  .chart svg{touch-action:pan-y}
+  .tipdot{pointer-events:none}
+  .tip{position:absolute;pointer-events:none;opacity:0;transition:opacity .09s;
+    background:rgba(6,8,18,.94);border:1px solid var(--panel-b);border-radius:9px;
+    padding:8px 10px;font-size:11.5px;line-height:1.5;white-space:nowrap;z-index:5;
+    box-shadow:0 6px 22px rgba(0,0,0,.45)}
+  .tip.on{opacity:1}
+  .tip .when{color:var(--ink3);font-size:10px;letter-spacing:.03em;margin-bottom:4px}
+  .tip .row{display:flex;justify-content:space-between;gap:14px;
+    font-variant-numeric:tabular-nums}
+  .tip .row u{text-decoration:none;color:var(--ink2)}
+  .tip .row b{font-weight:500;color:var(--ink)}
+  .mods{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  @media(max-width:860px){.mods{grid-template-columns:repeat(2,1fr)}}
+  .mod .top{display:flex;justify-content:space-between;align-items:baseline}
+  .mod .soc{font-size:22px;font-weight:300}
+  .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em}
+  .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
+  .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
+  .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
+  .kv u{text-decoration:none;color:var(--ink3)}
+  .warn{color:var(--warn);font-weight:600}
+  .muted{color:var(--ink3)}
+  /* Tabs. Two views of the same poll: what is happening now, and where the
+     day's energy went. Both read from /api/live, so switching costs nothing. */
+  .tabs{display:flex;gap:4px;margin-bottom:14px}
+  .tabs button{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
+    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
+    cursor:pointer;transition:background .12s,color .12s}
+  .tabs button:hover{color:var(--ink2)}
+  .tabs button[aria-selected="true"]{background:rgba(255,255,255,.17);color:var(--ink);font-weight:500}
+  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  .view[hidden]{display:none}
+  .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
+  .sank .nv{fill:var(--ink3);font:11px system-ui;font-variant-numeric:tabular-nums}
+  .sankwait{color:var(--ink3);font-size:12.5px;padding:26px 0;text-align:center}
+  /* Calibration advisory. The drift ladder escalates inside one shape — a strip
+     with a coloured rule — because it is one condition getting worse. A suspected
+     wiring fault is a different failure with a different cause and a different
+     fix, so it renders as a bordered card rather than a hotter strip. */
+  .cal{display:flex;gap:13px;align-items:flex-start;margin-bottom:12px;border-left:3px solid var(--ink3)}
+  .cal[hidden]{display:none}
+  .cal h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--ink2)}
+  .cal p{margin:5px 0 0;font-size:12px;line-height:1.5;color:var(--ink3);max-width:82ch}
+  .cal .calbody{min-width:0}
+  .cal .calwhen{margin-top:7px;font-size:10px;letter-spacing:.02em}
+  .cal .calmark{flex:0 0 auto;font-size:13px;line-height:1.65;color:var(--ink3)}
+  .cal.sev-warning{border-left-color:var(--warn)}
+  .cal.sev-warning h2,.cal.sev-elevated h2{color:var(--ink)}
+  .cal.sev-warning .calmark,.cal.sev-elevated .calmark{color:var(--warn)}
+  .cal.sev-elevated{border-left-width:5px;border-left-color:var(--warn);
+    background:linear-gradient(96deg,rgba(250,178,25,.15),rgba(250,178,25,.02) 46%,var(--panel))}
+  .cal.sev-elevated h2{font-size:16px}
+  .cal.sev-elevated p{color:var(--ink2);font-size:12.5px}
+  .cal.sev-elevated .calmark{font-size:17px}
+  .cal.sev-alert{border:2px solid var(--bad);padding:16px 18px;gap:15px;
+    background:linear-gradient(158deg,rgba(196,52,52,.34),rgba(88,14,14,.5));
+    backdrop-filter:none;-webkit-backdrop-filter:none;
+    box-shadow:0 0 0 1px rgba(208,59,59,.3),0 10px 34px rgba(150,30,30,.26);
+    animation:calpulse 2.8s ease-in-out infinite}
+  .cal.sev-alert h2{color:#fff;font-size:19px;font-weight:650;letter-spacing:-.015em}
+  .cal.sev-alert p{color:#ffd9d9;font-size:13.5px;max-width:74ch}
+  .cal.sev-alert .calwhen{color:#f0b4b4}
+  .cal.sev-alert .calmark{display:flex;align-items:center;justify-content:center;width:36px;height:36px;
+    border-radius:10px;background:var(--bad);color:#fff;font-size:20px;line-height:1}
+  @keyframes calpulse{
+    0%,100%{box-shadow:0 0 0 1px rgba(208,59,59,.3),0 10px 34px rgba(150,30,30,.26)}
+    50%{box-shadow:0 0 0 4px rgba(208,59,59,.5),0 10px 38px rgba(180,40,40,.42)}}
+  @media(prefers-reduced-motion:reduce){.cal.sev-alert{animation:none}}
+  /* Charge spread beside voltage spread. Neither number diagnoses anything on
+     its own; a long bar next to a short one is the reading. They are drawn to
+     the same shape and deliberately not to a shared scale. */
+  .agree{margin-bottom:11px;padding:11px 13px;border:1px solid var(--panel-b);
+    border-radius:11px;background:rgba(255,255,255,.045)}
+  .agree[hidden]{display:none}
+  .agree .pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  .agree .v{font-size:21px;font-weight:300;letter-spacing:-.02em;margin-top:2px}
+  .agree .v span{font-size:11px;opacity:.6;font-weight:400;margin-left:4px}
+  .agree .bar{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin-top:7px;overflow:hidden}
+  .agree .bar i{display:block;height:100%;width:0;border-radius:3px;background:var(--batt)}
+  .agree .bar.wide i{background:var(--warn)}
+  .agree .bar.bad i{background:var(--bad)}
+  /* Nothing reported is not the same as nothing to report: an empty bar would
+     read as perfect agreement, so an unknown spread is hatched instead. */
+  .agree .bar.none,.track.unknown{
+    background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+  /* A drifted counter is not a measurement. The tilde carries across a room, the
+     hatched fill says the same thing without words, and the tag explains it up
+     close. Bank state of charge is left plain — it is not the number that drifts. */
+  .mod.est .soc{color:var(--ink2)}
+  .est-tag{margin-left:7px;font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+    color:var(--ink);background:rgba(255,255,255,.15);border-radius:5px;padding:2px 6px;
+    vertical-align:4px;text-decoration:none;cursor:help}
+  .track i.odd{background:var(--warn)}
+  .mod.est .track i{background:repeating-linear-gradient(112deg,var(--batt) 0 6px,rgba(25,158,112,.3) 6px 12px)}
+  .mod.est .track i.odd{background:repeating-linear-gradient(112deg,var(--warn) 0 6px,rgba(250,178,25,.3) 6px 12px)}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid-line)}
+  th:first-child,td:first-child{text-align:left}
+  th{color:var(--ink3);font-weight:600;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+  .iconbtn{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.4}
+  .iconbtn:hover{background:rgba(255,255,255,.14);color:var(--ink)}
+  .iconbtn.wide{font-size:11px;flex:1}
+  .setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
+  .set select{margin-top:5px;width:100%;background:rgba(9,11,24,.7);color:var(--ink);
+    border:1px solid var(--panel-b);border-radius:8px;padding:5px 8px;font-family:inherit;font-size:12.5px}
+  details{margin-top:10px}
+  summary{cursor:pointer;font-size:11px;color:var(--ink3)}
+  .kv b{font-weight:500;font-variant-numeric:tabular-nums}
+  /* Extended telemetry. The panels are organised around the comparisons that
+     diagnose something — string against string, leg against leg, the BMS
+     voltage against the inverter's — because two numbers side by side say
+     what a register dump never does. Everything is scoped under .dtl so these
+     class names cannot reach the bars and rows the rest of the page draws. */
+  .dtlsum{font-size:12.5px;color:var(--ink2);padding:3px 0}
+  .dtl{margin-top:10px}
+  .dtl .rel{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:10px}
+  .dtl h3{font-size:11px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
+  /* Captions are sentences, not labels. They borrow .lbl for its colour and
+     have to undo the rest of it: uppercase with .17em tracking at 9.5px turns
+     a diagnosis into shouting nobody reads. */
+  .dtl .cap{display:block;margin-top:9px;line-height:1.5;font-size:10.5px;
+    letter-spacing:0;text-transform:none;color:var(--ink3)}
+  .dtl .strrow{display:grid;grid-template-columns:22px 1fr 106px;gap:9px;align-items:center;
+    font-size:11px;color:var(--ink2);margin-bottom:7px}
+  .dtl .bar{height:15px;border-radius:4px;background:rgba(255,255,255,.09);position:relative;overflow:hidden}
+  .dtl .bar i{position:absolute;inset:0 auto 0 0;border-radius:4px;display:block}
+  .dtl .bar span{position:absolute;right:6px;top:0;line-height:15px;font-size:10px;
+    color:rgba(255,255,255,.92);font-variant-numeric:tabular-nums}
+  .dtl .sublab{font-size:9.5px;color:var(--ink3);font-variant-numeric:tabular-nums}
+  .dtl .legs{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin:3px 0 9px}
+  .dtl .leg{height:34px;border-radius:5px;display:flex;align-items:center;padding:0 9px;
+    font-variant-numeric:tabular-nums;font-size:15px}
+  .dtl .legL{justify-content:flex-end;background:linear-gradient(90deg,transparent,rgba(57,135,229,.42))}
+  .dtl .legR{background:linear-gradient(90deg,rgba(57,135,229,.13),transparent)}
+  .dtl .split{font-size:9.5px;color:var(--ink3);text-align:center;letter-spacing:.1em}
+  .dtl .pairbar{display:flex;gap:3px;align-items:flex-end;height:44px;margin:6px 0 3px}
+  .dtl .pairbar div{flex:1;border-radius:3px 3px 0 0}
+  .dtl .delta{display:flex;align-items:baseline;gap:7px;margin-top:2px}
+  .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;font-variant-numeric:tabular-nums}
+  .dtl .kv{gap:12px}
+  .dtl .ok{color:var(--good)}
+  .dtl .bd{color:var(--bad);font-weight:700}
+  .dtl .pill{display:inline-block;font-size:9.5px;padding:2px 7px;border-radius:20px;
+    letter-spacing:.06em;font-weight:600}
+  .dtl .pill.y{background:rgba(12,163,12,.2);color:#5fd45f}
+  .dtl .pill.n{background:rgba(208,59,59,.22);color:#ff8a8a}
+  .dtl .pill.w{background:rgba(250,178,25,.2);color:#ffd479}
+  .dtl .pill.q{background:rgba(255,255,255,.11);color:var(--ink3)}
+  /* An unknown reading gets the hatch the rest of the page already uses for
+     one. An empty bar would read as zero, which is the one thing it is not. */
+  .dtl .bar.none,.dtl .pairbar div.none{
+    background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+  .dtl .pairbar div.none{height:100%}
+  /* The extra per-module rows belong to the same disclosure as the panels: the
+     across-the-room view is four numbers a pack, not fourteen. */
+  .mod .more{display:none}
+  :root.dtl-open .mod .more{display:block}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div style="display:flex;align-items:center;gap:12px">
+      <div class="conn" id="conn"><span class="dot" style="background:var(--ink3)"></span>connecting…</div>
+      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙</button>
+    </div>
+  </header>
+
+  <div class="p cal" id="cal" hidden></div>
+
+  <div class="p" id="settings" hidden>
+    <div class="chead"><h2>Settings</h2><span class="legend muted">stored in this browser</span></div>
+    <div class="setgrid">
+      <label class="set">
+        <span class="lbl">Temperature</span>
+        <select id="tempUnit">
+          <option value="F">Fahrenheit (°F)</option>
+          <option value="C">Celsius (°C)</option>
+        </select>
+      </label>
+      <label class="set">
+        <span class="lbl">Live refresh</span>
+        <select id="refreshSecs">
+          <option value="2">every 2 s</option>
+          <option value="5">every 5 s</option>
+          <option value="15">every 15 s</option>
+          <option value="60">every minute</option>
+        </select>
+      </label>
+      <div class="set">
+        <span class="lbl">Dongle</span>
+        <div style="display:flex;gap:6px;margin-top:5px">
+          <button class="iconbtn wide" id="yieldBtn">Release 5 min</button>
+          <button class="iconbtn wide" id="resumeBtn">Take back</button>
+        </div>
+        <div class="muted" style="font-size:10.5px;margin-top:6px">
+          The inverter allows one connection. Release it to use the vendor app for a firmware update.
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tabNow" aria-selected="true" aria-controls="viewNow">Now</button>
+    <button role="tab" id="tabFlow" aria-selected="false" aria-controls="viewFlow">Energy flow</button>
+  </div>
+
+  <div class="view" id="viewFlow" role="tabpanel" hidden>
+    <section class="p">
+      <div class="chead"><h2>Where today's energy went</h2>
+        <span class="legend"><span class="muted" id="flowTotal"></span></span>
+      </div>
+      <!-- Drawn from the inverter's own kWh counters, so the two sides balance
+           and the difference between them is real conversion loss rather than
+           an artefact of how we added things up. -->
+      <svg id="sankey" viewBox="0 0 900 400" role="img"
+           aria-label="Energy flow through the inverter so far today"></svg>
+      <div class="sankwait" id="sankeyWait" hidden>waiting for the inverter's energy counters</div>
+    </section>
+  </div>
+
+  <div class="view" id="viewNow" role="tabpanel">
+  <div class="toprow">
+    <div class="p hero">
+      <div class="lbl">Producing now</div>
+      <div class="v" id="pv">—<span> kW</span></div>
+      <!-- The inverter's own daily counter, not a figure computed from the
+           stored power. Integrating would agree on a clean day and quietly
+           undercount after any gap in collection, and the counter keeps
+           counting through our downtime. -->
+      <div class="today"><span class="lbl">Today</span><b id="pvToday">—</b></div>
+    </div>
+    <div class="flow">
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b></div>
+    </div>
+  </div>
+
+  <section class="p">
+    <div class="chead">
+      <h2>Power flow</h2>
+      <div class="legend">
+        <span><span class="sq" style="background:var(--pv)"></span>Solar</span>
+        <span><span class="sq" style="background:var(--load)"></span>Home</span>
+        <span><span class="sq" style="background:var(--grid)"></span>Grid</span>
+        <!-- The inverter's own temperature belongs beside the power it is
+             moving, not beside the battery's. It is a current reading only:
+             a fourth line on this chart would need a second axis, and a
+             temperature plotted against kilowatts shares no scale with them. -->
+        <span class="muted" id="invTemp"></span>
+      </div>
+      <div class="rng" id="ranges"></div>
+    </div>
+    <div class="chart" id="powerWrap"><svg id="power" viewBox="0 0 900 230" role="img" aria-label="Power flow over the selected range"></svg><div class="tip" id="powerTip"></div></div>
+    <details>
+      <summary>Show as a table</summary>
+      <div style="max-height:220px;overflow:auto;margin-top:8px">
+        <table id="powerTable"><thead><tr><th>Time</th><th>Solar</th><th>Home</th><th>Battery</th><th>Grid</th></tr></thead><tbody></tbody></table>
+      </div>
+    </details>
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Battery power</h2>
+      <div class="legend">
+        <span class="muted">above the line charging · below discharging</span>
+        <span class="muted" id="battNow"></span>
+      </div>
+    </div>
+    <div class="chart" id="battpowerWrap"><svg id="battpower" viewBox="0 0 900 150" role="img" aria-label="Battery charge and discharge over the selected range"></svg><div class="tip" id="battpowerTip"></div></div>
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Battery state of charge</h2><span class="legend" id="bankInfo"></span></div>
+    <div class="chart" id="socWrap"><svg id="soc" viewBox="0 0 900 130" role="img" aria-label="Battery state of charge over the selected range"></svg><div class="tip" id="socTip"></div></div>
+  </section>
+
+  </div><!-- /viewNow -->
+
+  <section>
+    <details id="detail">
+      <summary class="dtlsum">Detail — the rest of what the inverter reports</summary>
+      <div class="dtl" id="dtl"></div>
+    </details>
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Battery modules</h2><span class="legend muted">per module, live</span></div>
+    <div class="agree" id="agree" hidden>
+      <span class="lbl">Pack agreement</span>
+      <div class="pair">
+        <div>
+          <span class="lbl">Charge spread</span>
+          <div class="v" id="socSpread">—</div>
+          <div class="bar" id="socSpreadBar"><i></i></div>
+        </div>
+        <div>
+          <span class="lbl">Voltage spread</span>
+          <div class="v" id="voltSpread">—</div>
+          <div class="bar" id="voltSpreadBar"><i></i></div>
+        </div>
+      </div>
+    </div>
+    <div class="mods" id="mods"></div>
+  </section>
+</main>
+
+<script>
+const PALETTE = { pv:'#c98500', load:'#3987e5', batt:'#199e70', grid:'#9085e9' };
+const RANGES = [
+  { key:'6h',  label:'6h',  seconds:6*3600 },
+  { key:'24h', label:'24h', seconds:24*3600 },
+  { key:'7d',  label:'7d',  seconds:7*86400 },
+  { key:'30d', label:'30d', seconds:30*86400 },
+];
+let range = RANGES[1];
+const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
+// Held between polls because it changes how the per-module cards draw, not just
+// what the badge says.
+let calibration = null;
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
+  (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// A reading is a number or it is absent. Anything else — null, undefined, a
+// string, a NaN — is unknown, and unknown must never fall through to zero.
+const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
+const trim = (v) => v.toFixed(v % 1 === 0 ? 0 : 1);
+
+// Readings are stored and served in Celsius because that is what the hardware
+// reports; converting only on display means changing this never rewrites data.
+const settings = {
+  tempUnit: localStorage.getItem('as.tempUnit') || 'F',
+  refreshSecs: Number(localStorage.getItem('as.refreshSecs') || 5),
+};
+const tempOf = (c) => c === null || c === undefined ? null
+  : (settings.tempUnit === 'F' ? c * 9/5 + 32 : c);
+const tempStr = (c) => {
+  const v = tempOf(c);
+  return v === null ? '—' : `${v.toFixed(1)} °${settings.tempUnit}`;
+};
+
+let liveTimer = null;
+function scheduleLive() {
+  if (liveTimer) clearInterval(liveTimer);
+  liveTimer = setInterval(loadLive, settings.refreshSecs * 1000);
+}
+
+function wireSettings() {
+  $('tempUnit').value = settings.tempUnit;
+  $('refreshSecs').value = String(settings.refreshSecs);
+  $('settingsBtn').onclick = () => { $('settings').hidden = !$('settings').hidden; };
+  $('tempUnit').onchange = (e) => {
+    settings.tempUnit = e.target.value;
+    localStorage.setItem('as.tempUnit', settings.tempUnit);
+    loadLive();
+  };
+  $('refreshSecs').onchange = (e) => {
+    settings.refreshSecs = Number(e.target.value);
+    localStorage.setItem('as.refreshSecs', String(settings.refreshSecs));
+    scheduleLive();
+  };
+  $('yieldBtn').onclick = async () => {
+    await fetch('/api/yield', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({seconds: 300})});
+    loadLive();
+  };
+  $('resumeBtn').onclick = async () => {
+    await fetch('/api/resume', {method:'POST'});
+    loadLive();
+  };
+}
+const kw = (w) => w === null || w === undefined ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W');
+
+function drawRanges() {
+  $('ranges').innerHTML = RANGES.map(r =>
+    `<button data-k="${r.key}" aria-pressed="${r.key===range.key}">${r.label}</button>`).join('');
+  $('ranges').querySelectorAll('button').forEach(b =>
+    b.onclick = () => { range = RANGES.find(r => r.key === b.dataset.k); drawRanges(); loadHistory(); });
+}
+
+async function loadLive() {
+  try {
+    const [live, status, cal] = await Promise.all([
+      fetch('/api/live').then(r => r.json()),
+      fetch('/api/status').then(r => r.json()),
+      fetchCalibration(),
+    ]);
+    const i = live.inverter || {};
+    $('pv').innerHTML = (i.pv_total_power_w === null || i.pv_total_power_w === undefined)
+      ? '—<span> kW</span>'
+      : ((i.pv_total_power_w/1000).toFixed(2) + '<span> kW</span>');
+    $('load').textContent  = kw(i.load_power_w);
+    $('batt').textContent  = i.battery_power_w === null || i.battery_power_w === undefined ? '—'
+      : (i.battery_power_w >= 0 ? '+' : '') + kw(i.battery_power_w);
+    $('gridp').textContent = kw(i.grid_power_w);
+    // Absent until the first energy read lands, and absent again if the
+    // counters go stale — never a zero, which would read as a day with no sun.
+    const made = numOrNull(i.pv_energy_today_kwh);
+    $('pvToday').textContent = made === null ? DASH : `${made.toFixed(1)} kWh`;
+
+    const ok = status.connected && status.running;
+    const colour = status.yielding ? 'var(--warn)' : ok ? 'var(--good)' : 'var(--bad)';
+    const text = status.yielding ? 'dongle yielded' : ok ? 'collecting' : 'not collecting';
+    const when = i.timestamp ? new Date(i.timestamp).toLocaleTimeString() : '—';
+    $('conn').innerHTML = `<span class="dot" style="background:${colour}"></span>${text} · last reading ${when}`;
+
+    const soc = i.battery_soc_pct;
+    const parts = [];
+    if (soc !== null && soc !== undefined) parts.push(`bank ${soc.toFixed(0)}%`);
+    if (i.battery_temperature_c !== null && i.battery_temperature_c !== undefined)
+      parts.push(`battery ${tempStr(i.battery_temperature_c)}`);
+    $('bankInfo').textContent = parts.join(' · ');
+
+    // Inverter temperature sits with the power flow instead. Absent stays
+    // absent — an empty string, not a zero and not a stale last value.
+    const invT = numOrNull(i.inverter_temperature_c);
+    $('invTemp').textContent = invT === null ? '' : `inverter ${tempStr(invT)}`;
+    // Set before the cards draw: it decides whether their percentages are
+    // presented as measurements.
+    calibration = cal;
+    renderCalibration(cal);
+    renderAgreement(cal);
+    // Packs that stopped answering keep their last reading forever in
+    // latest_modules, so they are dropped before anything compares them.
+    const packs = reporting(live.modules);
+    drawModules(packs);
+    drawSankey(i);
+    // Same payload, no second request: /api/live already carries every column.
+    renderDetail(i, packs);
+  } catch (e) {
+    $('conn').innerHTML = '<span class="dot" style="background:var(--bad)"></span>API unreachable';
+  }
+}
+
+// The advisory is optional. A build without /api/calibration, or a request that
+// fails, must read as silence — a dashboard that shouts about its own plumbing
+// teaches the owner to ignore the place real warnings appear.
+async function fetchCalibration() {
+  try {
+    const r = await fetch('/api/calibration');
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+function renderCalibration(cal) {
+  const box = $('cal');
+  const sev = cal && typeof cal === 'object' ? cal.severity : null;
+  // "none" is not a quiet badge, it is no badge: a calibrated bank has nothing
+  // to say and the slot should be empty.
+  if (!CAL_SEVERITIES.includes(sev)) { box.hidden = true; box.className = 'p cal'; return; }
+  // The charge date belongs to the drift story only. Under a wiring alert the
+  // detail text says charging will not fix this, and handing the owner a
+  // charging date on the very next line folds back together the two conditions
+  // the backend goes out of its way to keep apart.
+  const when = cal.wiring_suspect || !cal.last_full_charge ? null : new Date(cal.last_full_charge);
+  const stamp = when && !isNaN(when.getTime())
+    ? `<div class="calwhen muted">Last full charge · ${esc(when.toLocaleString())}</div>` : '';
+  // The wording is the backend's. It distinguishes a stale counter from a
+  // failing battery, and rephrasing it here would undo that.
+  box.className = `p cal sev-${sev}`;
+  box.innerHTML = `<div class="calmark">${sev === 'alert' ? '⚠' : '●'}</div>
+    <div class="calbody"><h2>${esc(cal.headline)}</h2><p>${esc(cal.detail)}</p>${stamp}</div>`;
+  box.hidden = false;
+}
+
+function setSpread(id, value, unit, full, tone) {
+  $(id).innerHTML = value === null ? '—' : `${trim(value)}<span>${unit}</span>`;
+  const bar = $(id + 'Bar');
+  bar.className = 'bar' + (value === null ? ' none' : tone ? ' ' + tone : '');
+  // A hair of width so a real but tiny spread still shows; an unknown one gets
+  // no fill at all and the hatched track carries the meaning instead.
+  bar.querySelector('i').style.width =
+    value === null ? '0' : Math.max(2, Math.min(100, value / full * 100)) + '%';
+}
+
+function renderAgreement(cal) {
+  const box = $('agree');
+  if (!cal || typeof cal !== 'object') { box.hidden = true; return; }
+  const soc = numOrNull(cal.soc_spread_pct);
+  const mv = numOrNull(cal.voltage_spread_mv);
+  // Scales are per-axis on purpose. A wide charge bar over a short voltage bar
+  // is packs holding the same charge while their counters disagree; both bars
+  // long is a genuine imbalance.
+  setSpread('socSpread', soc, 'pts', 25, soc !== null && soc > 5 ? 'wide' : '');
+  setSpread('voltSpread', mv, 'mV', 250,
+    mv === null ? '' : mv >= 200 ? 'bad' : mv >= 50 ? 'wide' : '');
+  box.hidden = false;
+}
+
+// Fifteen minutes matches PACK_REPORT_MAX_AGE in calibration.py. At an
+// eleven-second poll that is some eighty missed reads — a dropped CAN link, not
+// jitter. Without this the page compares a week-old reading against three live
+// ones and calls the difference a finding.
+const PACK_MAX_AGE_MS = 15 * 60 * 1000;
+function reporting(mods) {
+  const now = Date.now();
+  return (mods || []).filter(m => {
+    const t = m && m.timestamp ? Date.parse(m.timestamp) : NaN;
+    return !isFinite(t) || now - t <= PACK_MAX_AGE_MS;
+  });
+}
+
+function drawModules(mods) {
+  if (!mods.length) {
+    $('mods').innerHTML = '<div class="p muted" style="grid-column:1/-1">No per-module data. '
+      + 'The battery block is populated over CAN — check the packs are in closed loop.</div>';
+    return;
+  }
+  // Once the counters have drifted this far the per-pack percentages are no
+  // longer good enough to decide anything from, so they stop being drawn as
+  // measurements. The bank figure is left alone; it is not what drifts.
+  const estimate = !!(calibration && calibration.soc_is_estimate);
+  // A weak cell shows up as a spread well above the pack's usual few millivolts.
+  // Both ends have to be present: half a reading is unknown, and standing in a
+  // zero for the missing end invents a delta large enough to raise a false alarm.
+  const deltas = mods.map(m => {
+    const hi = numOrNull(m.cell_max_voltage_v), lo = numOrNull(m.cell_min_voltage_v);
+    return hi === null || lo === null ? null : hi - lo;
+  });
+  // Low median, and only once enough packs report to have a baseline at all.
+  // The upper median makes an outlier its own reference: with two known deltas
+  // the larger one becomes "typical" and can never exceed three times itself,
+  // so the alarm goes silent in exactly the half-silent bank where a weak cell
+  // matters most. Below three readings there is no baseline worth computing,
+  // and the absolute floor is left to do the work alone.
+  const known = deltas.filter(d => d !== null).sort((a,b) => a-b);
+  const typical = known.length >= 3 ? known[Math.floor((known.length - 1) / 2)] : null;
+  // Above the pack's usual spread, or above 30 mV outright. With too few packs
+  // reporting to establish a baseline the absolute floor does the work alone.
+  const oddAbove = typical === null ? 0.03 : Math.max(typical * 3, 0.03);
+  $('mods').innerHTML = mods.map((m, n) => {
+    const d = deltas[n];
+    const odd = d !== null && d > oddAbove;
+    const soc = numOrNull(m.soc_pct);
+    const soh = numOrNull(m.soh_pct);
+    const cycles = numOrNull(m.cycle_count);
+    const est = estimate && soc !== null;
+    return `<div class="p mod${est ? ' est' : ''}">
+      <div class="top"><span class="soc">${soc === null ? '—' : (est ? '≈' : '') + soc.toFixed(0) + '%'}${
+        est ? '<abbr class="est-tag" title="estimate">est</abbr>' : ''}</span>
+        <span class="sn">${esc(m.serial)}</span></div>
+      <div class="track${soc === null ? ' unknown' : ''}">${soc === null ? ''
+        : `<i class="${odd ? 'odd' : ''}" style="width:${Math.max(0,Math.min(100,soc))}%"></i>`}</div>
+      <div class="kv"><u>Cell &Delta;</u><span class="${odd?'warn':''}">${
+        d === null ? '—' : d.toFixed(3)+' V'+(odd?' ⚠':'')}</span></div>
+      <div class="kv"><u>Temp</u><span>${tempStr(m.temperature_c)}</span></div>
+      <div class="kv"><u>SOH / cycles</u><span>${soh === null ? '—' : soh.toFixed(0)+'%'} / ${
+        cycles === null ? '—' : Math.round(cycles)}</span></div>
+      ${moduleDetail(m)}
+    </div>`;
+  }).join('');
+}
+
+// The rest of what a pack reports, revealed with the Detail disclosure. The
+// cell index fields sit beside the extreme each one identifies: on their own
+// they are a bare number, and next to the voltage they name the cell to open
+// the pack and look at.
+function moduleDetail(m) {
+  const rem = numOrNull(m.remaining_capacity_ah), full = numOrNull(m.full_capacity_ah);
+  const charge = rem === null && full === null ? DASH
+    : full === null ? `${qty(rem)} Ah`
+    : `${qty(rem)} of ${qty(full)} Ah`;
+  const chg = numOrNull(m.charge_current_limit_a), dis = numOrNull(m.discharge_current_limit_a);
+  const limits = chg === null && dis === null ? DASH
+    : `${qty(chg)} / ${qty(dis)} A`;
+  const cell = (value, index) => {
+    if (value === DASH) return DASH;
+    const k = numOrNull(index);
+    return k === null ? value : `${value} · cell ${Math.round(k)}`;
+  };
+  const status = numOrNull(m.status_code);
+  return `<div class="more">
+    ${kvRow('Voltage', uStr(numOrNull(m.voltage_v), 2, 'V'))}
+    ${kvRow('Charge', charge)}
+    ${kvRow('Current', uStr(numOrNull(m.current_a), 1, 'A'))}
+    ${kvRow('Limits chg / dis', limits)}
+    ${kvRow('Cell high', cell(uStr(numOrNull(m.cell_max_voltage_v), 3, 'V'), m.cell_max_voltage_num))}
+    ${kvRow('Cell low', cell(uStr(numOrNull(m.cell_min_voltage_v), 3, 'V'), m.cell_min_voltage_num))}
+    ${kvRow('Cell hottest', cell(tempStr(m.cell_max_temperature_c), m.cell_max_temperature_num))}
+    ${kvRow('Cell coldest', cell(tempStr(m.cell_min_temperature_c), m.cell_min_temperature_num))}
+    ${kvRow('Status', status === null ? DASH : gnum(Math.round(status), 0))}
+    ${codeRow('Fault', numOrNull(m.fault_code))}
+    ${codeRow('Warning', numOrNull(m.warning_code))}
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// Detail. The dashboard stores 147 columns a poll and the wall view draws
+// fourteen of them; the rest live here, grouped by the comparison that makes
+// them mean something rather than by the register map they arrived in.
+//
+// Every caption below is computed from the payload in front of it. None of
+// them is a stored sentence with numbers dropped in, and none of them appears
+// at all when an input is missing — a page whose whole argument is that absent
+// data is not zero cannot afford a derived claim resting on an absent number.
+// ---------------------------------------------------------------------------
+
+const DASH = '—';
+// Fixed digit counts, so a column of readings does not change width as the
+// values move. Grouping separators come from the browser's own locale.
+const gnum = (v, d) => v.toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d});
+const wStr = (v) => v === null ? DASH : gnum(Math.round(v), 0) + ' W';
+const uStr = (v, d, unit) => v === null ? DASH : gnum(v, d) + (unit ? ' ' + unit : '');
+// A quantity shown to a tenth only when it has one, so a 200 A limit is not
+// dressed up as 200.0 and a 7.5 A one is not rounded away to 8.
+const qty = (v, unit) => v === null ? DASH
+  : gnum(v, Number.isInteger(v) ? 0 : 1) + (unit ? ' ' + unit : '');
+
+// A temperature difference is not a temperature. Three degrees Celsius apart
+// is 5.4 °F apart, not 37.4 — putting a delta through tempOf() is the version
+// of this bug that looks right until someone switches units.
+const tempDeltaStr = (dc) => dc === null ? DASH
+  : `${(settings.tempUnit === 'F' ? dc * 9/5 : dc).toFixed(1)} °${settings.tempUnit}`;
+
+const runtimeStr = (s) => {
+  const t = Math.floor(s);
+  return `${gnum(Math.floor(t / 86400), 0)} d ${Math.floor((t % 86400) / 3600)} h`;
+};
+
+function median(xs) {
+  if (!xs.length) return null;
+  const a = [...xs].sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+const kvRow = (label, value, cls) =>
+  `<div class="kv"><u>${label}</u><b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
+
+// A caption with nothing to say is no caption. Returning an empty string here
+// rather than a placeholder is what keeps a missing input from becoming a
+// sentence about an em dash.
+const capOf = (text) => text ? `<span class="lbl cap">${esc(text)}</span>` : '';
+
+// Fault and warning registers are bitfields, not measurements. Zero is the
+// good case and says so in words; anything else is shown in decimal and hex
+// together, because the vendor's tables are indexed by bit.
+function codeRow(label, v) {
+  if (v === null) return kvRow(label, DASH);
+  const k = Math.round(v);
+  return k === 0 ? kvRow(label, 'none', 'ok')
+    : kvRow(label, `${gnum(k, 0)} (0x${k.toString(16).toUpperCase()})`, 'bd');
+}
+
+// A permission flag arrives as 1 or 0. Null is neither: a BMS that has stopped
+// reporting has not withheld consent, and drawing that as "Blocked" would
+// invent a refusal the pack never made.
+const flagOf = (v) => v === true ? true : v === false ? false
+  : typeof v === 'number' && isFinite(v) ? Math.round(v) !== 0 : null;
+
+// Power falling with voltage held up means the current is gone — a shadow or a
+// soiled panel. Power falling with the current held up means part of the
+// string has stopped contributing. Power alone cannot tell the two apart,
+// which is the only reason this panel is worth drawing.
+//
+// The weakest string is compared against the median of the others rather than
+// against the bank average, so one bad string cannot drag down the reference
+// it is being measured against. Both a current and a voltage are required from
+// every string that takes part; half a reading is not a data point.
+function stringCaption(s) {
+  const cand = s.filter(r => r.a !== null && r.v !== null);
+  if (cand.length < 2) return '';
+  const rank = (r) => r.p !== null ? r.p : r.v * r.a;
+  const weak = cand.reduce((lo, r) => rank(r) < rank(lo) ? r : lo, cand[0]);
+  const others = cand.filter(r => r !== weak);
+  const mi = median(others.map(r => r.a));
+  const mv = median(others.map(r => r.v));
+  if (!(mi > 0) || !(mv > 0)) return '';
+  // A string flat at zero while the others produce is not a percentage
+  // comparison, it is a string that is off. Saying "down 100% on current and
+  // down 100% on voltage" dresses that up as a measurement.
+  if (!(weak.a > 0) && !(weak.v > 0))
+    return `String ${weak.k} is producing nothing while the others are`;
+  const di = (mi - weak.a) / mi * 100;
+  const dv = (mv - weak.v) / mv * 100;
+  if (Math.max(di, dv) < 5) {
+    // Only strings reporting both readings took part. Claiming they all agree
+    // would cover a string that was excluded for missing one and may be the
+    // one sitting low — the bars above would contradict the sentence.
+    if (cand.length < s.length) return '';
+    const off = Math.max(0, di, dv);
+    return off < 0.5 ? 'Strings agree on current and voltage'
+      : `Strings agree — the weakest is within ${off.toFixed(0)}% of the others`;
+  }
+  // Named as a signature, not as a diagnosis. Current down while voltage holds
+  // is what shading looks like, and it is also what a soiled or failing panel
+  // looks like; the page is not entitled to pick between them.
+  if (di >= 5 && Math.abs(dv) < 3)
+    return `String ${weak.k} is down ${di.toFixed(0)}% on current while voltage holds`;
+  if (dv >= 5 && Math.abs(di) < 3)
+    return `String ${weak.k} is down ${dv.toFixed(0)}% on voltage while current holds`;
+  const bits = [];
+  const say = (d, what) => `${d > 0 ? 'down' : 'up'} ${Math.abs(d).toFixed(0)}% on ${what}`;
+  if (Math.abs(di) >= 5) bits.push(say(di, 'current'));
+  if (Math.abs(dv) >= 5) bits.push(say(dv, 'voltage'));
+  const ref = others.length > 1 ? 'the others' : `string ${others[0].k}`;
+  return `String ${weak.k} is ${bits.join(' and ')} against ${ref}`;
+}
+
+function detailStrings(i) {
+  const s = [1, 2, 3].map(k => ({
+    k,
+    p: numOrNull(i[`pv${k}_power_w`]),
+    v: numOrNull(i[`pv${k}_voltage_v`]),
+    a: numOrNull(i[`pv${k}_current_a`]),
+  }));
+  const known = s.map(r => r.p).filter(p => p !== null);
+  const top = known.length ? Math.max(...known) : null;
+  const rows = s.map(r => {
+    const width = r.p !== null && top !== null && top > 0
+      ? Math.max(0, Math.min(100, r.p / top * 100)) : 0;
+    const fill = r.p === null ? ''
+      : `<i style="width:${width.toFixed(1)}%;background:var(--pv)"></i>`;
+    // Voltage belongs on screen beside current, not only inside the caption.
+    // The panel's whole claim is that power alone cannot separate a shaded
+    // string from a partly disconnected one — and a caption that concludes
+    // something about voltage while showing none of it is unverifiable.
+    return `<div class="strrow"><span>${r.k}</span>
+      <div class="bar${r.p === null ? ' none' : ''}">${fill}<span>${wStr(r.p)}</span></div>
+      <span class="sublab">${uStr(r.a, 2, 'A')} · ${uStr(r.v, 0, 'V')}</span></div>`;
+  }).join('');
+  return `<div class="p"><h3>Strings — shade or a fault?</h3>${rows}${capOf(stringCaption(s))}</div>`;
+}
+
+// The two legs of a split-phase backup circuit are wired independently and
+// loaded by whatever happens to be on each one. On this hardware they are
+// routinely four to one, and the inverter's combined figure hides that
+// completely — which is the number an owner needs before adding a load.
+function detailLegs(i) {
+  const l1 = numOrNull(i.eps_l1_power_w), l2 = numOrNull(i.eps_l2_power_w);
+  const a1 = numOrNull(i.eps_l1_apparent_power_va), a2 = numOrNull(i.eps_l2_apparent_power_va);
+  const v1 = numOrNull(i.eps_l1_voltage_v), v2 = numOrNull(i.eps_l2_voltage_v);
+  let cap = '';
+  if (l1 !== null && l2 !== null) {
+    const sum = l1 + l2, imb = Math.abs(l1 - l2);
+    if (sum > 0) {
+      const p1 = Math.round(l1 / sum * 100);
+      cap = `${p1} / ${100 - p1} split · ${wStr(imb)} of imbalance`;
+    } else {
+      cap = `${wStr(imb)} of imbalance`;
+    }
+  }
+  // Real power over apparent power, taken a leg at a time. An inductive load
+  // shows up as a leg working harder than its watts suggest, and the combined
+  // power factor the inverter reports averages that away. A leg carrying
+  // nothing has no power factor rather than a factor of zero, so it drops out
+  // of the sentence instead of reading as the worst leg in the house. Both
+  // registers count in whole units, and at a handful of watts that quantising
+  // can put real power above apparent; a ratio over 1 is not a power factor,
+  // so it is reported as nothing rather than as an impossible number.
+  const pf = (w, va) => {
+    if (w === null || va === null || va <= 0) return null;
+    const r = w / va;
+    return r > 1.02 ? null : Math.min(1, r);
+  };
+  const f1 = pf(l1, a1), f2 = pf(l2, a2);
+  const bits = [];
+  if (f1 !== null) bits.push(`L1 ${f1.toFixed(2)}`);
+  if (f2 !== null) bits.push(`L2 ${f2.toFixed(2)}`);
+  let pfCap = bits.length ? `Power factor ${bits.join(' · ')}` : '';
+  // Only when the two legs genuinely differ, and stated as the two readings it
+  // came from rather than as a verdict on what is plugged in.
+  if (f1 !== null && f2 !== null && Math.abs(f1 - f2) >= 0.05) {
+    const lag = f1 < f2 ? { k:'L1', w:l1, va:a1 } : { k:'L2', w:l2, va:a2 };
+    pfCap += ` — ${lag.k} draws ${uStr(lag.va, 0, 'VA')} to deliver ${wStr(lag.w)}`;
+  }
+  return `<div class="p"><h3>Backup legs</h3>
+    <div class="legs">
+      <div class="leg legL">${wStr(l1)}</div>
+      <div class="split">L1 · L2</div>
+      <div class="leg legR">${wStr(l2)}</div>
+    </div>
+    ${capOf(cap)}
+    ${kvRow('Total', wStr(numOrNull(i.eps_power_w)))}
+    ${kvRow('Apparent total', uStr(numOrNull(i.eps_apparent_power_va), 0, 'VA'))}
+    ${kvRow('Apparent L1 · L2', a1 === null && a2 === null ? DASH
+      : `${uStr(a1, 0)} · ${uStr(a2, 0)} VA`)}
+    ${kvRow('Voltage L1 · L2', v1 === null && v2 === null ? DASH
+      : `${uStr(v1, 1)} · ${uStr(v2, 1)} V`)}
+    ${kvRow('Frequency', uStr(numOrNull(i.eps_frequency_hz), 2, 'Hz'))}
+    ${capOf(pfCap)}</div>`;
+}
+
+// Full scale for the heatsink bars, in Celsius. The conversion for display
+// happens after; the scale itself has to be in the unit the hardware reports
+// or switching to Fahrenheit would silently rescale the drawing.
+const HEATSINK_FULL_C = 90;
+
+function detailHeat(i) {
+  const r1 = numOrNull(i.radiator1_temperature_c);
+  const r2 = numOrNull(i.radiator2_temperature_c);
+  const inner = numOrNull(i.inverter_temperature_c);
+  // The control board sits away from both heatsinks, so it warms with the
+  // enclosure rather than with the power stage. Beside the other three it says
+  // whether a hot radiator is one component or the whole box.
+  const board = numOrNull(i.board_temperature_c);
+  const bar = (c, grad) => c === null ? '<div class="none"></div>'
+    : `<div style="height:${Math.max(2, Math.min(100, c / HEATSINK_FULL_C * 100)).toFixed(1)}%;`
+      + `background:${grad}"></div>`;
+  const hot = 'linear-gradient(180deg,var(--warn),rgba(250,178,25,.28))';
+  const cool = 'linear-gradient(180deg,rgba(255,255,255,.5),rgba(255,255,255,.13))';
+  const one = (c) => { const v = tempOf(c); return v === null ? DASH : v.toFixed(0); };
+  // The rows label the bars in the order they are drawn — the two radiators,
+  // then the two readings taken inside the case — so a pair with nothing in it
+  // collapses to a single dash rather than to a unit with no number under it.
+  const pair = (a, b) => a === null && b === null ? DASH
+    : `${one(a)} · ${one(b)} °${settings.tempUnit}`;
+  // There is no fan-speed register on this hardware, so a heatsink climbing
+  // while output holds steady is the only warning of a failing fan or a
+  // blocked intake that exists to give. That is worth saying in the panel.
+  const spread = r1 !== null && r2 !== null
+    ? `Radiators ${tempDeltaStr(Math.abs(r1 - r2))} apart. ` : '';
+  return `<div class="p"><h3>Heatsinks</h3>
+    <div class="pairbar">${bar(r1, hot)}${bar(r2, hot)}${bar(inner, cool)}${bar(board, cool)}</div>
+    ${kvRow('H1 · H2', pair(r1, r2))}
+    ${kvRow('Internal · board', pair(inner, board))}
+    ${capOf(spread + 'No fan-speed register exists — heatsink temperature is the only fan signal')}
+    </div>`;
+}
+
+// The BMS measures at the cells and the inverter at its own terminals, so the
+// gap between them is the drop across the cabling. Neither reading alone can
+// show a lug or a busbar going high-resistance; the difference can.
+function detailDrop(i) {
+  const bms = numOrNull(i.battery_voltage_v);
+  const inv = numOrNull(i.battery_voltage_inv_sample_v);
+  const d = bms !== null && inv !== null ? Math.abs(inv - bms) : null;
+  const head = d === null ? '' : `<div class="delta"><em>${uStr(d, 1, 'V')}</em>
+    <span class="lbl">between BMS and inverter</span></div>`;
+  return `<div class="p"><h3>Cable drop</h3>${head}
+    ${kvRow('At the cells', uStr(bms, 1, 'V'))}
+    ${kvRow('At the terminals', uStr(inv, 1, 'V'))}
+    ${d === null ? '' : capOf('Watch this widen under load — that points at a lug or a busbar')}</div>`;
+}
+
+// State of charge as a percentage hides how much energy that is, and hides
+// entirely that one pack can hold half again what its neighbour does at the
+// same percentage. Amp-hours do not.
+function detailEnergy(i, mods) {
+  const rem = numOrNull(i.battery_remaining_capacity_ah);
+  const full = numOrNull(i.battery_full_capacity_ah);
+  const pct = rem !== null && full !== null && full > 0
+    ? Math.max(0, Math.min(100, rem / full * 100)) : null;
+  const fill = pct === null ? '' : `<i style="width:${pct.toFixed(1)}%;background:var(--batt)"></i>`;
+  const packs = mods.map(m => ({
+    sn: typeof m.serial === 'string' && m.serial ? m.serial : null,
+    ah: numOrNull(m.remaining_capacity_ah),
+  }));
+  const seen = packs.filter(p => p.ah !== null);
+  // One em dash rather than a row of them: with nothing reported there is no
+  // per-pack reading to lay out, and four dashes only look like four failures.
+  const perPack = seen.length
+    ? packs.map(p => p.ah === null ? DASH : gnum(p.ah, 1)).join(' · ') + ' Ah'
+    : DASH;
+  let cap = '';
+  if (seen.length >= 2) {
+    const hi = seen.reduce((a, b) => b.ah > a.ah ? b : a);
+    const lo = seen.reduce((a, b) => b.ah < a.ah ? b : a);
+    const d = hi.ah - lo.ah;
+    // Below a whole percent the share says nothing the amp-hours have not
+    // already said, and "(0% more)" reads as a defect in the page.
+    const pct = lo.ah > 0 ? Math.round(d / lo.ah * 100) : 0;
+    const share = pct >= 1 ? ` (${pct}% more)` : '';
+    // Same rule as the strings: packs that reported nothing cannot be
+    // included in a claim that everything agrees.
+    const partial = seen.length < packs.length;
+    cap = d < 0.1 ? (partial ? '' : 'Packs agree on amp-hours to within 0.1 Ah')
+      : hi.sn && lo.sn ? `${hi.sn} holds ${gnum(d, 1)} Ah more than ${lo.sn}${share}`
+      : `The fullest pack holds ${gnum(d, 1)} Ah more than the emptiest${share}`;
+  }
+  const cur = numOrNull(i.battery_current_a);
+  const soh = numOrNull(i.battery_soh_pct);
+  const cycles = numOrNull(i.battery_cycle_count);
+  const cellHi = numOrNull(i.battery_max_cell_voltage_v);
+  const cellLo = numOrNull(i.battery_min_cell_voltage_v);
+  // battery_temperature_c is the hottest cell in the bank, not an average, so
+  // it is the top of this pair rather than a reading of its own.
+  const cellHot = numOrNull(i.battery_temperature_c);
+  const cellCold = numOrNull(i.battery_min_cell_temperature_c);
+  // The pair is worth more as a difference: a cell losing capacity shows up as
+  // the spread opening long before either end leaves its normal range. Both
+  // ends are required — standing a zero in for a missing one manufactures a
+  // spread of four volts out of nothing.
+  const mv = cellHi === null || cellLo === null ? null : Math.round((cellHi - cellLo) * 1000);
+  // The same 30 mV floor the per-module cards call odd, so a spread is named
+  // wide at one place whether it is measured across a pack or across the bank.
+  const wide = mv !== null && mv >= 30;
+  const cellCap = wide
+    ? `Cells ${gnum(mv, 0)} mV apart — a spread this wide is the earliest sign of a weak cell`
+    : '';
+  const dt = cellHot === null || cellCold === null ? null : Math.abs(cellHot - cellCold);
+  // How many modules the bank is answering for. A pack that stops talking over
+  // CAN takes this down with it, and the count sitting below the number of
+  // packs on screen is the clearest form that alarm takes.
+  const count = numOrNull(i.battery_module_count);
+  const n = count === null ? null : Math.round(count);
+  const short = n !== null && mods.length > 0 && n < mods.length;
+  // The shortfall itself decides the wording. Saying "one dropping off" when
+  // three are missing sends the owner after the wrong fault, and "1 modules"
+  // gives away that the number was never read into the sentence.
+  const gone = short ? mods.length - n : 0;
+  const countCap = short
+    ? `Bank reports ${gnum(n, 0)} module${n === 1 ? '' : 's'} while `
+      + `${gnum(mods.length, 0)} packs are listed — `
+      + `${gone === 1 ? 'one pack is not answering' : `${gnum(gone, 0)} packs are not answering`}`
+    : '';
+  const health = soh === null && cycles === null ? DASH
+    : `${soh === null ? DASH : gnum(Math.round(soh), 0) + '%'} / ${
+        cycles === null ? DASH : gnum(Math.round(cycles), 0)}`;
+  return `<div class="p"><h3>Energy, not percent</h3>
+    <div class="delta"><em>${qty(rem)}</em>
+      <span class="lbl">${full === null ? 'Ah in the bank' : `of ${qty(full)} Ah`}</span></div>
+    <div class="bar${pct === null ? ' none' : ''}" style="margin-top:8px">${fill}</div>
+    <div style="margin-top:7px">
+      ${kvRow('Per pack', perPack)}
+      ${kvRow('Current', uStr(cur, 1, 'A'))}
+      ${kvRow('Health / cycles', health)}
+      ${kvRow('Modules', n === null ? DASH : gnum(n, 0), short ? 'warn' : '')}
+      ${kvRow('Cell high', uStr(cellHi, 3, 'V'))}
+      ${kvRow('Cell low', uStr(cellLo, 3, 'V'))}
+      ${kvRow('Cell spread', mv === null ? DASH : `${gnum(mv, 0)} mV`, wide ? 'warn' : '')}
+      ${kvRow('Cell hottest', tempStr(cellHot))}
+      ${kvRow('Cell coldest', tempStr(cellCold))}
+      ${kvRow('Temperature spread', dt === null ? DASH : tempDeltaStr(dt))}
+    </div>
+    ${capOf(cap)}${capOf(cellCap)}${capOf(countCap)}</div>`;
+}
+
+function detailBms(i) {
+  const permit = (label, flag, limit) => {
+    const f = flagOf(flag);
+    const cls = f === null ? 'q' : f ? 'y' : 'n';
+    const text = f === null ? 'Unknown' : f ? 'Allowed' : 'Blocked';
+    const lim = limit === null ? '' : ` · ${qty(limit, 'A')}`;
+    return `<div class="kv"><u>${label}</u><span class="pill ${cls}">${text}${lim}</span></div>`;
+  };
+  const force = flagOf(i.bms_force_charge);
+  const forcePill = force === null ? '<span class="pill q">Unknown</span>'
+    : force ? '<span class="pill w">Requested</span>' : '<span class="pill q">Off</span>';
+  return `<div class="p"><h3>What the BMS will allow</h3>
+    ${permit('Charge', i.bms_allow_charge, numOrNull(i.bms_charge_current_limit_a))}
+    ${permit('Discharge', i.bms_allow_discharge, numOrNull(i.bms_discharge_current_limit_a))}
+    <div class="kv"><u>Force charge</u>${forcePill}</div>
+    ${kvRow('Charge reference', uStr(numOrNull(i.bms_charge_voltage_ref_v), 1, 'V'))}
+    ${kvRow('Discharge cutoff', uStr(numOrNull(i.bms_discharge_cutoff_v), 1, 'V'))}
+    ${numOrNull(i.bms_charge_current_limit_a) === null
+        && numOrNull(i.bms_discharge_current_limit_a) === null ? ''
+        : capOf('Limits fall when the pack is cold or near full — that is what stalls a charge')
+      }</div>`;
+}
+
+// Grid, AC and status hold no two numbers that mean something together, so
+// they are plain rows. A relationship panel here would be decoration.
+function detailGrid(i) {
+  const l1 = numOrNull(i.grid_power_l1_w), l2 = numOrNull(i.grid_power_l2_w);
+  return `<div class="p"><h3>Grid &amp; AC</h3>
+    ${kvRow('Leg 1 / Leg 2', l1 === null && l2 === null ? DASH : `${wStr(l1)} · ${wStr(l2)}`)}
+    ${kvRow('Voltage', uStr(numOrNull(i.grid_voltage_v), 1, 'V'))}
+    ${kvRow('Frequency', uStr(numOrNull(i.grid_frequency_hz), 2, 'Hz'))}
+    ${kvRow('Power factor', uStr(numOrNull(i.power_factor), 2))}
+    ${kvRow('Inverter current', uStr(numOrNull(i.inverter_current_a), 2, 'A'))}
+    ${kvRow('Inverter power', wStr(numOrNull(i.inverter_power_w)))}
+    ${kvRow('Rectifier power', wStr(numOrNull(i.rectifier_power_w)))}
+    ${kvRow('AC couple power', wStr(numOrNull(i.ac_couple_power_w)))}</div>`;
+}
+
+function detailStatus(i) {
+  const dev = numOrNull(i.device_status);
+  const run = numOrNull(i.inverter_run_time_s);
+  const b1 = numOrNull(i.bus_voltage_1_v), b2 = numOrNull(i.bus_voltage_2_v);
+  return `<div class="p"><h3>Status</h3>
+    ${codeRow('Device status', dev)}
+    ${codeRow('Inverter fault', numOrNull(i.inverter_fault_code))}
+    ${codeRow('Inverter warning', numOrNull(i.inverter_warning_code))}
+    ${codeRow('Battery fault', numOrNull(i.battery_fault_code))}
+    ${codeRow('Battery warning', numOrNull(i.battery_warning_code))}
+    ${kvRow('Run time', run === null ? DASH : runtimeStr(run))}
+    ${kvRow('DC bus 1 / 2', b1 === null && b2 === null ? DASH
+      : `${uStr(b1, 1)} / ${uStr(b2, 1)} V`)}</div>`;
+}
+
+function renderDetail(i, mods) {
+  $('dtl').innerHTML = '<div class="rel">'
+    + detailStrings(i) + detailLegs(i) + detailHeat(i) + detailDrop(i)
+    + detailEnergy(i, mods) + detailBms(i) + detailGrid(i) + detailStatus(i)
+    + '</div>';
+}
+
+// The disclosure state is remembered because this is a wall display: whoever
+// opened it was diagnosing something, and closing it on every refresh would
+// mean opening it again on every refresh. The class on the root element is
+// what lets the per-module cards follow the same switch without a re-render.
+function wireDetail() {
+  const box = $('detail');
+  const open = localStorage.getItem('as.detailOpen') === '1';
+  box.open = open;
+  document.documentElement.classList.toggle('dtl-open', open);
+  box.addEventListener('toggle', () => {
+    localStorage.setItem('as.detailOpen', box.open ? '1' : '0');
+    document.documentElement.classList.toggle('dtl-open', box.open);
+  });
+}
+
+function line(pts, colour, dash) {
+  if (pts.length < 2) return '';
+  return `<polyline fill="none" stroke="${colour}" stroke-width="2" stroke-linejoin="round"
+    stroke-linecap="round"${dash?` stroke-dasharray="${dash}"`:''} points="${pts.join(' ')}"/>`;
+}
+
+// What each chart is currently showing, so the hover can answer without
+// refetching. Replaced wholesale on every redraw rather than mutated, so a
+// pointer moving during a redraw reads one consistent set of points.
+const hovering = {};
+
+// Map a pointer position to the nearest sample. The SVG scales to its
+// container, so client pixels have to be converted back into viewBox units
+// before they mean anything — reading clientX directly is right only at one
+// window width, which is the sort of bug that looks like a rounding error.
+function attachHover(id, points, rows, geom) {
+  hovering[id] = { points, rows, geom };
+  const svg = $(id);
+  if (svg.dataset.hoverWired) return;
+  svg.dataset.hoverWired = '1';
+
+  const move = (ev) => {
+    const st = hovering[id];
+    const tip = $(`${id}Tip`);
+    if (!st || !st.points.length) { tip.classList.remove('on'); return; }
+    const box = svg.getBoundingClientRect();
+    if (!box.width) return;
+    const touch = ev.touches && ev.touches[0];
+    const vx = ((touch ? touch.clientX : ev.clientX) - box.left) / box.width * st.geom.W;
+    const { L, R, W } = st.geom;
+    const frac = (vx - L) / Math.max(W - L - R, 1);
+    const n = st.points.length;
+    const idx = Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
+    const pt = st.points[idx];
+
+    const parts = st.rows
+      .map(([label, key, fmt]) => {
+        const v = numOrNull(pt[key]);
+        return `<div class="row"><u>${esc(label)}</u><b>${v === null ? DASH : fmt(v)}</b></div>`;
+      }).join('');
+    const when = pt.timestamp ? new Date(pt.timestamp) : null;
+    tip.innerHTML = `<div class="when">${when ? esc(when.toLocaleString()) : ''}</div>${parts}`;
+    tip.classList.add('on');
+
+    // Keep the tooltip inside the chart rather than letting it push the page
+    // sideways — a wall tablet has no horizontal scrollbar to rescue it.
+    const px = (idx / Math.max(n - 1, 1)) * (box.width - (L + R) / st.geom.W * box.width)
+      + L / st.geom.W * box.width;
+    const tw = tip.offsetWidth || 150;
+    tip.style.left = `${Math.max(2, Math.min(box.width - tw - 2, px + 12))}px`;
+    tip.style.top = '6px';
+
+    const x = (L + (W - L - R) * idx / Math.max(n - 1, 1)).toFixed(1);
+    const g = svg.querySelector('#' + id + 'Cross');
+    if (g) g.innerHTML = `<line x1="${x}" y1="0" x2="${x}" y2="${st.geom.H}" `
+      + `stroke="rgba(255,255,255,.34)" stroke-width="1" class="tipdot"/>`;
+  };
+  const leave = () => {
+    $(`${id}Tip`).classList.remove('on');
+    const g = svg.querySelector('#' + id + 'Cross');
+    if (g) g.innerHTML = '';
+  };
+  svg.addEventListener('mousemove', move);
+  svg.addEventListener('mouseleave', leave);
+  svg.addEventListener('touchstart', move, { passive: true });
+  svg.addEventListener('touchmove', move, { passive: true });
+  svg.addEventListener('touchend', leave);
+}
+
+function drawPower(points) {
+  const W=900,H=230,L=48,R=14,T=12,B=26;
+  const series = [
+    ['pv_total_power_w', PALETTE.pv, null],
+    ['load_power_w', PALETTE.load, null],
+    ['grid_power_w', PALETTE.grid, '4 3'],
+  ];
+  const vals = points.flatMap(p => series.map(([k]) => p[k]).filter(v => v !== null && v !== undefined));
+  if (!vals.length) { $('power').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`; return; }
+  const hi = Math.max(1000, ...vals), lo = Math.min(0, ...vals);
+  const pad = (hi-lo)*0.08 || 500;
+  const top = hi+pad, bot = lo-pad;
+  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
+  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
+
+  let s = '';
+  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top-bot,1)))) / 2;
+  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
+    const y = sy(g);
+    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"
+      stroke="${Math.abs(g)<1e-9?'rgba(255,255,255,.28)':'var(--grid-line)'}" stroke-width="1"/>`;
+    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">${(g/1000).toFixed(g%1000?1:0)}</text>`;
+  }
+  s += `<text class="tick" x="${L-8}" y="${T+8}" text-anchor="end">kW</text>`;
+  const ticks = Math.min(6, points.length);
+  for (let t = 0; t < ticks; t++) {
+    const idx = Math.round(t*(points.length-1)/Math.max(ticks-1,1));
+    const when = new Date(points[idx].timestamp);
+    const label = range.seconds > 3*86400
+      ? when.toLocaleDateString(undefined,{month:'short',day:'numeric'})
+      : when.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
+    s += `<text class="tick" x="${sx(idx).toFixed(1)}" y="${H-8}" text-anchor="middle">${label}</text>`;
+  }
+  // Three series at equal weight is three things competing, and where they
+  // cross you lose which is which. So identity is carried by form as well as
+  // by hue — solar a filled area, home the heaviest line, grid a thin dashed
+  // trace — which also means the chart still reads when the colours do not.
+  s += `<defs><linearGradient id="pvfill" x1="0" y1="0" x2="0" y2="1">`
+    + `<stop offset="0%" stop-color="var(--pv)" stop-opacity="0.5"/>`
+    + `<stop offset="100%" stop-color="var(--pv)" stop-opacity="0.04"/></linearGradient></defs>`;
+
+  // Runs of consecutive readings. A gap is a break, never bridged: a comms
+  // outage has to look like one rather than a straight line across the hole.
+  const runsOf = (key) => {
+    const out = []; let run = [];
+    points.forEach((p, n) => {
+      const v = p[key];
+      if (v === null || v === undefined || p.is_gap) { if (run.length > 1) out.push(run); run = []; }
+      else run.push([sx(n), sy(v)]);
+    });
+    if (run.length > 1) out.push(run);
+    return out;
+  };
+
+  // Solar is what the array harvested, so it reads as volume rather than as a
+  // line. Filled to the zero line, not to the bottom of the chart, or a
+  // negative axis would put the fill on the wrong side of nothing.
+  const baseY = sy(Math.max(0, bot));
+  for (const run of runsOf('pv_total_power_w')) {
+    const d = run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+    s += `<polygon points="${run[0][0].toFixed(1)},${baseY.toFixed(1)} ${d} `
+      + `${run[run.length-1][0].toFixed(1)},${baseY.toFixed(1)}" fill="url(#pvfill)"/>`;
+  }
+
+  // Drawn last to first in importance: grid recedes, solar outlines its own
+  // fill, home sits on top because it is the one the owner acts on.
+  const stroke = (key, colour, width, dash) => {
+    for (const run of runsOf(key)) {
+      s += `<polyline points="${run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')}" `
+        + `fill="none" stroke="${colour}" stroke-width="${width}" stroke-linejoin="round"`
+        + `${dash ? ` stroke-dasharray="${dash}"` : ''}/>`;
+    }
+  };
+  stroke('grid_power_w', 'var(--grid)', 1.2, '4 3');
+  stroke('pv_total_power_w', 'var(--pv)', 1.6, null);
+  stroke('load_power_w', 'var(--load)', 2.1, null);
+  s += `<g id="powerCross"></g>`;
+  $('power').innerHTML = s;
+  attachHover('power', points, [
+    ['Solar', 'pv_total_power_w', kw],
+    ['Home', 'load_power_w', kw],
+    ['Grid', 'grid_power_w', kw],
+  ], { W, H, L, R });
+
+  const rows = points.slice(-200).reverse().map(p => `<tr>
+    <td>${new Date(p.timestamp).toLocaleString()}</td>
+    <td>${kw(p.pv_total_power_w)}</td><td>${kw(p.load_power_w)}</td>
+    <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
+  $('powerTable').querySelector('tbody').innerHTML = rows;
+}
+
+// Battery power is the one series with a meaningful zero: above it the bank is
+// taking charge, below it the house is running off it. Drawn on its own rather
+// than among solar, load and grid because those three are all consumption or
+// production and share a direction, while this one changes sign several times a
+// day — which is what made the combined chart hard to read.
+function drawBattery(points) {
+  const W=900,H=150,L=48,R=14,T=12,B=24;
+  const vals = points.map(p => p.battery_power_w).filter(v => v !== null && v !== undefined);
+  if (!vals.length) {
+    $('battpower').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`;
+    return;
+  }
+  // The scale is symmetric about zero on purpose. An asymmetric one would make
+  // a 3 kW charge and a 3 kW discharge draw different heights.
+  const mag = Math.max(1000, ...vals.map(Math.abs));
+  const top = mag * 1.08, bot = -top;
+  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
+  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
+
+  let s = '';
+  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top, 1)))) / 2;
+  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
+    const y = sy(g);
+    const zero = Math.abs(g) < 1e-9;
+    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}" `
+      + `stroke="${zero ? 'rgba(255,255,255,.28)' : 'var(--grid-line)'}" stroke-width="1"/>`;
+    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">`
+      + `${(g/1000).toFixed(Math.abs(g) >= 1000 || g === 0 ? 0 : 1)}</text>`;
+  }
+  s += `<text class="tick" x="${L}" y="9">kW</text>`;
+
+  // Filled to the zero line so the direction reads without consulting the
+  // legend, and split at the crossing so charge and discharge carry different
+  // colours. A gap breaks the fill rather than being bridged across.
+  let run = [];
+  const flush = () => {
+    if (run.length > 1) {
+      for (const [sign, colour] of [[1, PALETTE.batt], [-1, 'var(--batt-dis)']]) {
+        const clipped = run.map(([x, v]) => [x, sign > 0 ? Math.max(0, v) : Math.min(0, v)]);
+        if (!clipped.some(([, v]) => v !== 0)) continue;
+        const d = clipped.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+        s += `<polygon points="${clipped[0][0].toFixed(1)},${sy(0).toFixed(1)} ${d} `
+          + `${clipped[clipped.length-1][0].toFixed(1)},${sy(0).toFixed(1)}" `
+          + `fill="${colour}" fill-opacity="0.30"/>`;
+      }
+      s += `<polyline points="${run.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" `
+        + `fill="none" stroke="var(--batt)" stroke-width="1.6" stroke-linejoin="round"/>`;
+    }
+    run = [];
+  };
+  points.forEach((p, n) => {
+    const v = p.battery_power_w;
+    if (v === null || v === undefined || p.is_gap) flush();
+    else run.push([sx(n), v]);
+  });
+  flush();
+  s += `<g id="battpowerCross"></g>`;
+  $('battpower').innerHTML = s;
+  attachHover('battpower', points, [
+    ['Battery', 'battery_power_w', (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v))],
+    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
+  ], { W, H, L, R });
+}
+
+// Today's energy as a flow diagram, from the inverter's own counters. The two
+// sides balance by construction — everything entering the inverter leaves it —
+// so the gap between them is conversion loss, which is a real quantity and not
+// a rounding artefact. A line chart cannot show that at all.
+function drawSankey(i) {
+  const g = (k) => numOrNull(i[k]);
+  const solar = g('pv_energy_today_kwh');
+  const gridIn = g('grid_import_energy_today_kwh');
+  const gridOut = g('grid_export_energy_today_kwh') || 0;
+  const battIn = g('battery_charge_energy_today_kwh');
+  const battOut = g('battery_discharge_energy_today_kwh');
+  const house = g('load_energy_today_kwh');
+
+  // Every term is required. Standing a zero in for a missing counter would
+  // unbalance the diagram and present the imbalance as loss.
+  if ([solar, gridIn, battIn, battOut, house].some((v) => v === null)) {
+    $('sankey').innerHTML = '';
+    $('sankeyWait').hidden = false;
+    $('flowTotal').textContent = '';
+    return;
+  }
+  $('sankeyWait').hidden = true;
+
+  const inTotal = solar + gridIn + battOut;
+  const loss = Math.max(0, inTotal - (house + battIn + gridOut));
+  $('flowTotal').textContent = `${inTotal.toFixed(1)} kWh through the inverter today`;
+  if (inTotal <= 0) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+
+  const W = 900, XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
+  const scale = (BOT - TOP) / inTotal;
+  const stack = (items, x) => {
+    let y = TOP;
+    const out = items.filter(([, v]) => v > 0.05).map(([name, v, col]) => {
+      const n = { name, v, col, x, y, h: v * scale };
+      y += n.h + 10;
+      return n;
+    });
+    const shift = (BOT - (y - 10)) / 2;
+    out.forEach((n) => { n.y += shift; });
+    return out;
+  };
+  const src = stack([['Solar', solar, 'var(--pv)'], ['Grid', gridIn, 'var(--grid)'],
+                     ['Battery out', battOut, 'var(--batt)']], X1);
+  const hub = stack([['Inverter', inTotal, 'var(--ink3)']], X2 - 60);
+  const snk = stack([['House', house, 'var(--load)'], ['Battery in', battIn, 'var(--batt)'],
+                     ['Exported', gridOut, 'var(--grid)'], ['Losses', loss, 'var(--ink3)']], X3);
+
+  const ribbon = (x0, y0, x1, y1, h, col) => {
+    const mx = (x0 + x1) / 2;
+    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
+      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
+      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
+      + `fill="${col}" fill-opacity="0.34"/>`;
+  };
+  let out = '';
+  if (!hub.length) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+  let hy = hub[0].y;
+  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col); hy += n.h; }
+  hy = hub[0].y;
+  for (const n of snk) { out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col); hy += n.h; }
+  for (const n of [...src, ...hub, ...snk]) {
+    out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
+      + `rx="3" fill="${n.col}"/>`;
+    const right = n.x > 500;
+    const isHub = n.name === 'Inverter';
+    const tx = isHub ? n.x + XW / 2 : right ? n.x - 9 : n.x + XW + 9;
+    const anchor = isHub ? 'middle' : right ? 'end' : 'start';
+    const ty = n.y + n.h / 2;
+    out += isHub
+      ? `<text x="${tx}" y="${(n.y - 12).toFixed(1)}" text-anchor="middle" class="nn">${n.name}</text>`
+      : `<text x="${tx}" y="${(ty - 2).toFixed(1)}" text-anchor="${anchor}" class="nn">${esc(n.name)}</text>`
+        + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
+        + `${n.v.toFixed(1)} kWh</text>`;
+  }
+  $('sankey').innerHTML = `<g class="sank">${out}</g>`;
+}
+
+function wireTabs() {
+  const tabs = [['tabNow', 'viewNow'], ['tabFlow', 'viewFlow']];
+  const show = (want) => {
+    for (const [t, v] of tabs) {
+      const on = v === want;
+      $(t).setAttribute('aria-selected', String(on));
+      $(v).hidden = !on;
+    }
+    localStorage.setItem('as.tab', want);
+    // The charts size themselves from the container, which is zero-width while
+    // hidden, so anything revealed has to be redrawn rather than left stretched.
+    if (want === 'viewNow') loadHistory();
+  };
+  for (const [t, v] of tabs) $(t).onclick = () => show(v);
+  show(localStorage.getItem('as.tab') === 'viewFlow' ? 'viewFlow' : 'viewNow');
+}
+
+function drawSoc(points) {
+  const W=900,H=130,L=48,R=14,T=10,B=24;
+  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
+  const sy = (v) => T + (H-T-B) * (100 - v) / 100;
+  let s = '';
+  for (const g of [0,25,50,75,100]) {
+    const y = sy(g);
+    s += `<line x1="${L}" y1="${y}" x2="${W-R}" y2="${y}" stroke="var(--grid-line)" stroke-width="1"/>`;
+    s += `<text class="tick" x="${L-8}" y="${y+3}" text-anchor="end">${g}%</text>`;
+  }
+  let run = [];
+  points.forEach((p, n) => {
+    const v = p.battery_soc_pct;
+    if (v === null || v === undefined || p.is_gap) { s += line(run, PALETTE.batt); run = []; }
+    else run.push(`${sx(n).toFixed(1)},${sy(v).toFixed(1)}`);
+  });
+  s += line(run, PALETTE.batt);
+  s += `<g id="socCross"></g>`;
+  $('soc').innerHTML = s;
+  attachHover('soc', points, [
+    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
+    ['Battery', 'battery_power_w', kw],
+  ], { W, H, L, R });
+}
+
+async function loadHistory() {
+  const end = new Date();
+  const start = new Date(end.getTime() - range.seconds*1000);
+  const metrics = 'pv_total_power_w,load_power_w,battery_power_w,grid_power_w,battery_soc_pct';
+  const width = Math.max(300, Math.min(4000, Math.round(document.body.clientWidth)));
+  const url = `/api/history?start=${start.toISOString()}&end=${end.toISOString()}&metrics=${metrics}&width=${width}`;
+  try {
+    const body = await fetch(url).then(r => r.json());
+    drawPower(body.points || []);
+    drawBattery(body.points || []);
+    drawSoc(body.points || []);
+  } catch (e) {
+    $('power').innerHTML = `<text class="tick" x="48" y="40">history unavailable</text>`;
+  }
+}
+
+wireSettings();
+wireDetail();
+wireTabs();
+drawRanges();
+loadLive();
+loadHistory();
+scheduleLive();
+setInterval(loadHistory, 60000);
+</script>
+</body>
+</html>

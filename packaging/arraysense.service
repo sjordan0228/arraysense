@@ -1,0 +1,65 @@
+# systemd unit for Solar ArraySense.
+#
+# Install to /etc/systemd/system/arraysense.service and adjust User, Group and
+# the two paths below to match where you cloned the source.
+#
+# The stop timeout matters more than it looks. The dongle accepts exactly one
+# TCP client, and the service releases that slot during shutdown. Killing it
+# before it finishes leaves the dongle occupied until it times the connection
+# out on its own, which blocks both the next start and the vendor's app.
+
+[Unit]
+Description=Solar ArraySense
+Documentation=https://github.com/sjordan0228/arraysense
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=arraysense
+Group=arraysense
+
+WorkingDirectory=/opt/arraysense
+ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --config /etc/arraysense/config.toml
+
+# To serve on port 80 instead, add --port 80 above and uncomment the line below.
+# Ports under 1024 are privileged, and this service deliberately does not run as
+# root; the capability grants that one binding and nothing else. Running the
+# whole service as root to get a shorter URL is the wrong trade.
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# SIGTERM lets the lifespan hook disconnect cleanly before the process exits.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# An inverter that is unreachable is expected, not exceptional — the collector
+# already backs off and retries on its own. Restarting covers the case where
+# the process itself died.
+Restart=on-failure
+RestartSec=10
+
+# The database is the only thing this writes, and it needs no privileges beyond
+# that. Everything else is closed off.
+StateDirectory=arraysense
+ConfigurationDirectory=arraysense
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# Outbound to the dongle, inbound for the dashboard. Nothing else.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

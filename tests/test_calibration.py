@@ -1,0 +1,315 @@
+"""Tests for state-of-charge drift detection: arraysense.calibration.
+
+Timestamps step one minute apart because that is the tier the API actually
+reads. Detection depends on elapsed time between samples, so a helper that
+invented a convenient ten-minute cadence would exercise a code path production
+never takes.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from arraysense.calibration import (
+    ESTIMATE_AFTER_DAYS,
+    INFO_AFTER_DAYS,
+    WARNING_AFTER_DAYS,
+    assess,
+    full_charge_windows,
+    last_full_charge,
+    packs_recalibrated,
+)
+
+NOW = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+ABSORB_V = 55.9
+RESTING_V = 52.0
+
+
+def _inverter(
+    start: datetime,
+    volts: list[float],
+    current: float = 5.0,
+    ref: float = 56.0,
+) -> list[dict[str, Any]]:
+    """One row per minute, as the minute rollup tier serves them."""
+    return [
+        {
+            "timestamp": start + timedelta(minutes=i),
+            "battery_voltage_v": v,
+            "battery_current_a": current,
+            "bms_charge_voltage_ref_v": ref,
+            "error": None,
+        }
+        for i, v in enumerate(volts)
+    ]
+
+
+def _charge(minutes: int = 21, **kwargs: Any) -> list[float]:
+    """A resting bank, a spell at absorb voltage, then resting again."""
+    return [RESTING_V, *([kwargs.pop("volts", ABSORB_V)] * minutes), RESTING_V]
+
+
+def _modules(when: datetime, socs: dict[str, float], volts: float = 53.8) -> list[dict[str, Any]]:
+    return [
+        {"timestamp": when, "serial": s, "soc_pct": soc, "voltage_v": volts}
+        for s, soc in socs.items()
+    ]
+
+
+# --- finding the absorb windows ---------------------------------------------
+
+
+def test_a_sustained_absorb_period_is_a_full_charge_window() -> None:
+    (window,) = full_charge_windows(_inverter(NOW, _charge()))
+    assert window[0] == NOW + timedelta(minutes=1)
+    assert window[1] == NOW + timedelta(minutes=21)
+
+
+def test_a_brief_voltage_spike_is_not_a_full_charge() -> None:
+    # A couple of minutes at absorb voltage is a surge or a decode blip, not a
+    # charge that ran long enough for any BMS to reset its counter.
+    assert full_charge_windows(_inverter(NOW, _charge(minutes=3))) == []
+
+
+def test_two_distant_blips_do_not_splice_into_one_window() -> None:
+    # The defect this check exists for. Rollup tiers are built with an
+    # "error IS NULL" filter and carry no error column, so downtime shows up as
+    # rows that are simply missing. Judging continuity by list adjacency turned
+    # two isolated minutes hours apart into a two-hour absorb, declared a full
+    # charge that never happened, and silenced the warning for a month.
+    rows = [
+        *_inverter(NOW, [ABSORB_V]),
+        *_inverter(NOW + timedelta(hours=2), [ABSORB_V]),
+    ]
+    assert full_charge_windows(rows) == []
+
+
+def test_a_gap_mid_charge_splits_the_run_rather_than_bridging_it() -> None:
+    # Twenty minutes of absorb, an hour we have no readings for, then twenty
+    # more. Neither half reaches the threshold on its own and the hole must not
+    # be assumed to have been more of the same.
+    rows = [
+        *_inverter(NOW, [ABSORB_V] * 15),
+        *_inverter(NOW + timedelta(hours=1), [ABSORB_V] * 15),
+    ]
+    assert full_charge_windows(rows) == []
+
+
+def test_a_charge_still_pushing_current_has_not_reached_the_top() -> None:
+    # Charge current can hold the bank above its reference well short of full,
+    # so a run whose last sample is still at 90 A is a charge in progress.
+    assert full_charge_windows(_inverter(NOW, _charge(), current=90.0)) == []
+    assert len(full_charge_windows(_inverter(NOW, _charge(), current=4.0))) == 1
+
+
+def test_the_threshold_follows_the_bms_charge_reference() -> None:
+    # A bank configured to a lower charge voltage still reaches its own full.
+    # Hard-coding 56 V would mean such a bank never registered a full charge.
+    volts = [50.0, *([54.2] * 21), 50.0]
+    assert full_charge_windows(_inverter(NOW, volts, ref=56.0)) == []
+    assert len(full_charge_windows(_inverter(NOW, volts, ref=54.4))) == 1
+
+
+def test_a_run_still_open_at_the_end_of_the_data_still_counts() -> None:
+    # The bank may be absorbing right now. Requiring a return to rest before
+    # crediting the charge would delay the reset by hours.
+    (window,) = full_charge_windows(_inverter(NOW, [ABSORB_V] * 21))
+    assert window[1] == NOW + timedelta(minutes=20)
+
+
+def test_rows_without_a_voltage_do_not_extend_a_window() -> None:
+    rows = _inverter(NOW, _charge())
+    for row in rows[5:9]:
+        row["battery_voltage_v"] = None
+    assert full_charge_windows(rows) == []
+
+
+def test_no_history_at_all_yields_no_windows() -> None:
+    assert full_charge_windows([]) == []
+
+
+# --- deciding whether the packs actually recalibrated -----------------------
+
+
+def test_a_full_charge_needs_every_pack_to_reach_full() -> None:
+    inverter = _inverter(NOW, _charge())
+    absorb = NOW + timedelta(minutes=10)
+    short = _modules(absorb, {"A": 100.0, "B": 100.0, "C": 100.0, "D": 91.0})
+    assert last_full_charge(inverter, short) is None
+    complete = _modules(absorb, {"A": 100.0, "B": 100.0, "C": 99.0, "D": 100.0})
+    assert last_full_charge(inverter, complete) == NOW + timedelta(minutes=21)
+
+
+def test_ninety_nine_percent_counts_as_recalibrated() -> None:
+    # The BMS reports whole percent to an accuracy of five, so demanding
+    # exactly 100 would strand a pack that never quite says it.
+    assert packs_recalibrated(_modules(NOW, {"A": 99.0}))
+    assert not packs_recalibrated(_modules(NOW, {"A": 98.0}))
+
+
+def test_a_pack_silent_through_the_window_blocks_the_verdict() -> None:
+    # Silence is not consent. A CAN dropout on one pack during a charge would
+    # otherwise restart the drift clock for the whole bank, and that pack —
+    # whose counter genuinely never reset — is then reported as calibrated for
+    # as long as it keeps drifting.
+    reported = _modules(NOW, {"A": 100.0, "B": 100.0, "C": 100.0})
+    assert packs_recalibrated(reported)
+    assert not packs_recalibrated(reported, expected=["A", "B", "C", "D"])
+
+
+def test_a_pack_reporting_no_number_is_not_counted_as_full() -> None:
+    rows = [*_modules(NOW, {"A": 100.0}), {"timestamp": NOW, "serial": "B", "soc_pct": None}]
+    assert not packs_recalibrated(rows, expected=["A", "B"])
+
+
+def test_no_packs_reporting_is_not_a_full_charge() -> None:
+    assert not packs_recalibrated([])
+
+
+def test_a_pack_reading_full_outside_an_absorb_window_does_not_count() -> None:
+    # A pack drifted high reads 100% long before the bank is full. Requiring
+    # the bank to be at its charge reference is what rejects that.
+    inverter = _inverter(NOW, [RESTING_V] * 30)
+    assert last_full_charge(inverter, _modules(NOW, {"A": 100.0, "B": 100.0})) is None
+
+
+# --- the severity ladder -----------------------------------------------------
+
+
+def _at(days: float, **kwargs: Any) -> Any:
+    return assess(
+        now=NOW,
+        last_full=NOW - timedelta(days=days),
+        searched_days=60.0,
+        modules=kwargs.pop("modules", _modules(NOW, {"A": 61.0, "B": 62.0})),
+        **kwargs,
+    )
+
+
+def test_the_ladder_climbs_at_its_stated_boundaries() -> None:
+    # Each threshold is pinned on both sides. Without this the constants can be
+    # moved, or a whole band removed, with every test still passing.
+    assert _at(INFO_AFTER_DAYS - 0.1).severity == "none"
+    assert _at(INFO_AFTER_DAYS).severity == "info"
+    assert _at(WARNING_AFTER_DAYS - 0.1).severity == "info"
+    assert _at(WARNING_AFTER_DAYS).severity == "warning"
+    assert _at(ESTIMATE_AFTER_DAYS - 0.1).severity == "warning"
+    assert _at(ESTIMATE_AFTER_DAYS).severity == "elevated"
+
+
+def test_only_the_elevated_band_relabels_the_readings_as_estimates() -> None:
+    assert not _at(3).soc_is_estimate
+    assert not _at(INFO_AFTER_DAYS).soc_is_estimate
+    assert not _at(WARNING_AFTER_DAYS).soc_is_estimate
+    assert _at(ESTIMATE_AFTER_DAYS).soc_is_estimate
+
+
+def test_a_lone_pack_is_still_relabelled_once_the_readings_are_stale() -> None:
+    # soc_is_estimate must not depend on there being a spread to measure. A
+    # single-pack bank, or one with three packs off the CAN bus, has readings
+    # every bit as stale as a four-pack bank.
+    status = _at(ESTIMATE_AFTER_DAYS + 1, modules=_modules(NOW, {"A": 61.0}))
+    assert status.soc_spread_pct is None
+    assert status.soc_is_estimate
+
+
+def test_no_full_charge_in_the_searched_history_is_reported_as_at_least() -> None:
+    # Never seen is not the same as never happened. The status says how far
+    # back we looked rather than inventing a date.
+    status = assess(now=NOW, last_full=None, searched_days=60.0, modules=_modules(NOW, {"A": 61.0}))
+    assert status.severity == "elevated"
+    assert status.days_since is None
+    assert "60" in status.detail
+
+
+# --- telling a drifting gauge apart from a real fault -----------------------
+
+
+def test_matched_voltages_say_the_gauges_drifted_not_the_packs() -> None:
+    # The claim this module exists to make. Four packs within 30 mV hold the
+    # same charge whatever their counters say, and the message has to say so —
+    # a warning that alleges a battery problem would be false.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 57.0, "voltage_v": 53.78},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 76.0, "voltage_v": 53.76},
+    ]
+    status = _at(31, modules=modules)
+    assert status.soc_spread_pct == 19.0
+    assert status.voltage_spread_mv == 20.0
+    assert not status.wiring_suspect
+    assert "counters" in status.detail
+    assert "same charge" in status.detail
+
+
+def test_packs_that_agree_on_charge_get_no_counters_disagree_claim() -> None:
+    # The sentence above is a diagnosis, not decoration. It must not appear
+    # when the packs agree on percentage, because then there is nothing to
+    # explain away.
+    status = _at(31, modules=_modules(NOW, {"A": 61.0, "B": 62.0}))
+    assert "counters" not in status.detail
+
+
+def test_a_wide_voltage_spread_is_a_different_and_louder_problem() -> None:
+    # Packs in parallel are forced to the same voltage. A quarter of a volt
+    # between them is a lug, a busbar or a failing pack — not a drifting
+    # counter, and not something charging will fix.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 60.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 60.0, "voltage_v": 53.55},
+    ]
+    status = _at(2, modules=modules)
+    assert status.voltage_spread_mv == 250.0
+    assert status.wiring_suspect
+    assert status.severity == "alert"
+    assert "charge" not in status.detail.lower().replace("charging will not fix", "")
+
+
+def test_a_wiring_fault_does_not_erase_the_drift_verdict() -> None:
+    # A bank with both a bad lug and four months of drift is the one case where
+    # the per-pack numbers are least worth trusting. An earlier version
+    # returned early from the wiring branch and rendered them as measurements.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 40.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 70.0, "voltage_v": 53.50},
+    ]
+    status = _at(120, modules=modules)
+    assert status.wiring_suspect
+    assert status.soc_is_estimate
+    assert status.days_since == 120.0
+
+
+def test_a_pack_that_stopped_reporting_does_not_fire_the_wiring_alarm() -> None:
+    # The latest-per-module query has no time bound, so a pack that fell off
+    # the CAN bus keeps returning its final reading forever. Comparing that
+    # against three live packs sends the owner after a fault that does not
+    # exist, while the real problem — a dropped link — goes unnamed.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 60.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 61.0, "voltage_v": 53.79},
+        {"timestamp": NOW, "serial": "C", "soc_pct": 60.0, "voltage_v": 53.81},
+        {"timestamp": NOW - timedelta(days=7), "serial": "D", "soc_pct": 95.0, "voltage_v": 51.20},
+    ]
+    status = _at(2, modules=modules)
+    assert not status.wiring_suspect
+    assert status.voltage_spread_mv == 20.0
+    assert status.soc_spread_pct == 1.0
+
+
+def test_a_silent_pack_is_unknown_not_zero() -> None:
+    # An absent module must never be folded into the spread as 0%, which would
+    # manufacture a 60-point drift out of a CAN dropout.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 61.0, "voltage_v": 53.78},
+        {"timestamp": NOW, "serial": "B", "soc_pct": None, "voltage_v": None},
+    ]
+    status = _at(2, modules=modules)
+    assert status.soc_spread_pct is None
+    assert status.voltage_spread_mv is None
+    assert not status.wiring_suspect
+
+
+def test_a_single_pack_bank_has_no_spread_to_report() -> None:
+    status = _at(2, modules=_modules(NOW, {"A": 61.0}))
+    assert status.soc_spread_pct is None
+    assert not status.wiring_suspect

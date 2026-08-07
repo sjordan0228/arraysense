@@ -1,0 +1,22 @@
+# Solar ArraySense configuration.
+# Copy to /etc/arraysense/config.toml and fill in your own values.
+# This file identifies your hardware — keep it out of version control.
+
+# Address of the inverter's WiFi dongle. Give it a static DHCP lease.
+dongle_host = "192.168.1.50"
+
+# The dongle's 10-character serial. On its label, in your router's DHCP
+# list, or broadcast as the dongle's WiFi access point name.
+dongle_serial = "BA12345678"
+
+# The inverter's 10-character serial. Read it from the inverter itself:
+# other tools have been observed reporting a different value, and a
+# mismatch makes every read fail.
+inverter_serial = "CE12345678"
+
+# Seconds between reads. The dongle answers when it answers, so asking faster
+# than the round trip takes gains nothing.
+poll_interval = 11.0
+
+# Where the database is written. Prefer an SSD over a Pi's SD card.
+database_path = "/var/lib/arraysense/arraysense.db"
