@@ -131,6 +131,18 @@ class CollectorService:
         """Whether the dongle has been released for someone else to use."""
         return self.status.yielding
 
+    @property
+    def source(self) -> InverterSource:
+        """The inverter this is polling.
+
+        Exposed so the status endpoint can report diagnostics the source keeps
+        and the service does not — the count of crossed replies, for one, which
+        belongs to whichever transport had to recover from them. Read-only: the
+        service owns the connection's lifecycle and a caller that reconnected
+        it out from under the poll loop would lose the dongle's single slot.
+        """
+        return self._source
+
     async def start(self) -> None:
         """Begin polling in the background.
 

@@ -1175,3 +1175,25 @@ def test_the_month_charge_is_judged_in_the_owners_zone(client: Any) -> None:
         },
     ).json()
     assert (body.get("cost") or {}).get("fixed_charge") == pytest.approx(15.0, abs=0.01)
+
+
+def test_status_reports_recovered_crossed_replies(client: Any) -> None:
+    # The dongle serves its vendor's cloud on the same socket and the replies
+    # cross. One retried and recovered is the dongle being itself; a rate that
+    # climbs is a fault. Neither is visible today: a successful retry logs at
+    # DEBUG and the service runs at INFO, so the healthy case and the failing
+    # case look identical from outside — which is the whole reason the adapter
+    # counts them.
+    body = client.get("/api/status").json()
+    assert "misroutes" in body
+
+
+def test_status_says_nothing_about_misroutes_a_source_cannot_count(
+    client: Any,
+) -> None:
+    # FakeSource has no counter, and a source that cannot count crossed replies
+    # must report null rather than zero. Zero is a measurement meaning "none
+    # happened", and claiming it from a source that never looked is the same
+    # error as rendering a missing reading as 0.
+    body = client.get("/api/status").json()
+    assert body["misroutes"] is None

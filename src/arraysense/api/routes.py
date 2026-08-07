@@ -130,6 +130,17 @@ async def status(request: Request) -> dict[str, Any]:
         "total_samples": s.total_samples,
         "total_failures": s.total_failures,
         "started_at": s.started_at.isoformat() if s.started_at else None,
+        # Crossed replies the adapter retried. The dongle serves its vendor's
+        # cloud on the same socket and the answers cross, so a read of register
+        # 32 comes back carrying 5000. One recovered is the dongle being itself
+        # and a climbing rate is a fault, but neither was visible from outside:
+        # a successful retry logs at DEBUG and the service runs at INFO, which
+        # made the healthy case and the failing case look identical.
+        #
+        # None rather than 0 from a source that does not count them. Zero is a
+        # measurement meaning none happened, and claiming it from something that
+        # never looked is the same error as rendering a missing reading as 0.
+        "misroutes": getattr(service.source, "misroutes", None),
     }
 
 
