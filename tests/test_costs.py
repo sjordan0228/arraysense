@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from arraysense.costs import band_intervals, period_energy
-from arraysense.tariff import Tariff, compute_cost, estimate_bill, parse_bands
+from arraysense.tariff import (
+    PeriodEnergy,
+    Tariff,
+    compute_cost,
+    estimate_bill,
+    parse_bands,
+)
 
 TZ = ZoneInfo("America/Chicago")
 
@@ -307,3 +314,77 @@ def test_the_projection_scales_by_what_was_watched_not_by_what_was_asked_for() -
     assert bill is not None
     # 12 kWh over 12 hours, across a 744-hour month.
     assert bill.projected_energy_cost == pytest.approx(12 * 0.10 * (744 / 12), rel=0.02)
+
+
+def test_a_gap_inside_a_band_does_not_inflate_the_projection() -> None:
+    # Counters keep counting while nobody is watching — that is the whole
+    # reason this reads them instead of integrating power — so a delta across
+    # a four-hour outage still covers those four hours. Dividing that energy by
+    # the two hours the collector was awake projects a month at three times the
+    # real rate. The denominator has to be the span the counters account for,
+    # which is a different question from how much of it was observed.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"), fixed_monthly=0.0)
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    energy = period_energy(flat, _counter(start, (0, 1, 5, 6)), start, end, TZ)
+    assert energy.grid_import_kwh["Flat"] == pytest.approx(6.0)
+    # Still honest about how much of the day anybody watched.
+    assert energy.measured_minutes == pytest.approx(120)
+    # But the six kilowatt-hours are spread across six hours, not two.
+    assert energy.counted_minutes == pytest.approx(360)
+    bill = estimate_bill(flat, energy)
+    assert bill is not None
+    assert bill.projected_energy_cost == pytest.approx(6 * 0.10 * (744 / 6), rel=0.02)
+
+
+def test_a_failed_poll_is_not_evidence_that_anything_was_measured() -> None:
+    # A row with no counter on it is a poll that came back empty. Counting its
+    # timestamp made four failed polls a minute apart look like three minutes
+    # of collection, and coverage is the figure the page uses to decide whether
+    # to warn that a total is short.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"))
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    rows: list[dict[str, object]] = [
+        {"timestamp": start + timedelta(minutes=m), "grid_import_energy_total_kwh": None}
+        for m in range(4)
+    ]
+    energy = period_energy(flat, rows, start, end, TZ)
+    assert energy.measured_minutes == 0.0
+    assert energy.counted_minutes == 0.0
+
+
+def test_a_reading_from_before_the_period_still_bounds_it() -> None:
+    # The endpoint widens its query so the first interval has an earlier
+    # reading to be measured from. Discarding that row outright loses the
+    # stretch between the period's start and the first reading inside it.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"))
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    rows = _counter(start - timedelta(hours=1), (0, 2, 3))  # 23:00, 01:00, 02:00
+    energy = period_energy(flat, rows, start, end, TZ)
+    assert energy.counted_minutes == pytest.approx(120)
+
+
+def test_an_unknown_export_credit_leaves_the_bill_absent_rather_than_larger() -> None:
+    # A tariff that pays for export and an export figure nobody has is a bill
+    # that cannot be told, not a bill with no credit on it. Netting off nothing
+    # quotes a total higher than the one that arrives.
+    paying = Tariff(
+        bands=parse_bands("Flat | 0.10 | 00:00-24:00"),
+        fixed_monthly=10.0,
+        export_per_kwh=0.05,
+    )
+    energy = PeriodEnergy(
+        start=_day(2026, 7, 1),
+        end=_day(2026, 7, 11),
+        grid_import_kwh={"Flat": 100.0},
+        grid_export_kwh=None,
+        counted_minutes=10 * 1440,
+    )
+    bill = estimate_bill(paying, energy)
+    assert bill is not None
+    assert bill.projected_energy_cost is not None
+    assert bill.estimated_total is None
+
+    # And with the export known, it is told.
+    known = estimate_bill(paying, replace(energy, grid_export_kwh=40.0))
+    assert known is not None
+    assert known.estimated_total is not None

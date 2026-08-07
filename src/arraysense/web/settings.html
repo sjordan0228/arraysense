@@ -166,6 +166,15 @@ function control(spec, value) {
 // Checked here as well as there so a mistake is caught beside the control that
 // made it — the server validates every value before writing any of them, so
 // one bad field otherwise means a whole form rejected with a single message.
+//
+// This is a courtesy, never the authority, and it is deliberately the more
+// permissive of the two. Where the two cannot agree exactly — Node and Python
+// disagree about which code points are assigned, and the tariff's grammar is
+// checked only by the parser, which this page must not carry a second copy of
+// — the difference has to fall this way round. A page that accepts what the
+// server refuses shows the server's own message on the field. A page that
+// refuses what the server would accept is a value nobody can save and no
+// message that explains why.
 function fault(spec, value) {
   if (value === undefined) return null;
   if (spec.kind === 'int' || spec.kind === 'float') {
@@ -182,8 +191,12 @@ function fault(spec, value) {
     return null;
   }
   if (spec.kind === 'str') {
-    if (spec.max_length && value.length > spec.max_length) {
-      return `${spec.label} is too long at ${value.length} characters, `
+    // Counted in code points, the way Python counts them. A JavaScript string's
+    // length is UTF-16 code units, so an emoji counts twice here and once
+    // there — and the two would disagree about a value near the cap.
+    const points = [...value].length;
+    if (spec.max_length && points > spec.max_length) {
+      return `${spec.label} is too long at ${points} characters, `
         + `the limit is ${spec.max_length}.`;
     }
     // The same rule settings.py applies: a newline is content only where the
@@ -192,12 +205,12 @@ function fault(spec, value) {
     // one — a newline is also a control character, and checking that
     // separately is how this rejected the very field it had just permitted.
     const allowed = isLong(spec) ? ' \n' : ' ';
-    const bad = [...value].some((ch) => {
-      if (allowed.includes(ch)) return false;
-      const code = ch.charCodeAt(0);
-      return /\s/.test(ch) || code < 32 || code === 127
-        || (code >= 0x200b && code <= 0x200f) || code === 0xfeff;
-    });
+    // Python's str.isprintable() is the rule on the other side, and it rejects
+    // every Unicode category the regex below names — the format characters
+    // (Cf) that a narrower list of "zero-width" code points kept missing, such
+    // as the soft hyphen and the word joiner.
+    const bad = [...value].some((ch) =>
+      !allowed.includes(ch) && (/\s/u.test(ch) || /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u.test(ch)));
     if (bad) return `${spec.label} must not contain control or invisible characters.`;
   }
   return null;

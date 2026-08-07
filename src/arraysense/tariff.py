@@ -275,9 +275,17 @@ class PeriodEnergy:
     Nobody meters the bank, so ``battery_discharge_kwh`` is priced by nothing —
     but it is what the system carried through the expensive hours, and valuing
     it at the band's own rate is the only way to say what those hours would
-    otherwise have cost. ``measured_minutes`` against ``elapsed_minutes`` says
-    how much of the period the collector was running for, so a total shortened
-    by an outage can be shown as short rather than as a quiet month.
+    otherwise have cost.
+
+    Three durations, and they answer three different questions. ``elapsed`` is
+    how long the period was. ``measured`` is how much of it anybody watched,
+    which is what a coverage figure is drawn from, so a total shortened by an
+    outage can be shown as short rather than as a quiet month. ``counted`` is
+    the span the energy totals actually account for — first reading to last —
+    and it is the only one a projection may divide by. A counter delta spans an
+    outage by design, so six kilowatt-hours read across a four-hour gap belong
+    to six hours and not to the two the collector was awake for; dividing by
+    ``measured`` there projected a month at three times the real rate.
     """
 
     start: datetime
@@ -288,6 +296,7 @@ class PeriodEnergy:
     battery_discharge_kwh: Mapping[str, float | None] | None = None
     measured_minutes: float | None = None
     elapsed_minutes: float | None = None
+    counted_minutes: float | None = None
 
     def __post_init__(self) -> None:
         """Reject naive bounds and a period that runs backwards.
@@ -796,25 +805,27 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     _, so_far = _price(active, imported)
     whole_month = tariff.bands_in_effect(month_start, month_end) or tariff.bands
 
-    # Scaled by what was *watched*, not by what was asked for. A collector that
-    # ran for twelve hours of a day the caller requested in full has measured
-    # half a day's energy, and dividing it by the whole day projects a month at
-    # half the rate the house actually uses. Falls back to the requested span
-    # when nothing said how much was observed.
-    observed = covered if energy.measured_minutes is None else energy.measured_minutes * 60
-    scale = max(month_seconds / observed, 1.0) if observed > 0 else None
+    # Scaled by the span the counters account for, not by the span requested
+    # and not by the time observed. A collector that ran for twelve hours of a
+    # day asked for in full measured half a day's energy, and dividing that by
+    # the whole day projects a month at half the real rate; dividing it instead
+    # by the minutes anybody watched overshoots the other way, because a
+    # counter kept counting through every gap between those minutes.
+    accounted = covered if energy.counted_minutes is None else energy.counted_minutes * 60
+    scale = max(month_seconds / accounted, 1.0) if accounted > 0 else None
     projected = None if so_far is None or scale is None else so_far * scale
 
+    pays_for_export = tariff.export_per_kwh is not None
     credit: float | None = None
-    if (
-        tariff.export_per_kwh is not None
-        and energy.grid_export_kwh is not None
-        and scale is not None
-    ):
-        credit = energy.grid_export_kwh * tariff.export_per_kwh * scale
+    if pays_for_export and energy.grid_export_kwh is not None and scale is not None:
+        credit = energy.grid_export_kwh * tariff.export_per_kwh * scale  # type: ignore[operator]
 
     total: float | None = None
-    if projected is not None:
+    # A tariff that pays for export and an export figure nobody has is not a
+    # bill of zero credit — it is a bill that cannot be told. Netting off
+    # nothing there would quote a total higher than the one that arrives, and
+    # doing it silently is worse than not quoting one.
+    if projected is not None and not (pays_for_export and credit is None):
         total = _money(projected + tariff.fixed_monthly - (credit or 0.0))
 
     return BillEstimate(

@@ -318,6 +318,12 @@ async def costs(
             "bill": None,
         }
 
+    # A naive bound means the zone the caller asked about, not the server's.
+    # Resolved here rather than deeper down, because the store query below
+    # turns these into epoch seconds and would otherwise read a naive midnight
+    # as midnight wherever the service happens to be installed.
+    start, end = with_zone(start, zone), with_zone(end, zone)
+
     # Read back before the period starts so its first interval has a reading to
     # be measured *from*, rather than starting at whatever row happens to fall
     # inside it. Without the lead, the first stretch of every month is short by

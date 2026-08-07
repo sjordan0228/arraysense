@@ -25,7 +25,13 @@ from datetime import UTC, datetime, timedelta, tzinfo
 from itertools import pairwise
 from zoneinfo import ZoneInfo
 
-from arraysense.energy import MAX_EDGE_GAP, EnergyBucket, bucket_totals, with_zone
+from arraysense.energy import (
+    ENERGY_FIELDS,
+    MAX_EDGE_GAP,
+    EnergyBucket,
+    bucket_totals,
+    with_zone,
+)
 from arraysense.tariff import PeriodEnergy, RateBand, Tariff
 
 logger = logging.getLogger(__name__)
@@ -152,16 +158,15 @@ def _aligned(
     the period's energy had vanished from it.
 
     Both sequences are in time order and the buckets are a subsequence, so one
-    pointer walk aligns them exactly.
+    pointer walk aligns them exactly. Edges are compared as absolute instants:
+    two local datetimes an hour apart inside the repeated autumn hour compare
+    equal when they share a ``tzinfo``, which would let the second occurrence
+    of 01:00 claim the first one's bucket.
     """
     out: list[EnergyBucket | None] = []
     index = 0
     for interval in intervals:
-        if (
-            index < len(buckets)
-            and buckets[index].start == interval.start
-            and buckets[index].end == interval.end
-        ):
+        if index < len(buckets) and _same_edges(buckets[index], interval):
             out.append(buckets[index])
             index += 1
         else:
@@ -169,12 +174,44 @@ def _aligned(
     return out
 
 
-def _observed_minutes(
-    rows: Sequence[Mapping[str, object]],
-    start: datetime,
-    end: datetime,
-    max_gap: timedelta,
-) -> float:
+def _same_edges(bucket: EnergyBucket, interval: BandInterval) -> bool:
+    """Whether a bucket spans exactly this interval, judged in absolute time."""
+    return bucket.start.astimezone(UTC) == interval.start.astimezone(UTC) and bucket.end.astimezone(
+        UTC
+    ) == interval.end.astimezone(UTC)
+
+
+def _reading_moments(
+    rows: Sequence[Mapping[str, object]], start: datetime, end: datetime
+) -> list[datetime]:
+    """When a counter was actually read, in order, within the period.
+
+    A row with no counter on it is a failed poll or a row from a tier that does
+    not carry energy, and it is not evidence that anything was measured.
+    Counting those made four failed polls a minute apart look like three
+    minutes of collection.
+    """
+    fields = list(ENERGY_FIELDS.values())
+    seen: list[datetime] = []
+    for row in rows:
+        if all(row.get(f) is None for f in fields):
+            continue
+        moment = _local_or_none(row.get("timestamp"), start.tzinfo)
+        if moment is not None and moment <= end:
+            seen.append(moment)
+    seen.sort()
+    inside = [m for m in seen if m >= start]
+    # A reading from before the period still bounds it: the caller widens the
+    # query precisely so the first interval has something to be measured from,
+    # and dropping it outright loses the stretch between the period's start and
+    # the first reading inside it.
+    before = [m for m in seen if m < start]
+    if before and inside:
+        inside.insert(0, start)
+    return inside
+
+
+def _observed_minutes(moments: Sequence[datetime], max_gap: timedelta) -> float:
     """How many minutes of the period the collector was actually running for.
 
     Measured off the readings themselves rather than off the bands, because the
@@ -184,18 +221,31 @@ def _observed_minutes(
     readings reported itself as complete coverage and the page drew "100%".
 
     Two readings more than ``max_gap`` apart bracket an outage rather than a
-    quiet stretch, so the time between them is not counted.
+    quiet stretch, so the time between them is not counted. That makes this the
+    wrong denominator for a projection and the right one for a coverage figure;
+    see ``_counted_minutes`` for the other.
     """
-    stamped = [_local_or_none(row.get("timestamp"), start.tzinfo) for row in rows]
-    inside = sorted(m for m in stamped if m is not None and start <= m <= end)
-    if len(inside) < 2:
+    if len(moments) < 2:
         return 0.0
     total = 0.0
-    for earlier, later in pairwise(inside):
+    for earlier, later in pairwise(moments):
         span = later.astimezone(UTC) - earlier.astimezone(UTC)
         if span <= max_gap:
             total += span.total_seconds() / 60
     return total
+
+
+def _counted_minutes(moments: Sequence[datetime]) -> float:
+    """The span the energy totals account for: first reading to last.
+
+    Gaps included, deliberately. A counter delta covers the outage it spans —
+    that is the entire reason this reads counters instead of integrating power
+    — so the energy between the first and last reading belongs to all of the
+    time between them, not only to the parts anybody watched.
+    """
+    if len(moments) < 2:
+        return 0.0
+    return _real_minutes(moments[0], moments[-1])
 
 
 def _local_or_none(value: object, tz: tzinfo | None) -> datetime | None:
@@ -265,7 +315,7 @@ def period_energy(
         if value is not None:
             exported = (exported or 0.0) + value
 
-    measured = _observed_minutes(rows, local_start, local_end, max_gap)
+    moments = _reading_moments(rows, local_start, local_end)
 
     return PeriodEnergy(
         start=local_start,
@@ -274,6 +324,7 @@ def period_energy(
         load_kwh=load or None,
         grid_export_kwh=exported,
         battery_discharge_kwh=discharged or None,
-        measured_minutes=measured,
+        measured_minutes=_observed_minutes(moments, max_gap),
+        counted_minutes=_counted_minutes(moments),
         elapsed_minutes=_real_minutes(intervals[0].start, intervals[-1].end),
     )
