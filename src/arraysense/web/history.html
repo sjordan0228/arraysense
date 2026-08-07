@@ -167,7 +167,12 @@ const WHOLE_NUMBER_ABOVE = 100;
 // `configured` false means no tariff has been entered, and then the column is
 // not drawn at all. Not a column of dashes, and certainly not zeroes: there is
 // nothing to say about money on an install that has never entered a rate.
-let priced = { configured: false, currency: null };
+//
+// `totals` is the footer's row, priced by the service over the same buckets it
+// sent. It is not the sum of the column above it and must not be replaced by
+// one: the cells are rounded to the cent they are read at, and thirty-one
+// shares of a $15.00 connection charge shown as $0.48 add up to $14.88.
+let priced = { configured: false, currency: null, totals: null };
 
 // Which span is on screen. Module scope rather than passed around because the
 // chart is built once and updated in place — uPlot keeps the axis formatters
@@ -328,10 +333,16 @@ function drawTable(span, rows) {
   drawTotals(span, rows, places);
 }
 
-// The sum of what is actually on screen, said in those words. A figure labelled
+// The totals row, and what it covers said in those words. A figure labelled
 // "30 days" that quietly adds up twenty-seven of them is the same lie as a
 // missing day rendered as zero, so the count, the holes and the partials are
 // spelled out beside it. A column nothing reported stays a dash.
+//
+// The kilowatt-hour columns are added up here and the money columns are not.
+// Counters carry one decimal, so a column of tenths adds to a tenth and the
+// only thing lost is float noise; money is rounded to the cent it is read at,
+// and adding a rounded column is how a total drifts from the bill it is a view
+// of.
 function drawTotals(span, rows, places) {
   const reported = rows.filter((r) => r.reported);
   if (!reported.length) { $('hist').querySelector('tfoot').innerHTML = ''; return; }
@@ -352,22 +363,17 @@ function drawTotals(span, rows, places) {
   if (partial) notes.push(`${partial} partial`);
   const unpriced = priced.configured ? reported.filter((r) => r.cost === null).length : 0;
   if (unpriced) notes.push(`${unpriced} not priced`);
+  // Priced by the service over these same buckets, from the kilowatt-hours
+  // behind them: a cell reads $0.48 because that is a cent-rounded thirty-first
+  // of the connection charge, and thirty-one of those come to $14.88 against
+  // the $15.00 billed. A bucket it could not price is out of the total for the
+  // same reason it is a dash in the column, and the note above says how many.
+  const total = priced.totals || {};
   $('hist').querySelector('tfoot').innerHTML =
     `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}`
     + (priced.configured
-        ? costCell(moneyTotal(reported, 'cost')) + costCell(moneyTotal(reported, 'saved'))
+        ? costCell(numOrNull(total.cost)) + costCell(numOrNull(total.saved))
         : '') + '</tr>';
-}
-
-// The sum of the money actually on screen. A row nobody could price is left
-// out of it rather than counted as nothing, and the footer says how many were
-// left out — a total that quietly skips a day is the same lie as a missing day
-// drawn as zero, only in currency. Every row unpriced means there is no total
-// to give at all.
-function moneyTotal(reported, key) {
-  const priceable = reported.filter((r) => r[key] !== null);
-  if (!priceable.length) return null;
-  return Math.round(priceable.reduce((sum, r) => sum + r[key], 0) * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +640,7 @@ async function load() {
     priced = {
       configured: body.configured === true,
       currency: typeof body.currency === 'string' ? body.currency : null,
+      totals: (body.totals && typeof body.totals === 'object') ? body.totals : null,
     };
     // The note below the table depends on whether there is a cost column, and
     // that is not known until the first reply arrives.

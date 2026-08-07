@@ -15,6 +15,7 @@ it actually got.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -38,6 +39,7 @@ from arraysense.tariff import (
     CostResult,
     PeriodEnergy,
     Tariff,
+    apportion_fixed,
     estimate_bill,
     load_tariff,
 )
@@ -531,9 +533,15 @@ async def energy(
     kilowatt-hours at the peak rate. It also means one read of the counters
     answers both questions instead of two reads that have to agree.
 
+    It also carries ``totals``: the whole span priced in one pass, which is not
+    the sum of the buckets and must not be replaced by one. The per-bucket
+    figures are rounded to the cent they are displayed at, and adding thirty-one
+    of those together turns a $15.00 connection charge into $14.88. A page that
+    added its own column up would drift from the month it is a view of.
+
     With no tariff entered the reply carries no money at all: no currency, no
-    cost on any bucket, and ``configured`` false. Not zero — an install that
-    has never entered a tariff shows its energy and says so.
+    cost on any bucket, no totals, and ``configured`` false. Not zero — an
+    install that has never entered a tariff shows its energy and says so.
     """
     try:
         zone = resolve_zone(tz)
@@ -550,13 +558,13 @@ async def energy(
         values = SettingsStore(store).all()
         tariff, stored = load_tariff(values), str(values.get(SETTING_BANDS) or "").strip()
 
+    # Both keyed by the bucket's own opening edge, so money reaches the bucket
+    # it belongs to by identity rather than by counting: the reply leaves out a
+    # bucket the counters said nothing about, and a cost matched by position
+    # would then slide onto that bucket's neighbour.
     money: dict[datetime, CostResult | None] = {}
+    splits: dict[datetime, PeriodEnergy] = {}
     if tariff is not None:
-        # Keyed by the bucket's own opening edge, so money reaches the bucket
-        # it belongs to by identity rather than by counting: the reply leaves
-        # out a bucket the counters said nothing about, and a cost matched by
-        # position would then slide onto that bucket's neighbour.
-        #
         # ``end`` goes with it so the bucket in progress is priced over the
         # part of itself that has happened. A calendar month runs to the first
         # of the next, and pricing hours still in the future leaves the whole
@@ -564,14 +572,9 @@ async def energy(
         # electricity.
         priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
         for index, split in enumerate(priced_buckets):
+            splits[read.edges[index]] = split
             money[read.edges[index]] = price_period(
-                tariff,
-                split,
-                # A month bucket is a billing month and owes the whole charge;
-                # a day inside one owes a day's share. Passing it here rather
-                # than letting each path decide is what keeps this page and the
-                # Costs page agreeing about the month in progress.
-                fixed_charge=tariff.fixed_monthly if period == "month" else None,
+                tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
             )
 
     payload: dict[str, Any] = {
@@ -596,8 +599,134 @@ async def energy(
             # for opposite actions, and conflating them tells somebody staring
             # at the tariff they just typed that they have not entered one.
             "unreadable": tariff is None and bool(stored),
+            # Over the buckets above and in their order, so the footer of a
+            # table totals the rows of that same table and nothing else.
+            "totals": _period_total(
+                tariff,
+                period,
+                [
+                    (splits[bucket.start], money.get(bucket.start))
+                    for bucket in read.buckets
+                    if bucket.start in splits
+                ],
+            ),
         }
     return payload
+
+
+def _bucket_fixed(tariff: Tariff, period: Period, span: PeriodEnergy) -> float:
+    """One bucket's share of the monthly connection charge, unrounded.
+
+    A month bucket is a billing month and owes the whole charge; a day inside
+    one owes a day's share. Decided here rather than at each call site because
+    the per-bucket figure and the period total have to agree on it — a total
+    that apportioned differently from the rows above it would be a footer that
+    contradicts its own column.
+
+    Unrounded on purpose. It is one input to a figure rounded once, and the
+    whole reason this endpoint reports a total at all is that rounding first
+    and adding afterwards turns thirty-one shares of $15.00 into $14.88.
+    """
+    if period == "month":
+        return tariff.fixed_monthly
+    return apportion_fixed(tariff.fixed_monthly, span.start, span.end)
+
+
+def _merge_bands(
+    parts: Iterable[Mapping[str, float | None] | None],
+) -> dict[str, float | None]:
+    """Add each band's kilowatt-hours across several buckets, keeping unknown unknown.
+
+    A band one bucket could not measure makes that band unknown for the whole
+    run rather than the sum of the buckets that did report it — which would be
+    a missing reading rendered as a smaller number, at the point where it turns
+    into money. A band simply absent from a bucket is different and is skipped:
+    the day before the season turns never entered the peak window, so it has
+    nothing to contribute rather than something nobody watched.
+    """
+    out: dict[str, float | None] = {}
+    for part in parts:
+        for name, kwh in (part or {}).items():
+            running = out.get(name, 0.0)
+            out[name] = None if kwh is None or running is None else running + kwh
+    return out
+
+
+def _price_together(
+    tariff: Tariff, period: Period, spans: Sequence[PeriodEnergy]
+) -> CostResult | None:
+    """Price a run of buckets as one period rather than adding up their costs.
+
+    ``spans`` arrives in calendar order, so the combined period runs from the
+    first bucket's start to the last one's end without comparing two datetimes
+    that share a zone — a comparison Python answers off the wall clock, which
+    is the trap every other duration in this project goes out of its way to
+    avoid.
+
+    The connection charge is summed from the buckets rather than apportioned
+    across the span, because the span may have holes in it. A month missing its
+    fifteenth owes thirty days of the charge, not thirty-one, and apportioning
+    over the whole month would quietly charge for the day nobody could price.
+    """
+    if not spans:
+        return None
+    return price_period(
+        tariff,
+        PeriodEnergy(
+            start=spans[0].start,
+            end=spans[-1].end,
+            grid_import_kwh=_merge_bands(span.grid_import_kwh for span in spans),
+            load_kwh=_merge_bands(span.load_kwh for span in spans) or None,
+            battery_discharge_kwh=_merge_bands(span.battery_discharge_kwh for span in spans)
+            or None,
+        ),
+        fixed_charge=sum(_bucket_fixed(tariff, period, span) for span in spans),
+    )
+
+
+def _period_total(
+    tariff: Tariff | None,
+    period: Period,
+    buckets: Sequence[tuple[PeriodEnergy, CostResult | None]],
+) -> dict[str, Any]:
+    """What the whole span cost, priced once rather than added up from the rows.
+
+    The History page's footer used to sum the column above it, and that column
+    has already been rounded to the cent a reader can see. Thirty-one shares of
+    a connection charge are $0.4838 apiece, shown as $0.48 and adding to $14.88
+    against the $15.00 the supplier bills. Whether the roundings cancel is pure
+    luck in the divisor — thirty shares of $15.00 come to exactly $15.00, and
+    twenty-eight come to $15.12 — which is the argument for not summing
+    displayed figures at all rather than an argument about magnitude. So the
+    buckets' band energy is added up
+    unrounded and priced in a single pass, exactly as the monthly row is, and
+    the page draws what comes back instead of deriving money a second time.
+
+    Only the buckets the service could price are in it. A month with a day
+    nobody measured does not cost the sum of the days that were, and this says
+    so by covering fewer rows rather than by treating the hole as free; a span
+    where nothing could be priced has no total at all, which is a dash and
+    never a zero.
+
+    Cost and savings are totalled over their own rows, because they can be
+    knowable for different ones. A counter reset takes one column backwards and
+    not the other, leaving a day whose import is readable and whose house load
+    is not — that day has a cost and no statable saving, and dropping it from
+    both totals would understate the bill it is part of.
+    """
+    if tariff is None:
+        return {}
+    costed = [energy for energy, result in buckets if result and result.cost is not None]
+    saving = [energy for energy, result in buckets if result and result.savings is not None]
+    whole = _price_together(tariff, period, costed)
+    against = _price_together(tariff, period, saving)
+    return {
+        "cost": whole.cost if whole else None,
+        "energy_cost": whole.energy_cost if whole else None,
+        "fixed_charge": whole.fixed_charge if whole else None,
+        "saved": against.savings if against else None,
+        "no_solar_cost": against.no_solar_cost if against else None,
+    }
 
 
 def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str, Any]:

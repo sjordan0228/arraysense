@@ -8,8 +8,10 @@
 // about what the same number means.
 //
 // Loaded as a classic script — not a module — immediately before each page's
-// own script, so everything declared here is already in scope for it. Nothing
-// runs on load except the stylesheet below.
+// own script, so everything declared here is already in scope for it. Two
+// things run on load: the stylesheet below, and the stale-data watch, which
+// puts itself on every page precisely because no page has to remember to ask
+// for it.
 
 // ---------------------------------------------------------------------------
 // The shared look. Injected rather than served as a second file so a page needs
@@ -75,6 +77,34 @@ const BASE_CSS = `
   .nav a[aria-current="page"]{background:rgba(255,255,255,.17);color:var(--ink);font-weight:500}
   .nav a:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .view[hidden]{display:none}
+  /* The stale-data banner. It sits directly under the nav on every page — the
+     slot the dashboard's calibration advisory already uses — so a warning
+     appearing never pushes the navigation down the screen, and it is shaped
+     like that advisory on purpose: a strip with a coloured rule. A second
+     visual language for "something is wrong" is one the reader has to learn
+     twice. The rule's colour is never what carries the meaning; the mark and
+     the headline say which condition this is in a glyph and in words. */
+  .stale{display:flex;gap:13px;align-items:flex-start;margin-bottom:12px;
+    border-left:3px solid var(--ink3)}
+  .stale[hidden]{display:none}
+  .stale h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--ink)}
+  .stale p{margin:5px 0 0;font-size:12px;line-height:1.5;color:var(--ink2);max-width:82ch}
+  .stale .stalebody{min-width:0}
+  .stale .stalemark{flex:0 0 auto;font-size:15px;line-height:1.5;color:var(--ink3)}
+  /* The inverter's own words, quieter than the sentence that introduces them
+     and allowed to break anywhere: "OSError: [Errno 113] No route to host" has
+     nowhere to wrap on a phone. */
+  .stale .stalewhy{margin-top:7px;font-size:10.5px;color:var(--ink3);
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
+  .stale .stalewhy[hidden]{display:none}
+  /* A deliberate yield is the quiet tone: the default rule, and a headline a
+     shade down from the two that report a fault. */
+  .stale.tone-note h2{color:var(--ink2)}
+  .stale.tone-warn{border-left-color:var(--warn)}
+  .stale.tone-warn .stalemark{color:var(--warn)}
+  .stale.tone-bad{border-left-width:5px;border-left-color:var(--bad);
+    background:linear-gradient(96deg,rgba(208,59,59,.17),rgba(208,59,59,.02) 46%,var(--panel))}
+  .stale.tone-bad .stalemark{color:var(--bad)}
   /* Charts. uPlot draws to a canvas and ships a light-mode stylesheet; the
      vendored copy is left pristine so a newer release can be dropped straight
      in, which means every dark-page override belongs here instead. */
@@ -267,6 +297,295 @@ function drawNav(current) {
   el.innerHTML = NAV.map((n) =>
     `<a href="${n.href}"${n.key === current ? ' aria-current="page"' : ''}>${esc(n.label)}</a>`
   ).join('');
+}
+
+// ---------------------------------------------------------------------------
+// The stale-data warning.
+//
+// Every page draws whatever the store last had in it and says nothing about how
+// old that is, so a collector that has stopped leaves the charts their shape
+// and the cards their numbers: a frozen dashboard is indistinguishable from a
+// quiet afternoon. It is the lie this project refuses everywhere else — a
+// missing reading is a dash and never a zero — told about the whole screen at
+// once.
+//
+// It belongs here rather than on the dashboard because Costs and History price
+// and total the same readings, and a stale bill is worth knowing about too.
+// Nothing on any page opts in: the banner finds its own place under the nav
+// this file already draws, and a warning a page has to remember to ask for is a
+// warning the sixth page forgets.
+// ---------------------------------------------------------------------------
+
+// Older than this and the reader is told. About sixty-five missed polls at the
+// reference cadence, so neither a blip nor the fifty-odd seconds a restart
+// costs can reach it.
+const STALE_AFTER_MS = 15 * 60 * 1000;
+
+// STALL_AFTER in collector/service.py, and the two numbers belong to each
+// other. The reader is warned at fifteen minutes and the watchdog restarts a
+// dead loop at twenty, so the normal experience of a crash is a warning that
+// appears and then clears itself — which is the right way round. Whoever
+// changes one changes both.
+const WATCHDOG_AFTER_MS = 20 * 60 * 1000;
+
+// How often the banner asks. Staleness is measured in quarter-hours, so this
+// governs how quickly the warning *clears* far more than how quickly it shows.
+const STALE_POLL_MS = 30 * 1000;
+
+// A timestamp from the status payload as epoch milliseconds, or null. An
+// absent or unparseable one is unknown and must not become an epoch of 1970,
+// which would read as fifty-six years stale.
+//
+// Named for the pair it belongs to rather than the obvious `stamp`, because
+// three of the five pages already declare a top-level function by that name —
+// and a `const` here against a `function` there is not shadowing but a
+// SyntaxError that stops the whole page script from running.
+const msOrNull = (iso) => {
+  const t = Date.parse(iso || '');
+  return Number.isFinite(t) ? t : null;
+};
+
+// How long it has been, in words. "Stale" answers the wrong question: the
+// useful one is always how far behind the screen is, and an hour behind and a
+// week behind call for different reactions.
+function elapsedWords(ms) {
+  const plural = (n, unit) => `${n} ${unit}${n === 1 ? '' : 's'}`;
+  const mins = Math.max(0, Math.round(ms / 60000));
+  if (mins < 60) return plural(mins, 'minute');
+  const hours = Math.floor(mins / 60);
+  if (hours < 48) {
+    const rest = mins % 60;
+    return plural(hours, 'hour') + (rest ? ' ' + plural(rest, 'minute') : '');
+  }
+  return plural(Math.floor(hours / 24), 'day')
+    + (hours % 24 ? ' ' + plural(hours % 24, 'hour') : '');
+}
+
+// A time of day for something that happened today, and the full date once it is
+// old enough that "14:32" would name the wrong day. Either way it is the
+// reader's own clock, because "when did this stop" is a question about their
+// afternoon and not about UTC.
+const clockWords = (t, age) => age !== null && age < 18 * 3600000
+  ? new Date(t).toLocaleTimeString() : new Date(t).toLocaleString();
+
+// What to say, given /api/status and the moment to measure against — or null
+// when there is nothing to say. Separated from the drawing so the cases can be
+// reasoned about as cases, and so each one can be asserted on directly.
+//
+// The distinction that matters most here is the one CollectorService.
+// stalled_for() draws: an inverter that will not answer is *not* a collector
+// that has died. Failing polls are the loop working correctly — it records each
+// gap, backs off and keeps trying — so that case names the inverter and quotes
+// the error, while silence from the loop itself names the service.
+//
+// Each tone carries its own mark, borrowed from the calibration ladder on the
+// dashboard: a dot advises, a triangle alerts, and here a pause bar says the
+// silence was asked for. Three shapes for three tones, so the reader who cannot
+// tell the amber rule from the red one still has the distinction.
+function staleState(status, now) {
+  if (!status || typeof status !== 'object') {
+    return {
+      kind: 'unreachable', tone: 'bad', mark: '⚠',
+      headline: 'The service is not answering',
+      detail: 'Nothing on this page can be trusted as current: /api/status could not be '
+        + 'reached, so there is no way to say how old these readings are.',
+      why: '',
+    };
+  }
+  const success = msOrNull(status.last_success);
+  const failure = msOrNull(status.last_failure);
+  // The age of the data, which is what the reader is being warned about, and
+  // not the age of the last attempt. A collector that has never managed a
+  // reading is measured from when it started, because that is how long the
+  // screen has been showing whatever the previous run left behind.
+  const from = success !== null ? success : msOrNull(status.started_at);
+  const age = from === null ? null : Math.max(0, now - from);
+  if (age !== null && age <= STALE_AFTER_MS) return null;
+
+  const words = age === null ? null : elapsedWords(age);
+  const behind = success !== null ? `Last reading ${clockWords(success, age)}, ${words} ago.`
+    : words !== null ? `Nothing has been read for ${words}.`
+    : 'Nothing has been read at all.';
+  const stopped = (because) => ({
+    kind: 'stopped', tone: 'bad', mark: '⚠',
+    headline: 'The collector has stopped', detail: `${behind} ${because}`, why: '',
+  });
+
+  // Silence somebody asked for. The dongle takes one TCP client at a time, so
+  // releasing it for the vendor's app is a deliberate act with an end time on
+  // it, and a warning here would train the reader to wave away the real ones.
+  if (status.yielding) {
+    const until = msOrNull(status.yield_until);
+    const resumes = until !== null && until > now
+      ? `polling resumes at ${new Date(until).toLocaleTimeString()}`
+      : 'polling resumes when the yield ends';
+    return {
+      kind: 'yield', tone: 'note', mark: '⏸',
+      headline: 'Paused — the dongle was handed over on purpose',
+      detail: `${behind} It takes one connection at a time and was released so another `
+        + `app could use it, so nothing is wrong here: ${resumes}.`,
+      why: '',
+    };
+  }
+
+  // Consulted here although stalled_for() deliberately ignores it. The watchdog
+  // avoids this flag because a dying loop clears it on its way out — but from
+  // the browser, a service reporting that it is not running is reporting
+  // exactly the thing this banner exists to say, whichever way it got there.
+  if (status.running === false) {
+    return stopped('The service is not polling, so nothing on this page will change '
+      + 'until it starts again.');
+  }
+
+  const marks = [success, failure].filter((t) => t !== null);
+  const idle = marks.length ? now - Math.max(...marks) : null;
+  if (failure !== null && idle !== null && idle <= WATCHDOG_AFTER_MS) {
+    const tries = Number(status.consecutive_failures);
+    return {
+      kind: 'inverter', tone: 'warn', mark: '●',
+      headline: 'The inverter is not responding',
+      detail: `${behind} The collector is still trying and is recording the gap`
+        + (Number.isFinite(tries) && tries > 0 ? `; ${tries} polls in a row have failed` : '')
+        + '.',
+      // Usually names the cause outright — a refused connection, no route to
+      // the dongle, a read that timed out — which is most of the diagnosis.
+      why: status.last_error ? String(status.last_error) : '',
+    };
+  }
+  if (idle === null || idle > WATCHDOG_AFTER_MS) {
+    return stopped('Neither a reading nor a failed poll has been recorded since, so the '
+      + 'poll loop is not running.');
+  }
+  // Stale, and it is too early to say why: the loop has marked nothing, but not
+  // for long enough to have been declared stuck. Saying which fault it is would
+  // be a guess, and the watchdog settles it within five minutes either way.
+  return {
+    kind: 'silent', tone: 'warn', mark: '●',
+    headline: 'No new readings',
+    detail: `${behind} Neither a reading nor a failed poll has been recorded since. If the `
+      + 'collector does not recover, the service restarts itself after twenty minutes.',
+    why: '',
+  };
+}
+
+// The banner's own element and its parts, built once. Kept and rewritten in
+// place rather than rebuilt, so the polite live region announces a change of
+// cause instead of re-reading itself every time the minute ticks over.
+let stalePart = null;
+
+function staleElement() {
+  if (stalePart) return stalePart;
+  const nav = $('nav');
+  const host = nav ? nav.parentNode : (document.querySelector('main') || document.body);
+  if (!host) return null;
+  const box = document.createElement('div');
+  box.className = 'p stale';
+  box.id = 'staleBanner';
+  box.hidden = true;
+  box.setAttribute('role', 'status');
+  box.setAttribute('aria-live', 'polite');
+  const mark = box.appendChild(document.createElement('div'));
+  mark.className = 'stalemark';
+  // Decorative: the glyph repeats what the headline says, and a screen reader
+  // announcing "warning sign" before the sentence adds nothing.
+  mark.setAttribute('aria-hidden', 'true');
+  const body = box.appendChild(document.createElement('div'));
+  body.className = 'stalebody';
+  const head = body.appendChild(document.createElement('h2'));
+  // The two lines that change as the minutes pass are left out of the live
+  // region, so the cause is announced once rather than the age every half
+  // minute for as long as the outage lasts.
+  const detail = body.appendChild(document.createElement('p'));
+  detail.setAttribute('aria-live', 'off');
+  const why = body.appendChild(document.createElement('div'));
+  why.className = 'stalewhy';
+  why.setAttribute('aria-live', 'off');
+  why.hidden = true;
+  if (nav) host.insertBefore(box, nav.nextSibling);
+  else host.insertBefore(box, host.firstChild);
+  stalePart = { box, mark, head, detail, why };
+  return stalePart;
+}
+
+function showStale(state) {
+  const parts = staleElement();
+  if (!parts) return;
+  if (!state) { parts.box.hidden = true; return; }
+  // Written as text and never as markup. last_error is a string from somewhere
+  // down in the transport stack and has no business being parsed as HTML, and
+  // text also means there is no esc() call here to forget. Only on a change,
+  // so an unchanged line is not re-announced to a screen reader.
+  const set = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+  parts.box.className = `p stale tone-${state.tone}`;
+  set(parts.mark, state.mark);
+  set(parts.head, state.headline);
+  set(parts.detail, state.detail);
+  set(parts.why, state.why || '');
+  parts.why.hidden = !state.why;
+  parts.box.hidden = false;
+  // No dismiss control, deliberately. Unlike the drift advisory this describes
+  // a condition that is either true this minute or it is not, and it clears
+  // itself the moment a reading arrives — there is nothing to snooze.
+}
+
+// One request, and the service's own clock along with it. A timestamp the
+// service wrote compared against the browser's idea of now compares two clocks,
+// and the wall tablet this is read on may have no working NTP; the Date header
+// is the service answering "what time is it there", so the age is measured
+// against the clock that produced the reading.
+// How many checks in a row must fail before the page says the service is not
+// answering. One is not evidence: a laptop waking from sleep, a WiFi roam or a
+// restart between polls all drop a single request, and at a thirty-second
+// cadence the loudest banner on the page would flash for every one of them.
+// Requiring a second consecutive failure puts thirty seconds between the blip
+// and the banner, which is a poll's worth of confirmation rather than none.
+const STALE_TOLERATED_MISSES = 1;
+let staleMisses = 0;
+
+async function checkStale() {
+  let status = null;
+  let now = Date.now();
+  try {
+    const response = await fetch('/api/status');
+    if (response.ok) {
+      const served = Date.parse(response.headers.get('date') || '');
+      if (Number.isFinite(served)) now = served;
+      status = await response.json();
+    }
+  } catch (err) {
+    // A status endpoint that cannot be reached is itself one of the cases, and
+    // staleState says so; nothing is swallowed by landing here.
+    status = null;
+  }
+  if (status === null) {
+    staleMisses += 1;
+    // Hold the previous verdict rather than replacing it with a louder one.
+    // If the collector really has stopped, the banner already up is the more
+    // accurate of the two and this only delays the escalation by a poll.
+    if (staleMisses <= STALE_TOLERATED_MISSES) return;
+  } else {
+    staleMisses = 0;
+  }
+  showStale(staleState(status, now));
+}
+
+function startStaleWatch() {
+  checkStale();
+  setInterval(checkStale, STALE_POLL_MS);
+  // A backgrounded tab has its timers throttled, so what a reader sees on
+  // coming back can be minutes out of date — including the banner whose whole
+  // job is to say that.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) checkStale();
+  });
+}
+
+// common.js is loaded from <head>, so on most pages there is no <nav> to hang
+// the banner under yet.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', startStaleWatch);
+} else {
+  startStaleWatch();
 }
 
 // ---------------------------------------------------------------------------

@@ -348,17 +348,46 @@ def _local_or_none(value: object, tz: tzinfo | None) -> datetime | None:
 # The energy-bucket fields that get split per band. Grid export is
 # deliberately not among them: no tariff here pays differently for export by
 # hour, so it is totalled whole and a band split would be invented precision.
+# See ``_whole_export`` for the totalling, which is not simply a sum.
 _SPLIT_FIELDS = ("grid_imported_kwh", "load_kwh", "battery_discharged_kwh")
 
 
 @dataclass(frozen=True)
 class _BandSplit:
-    """Grid import, house load and bank discharge per band, plus whole export."""
+    """Grid import, house load and bank discharge per band, plus whole export.
+
+    Every one of them is None where nobody measured it, and None here means the
+    same thing it means everywhere else: unknown, not nothing.
+    """
 
     imported: dict[str, float | None]
     load: dict[str, float | None]
     discharged: dict[str, float | None]
     exported: float | None
+
+
+def _whole_export(buckets: Sequence[EnergyBucket | None]) -> float | None:
+    """Total the period's export, or None if any stretch of it went unread.
+
+    Export takes no band split — no tariff here prices it by the hour — but it
+    is still a sum, and a sum is only as complete as the stretches it was added
+    from. Dropping the ones nobody measured and totalling the rest is the same
+    missing reading rendered as zero that the band split refuses, one field
+    along: a day with a seven-hour hole in it reported 17 kWh as confidently as
+    the 24 the meter actually holds, and a tariff that pays for export then
+    credits the difference to nobody.
+
+    A stretch no band covers still counts. Its energy is unpriced, not
+    unexported, and leaving it out would understate the total for a reason that
+    has nothing to do with the meter.
+    """
+    total: float | None = None
+    for bucket in buckets:
+        value = None if bucket is None else bucket.totals.get("grid_exported_kwh")
+        if value is None:
+            return None
+        total = (total or 0.0) + value
+    return total
 
 
 def _band_split(
@@ -371,7 +400,6 @@ def _band_split(
     the step where kilowatt-hours become money.
     """
     totals: dict[str, dict[str, float | None]] = {field: {} for field in _SPLIT_FIELDS}
-    exported: float | None = None
     for interval, bucket in zip(intervals, buckets, strict=True):
         if interval.band is None:
             logger.debug(
@@ -389,15 +417,11 @@ def _band_split(
                 into[interval.band] = None
             elif into.get(interval.band, 0.0) is not None:
                 into[interval.band] = (into.get(interval.band) or 0.0) + value
-    for bucket in buckets:
-        value = None if bucket is None else bucket.totals.get("grid_exported_kwh")
-        if value is not None:
-            exported = (exported or 0.0) + value
     return _BandSplit(
         imported=totals["grid_imported_kwh"],
         load=totals["load_kwh"],
         discharged=totals["battery_discharged_kwh"],
-        exported=exported,
+        exported=_whole_export(buckets),
     )
 
 

@@ -398,6 +398,95 @@ def test_an_unknown_export_credit_leaves_the_bill_absent_rather_than_larger() ->
     assert known.estimated_total is not None
 
 
+def _exporting_rows(
+    start: datetime, hours: int, silent: frozenset[int] = frozenset()
+) -> list[dict[str, object]]:
+    """Hourly counters on which the export meter climbs as well, and may go quiet.
+
+    ``silent`` names the hours whose row carries no export counter at all. The
+    inverter answers a poll without answering every energy register, so one
+    counter going absent while the others keep arriving is an ordinary reading
+    and not an outage — and it is the case in which the period is fully
+    measured in every respect except its export.
+    """
+    rows: list[dict[str, object]] = []
+    for hour in range(hours + 1):
+        row: dict[str, object] = {
+            "timestamp": start + timedelta(hours=hour),
+            "grid_import_energy_total_kwh": 1000.0 + hour,
+            "load_energy_total_kwh": 2000.0 + hour * 2,
+        }
+        if hour not in silent:
+            row["grid_export_energy_total_kwh"] = 300.0 + hour
+        rows.append(row)
+    return rows
+
+
+def test_export_measured_across_part_of_a_period_is_unknown_not_the_part() -> None:
+    # Nothing at all recorded between two in the afternoon and nine at night.
+    # The stretches either side exported 14 and 3 kilowatt-hours, and the meter
+    # says the day exported 24 — so summing the two that were read reports 17 as
+    # confidently as if the hole had never happened. It is not a smaller export;
+    # it is an export nobody knows.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    full = _exporting_rows(start, 24)
+    holed = full[:15] + full[21:]
+    assert period_energy(COSERV, holed, start, end, TZ).grid_export_kwh is None
+
+    # And a day read end to end still reports the whole of it.
+    assert period_energy(COSERV, full, start, end, TZ).grid_export_kwh == pytest.approx(24.0)
+
+
+def test_an_export_counter_that_goes_quiet_alone_still_leaves_it_unknown() -> None:
+    # The harder shape, because everything else about the day is measured: the
+    # import counter arrives all day and only the export register goes quiet
+    # through the peak window. Every band prices, the bill looks complete, and
+    # the export figure riding along with it was summed from the hours that
+    # happened to answer.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    quiet = _exporting_rows(start, 24, frozenset(range(16, 21)))
+    energy = period_energy(COSERV, quiet, start, end, TZ)
+    assert energy.grid_import_kwh["On-peak"] == pytest.approx(5.0)
+    assert energy.grid_import_kwh["Off-peak"] == pytest.approx(19.0)
+    assert energy.grid_export_kwh is None
+
+
+def test_an_unmeasured_export_earns_no_credit_and_tells_no_bill() -> None:
+    # What the unknown is for. The tariff pays for export, so a credit invented
+    # from the hours that answered is money on the page nobody can check, and a
+    # month projected from it quotes a total the supplier will not send.
+    paying = replace(COSERV, export_per_kwh=0.05)
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    quiet = _exporting_rows(start, 24, frozenset(range(16, 21)))
+    energy = period_energy(paying, quiet, start, end, TZ)
+
+    result = price_period(paying, energy)
+    assert result is not None
+    # The import side is fully measured, so the day itself still prices. Only
+    # the credit is absent, which is exactly the claim being made.
+    assert result.cost is not None
+    assert result.export_credit is None
+
+    bill = estimate_bill(paying, energy)
+    assert bill is not None
+    assert bill.projected_export_credit is None
+    assert bill.estimated_total is None
+
+
+def test_the_bucket_path_calls_the_same_export_unknown() -> None:
+    # The History page prices its days through the other entry point, and a
+    # figure that is unknown on the Costs page and a number on the History page
+    # is the disagreement this module exists to prevent.
+    start, end = _day(2026, 7, 14), _day(2026, 7, 17)
+    full = _exporting_rows(start, 72)
+    # Hours 39 to 44 are the second day's peak window, and nothing was recorded
+    # in them. The days either side are read end to end.
+    days = bucket_energy(COSERV, full[:39] + full[45:], bucket_edges(start, end, "day", TZ), TZ)
+    assert days[0].grid_export_kwh == pytest.approx(24.0)
+    assert days[1].grid_export_kwh is None
+    assert days[2].grid_export_kwh == pytest.approx(24.0)
+
+
 # --- the band scan itself -----------------------------------------------------
 
 
