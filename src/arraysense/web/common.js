@@ -251,6 +251,7 @@ const tempDeltaStr = (dc) => dc === null ? DASH
 const NAV = [
   { key:'now',     label:'Now',         href:'/#now' },
   { key:'flow',    label:'Energy flow', href:'/#flow' },
+  { key:'inverter', label:'Inverter',  href:'/#inverter' },
   { key:'graphs',  label:'Graphs',      href:'/graphs' },
   { key:'history', label:'History',     href:'/history' },
   { key:'costs',   label:'Costs',       href:'/costs' },
@@ -491,6 +492,19 @@ function pvFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
   grad.addColorStop(0, fade('--pv', .5));
   grad.addColorStop(1, fade('--pv', .04));
+  return grad;
+}
+
+// Grid import is filled for the same reason solar is, and for one more: when
+// the house runs on the grid, import *equals* house load to the watt, so a grid
+// line lies exactly under the home line and vanishes beneath it. An area cannot
+// vanish that way — the body of it shows below the coincident line even where
+// the two edges are identical. A dashed line was tried first and was too faint
+// to see at all, which is the honest reason this is a fill.
+function gridFill(u) {
+  const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
+  grad.addColorStop(0, fade('--grid', .42));
+  grad.addColorStop(1, fade('--grid', .05));
   return grad;
 }
 

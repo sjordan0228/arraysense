@@ -9,6 +9,7 @@ always agrees.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
+from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
 
 T0 = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
@@ -983,3 +985,89 @@ def test_a_completed_day_whose_peak_went_unwatched_is_still_a_dash(tmp_path: Pat
         body = _july(c, period="day", priced=True)
     by_day = {b["start"][:10]: b for b in body["buckets"]}
     assert by_day["2026-07-20"]["cost"] is None
+
+
+def test_costs_reads_a_month_older_than_the_minute_tier_keeps(client: Any) -> None:
+    # The minute tier is retained for a year and the raw tier for thirty days,
+    # so a month older than either exists only in the hourly tier. Falling from
+    # minute straight to raw found nothing and reported the month as unpriceable
+    # — while the History page, which does consult hourly, showed a figure for
+    # the very same month.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    old = datetime(2024, 6, 1, tzinfo=UTC)
+    for hour in range(0, 49):
+        store.append(
+            Sample(
+                timestamp=old + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 100.0 + hour,
+                    "load_energy_total_kwh": 200.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(
+        conn, int(old.timestamp()) - 3600, int((old + timedelta(days=3)).timestamp())
+    )
+    conn.commit()
+    # Nothing may remain in the tiers the endpoint used to depend on.
+    conn.execute("DELETE FROM inverter_raw")
+    conn.execute("DELETE FROM inverter_minute")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2024-06-01T00:00:00Z",
+            "end": "2024-06-02T00:00:00Z",
+            "tz": "UTC",
+        },
+    ).json()
+    assert body["tier"] == "hourly"
+    assert body["cost"] is not None
+    assert body["cost"]["energy_cost"] is not None
+
+
+def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:
+    # The History page shows saving beside cost. It is the counterfactual — the
+    # same house load bought entirely from the grid, less what the grid actually
+    # cost — and it must come from the same place the Costs page gets it, or the
+    # two pages disagree about the same day.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    body = client.get(
+        "/api/energy",
+        params={
+            "start": T0.isoformat(),
+            "end": (T0 + timedelta(days=1)).isoformat(),
+            "period": "day",
+            "priced": 1,
+            "tz": "UTC",
+        },
+    ).json()
+    assert body["configured"] is True
+    for bucket in body["buckets"]:
+        assert "saved" in bucket
+        assert "no_solar_cost" in bucket
+
+
+def test_without_a_tariff_a_bucket_carries_no_saving_key_at_all(client: Any) -> None:
+    # Absent, not null. A column of dashes over an install that simply has no
+    # rates entered invites the reader to wonder what went wrong, when nothing
+    # did — so the page draws no column rather than an empty one.
+    body = client.get(
+        "/api/energy",
+        params={
+            "start": T0.isoformat(),
+            "end": (T0 + timedelta(days=1)).isoformat(),
+            "period": "day",
+            "priced": 1,
+            "tz": "UTC",
+        },
+    ).json()
+    assert body["configured"] is False
+    for bucket in body["buckets"]:
+        assert "saved" not in bucket
+        assert "cost" not in bucket

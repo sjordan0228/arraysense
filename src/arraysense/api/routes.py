@@ -329,11 +329,19 @@ async def costs(
     # inside it. Without the lead, the first stretch of every month is short by
     # however long it took the first sample to arrive.
     lead = start - COUNTER_LEAD
+    # Minute first, then coarser, then raw. Hourly has to be in the chain and
+    # not just as a last resort: the minute tier is kept for a year, so a month
+    # older than that has nothing there while the hourly tier holds it back to
+    # the beginning. Falling straight from minute to raw — which is kept thirty
+    # days — found nothing and priced August 2025 as unknown, while the History
+    # page read the same month out of the hourly tier and showed $87.65.
+    rows: list[dict[str, Any]] = []
     tier = "minute"
-    rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=tier)
-    if not rows:
-        tier = "full"
-        rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=tier)
+    for candidate in ("minute", "hourly", "full"):
+        tier = candidate
+        rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
+        if rows:
+            break
     try:
         energy = period_energy(tariff, rows, start, end, zone)
     except ValueError as exc:
@@ -556,15 +564,30 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
     because it is money owed for that day, and it is broken out because a
     reader adding up a column of days should be able to see that the standing
     charge is in there once per month rather than once per row.
+
+    ``saved`` is what the same house load would have cost bought entirely from
+    the grid, less what the grid actually cost. It excludes the connection
+    charge, which is payable whatever the roof does — counting it against the
+    array would make the system look worse the more it saved. It is null rather
+    than zero whenever either side of that subtraction is unknown, because a
+    saving computed from a half-measured day is a number nobody can check.
     """
     if tariff is None:
         return {}
     if result is None:
-        return {"cost": None, "energy_cost": None, "fixed_charge": None}
+        return {
+            "cost": None,
+            "energy_cost": None,
+            "fixed_charge": None,
+            "saved": None,
+            "no_solar_cost": None,
+        }
     return {
         "cost": result.cost,
         "energy_cost": result.energy_cost,
         "fixed_charge": result.fixed_charge,
+        "saved": result.savings,
+        "no_solar_cost": result.no_solar_cost,
     }
 
 

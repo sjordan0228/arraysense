@@ -259,6 +259,7 @@ function buildRows(span, buckets) {
       // null, which is a different thing from a cheap day and has to stay that
       // way all the way to the cell.
       cost: got ? numOrNull(got.cost) : null,
+      saved: got ? numOrNull(got.saved) : null,
     });
   }
   return rows;
@@ -306,7 +307,7 @@ function drawTable(span, rows) {
   const places = decimals(rows);
   $('headRow').innerHTML = `<th>${esc(span.whenHeading)}</th>`
     + COLUMNS.map((c) => `<th>${esc(c.label)}</th>`).join('')
-    + (priced.configured ? '<th class="cost">Cost</th>' : '');
+    + (priced.configured ? '<th class="cost">Cost</th><th class="cost">Saved</th>' : '');
   // Newest first: the row the owner came to look at is today's, and it should
   // not be thirty rows down. The chart runs the other way because time reads
   // left to right; the table reads top down.
@@ -318,7 +319,7 @@ function drawTable(span, rows) {
         : '';
     return `<tr${r.reported ? '' : ' class="absent"'}><td>${esc(r.label)}${tag}</td>`
       + COLUMNS.map((c) => cell(r.totals[c.key], places[c.key])).join('')
-      + (priced.configured ? costCell(r.cost) : '')
+      + (priced.configured ? costCell(r.cost) + costCell(r.saved) : '')
       + '</tr>';
   }).join('');
   drawTotals(span, rows, places);
@@ -350,7 +351,9 @@ function drawTotals(span, rows, places) {
   if (unpriced) notes.push(`${unpriced} not priced`);
   $('hist').querySelector('tfoot').innerHTML =
     `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}`
-    + (priced.configured ? costCell(costTotal(reported)) : '') + '</tr>';
+    + (priced.configured
+        ? costCell(moneyTotal(reported, 'cost')) + costCell(moneyTotal(reported, 'saved'))
+        : '') + '</tr>';
 }
 
 // The sum of the money actually on screen. A row nobody could price is left
@@ -358,10 +361,10 @@ function drawTotals(span, rows, places) {
 // left out — a total that quietly skips a day is the same lie as a missing day
 // drawn as zero, only in currency. Every row unpriced means there is no total
 // to give at all.
-function costTotal(reported) {
-  const priceable = reported.filter((r) => r.cost !== null);
+function moneyTotal(reported, key) {
+  const priceable = reported.filter((r) => r[key] !== null);
   if (!priceable.length) return null;
-  return Math.round(priceable.reduce((sum, r) => sum + r.cost, 0) * 100) / 100;
+  return Math.round(priceable.reduce((sum, r) => sum + r[key], 0) * 100) / 100;
 }
 
 // ---------------------------------------------------------------------------
@@ -504,6 +507,7 @@ function bucketReadout() {
         }).join('')
           + (priced.configured
             ? `<div class="row"><u>Cost</u><b>${esc(money(row.cost, priced.currency))}</b></div>`
+              + `<div class="row"><u>Saved</u><b>${esc(money(row.saved, priced.currency))}</b></div>`
             : '');
         tip.innerHTML = `<div class="when">${esc(row.label)}${row.partial ? ' · partial' : ''}</div>${body}`;
         tip.classList.add('on');
