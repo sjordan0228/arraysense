@@ -82,16 +82,9 @@
       <span class="legend muted">grid, backup panel and the inverter itself</span>
     </div>
     <div id="acBands"></div>
-    <!-- Outside temperature and cloud cover are named in the issue and are
-         deliberately not here. They are not inverter readings: no weather
-         source exists, the metric registry has no home for a reading the
-         hardware never reported, and there is no location setting to fetch one
-         against. A trace drawn from a guess would be indistinguishable on
-         screen from a measured one, so there is no trace. When a weather
-         source lands they belong beside the solar bands. -->
-    <p class="why">Outside temperature and cloud cover are not plotted. They are not inverter
-      readings and nothing records them yet, and a line drawn from a guess would look exactly
-      like a line drawn from a measurement.</p>
+    <!-- Outside temperature and cloud cover belong beside the solar bands once
+         a weather source exists. Tracked as issue #5; the note that used to
+         stand here explaining their absence was longer than the absence. -->
   </section>
 </main>
 

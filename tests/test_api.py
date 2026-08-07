@@ -912,8 +912,13 @@ def test_the_month_in_progress_is_priced_over_the_part_that_has_happened(tmp_pat
     assert bucket["complete"] is False
     assert bucket["cost"] == costs["cost"]["cost"]
     assert bucket["cost"] > 0
-    # And the standing charge is only the part of the month that has run.
-    assert bucket["fixed_charge"] == pytest.approx(15.0 * 17.375 / 31, abs=0.02)
+    # The standing charge is the whole month's, not the part that has run. It
+    # falls due once for the month however early in it you ask, so showing a
+    # slice described an instalment nobody is billed and understated the month.
+    # Both paths charge it the same way, which is the assertion above: a page
+    # showing one figure while the other page shows another is the failure this
+    # pair of assertions exists to catch.
+    assert bucket["fixed_charge"] == pytest.approx(15.0, abs=0.01)
 
 
 def test_a_whole_month_asked_about_beyond_its_end_is_unchanged(tmp_path: Path) -> None:
@@ -1091,3 +1096,47 @@ def test_the_vendored_library_is_still_cacheable(client: Any) -> None:
     r = client.get("/vendor/uPlot.min.css")
     assert r.status_code == 200
     assert "no-cache" not in r.headers.get("cache-control", "")
+
+
+def test_a_single_day_is_charged_a_days_share_by_both_endpoints(client: Any) -> None:
+    # The whole connection charge belongs to a billing month, not to any period
+    # somebody happens to ask about. Charging it per request made /api/costs
+    # answer 15.55 for a day the History page priced at 0.74 — the same day,
+    # two figures, which is the thing this project most has to avoid.
+    client.put(
+        "/api/settings",
+        json={"tariff.bands": "Flat | 0.12 | 00:00-24:00", "tariff.fixed_monthly": 15.0},
+    )
+    mid = datetime(2026, 7, 15, 5, 0, tzinfo=UTC)
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": mid.isoformat(),
+            "end": (mid + timedelta(days=1)).isoformat(),
+            "tz": "America/Chicago",
+        },
+    ).json()
+    charged = (body.get("cost") or {}).get("fixed_charge")
+    assert charged is not None
+    # A day of a 31-day month, not the whole month.
+    assert charged == pytest.approx(15.0 / 31, abs=0.02)
+
+
+def test_the_month_charge_is_judged_in_the_owners_zone(client: Any) -> None:
+    # The page asks for 05:00 UTC because that is local midnight in Chicago.
+    # Comparing that against UTC midnight says "not a month start" and quietly
+    # apportions — which is exactly the with_zone trap that has now cost this
+    # project three separate bugs.
+    client.put(
+        "/api/settings",
+        json={"tariff.bands": "Flat | 0.12 | 00:00-24:00", "tariff.fixed_monthly": 15.0},
+    )
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-01T05:00:00Z",
+            "end": "2026-07-20T05:00:00Z",
+            "tz": "America/Chicago",
+        },
+    ).json()
+    assert (body.get("cost") or {}).get("fixed_charge") == pytest.approx(15.0, abs=0.01)

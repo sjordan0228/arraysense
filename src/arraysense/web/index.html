@@ -897,16 +897,13 @@ function detailHeat(i) {
   // collapses to a single dash rather than to a unit with no number under it.
   const pair = (a, b) => a === null && b === null ? DASH
     : `${one(a)} · ${one(b)} °${settings.tempUnit}`;
-  // There is no fan-speed register on this hardware, so a heatsink climbing
-  // while output holds steady is the only warning of a failing fan or a
-  // blocked intake that exists to give. That is worth saying in the panel.
   const spread = r1 !== null && r2 !== null
     ? `Heatsinks ${tempDeltaStr(Math.abs(r1 - r2))} apart. ` : '';
   return `<div class="p"><h3>Inverter Temp</h3>
     <div class="pairbar">${bar(r1, hot)}${bar(r2, hot)}${bar(inner, cool)}${bar(board, cool)}</div>
     ${kvRow('H1 · H2', pair(r1, r2))}
     ${kvRow('Internal · board', pair(inner, board))}
-    ${capOf(spread + 'No fan-speed register exists — heatsink temperature is the only fan signal')}
+    ${capOf(spread)}
     </div>`;
 }
 

@@ -517,7 +517,11 @@ def bucket_energy(
     return out
 
 
-def price_period(tariff: Tariff | None, energy: PeriodEnergy) -> CostResult | None:
+def price_period(
+    tariff: Tariff | None,
+    energy: PeriodEnergy,
+    fixed_charge: float | None = None,
+) -> CostResult | None:
     """Price a split period against the bands it actually entered.
 
     ``compute_cost`` has to work out for itself which bands could apply, and
@@ -540,12 +544,14 @@ def price_period(tariff: Tariff | None, energy: PeriodEnergy) -> CostResult | No
     and the only one this changes.
     """
     if tariff is None or not energy.grid_import_kwh:
-        return compute_cost(tariff, energy)
+        return compute_cost(tariff, energy, fixed_charge)
     entered = {name.strip().casefold() for name in energy.grid_import_kwh}
     narrowed = tuple(band for band in tariff.bands if band.key in entered)
     # An empty set would leave compute_cost pricing nothing at all and calling
     # the answer zero, which is the one output this project never produces.
-    return compute_cost(replace(tariff, bands=narrowed) if narrowed else tariff, energy)
+    return compute_cost(
+        replace(tariff, bands=narrowed) if narrowed else tariff, energy, fixed_charge
+    )
 
 
 def _capped(edge: datetime, until: datetime | None) -> datetime:

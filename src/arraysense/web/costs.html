@@ -362,8 +362,7 @@ function renderCards(p) {
   if (p.fixedMonthly === null) {
     costBits.push('the connection charge is not known');
   } else if (p.fixedMonthly > 0) {
-    costBits.push(`connection charge <b>${esc(money(p.fixedSoFar, cur))}</b> of `
-      + `${esc(money(p.fixedMonthly, cur))} so far`);
+    costBits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
   } else {
     costBits.push('no connection charge on this tariff');
   }

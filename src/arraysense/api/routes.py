@@ -18,6 +18,7 @@ import logging
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -347,7 +348,7 @@ async def costs(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    result = price_period(tariff, energy)
+    result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
     bill = estimate_bill(tariff, energy)
 
     # The page needs more than the priced totals to be honest about them: the
@@ -367,6 +368,34 @@ async def costs(
         "elapsed_minutes": energy.elapsed_minutes,
         "unpriced_minutes": round(unpriced_minutes(tariff, start, end, zone)),
     }
+
+
+def _month_charge(tariff: Tariff, start: datetime, zone: ZoneInfo) -> float | None:
+    """The whole monthly connection charge, when the period is a billing month.
+
+    The charge falls due once for the month however early in it you ask, so a
+    month-to-date bill apportioning it showed "$3.11 of $15.00 so far" — an
+    instalment nobody is billed, and an understatement of what the month will
+    cost. A period beginning at local midnight on the first is that question.
+
+    Anything else gets None and is apportioned, which is what keeps the two
+    endpoints from answering the same question differently. Asked about a single
+    day, this endpoint used to charge the whole fifteen dollars while the
+    History page's row for that same day charged its share of it — 15.55
+    against 0.74 for the identical day.
+
+    Compared in the owner's zone, not in whatever the query string carried. The
+    page asks for 05:00 UTC because that is local midnight in Chicago, and the
+    same comparison against UTC midnight answers no to the one question this
+    exists to ask. That is the third bug this project has had from reading a
+    wall-clock question off a UTC instant.
+    """
+    local = start.astimezone(zone)
+    return (
+        tariff.fixed_monthly
+        if local == local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        else None
+    )
 
 
 def _band_rows(
@@ -523,7 +552,15 @@ async def energy(
         # electricity.
         priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
         for index, split in enumerate(priced_buckets):
-            money[read.edges[index]] = price_period(tariff, split)
+            money[read.edges[index]] = price_period(
+                tariff,
+                split,
+                # A month bucket is a billing month and owes the whole charge;
+                # a day inside one owes a day's share. Passing it here rather
+                # than letting each path decide is what keeps this page and the
+                # Costs page agreeing about the month in progress.
+                fixed_charge=tariff.fixed_monthly if period == "month" else None,
+            )
 
     payload: dict[str, Any] = {
         "period": period,

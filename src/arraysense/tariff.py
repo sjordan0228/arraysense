@@ -716,7 +716,11 @@ def _price(
     return breakdown, total
 
 
-def compute_cost(tariff: Tariff | None, energy: PeriodEnergy) -> CostResult | None:
+def compute_cost(
+    tariff: Tariff | None,
+    energy: PeriodEnergy,
+    fixed_charge: float | None = None,
+) -> CostResult | None:
     """Price a period: what the grid cost, what it saved, and what export earned.
 
     Returns None when there is no tariff, which is how an install that has never
@@ -748,7 +752,20 @@ def compute_cost(tariff: Tariff | None, energy: PeriodEnergy) -> CostResult | No
     consumed = _by_band(energy.load_kwh, active, "house load")
     _, no_solar = _price(active, consumed)
 
-    fixed = apportion_fixed(tariff.fixed_monthly, energy.start, energy.end)
+    # Apportioned by default, because most callers are pricing a bucket: a day
+    # inside a month owes a day's share of the connection charge, and charging
+    # each of thirty-one days the whole of it would be absurd.
+    #
+    # A caller pricing a *billing month* passes the charge it wants instead. The
+    # charge falls due once for the month whatever day it is read on, so a
+    # month-to-date bill that shows three dollars of fifteen is describing an
+    # instalment nobody is billed — the fifteen is owed, and showing part of it
+    # understates what the month will cost.
+    fixed = (
+        apportion_fixed(tariff.fixed_monthly, energy.start, energy.end)
+        if fixed_charge is None
+        else fixed_charge
+    )
 
     credit: float | None = None
     if tariff.export_per_kwh is not None and energy.grid_export_kwh is not None:
