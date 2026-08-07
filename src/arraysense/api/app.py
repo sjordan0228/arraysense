@@ -37,6 +37,7 @@ PAGES = {
     "/graphs": "graphs.html",
     "/history": "history.html",
     "/costs": "costs.html",
+    "/settings": "settings.html",
 }
 
 # The code every page is built from — the palette, the formatters, the nav and

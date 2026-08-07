@@ -21,8 +21,11 @@ from __future__ import annotations
 import logging
 import math
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+from arraysense.tariff import parse_bands
 
 if TYPE_CHECKING:
     from arraysense.store.sqlite_store import SqliteStore
@@ -61,6 +64,19 @@ class SettingSpec:
     # theoretical — a flat 128 rejected the reference installation's own tariff
     # at 130 characters, which is three bands with their seasons.
     max_length: int = 128
+    # Whether a newline is content rather than corruption. False for everything
+    # that reaches a wire protocol; true for a value a person writes a line at
+    # a time. The tariff is the only one so far, and ``parse_bands`` has always
+    # accepted newlines between bands — it was this validator that refused
+    # them, so a tariff typed the way it reads could not be saved at all.
+    multiline: bool = False
+    # An extra check for a value whose grammar the scalar types cannot express.
+    # Raises ValueError with a message meant for the person typing. Without it
+    # a malformed tariff saved, reported itself as saved, and only failed at
+    # the far end — where the Costs page could tell it had no usable tariff but
+    # not that one had been entered, so it said "no tariff entered" to somebody
+    # looking straight at the one they had just typed.
+    check: Callable[[str], object] | None = None
 
     def validate(self, value: object) -> object:
         """Return ``value`` coerced to this setting's type, or raise ValueError.
@@ -87,13 +103,19 @@ class SettingSpec:
             # These reach a wire protocol and a socket. A control character or
             # a zero-width space is not a hostname or a serial, and a value
             # that only looks blank would override a working one.
-            if any(ch.isspace() or not ch.isprintable() for ch in value if ch != " "):
+            allowed = {" ", "\n"} if self.multiline else {" "}
+            if any(ch.isspace() or not ch.isprintable() for ch in value if ch not in allowed):
                 raise ValueError(f"{self.key} must not contain control or invisible characters")
             if len(value) > self.max_length:
                 raise ValueError(
                     f"{self.key} is too long at {len(value)} characters, "
                     f"the limit is {self.max_length}"
                 )
+            if self.check is not None and value.strip():
+                try:
+                    self.check(value)
+                except ValueError as exc:
+                    raise ValueError(f"{self.key}: {exc}") from exc
             return value
         # Booleans are integers in Python, so they have to be excluded before
         # the numeric check or `true` would quietly become 1.
@@ -106,6 +128,11 @@ class SettingSpec:
         # still up, so the service looked healthy while collecting nothing.
         if not math.isfinite(value):
             raise ValueError(f"{self.key} must be a finite number, got {value!r}")
+        # A whole-number setting given 5.5 was quietly stored as 5 — the same
+        # coercion this docstring disclaims two paragraphs up, and the reason
+        # the settings page and this validator disagreed about one field.
+        if self.kind == "int" and value != int(value):
+            raise ValueError(f"{self.key} must be a whole number, got {value!r}")
         number = int(value) if self.kind == "int" else float(value)
         if self.lower is not None and number < self.lower:
             raise ValueError(f"{self.key} must be at least {self.lower}, got {number}")
@@ -169,6 +196,13 @@ SETTINGS: tuple[SettingSpec, ...] = (
         key="tariff.bands",
         # Several bands, each with a name, a price, its hours and its season.
         max_length=2000,
+        # The help text below says "one band per line", and it has to be true:
+        # parse_bands splits on newlines and always has.
+        multiline=True,
+        # Checked with the real parser, so the page reports a malformed band
+        # beside the box it was typed in rather than storing it and letting
+        # the Costs page discover it as an absence.
+        check=parse_bands,
         kind="str",
         default="",
         label="Rate bands",
@@ -453,6 +487,12 @@ def describe() -> list[dict[str, object]]:
             "upper": spec.upper,
             "secret": spec.secret,
             "default": spec.default,
+            # Both are needed by a page that wants to refuse exactly what the
+            # server refuses. Without max_length a text box happily submits a
+            # value the server then rejects; without multiline it cannot tell
+            # which field is a line and which is a paragraph.
+            "max_length": spec.max_length,
+            "multiline": spec.multiline,
         }
         for spec in SETTINGS
     ]

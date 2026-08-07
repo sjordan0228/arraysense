@@ -21,10 +21,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
+from itertools import pairwise
 from zoneinfo import ZoneInfo
 
-from arraysense.energy import MAX_EDGE_GAP, bucket_totals, with_zone
+from arraysense.energy import MAX_EDGE_GAP, EnergyBucket, bucket_totals, with_zone
 from arraysense.tariff import PeriodEnergy, RateBand, Tariff
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,33 @@ _SCAN_STEP = timedelta(minutes=1)
 # A band boundary that lands mid-interval cannot be attributed, so the scan is
 # capped rather than left to run over a year of history a minute at a time.
 MAX_SCAN_DAYS = 70
+
+
+def _local(moment: datetime, zone: ZoneInfo) -> datetime:
+    """Read a moment as a wall clock in the owner's zone.
+
+    Two steps, and both are load-bearing. A naive bound means the zone the
+    request asked about, so it is attached. An aware one — which is what a
+    query string ending in Z parses to — has to be *converted*, not merely
+    labelled: attaching a zone to an aware datetime silently does nothing, and
+    the bands were then matched against the UTC clock. On the reference
+    installation that put the 15:00-20:00 peak window at 10:00-15:00 local and
+    mispriced every hour of every day.
+    """
+    return with_zone(moment, zone).astimezone(zone)
+
+
+def _real_minutes(start: datetime, end: datetime) -> float:
+    """Minutes that actually passed between two instants, across a clock change.
+
+    Converted to UTC first, and that conversion is the whole function. Two
+    datetimes sharing a ``tzinfo`` subtract as though they were naive — Python
+    documents this — so a 23-hour spring day measured 1440 minutes and a
+    25-hour autumn day measured 1440 as well. The page divides one of these by
+    the other and shows it as coverage, where the error reads as an hour of
+    collection lost, or an hour of nothing presented as fully observed.
+    """
+    return (end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() / 60
 
 
 @dataclass(frozen=True)
@@ -67,25 +95,114 @@ def band_intervals(
     if end - start > timedelta(days=MAX_SCAN_DAYS):
         raise ValueError(f"a costed period may not exceed {MAX_SCAN_DAYS} days")
 
-    local_start = with_zone(start, zone)
-    local_end = with_zone(end, zone)
+    local_start = _local(start, zone)
+    local_end = _local(end, zone)
+    # Stepped in absolute time and read as a wall clock, never stepped in wall
+    # clock. Adding a minute to an aware local datetime does naive arithmetic:
+    # on the day the clocks go back it walks 01:00 to 01:59 once when those
+    # minutes happen twice, so the second pass is priced by whatever band the
+    # first pass ended in. Stepping through UTC visits every real minute
+    # exactly once and skips none.
+    instant = local_start.astimezone(UTC)
+    finish = local_end.astimezone(UTC)
     out: list[BandInterval] = []
     edge = local_start
     current = _band_name(tariff, local_start)
-    moment = local_start + _SCAN_STEP
-    while moment < local_end:
+    instant += _SCAN_STEP
+    while instant < finish:
+        moment = instant.astimezone(zone)
         name = _band_name(tariff, moment)
         if name != current:
             out.append(BandInterval(current, edge, moment))
             edge, current = moment, name
-        moment += _SCAN_STEP
+        instant += _SCAN_STEP
     out.append(BandInterval(current, edge, local_end))
     return out
+
+
+def unpriced_minutes(tariff: Tariff, start: datetime, end: datetime, zone: ZoneInfo) -> float:
+    """How many minutes of the period no band prices at all.
+
+    A tariff with a hole in it prices less energy than the period used, and the
+    total then looks like a small bill rather than a wrong one. Counted in real
+    minutes, so the answer does not gain or lose an hour at a clock change.
+    """
+    return sum(
+        _real_minutes(i.start, i.end)
+        for i in band_intervals(tariff, start, end, zone)
+        if i.band is None
+    )
 
 
 def _band_name(tariff: Tariff, moment: datetime) -> str | None:
     band: RateBand | None = tariff.band_at(moment)
     return band.name if band is not None else None
+
+
+def _aligned(
+    intervals: Sequence[BandInterval], buckets: Sequence[EnergyBucket]
+) -> list[EnergyBucket | None]:
+    """Line each interval up with its own bucket, or with None if it has none.
+
+    ``bucket_totals`` leaves out a bucket it had nothing to report for, so the
+    result is a subsequence of the intervals rather than a parallel list.
+    Pairing the two by position therefore slides every bucket after the gap one
+    band to the left — reproduced as seven off-peak kilowatt-hours billed at
+    the peak rate, on a total that reported itself confidently while a third of
+    the period's energy had vanished from it.
+
+    Both sequences are in time order and the buckets are a subsequence, so one
+    pointer walk aligns them exactly.
+    """
+    out: list[EnergyBucket | None] = []
+    index = 0
+    for interval in intervals:
+        if (
+            index < len(buckets)
+            and buckets[index].start == interval.start
+            and buckets[index].end == interval.end
+        ):
+            out.append(buckets[index])
+            index += 1
+        else:
+            out.append(None)
+    return out
+
+
+def _observed_minutes(
+    rows: Sequence[Mapping[str, object]],
+    start: datetime,
+    end: datetime,
+    max_gap: timedelta,
+) -> float:
+    """How many minutes of the period the collector was actually running for.
+
+    Measured off the readings themselves rather than off the bands, because the
+    question has nothing to do with the tariff. Deriving it from the bands
+    instead said a whole interval was observed whenever any of it was — and
+    under a single all-day band that is the whole day, so half a day of
+    readings reported itself as complete coverage and the page drew "100%".
+
+    Two readings more than ``max_gap`` apart bracket an outage rather than a
+    quiet stretch, so the time between them is not counted.
+    """
+    stamped = [_local_or_none(row.get("timestamp"), start.tzinfo) for row in rows]
+    inside = sorted(m for m in stamped if m is not None and start <= m <= end)
+    if len(inside) < 2:
+        return 0.0
+    total = 0.0
+    for earlier, later in pairwise(inside):
+        span = later.astimezone(UTC) - earlier.astimezone(UTC)
+        if span <= max_gap:
+            total += span.total_seconds() / 60
+    return total
+
+
+def _local_or_none(value: object, tz: tzinfo | None) -> datetime | None:
+    """A row's timestamp as an aware datetime, or None if it is not one."""
+    if not isinstance(value, datetime):
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=tz)
 
 
 def period_energy(
@@ -108,35 +225,55 @@ def period_energy(
     not occurred yet is a guess.
     """
     intervals = band_intervals(tariff, start, end, zone)
+    # Reported in the owner's zone, not the caller's. Downstream, the month a
+    # bill belongs to and the season a band is in are both read off these
+    # bounds, and both are wall-clock questions.
+    local_start, local_end = _local(start, zone), _local(end, zone)
     if not intervals:
-        return PeriodEnergy(start=start, end=end, grid_import_kwh={})
+        return PeriodEnergy(start=local_start, end=local_end, grid_import_kwh={})
 
     edges = [intervals[0].start, *(i.end for i in intervals)]
-    buckets = bucket_totals(rows, edges, max_gap)
+    buckets = _aligned(intervals, bucket_totals(rows, edges, max_gap))
 
     imported: dict[str, float | None] = {}
     load: dict[str, float | None] = {}
+    discharged: dict[str, float | None] = {}
     exported: float | None = None
-    for interval, bucket in zip(intervals, buckets, strict=False):
+    for interval, bucket in zip(intervals, buckets, strict=True):
         if interval.band is None:
             logger.debug(
                 "no band covers %s to %s; its energy is unpriced", interval.start, interval.end
             )
             continue
-        for key, into in (("grid_imported_kwh", imported), ("load_kwh", load)):
-            value = bucket.totals.get(key)
+        for key, into in (
+            ("grid_imported_kwh", imported),
+            ("load_kwh", load),
+            ("battery_discharged_kwh", discharged),
+        ):
+            value = None if bucket is None else bucket.totals.get(key)
             if value is None:
-                continue
-            into[interval.band] = (into.get(interval.band) or 0.0) + value
+                # Unknown, and unknown wins. A band occurs more than once in a
+                # day — off-peak runs before the evening peak and again after
+                # it — so keeping an earlier stretch as the band's total is a
+                # missing reading rendered as zero, in the one place where it
+                # becomes money.
+                into[interval.band] = None
+            elif into.get(interval.band, 0.0) is not None:
+                into[interval.band] = (into.get(interval.band) or 0.0) + value
     for bucket in buckets:
-        value = bucket.totals.get("grid_exported_kwh")
+        value = None if bucket is None else bucket.totals.get("grid_exported_kwh")
         if value is not None:
             exported = (exported or 0.0) + value
 
+    measured = _observed_minutes(rows, local_start, local_end, max_gap)
+
     return PeriodEnergy(
-        start=start,
-        end=end,
+        start=local_start,
+        end=local_end,
         grid_import_kwh=imported,
         load_kwh=load or None,
         grid_export_kwh=exported,
+        battery_discharge_kwh=discharged or None,
+        measured_minutes=measured,
+        elapsed_minutes=_real_minutes(intervals[0].start, intervals[-1].end),
     )

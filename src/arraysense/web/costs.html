@@ -110,7 +110,7 @@
     <!-- Where the tariff is entered: the rate bands, the connection charge,
          the export rate and the currency are settings on the service, served
          by /api/settings, not preferences held in this browser. -->
-    <a class="iconbtn" href="/#settings">Open settings — the ⚙ on the dashboard</a>
+    <a class="iconbtn" href="/settings">Enter a tariff in settings</a>
   </div>
 
   <div class="cards" id="cards" hidden>
@@ -190,21 +190,18 @@
 // palette and the nav — comes from /common.js, loaded above. This file is only
 // what is particular to costs.
 //
-// Two things here look like duplication and are not quite.
+// Nothing here prices anything. The page asks /api/costs what the month cost
+// and draws the answer; the tariff grammar, the band boundaries and every
+// multiplication live in src/arraysense/costs.py and src/arraysense/tariff.py.
 //
-// The rate bands are parsed in the browser because there is no endpoint that
-// serves a priced answer: /api/settings hands out the band text the owner
-// typed, and this page turns it into money. src/arraysense/tariff.py is the
-// same model in Python and is the authority on the format — the grammar below
-// mirrors it deliberately, and if the two ever disagree the Python one is
-// right. The moment a /api/cost endpoint exists, everything between here and
-// the fetch section should be deleted in favour of it.
-//
-// Energy per rate band is likewise derived here, from the inverter's lifetime
-// counters rather than from integrated power. Integration agrees on a clean
-// day and quietly undercounts after any gap in collection; a counter kept
-// counting while we were not watching, so the difference between two readings
-// of it is right even across an outage.
+// It was not always so, and the reason is worth keeping: this page used to
+// hold a second implementation of the tariff format, and the two disagreed
+// within a day of the first one changing. The page's parser rejected the
+// seasonal band syntax the Python parser accepts, so a real tariff rendered as
+// "the rate bands could not be read" and hid every figure — and in the older
+// syntax it did accept, it had no notion of a season at all, so it applied a
+// summer peak window to a January evening. Money is exactly the wrong thing to
+// compute twice.
 
 // ---------------------------------------------------------------------------
 // Money on screen.
@@ -246,315 +243,13 @@ function rateStr(v, cur) {
 const pctStr = (v) => v === null || v === undefined || !isFinite(v)
   ? DASH : `${(v * 100).toFixed(0)}%`;
 
-const clock = (minutes) =>
-  `${String(Math.floor(minutes / 60)).padStart(2, '0')}:${String(minutes % 60).padStart(2, '0')}`;
-
-// ---------------------------------------------------------------------------
-// The tariff, as the settings page stores it. Mirrors tariff.parse_bands.
-// ---------------------------------------------------------------------------
-
-const MINUTES_PER_DAY = 24 * 60;
-
-// Digits only, deliberately. Number() reads "0x10" as sixteen and "" as zero,
-// so a typed range of ":30" or "0x10-20" would parse into a time nobody meant
-// — where Python's int() refuses both, and the two parsers have to agree about
-// what a tariff says.
-const CLOCK_PART = /^\d{1,2}$/;
-const PRICE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
-
-// Accepts 16, 16:00 and 24:00, because that is how tariffs are written down:
-// midnight at the far end of a range is 24:00 on most bills and 00:00 on a
-// clock, and both mean the same instant.
-function parseClock(token, entry) {
-  const text = String(token).trim();
-  const cut = text.indexOf(':');
-  const hourText = (cut < 0 ? text : text.slice(0, cut)).trim();
-  const minuteText = cut < 0 ? '' : text.slice(cut + 1).trim();
-  if (!CLOCK_PART.test(hourText) || (minuteText !== '' && !CLOCK_PART.test(minuteText))) {
-    throw new Error(`${entry}: “${text}” is not a time like 16:00`);
-  }
-  const hour = Number(hourText);
-  const minute = minuteText === '' ? 0 : Number(minuteText);
-  if (hour === 24 && minute === 0) return 0;
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) {
-    throw new Error(`${entry}: “${text}” is not a time of day`);
-  }
-  return hour * 60 + minute;
-}
-
-// 24 at the end of a range closes the day; 16:00-16:00 is somebody having
-// written something they did not mean.
-const endsTheDay = (token) => String(token).trim().split(':')[0].trim() === '24';
-
-function parseHours(text, entry) {
-  const ranges = [];
-  for (const chunk of String(text).split(',')) {
-    const span = chunk.trim();
-    if (!span) continue;
-    const cut = span.indexOf('-');
-    if (cut < 0) throw new Error(`${entry}: “${span}” is not a range like 16:00-21:00`);
-    const start = parseClock(span.slice(0, cut), entry);
-    const endText = span.slice(cut + 1);
-    const end = parseClock(endText, entry);
-    if (start === end && !endsTheDay(endText)) {
-      throw new Error(`${entry}: “${span}” starts and ends at the same time. `
-        + 'Write 00:00-24:00 for a band that applies all day.');
-    }
-    ranges.push({ start, end });
-  }
-  if (!ranges.length) throw new Error(`${entry}: a band needs at least one time range`);
-  return ranges;
-}
-
-// end is exclusive so two adjacent bands do not both claim the instant between
-// them, and a range whose start is at or after its end wraps: 21:00-06:00 is
-// the night, not an empty set. Getting that wrong puts every overnight
-// kilowatt-hour in no band at all.
-const inRange = (r, minute) =>
-  r.start < r.end ? minute >= r.start && minute < r.end : minute >= r.start || minute < r.end;
-
-// Refuses rather than guesses, for the same reason the Python does: a
-// half-understood tariff prices a bill wrongly and says nothing about it,
-// while one that was refused gets fixed.
-function parseBands(text) {
-  const bands = [];
-  const seen = new Map();
-  // Semicolons and newlines both separate bands, so a one-line field and a
-  // textarea each work without the owner being told which.
-  for (const raw of String(text).replace(/\n/g, ';').split(';')) {
-    const entry = raw.trim();
-    if (!entry) continue;
-    const parts = entry.split('|').map((p) => p.trim());
-    if (parts.length !== 3) {
-      throw new Error(`${entry}: a band is “name | price | hours”, three fields separated by |`);
-    }
-    const [name, priceText, hoursText] = parts;
-    if (!name) throw new Error(`${entry}: a band needs a name; energy is reported against it`);
-    if (!PRICE.test(priceText)) {
-      throw new Error(`${entry}: “${priceText}” is not a price per kWh`);
-    }
-    const price = Number(priceText);
-    if (!isFinite(price) || price < 0) {
-      throw new Error(`${entry}: a price per kWh cannot be “${priceText}”`);
-    }
-    const key = name.toLowerCase();
-    if (seen.has(key)) {
-      throw new Error(`two rate bands are both called “${name}”; energy is reported per band `
-        + 'by name, so the names have to differ');
-    }
-    seen.set(key, name);
-    bands.push({ name, key, price, ranges: parseHours(hoursText, entry) });
-  }
-  if (!bands.length) throw new Error('no rate bands in that text');
-  return bands;
-}
-
-// Bands are wall-clock hours in the owner's zone, which is this browser's
-// zone: reading a stored UTC instant as a wall clock prices four in the
-// afternoon as nine at night. Date does the daylight-saving arithmetic, so the
-// 23-hour day has 23 hours of bands in it and the 25-hour day has 25.
-//
-// Bands are tried in the order they were written and the first match wins, so
-// an overlap resolves predictably. An hour no band claims has no price at all.
-function bandAt(bands, ms) {
-  const when = new Date(ms);
-  const minute = when.getHours() * 60 + when.getMinutes();
-  for (const band of bands) {
-    for (const r of band.ranges) if (inRange(r, minute)) return band;
-  }
-  return null;
-}
-
-// How many minutes of a stretch of the calendar belong to each band. Stepping
-// a minute at a time rather than multiplying five hours by the number of days:
-// a clock change makes one day 23 hours long and another 25, and one of them
-// loses an hour of peak that a multiplication would still charge for.
-function bandMinutes(bands, fromMs, toMs) {
-  const held = new Map();
-  for (const band of bands) held.set(band.key, 0);
-  for (let t = fromMs; t < toMs; t += 60000) {
-    const band = bandAt(bands, t);
-    if (band) held.set(band.key, held.get(band.key) + 1);
-  }
-  return held;
-}
-
-// How many minutes of an ordinary day no band prices at all. Anything above
-// zero means energy used in those hours belongs to no band, so a cost built
-// from per-band totals quietly comes out low — worth saying on the page rather
-// than discovering as a bill that never matches.
-function uncoveredMinutes(bands) {
-  let count = 0;
-  for (let minute = 0; minute < MINUTES_PER_DAY; minute++) {
-    if (!bands.some((b) => b.ranges.some((r) => inRange(r, minute)))) count += 1;
-  }
-  return count;
-}
-
-// ---------------------------------------------------------------------------
-// Energy per band, from the lifetime counters.
-// ---------------------------------------------------------------------------
-
-// How far a counter must fall before the fall is read as a reset rather than a
-// bad reading. Mirrors energy.RESET_MAX_REMAINING: a counter that restarts
-// comes back near zero, and a lifetime total of 36,246 that dips to 36,245 is
-// noise, not thirty-six thousand kilowatt-hours of new energy.
-const RESET_MAX_REMAINING = 0.5;
-
-// Lifetime counters are monotonic, so the energy between two readings is the
-// difference — right even if the collector was down for half of it. Two cases
-// give no answer rather than a wrong one: a counter that restarted, since what
-// it held before the restart is unknowable, and one that slipped backwards
-// without restarting, which is a bad read.
-function counterDelta(previous, current) {
-  if (current >= previous) return { kwh: current - previous, lost: false };
-  if (current <= previous * RESET_MAX_REMAINING) return { kwh: current, lost: true };
-  return { kwh: null, lost: true };
-}
-
-// Whether a stretch of time belongs to exactly one band, or to none at all.
-//
-// Walked rather than judged by its two ends, because a gap that opens at one
-// in the afternoon and closes at ten at night opens and closes off-peak with
-// the whole evening peak hidden inside it. Five-minute steps resolve any band
-// a person would write down, and the walk is bounded by the read itself: the
-// spans it is called on do not overlap.
-//
-// Returns the band, boxed so that "one band, and it is the unpriced hours"
-// stays distinguishable from "more than one band". Null is the second.
-function spanBand(bands, from, to) {
-  const STEP = 5 * 60000;
-  const found = bandAt(bands, from);
-  const key = found ? found.key : '';
-  for (let t = from + STEP; t < to; t += STEP) {
-    const here = bandAt(bands, t);
-    if ((here ? here.key : '') !== key) return null;
-  }
-  const last = bandAt(bands, to - 1);
-  return (last ? last.key : '') === key ? { band: found } : null;
-}
-
-function readings(points, metric) {
-  const out = [];
-  for (const p of points || []) {
-    if (!p) continue;
-    const value = numOrNull(p[metric]);
-    const at = Date.parse(p.timestamp);
-    if (value === null || !Number.isFinite(at)) continue;
-    out.push([at, value]);
-  }
-  out.sort((a, b) => a[0] - b[0]);
-  return out;
-}
-
-// Split one counter's energy across the rate bands.
-//
-// The subtle part is which instants a pair of readings describes. At full
-// cadence a row is a reading, so the pair (t0, t1] is energy that happened
-// between them. On a rollup tier a row is a bucket, timestamped at its start
-// and holding the *highest* value seen inside it — which for a monotonic
-// counter is the value at the bucket's end. So a pair of rolled rows describes
-// energy over [t0 + bucket, t1 + bucket): one bucket later than the timestamps
-// suggest, and exactly the bucket that begins at t1. Attributing by the
-// timestamps alone would price the 15:00 hour at the 14:00 rate.
-//
-// A pair whose span lies inside one band is that band's. A pair that straddles
-// a boundary by no more than a sample or two is attributed by its midpoint,
-// which is wrong by at most one sampling interval. A pair that straddles a
-// boundary because collection stopped for hours is attributed to nothing: the
-// energy is real, but which side of the boundary it happened on is not
-// knowable, and guessing would misprice exactly the hours this page exists to
-// separate.
-function bandEnergy(points, metric, bands, resolutionMs, fromMs, toMs) {
-  const kwh = new Map();
-  const covered = new Map();
-  for (const band of bands) { kwh.set(band.key, 0); covered.set(band.key, 0); }
-  const tolerance = Math.max(resolutionMs * 1.5, 90000);
-  const series = readings(points, metric);
-  let unplaced = 0;
-  let unpriced = 0;
-  let gaps = false;
-  let measuredMs = 0;
-
-  for (let i = 1; i < series.length; i++) {
-    const [t0, v0] = series[i - 1];
-    const [t1, v1] = series[i];
-    const from = t0 + resolutionMs;
-    const to = t1 + resolutionMs;
-    if (to <= from) continue;
-    // Half an interval either side of a month boundary is the finest cut that
-    // can be made without inventing a distribution inside it.
-    const middle = (from + to) / 2;
-    if (middle < fromMs || middle >= toMs) continue;
-    const step = counterDelta(v0, v1);
-    if (step.lost) gaps = true;
-    if (step.kwh === null) continue;
-
-    let band = null;
-    if (to - from <= tolerance) {
-      // One sampling interval. It may straddle a boundary by a few seconds,
-      // and the midpoint decides which side — wrong by at most that interval.
-      band = bandAt(bands, middle);
-    } else {
-      // Longer than a sample: collection stopped. The energy is real and the
-      // counter caught up, but where inside the hole it happened is not
-      // knowable, so it counts only if the whole hole sits in one band.
-      const uniform = spanBand(bands, from, to);
-      if (!uniform) {
-        unplaced += step.kwh;
-        gaps = true;
-        continue;
-      }
-      band = uniform.band;
-    }
-    measuredMs += to - from;
-    if (!band) { unpriced += step.kwh; continue; }
-    kwh.set(band.key, kwh.get(band.key) + step.kwh);
-    covered.set(band.key, covered.get(band.key) + (to - from));
-  }
-  return { kwh, covered, unplaced, unpriced, gaps, measuredMs };
-}
-
-// A band with no energy reported is one of two entirely different things, and
-// the difference decides whether a figure exists at all.
-//
-// A band whose hours have not come round yet this month imported nothing,
-// which is a measurement: zero. A band whose hours did pass with nothing
-// recorded across them is unknown, and unknown propagates — a total that
-// quietly leaves a band out is worse than no total.
-function bandReading(band, split, elapsedMinutes) {
-  const coveredMs = split.covered.get(band.key) || 0;
-  if (elapsedMinutes <= 0) return { kwh: 0, coverage: 1, minutes: 0 };
-  if (coveredMs <= 0) return { kwh: null, coverage: 0, minutes: 0 };
-  return {
-    kwh: split.kwh.get(band.key) || 0,
-    coverage: Math.min(1, coveredMs / (elapsedMinutes * 60000)),
-    minutes: coveredMs / 60000,
-  };
-}
+// The en dash the service joins a range with, so a season reads the same way
+// its hours do. Not the em dash DASH, which this page means as "no value".
+const DASH_TO = '–';
 
 // ---------------------------------------------------------------------------
 // Reading the API.
 // ---------------------------------------------------------------------------
-
-// Which lifetime counters the pricing needs. Grid import is what was paid for,
-// house load is the counterfactual it is priced against, and discharge is how
-// much of the expensive hours the bank carried.
-const COUNTERS = {
-  imported: 'grid_import_energy_total_kwh',
-  house: 'load_energy_total_kwh',
-  discharged: 'battery_discharge_energy_total_kwh',
-};
-
-// Read back before the month starts so the first interval of the month has a
-// reading to be measured from, rather than starting at whatever the first row
-// inside it happens to be. Two hours matches the widening the energy endpoint
-// does for the same reason.
-const LEAD_MS = 2 * 3600 * 1000;
-
-// The poll interval if the settings read failed; only used to size a straddle
-// tolerance, never to price anything.
-const FALLBACK_CADENCE = 11;
 
 async function getJSON(url) {
   const response = await fetch(url);
@@ -589,150 +284,16 @@ async function monthEnergy(win) {
   return buckets.length ? buckets[buckets.length - 1] : null;
 }
 
-// The coarsest resolution that still resolves every band boundary. Hour-long
-// buckets answer a month in 744 rows and put every boundary of an hour-aligned
-// tariff exactly on a bucket edge; a tariff with a boundary at half past needs
-// minutes, and pays for them in rows.
-function wantedResolution(bands, spanMs) {
-  const aligned = bands.every((b) => b.ranges.every((r) => r.start % 60 === 0 && r.end % 60 === 0));
-  return aligned && spanMs >= 3 * 86400000 ? 3600 : 60;
-}
-
-// What one row of the tier the server chose actually covers. The full tier's
-// resolution is the polling interval, which only the settings know.
-const tierResolution = (tier, cadence) =>
-  tier === 'hourly' ? 3600 : tier === 'minute' ? 60 : cadence;
-
-async function counterHistory(win, bands, cadence) {
-  const start = new Date(win.start.getTime() - LEAD_MS);
-  const spanSeconds = (win.now.getTime() - start.getTime()) / 1000;
-  const wanted = wantedResolution(bands, win.now.getTime() - win.start.getTime());
-  // The endpoint picks a tier from the span and the width it is given, so
-  // asking for one point per wanted-resolution period asks for that tier.
-  const width = Math.max(1, Math.min(10000, Math.round(spanSeconds / wanted)));
-  const metrics = Object.values(COUNTERS).join(',');
-  const body = await getJSON(`/api/history?start=${encodeURIComponent(start.toISOString())}`
-    + `&end=${encodeURIComponent(win.now.toISOString())}&metrics=${metrics}&width=${width}`);
-  return {
-    points: body.points || [],
-    tier: body.tier || 'full',
-    resolution: tierResolution(body.tier, cadence),
-    // Kept so the page can say when it was handed something coarser than the
-    // tariff needs, rather than quietly pricing across a boundary.
-    wanted,
-  };
-}
-
-// What to call a tier in a sentence.
-const tierWord = (tier) => (tier === 'hourly' ? 'hour' : tier === 'minute' ? 'minute' : 'reading');
-
-// ---------------------------------------------------------------------------
-// Pricing.
-// ---------------------------------------------------------------------------
+// Which stored resolution the service answered from. Named rather than shown
+// raw because "full" means nothing to a reader — it is the raw poll, one row
+// every few seconds.
+const tierWord = (tier) =>
+  tier === 'hourly' ? 'hourly' : tier === 'minute' ? 'minute' : 'raw';
 
 // Real elapsed time, never a difference of calendar fields. One month a year
 // is 721 hours long and one is 743, and apportioning a connection charge by
 // the wrong one is out by an hour twice a year.
 const elapsed = (a, b) => b.getTime() - a.getTime();
-
-// Every money figure is absent rather than zero when one of its inputs was not
-// reported. A caption with a hole in it does not appear at all.
-function price(tariff, history, win, exportedKwh) {
-  const monthMs = elapsed(win.start, win.end);
-  const soFarMs = Math.max(0, elapsed(win.start, win.now));
-  const elapsedBands = bandMinutes(tariff.bands, win.start.getTime(), win.now.getTime());
-  const wholeBands = bandMinutes(tariff.bands, win.start.getTime(), win.end.getTime());
-
-  const splits = {};
-  for (const [key, metric] of Object.entries(COUNTERS)) {
-    splits[key] = history
-      ? bandEnergy(history.points, metric, tariff.bands, history.resolution * 1000,
-          win.start.getTime(), win.now.getTime())
-      : null;
-  }
-
-  const rows = [];
-  let energyCost = 0;
-  let noSolarCost = 0;
-  let projectedCost = 0;
-  let measuredMinutes = 0;
-  let wholeMinutes = 0;
-  for (const band of tariff.bands) {
-    const minutes = elapsedBands.get(band.key) || 0;
-    const imported = splits.imported ? bandReading(band, splits.imported, minutes) : null;
-    const house = splits.house ? bandReading(band, splits.house, minutes) : null;
-    const battery = splits.discharged ? bandReading(band, splits.discharged, minutes) : null;
-    const importKwh = imported ? imported.kwh : null;
-    const houseKwh = house ? house.kwh : null;
-    const row = {
-      band,
-      hours: band.ranges.map((r) => `${clock(r.start)}–${clock(r.end)}`).join(', '),
-      importKwh,
-      houseKwh,
-      batteryKwh: battery ? battery.kwh : null,
-      coverage: imported ? imported.coverage : 0,
-      cost: importKwh === null ? null : importKwh * band.price,
-      houseCost: houseKwh === null ? null : houseKwh * band.price,
-      batteryValue: battery && battery.kwh !== null ? battery.kwh * band.price : null,
-    };
-    row.saved = row.houseCost === null || row.cost === null ? null : row.houseCost - row.cost;
-    rows.push(row);
-
-    if (row.cost === null) energyCost = null;
-    else if (energyCost !== null) energyCost += row.cost;
-    if (row.houseCost === null) noSolarCost = null;
-    else if (noSolarCost !== null) noSolarCost += row.houseCost;
-
-    // Projecting the month means projecting each band from its own measured
-    // rate. One blended factor would price the hours nobody has lived through
-    // yet at the average of the ones they have, and on a tariff whose whole
-    // point is that five hours cost triple, that is the wrong average.
-    const whole = wholeBands.get(band.key) || 0;
-    const seen = imported ? imported.minutes : 0;
-    if (importKwh === null || seen <= 0) projectedCost = null;
-    else if (projectedCost !== null) projectedCost += (importKwh / seen) * whole * band.price;
-    measuredMinutes += seen;
-    wholeMinutes += whole;
-  }
-
-  // The connection charge is payable whatever the usage: it belongs in the
-  // bill and never in the saving, since counting it against the array would
-  // make the solar look worse the more it saved.
-  const fixedSoFar = monthMs > 0 ? tariff.fixedMonthly * (soFarMs / monthMs) : 0;
-
-  const credit = tariff.exportPerKwh > 0 && exportedKwh !== null && exportedKwh !== undefined
-    ? exportedKwh * tariff.exportPerKwh : null;
-  const projectedShare = measuredMinutes > 0 ? wholeMinutes / measuredMinutes : null;
-  const projectedCredit = credit === null || projectedShare === null
-    ? null : credit * Math.max(1, projectedShare);
-
-  const unplaced = splits.imported ? splits.imported.unplaced : 0;
-  const unpriced = splits.imported ? splits.imported.unpriced : 0;
-  return {
-    currency: tariff.currency,
-    rows,
-    energyCost,
-    noSolarCost,
-    savings: energyCost === null || noSolarCost === null ? null : noSolarCost - energyCost,
-    fixedMonthly: tariff.fixedMonthly,
-    fixedSoFar,
-    costSoFar: energyCost === null ? null : energyCost + fixedSoFar,
-    projectedCost,
-    estimatedTotal: projectedCost === null
-      ? null : projectedCost + tariff.fixedMonthly - (projectedCredit || 0),
-    credit,
-    projectedCredit,
-    fractionElapsed: monthMs > 0 ? Math.min(1, soFarMs / monthMs) : null,
-    coverage: soFarMs > 0 ? Math.min(1, (measuredMinutes * 60000) / soFarMs) : null,
-    unplacedKwh: unplaced,
-    unpricedKwh: unpriced,
-    unpricedMinutes: uncoveredMinutes(tariff.bands),
-    gaps: splits.imported ? splits.imported.gaps : false,
-    tier: history ? history.tier : null,
-    resolution: history ? history.resolution : null,
-    coarse: history ? history.resolution > history.wanted : false,
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Drawing.
@@ -770,14 +331,19 @@ function renderMonth(win, priced) {
   bar.querySelector('i').style.width = fraction === null ? '0' : `${fraction * 100}%`;
 }
 
-function renderNoTariff(reason) {
-  const why = reason
-    ? `The rate bands in settings could not be read: ${reason} Until that is fixed nothing is priced.`
+// Two states, not one. "Nothing entered" and "something entered that cannot be
+// read" call for opposite actions, and telling somebody staring at the tariff
+// they just typed that they have not entered one sends them to do it again.
+function renderNoTariff(unreadable) {
+  const why = unreadable
+    ? 'A tariff is stored and the service cannot read it, so nothing here is priced. Open '
+      + 'settings and save the rate bands again — they are checked as they are saved, and the '
+      + 'box will say what is wrong with them.'
     : 'A rate nobody entered is a rate this page would be inventing, and an invented rate '
       + 'produces a savings figure that reads as though it were measured. So there is no money '
       + 'anywhere on this page — not zero, not a national average — only the energy below. '
       + 'Enter the rate bands, the connection charge and your currency and every figure appears.';
-  $('notariffWhy').innerHTML = reason ? `<span class="why">${esc(why)}</span>` : esc(why);
+  $('notariffWhy').innerHTML = unreadable ? `<span class="why">${esc(why)}</span>` : esc(why);
   $('notariff').hidden = false;
   $('cards').hidden = true;
   $('sankeySec').hidden = true;
@@ -789,10 +355,17 @@ function renderCards(p) {
   $('cards').hidden = false;
   $('costV').innerHTML = bigMoney(p.costSoFar, cur);
   const costBits = [`Grid energy <b>${esc(money(p.energyCost, cur))}</b>`];
-  costBits.push(p.fixedMonthly > 0
-    ? `connection charge <b>${esc(money(p.fixedSoFar, cur))}</b> of `
-      + `${esc(money(p.fixedMonthly, cur))} so far`
-    : 'no connection charge on this tariff');
+  // Three cases, not two. A charge of nothing is a tariff that has none; a
+  // charge nobody reported is a tariff we cannot speak for, and saying "no
+  // connection charge" there would be inventing the more flattering of them.
+  if (p.fixedMonthly === null) {
+    costBits.push('the connection charge is not known');
+  } else if (p.fixedMonthly > 0) {
+    costBits.push(`connection charge <b>${esc(money(p.fixedSoFar, cur))}</b> of `
+      + `${esc(money(p.fixedMonthly, cur))} so far`);
+  } else {
+    costBits.push('no connection charge on this tariff');
+  }
   $('costSub').innerHTML = `${costBits.join(' · ')}.`;
 
   $('billV').innerHTML = bigMoney(p.estimatedTotal, cur);
@@ -807,10 +380,18 @@ function renderCards(p) {
         + 'projected from it. Come back after the first full day.';
   } else {
     const bits = [`Energy <b>${esc(money(p.projectedCost, cur))}</b>`];
-    if (p.fixedMonthly > 0) bits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
+    if (p.fixedMonthly) bits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
     if (p.projectedCredit) bits.push(`less export credit <b>${esc(money(p.projectedCredit, cur))}</b>`);
-    $('billSub').innerHTML = `${bits.join(' · ')}. An estimate: it assumes the rest of the `
-      + 'month uses each rate band at the rate this one has so far.';
+    // A month that changes season breaks the projection's own premise: the
+    // remaining days are priced by a different set of bands than the measured
+    // ones, so scaling one to the other is arithmetic across two tariffs.
+    const caveat = p.seasonChanges
+      ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
+        + 'different bands than the part measured — treat the projection as the roughest of '
+        + 'guides.'
+      : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
+        + 'one has so far.';
+    $('billSub').innerHTML = `${bits.join(' · ')}. ${caveat}`;
   }
 
   const saved = $('saveV');
@@ -983,7 +564,6 @@ function renderBands(p) {
   const costs = p.rows.map((r) => (r.cost === null ? 0 : r.cost));
   const widest = Math.max(...costs, 0);
   const body = p.rows.map((r) => {
-    const part = r.coverage > 0 && r.coverage < 0.98 ? ' class="part"' : '';
     const bar = widest > 0 && r.cost !== null
       ? `<div class="bandbar"><i style="width:${Math.max(2, (r.cost / widest) * 100).toFixed(1)}%">`
         + '</i></div>'
@@ -991,9 +571,9 @@ function renderBands(p) {
     return `<tr>
       <td>${esc(r.band.name)}<div class="hours">${esc(r.hours)}</div></td>
       <td>${esc(rateStr(r.band.price, cur))}</td>
-      <td${part}>${esc(uStr(r.importKwh, 1, 'kWh'))}</td>
+      <td>${esc(uStr(r.importKwh, 1, 'kWh'))}</td>
       <td>${esc(money(r.cost, cur))}${bar}</td>
-      <td${part}>${esc(uStr(r.houseKwh, 1, 'kWh'))}</td>
+      <td>${esc(uStr(r.houseKwh, 1, 'kWh'))}</td>
       <td>${esc(money(r.houseCost, cur))}</td>
       <td>${esc(money(r.saved, cur))}</td>
     </tr>`;
@@ -1009,7 +589,8 @@ function renderBands(p) {
   $('bandTable').querySelector('tbody').innerHTML = body + totals;
   renderSplit(p);
 
-  $('bandTier').textContent = p.tier ? `counter differences, one point per ${tierWord(p.tier)}` : '';
+  $('bandTier').textContent = p.tier
+    ? `counter differences, read from the ${tierWord(p.tier)} tier` : '';
 
   // Captions state only what was measured. One whose inputs are missing does
   // not appear at all rather than appearing with a dash in the middle.
@@ -1035,20 +616,15 @@ function renderBands(p) {
     }
   }
   if (p.unpricedMinutes > 0) {
-    const fell = p.unpricedKwh > 0.05
-      ? ` ${esc(uStr(p.unpricedKwh, 1, 'kWh'))} was imported in them, and is missing from every `
-        + 'figure here.'
-      : '';
-    notes.push(`<span class="warn">The bands leave ${p.unpricedMinutes} minutes of the day `
-      + `unpriced</span>, so energy used in those hours belongs to no band.${fell}`);
+    notes.push(`<span class="warn">The bands leave ${p.unpricedMinutes} minutes of this month `
+      + 'unpriced</span> — energy used in those hours belongs to no band, and is missing from '
+      + 'every figure here. Widen a band, or add one covering the rest of the day.');
   }
-  if (p.unplacedKwh > 0.05) {
-    notes.push(`<span class="warn">${esc(uStr(p.unplacedKwh, 1, 'kWh'))} could not be placed in a `
-      + 'band</span> — collection stopped across a band boundary, and which side of it that '
-      + 'energy fell on is not knowable. The cost above is short by that much.');
-  }
-  if (p.rows.some((r) => r.coverage > 0 && r.coverage < 0.98)) {
-    notes.push('A dot marks a band the collector was not running through all of.');
+  if (p.rows.some((r) => r.importKwh === null)) {
+    notes.push('A band showing ' + DASH + ' was not measured across the whole month: the '
+      + 'collector stopped across one of its boundaries, and which side of that boundary the '
+      + 'energy fell on is not knowable. It is left out rather than guessed at, so the totals '
+      + 'above are absent too.');
   }
   $('bandCap').innerHTML = notes.join(' ');
 }
@@ -1087,9 +663,9 @@ function renderEnergy(bucket) {
       + 'reading is not a reading of zero.';
 }
 
-function renderAssumptions(p, tariff, unreadable) {
+function renderAssumptions(p, hasTariff, unreadable) {
   const bits = [];
-  if (tariff) {
+  if (hasTariff) {
     bits.push('Energy comes from the inverter’s own lifetime kWh counters, differenced '
       + 'across each rate band. Integrating stored power instead would agree on a clean day and '
       + 'quietly undercount after any gap in collection.');
@@ -1105,12 +681,15 @@ function renderAssumptions(p, tariff, unreadable) {
     bits.push('Every figure is rounded once, where it is shown. A breakdown can therefore be a '
       + 'cent away from its total — pricing the total is exact, and summing rounded parts '
       + 'drifts from it.');
+    bits.push('Pricing happens in the service, not in this page. A tariff has one grammar and '
+      + 'one meaning, and the moment there were two implementations of it they disagreed — so '
+      + 'everything above arrives already priced, and the page only draws it.');
     if (p && p.tier) {
-      bits.push(`This month was read one point per ${tierWord(p.tier)}, which is `
-        + (p.coarse
-          ? 'coarser than this tariff’s band boundaries: energy either side of a boundary can '
-            + 'land in the neighbouring band.'
-          : 'fine enough to resolve every boundary in the tariff as entered.'));
+      bits.push(`This month was read from the ${esc(tierWord(p.tier))} tier, `
+        + (p.tier === 'hourly'
+          ? 'which resolves a band boundary only to the hour: a tariff that changes rate at half '
+            + 'past would put the half hour either side in the wrong band.'
+          : 'which resolves every boundary a tariff can express.'));
     }
   } else if (unreadable) {
     bits.push('The tariff could not be read from the service just now, so nothing is priced. '
@@ -1127,48 +706,94 @@ function renderAssumptions(p, tariff, unreadable) {
 // Loading.
 // ---------------------------------------------------------------------------
 
-function readTariff(values) {
-  const currency = String(values['tariff.currency'] || '$');
-  const text = String(values['tariff.bands'] || '');
-  if (!text.trim()) return { tariff: null, reason: '', currency };
-  try {
-    return {
-      currency,
-      reason: '',
-      tariff: {
-        bands: parseBands(text),
-        fixedMonthly: Math.max(0, numOrNull(values['tariff.fixed_monthly']) || 0),
-        exportPerKwh: Math.max(0, numOrNull(values['tariff.export_per_kwh']) || 0),
-        currency,
-      },
-    };
-  } catch (e) {
-    return { tariff: null, reason: `${e.message}.`, currency };
+// Ask the service what the month cost. The tariff grammar, the band boundaries
+// and every multiplication live behind this one URL, because when the page had
+// its own copy of them the two drifted immediately — this page's parser
+// rejected the seasonal band format the service accepts, and in the form it did
+// accept it applied the summer peak window to a January evening.
+async function monthCost(win) {
+  const zone = localZone();
+  return getJSON(`/api/costs?start=${encodeURIComponent(win.start.toISOString())}`
+    + `&end=${encodeURIComponent(win.now.toISOString())}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
+}
+
+// The service's answer in the shape the drawing below reads. A mapping, not a
+// calculation: every figure here was computed server-side, and the only
+// arithmetic is adding a band's cost to the counterfactual it is subtracted
+// from. Absent stays absent through all of it — null never becomes 0.
+function fromQuote(quote) {
+  const cost = quote.cost || {};
+  const bill = quote.bill || {};
+
+  // Renamed, never recomputed. Every figure below arrived priced; the only
+  // work here is giving each one the name the drawing code reads it by.
+  const rows = (quote.rows || []).map((r) => ({
+    band: { name: r.name, price: r.price_per_kwh },
+    hours: [r.hours || '', r.months ? monthNames(r.months) : ''].filter(Boolean).join(' \u00b7 '),
+    importKwh: numOrNull(r.import_kwh),
+    houseKwh: numOrNull(r.house_kwh),
+    batteryKwh: numOrNull(r.battery_kwh),
+    cost: numOrNull(r.cost),
+    houseCost: numOrNull(r.house_cost),
+    batteryValue: numOrNull(r.battery_value),
+    saved: numOrNull(r.saved),
+  }));
+
+  const measured = numOrNull(quote.measured_minutes);
+  const elapsedMin = numOrNull(quote.elapsed_minutes);
+  return {
+    currency: quote.currency || '$',
+    rows,
+    energyCost: numOrNull(cost.energy_cost),
+    noSolarCost: numOrNull(cost.no_solar_cost),
+    savings: numOrNull(cost.savings),
+    // Absent, not zero. A connection charge nobody reported is unknown, and
+    // rendering it as nought says the tariff has none — which is a different
+    // claim, and one this page has no basis for making.
+    fixedMonthly: numOrNull(bill.fixed_charge),
+    fixedSoFar: numOrNull(cost.fixed_charge),
+    costSoFar: numOrNull(cost.cost),
+    projectedCost: numOrNull(bill.projected_energy_cost),
+    estimatedTotal: numOrNull(bill.estimated_total),
+    credit: numOrNull(cost.export_credit),
+    projectedCredit: numOrNull(bill.projected_export_credit),
+    seasonChanges: bill.season_changes === true,
+    fractionElapsed: numOrNull(bill.fraction_elapsed),
+    coverage: measured === null || !elapsedMin ? null : Math.min(1, measured / elapsedMin),
+    unpricedMinutes: numOrNull(quote.unpriced_minutes),
+    tier: quote.tier || null,
+  };
+}
+
+// A season as a reader would say it: 'Jun–Sep', or 'Nov–Apr' across the turn of
+// the year, and a comma list when the months do not run consecutively.
+function monthNames(list) {
+  const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const set = new Set(list);
+  if (set.size === 0 || set.size === 12) return '';
+  const label = (m) => names[m - 1];
+  // A run is contiguous if walking forward from its first month, wrapping at
+  // December, covers every month in the set and nothing else.
+  for (const first of set) {
+    let m = first;
+    let seen = 0;
+    while (set.has(m) && seen < set.size) { m = m === 12 ? 1 : m + 1; seen += 1; }
+    if (seen === set.size && !set.has(m)) {
+      const last = m === 1 ? 12 : m - 1;
+      return set.size === 1 ? label(first) : `${label(first)}${DASH_TO}${label(last)}`;
+    }
   }
+  return [...set].sort((a, b) => a - b).map(label).join(', ');
 }
 
 async function refresh() {
   const win = monthWindow(new Date());
-  // Collected rather than set as they happen: three reads can fail in one
-  // pass, and a second failure overwriting the first would leave the page
-  // explaining only half of what went wrong.
+  // Collected rather than set as they happen: two reads can fail in one pass,
+  // and a second failure overwriting the first would leave the page explaining
+  // only half of what went wrong.
   const trouble = [];
-
-  let values = {};
-  let settingsFailed = false;
-  try {
-    const body = await getJSON('/api/settings');
-    values = (body && body.values) || {};
-  } catch (e) {
-    settingsFailed = true;
-    // The money already on screen is left where it is, the way the dashboard
-    // leaves its charts up through a failed poll — but it is now of unknown
-    // vintage, and the note has to say so rather than let it read as current.
-    trouble.push('Settings could not be read, so the tariff is unknown. Any money still on '
-      + 'screen is from the last successful read.');
-  }
-  const { tariff, reason } = readTariff(values);
-  const cadence = numOrNull(values['collector.poll_interval']) || FALLBACK_CADENCE;
 
   let bucket = null;
   try {
@@ -1179,29 +804,40 @@ async function refresh() {
   renderEnergy(bucket);
   renderMonth(win, null);
 
-  if (!tariff) {
-    if (!settingsFailed) renderNoTariff(reason);
-    renderAssumptions(null, null, settingsFailed);
+  let quote = null;
+  try {
+    quote = await monthCost(win);
+  } catch (e) {
+    // The money already on screen is left where it is, the way the dashboard
+    // leaves its charts up through a failed poll — but it is now of unknown
+    // vintage, and the note has to say so rather than let it read as current.
+    trouble.push(`The month’s cost could not be read: ${e.message}. Any money still on screen `
+      + 'is from the last successful read.');
+  }
+
+  if (quote && !quote.configured) {
+    renderNoTariff(quote.unreadable === true);
+    renderAssumptions(null, false, quote.unreadable === true);
+    pageNote(trouble.join(' '));
+    stamp();
+    return;
+  }
+  if (!quote || !quote.cost) {
+    // Configured but unpriceable: the service has a tariff and could not apply
+    // it to this month. Nothing is invented to fill the gap.
+    renderAssumptions(null, Boolean(quote), !quote);
     pageNote(trouble.join(' '));
     stamp();
     return;
   }
   $('notariff').hidden = true;
 
-  let history = null;
-  try {
-    history = await counterHistory(win, tariff.bands, cadence);
-  } catch (e) {
-    trouble.push(`The energy counters could not be read: ${e.message}. `
-      + 'No money is shown rather than a figure built from part of the month.');
-  }
-  const exported = bucket ? numOrNull(bucket.grid_exported_kwh) : null;
-  const priced = price(tariff, history, win, exported);
+  const priced = fromQuote(quote);
   renderMonth(win, priced);
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
-  renderAssumptions(priced, tariff, false);
+  renderAssumptions(priced, true, false);
   pageNote(trouble.join(' '));
   stamp();
 }
@@ -1213,9 +849,14 @@ function stamp() {
 // Boot. Everything above is definitions; nothing runs until here. Costs move
 // by the hour at most, so this refreshes far more slowly than the dashboard —
 // the month's counter history is a bigger read than a live poll.
-drawNav('costs');
-refresh();
-setInterval(refresh, 5 * 60 * 1000);
+async function boot() {
+  await syncDisplayDefaults();
+  drawNav('costs');
+  await refresh();
+  setInterval(refresh, 5 * 60 * 1000);
+}
+
+boot();
 </script>
 </body>
 </html>

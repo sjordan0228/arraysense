@@ -604,3 +604,116 @@ def test_costs_refuses_a_period_too_long_to_price(client: Any) -> None:
     )
     assert r.status_code == 400
     assert "days" in r.json()["detail"]
+
+
+def test_costs_carries_everything_the_page_would_otherwise_derive_twice(client: Any) -> None:
+    # The page draws; it does not compute. Every field here exists because the
+    # alternative was the browser working it out again from a second endpoint,
+    # and a second derivation of the same thing is how the tariff grammar came
+    # to have two implementations that disagreed.
+    client.put(
+        "/api/settings",
+        json={
+            "tariff.bands": (
+                "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+                "Off-peak | 0.086709 | 00:00-24:00 | May-Oct"
+            ),
+            "tariff.fixed_monthly": 15.0,
+        },
+    )
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-07-16T00:00:00Z",
+            "tz": "America/Chicago",
+        },
+    ).json()
+    peak = next(r for r in body["rows"] if r["name"] == "On-peak")
+    assert peak["hours"] == "15:00\N{EN DASH}20:00"
+    # The season, so a peak window nobody is currently in is not shown as a
+    # rate they are being charged today.
+    assert peak["months"] == [5, 6, 7, 8, 9, 10]
+    # Every figure the table draws, already in money. The page multiplying a
+    # rate by a kilowatt-hour is the same mistake as the page parsing a tariff.
+    for key in (
+        "import_kwh",
+        "cost",
+        "house_kwh",
+        "house_cost",
+        "battery_kwh",
+        "battery_value",
+        "saved",
+        "price_per_kwh",
+    ):
+        assert key in peak, key
+    for key in ("tier", "unpriced_minutes", "measured_minutes"):
+        assert key in body, key
+    assert body["elapsed_minutes"] == pytest.approx(1440.0)
+
+
+def test_costs_says_whether_a_stored_tariff_is_merely_absent_or_unreadable(client: Any) -> None:
+    # "Nothing entered" and "something entered that cannot be read" call for
+    # opposite actions, and conflating them tells somebody staring at the
+    # tariff they just typed that they have not entered one.
+    body = client.get(
+        "/api/costs",
+        params={"start": "2026-07-15T00:00:00Z", "end": "2026-07-16T00:00:00Z"},
+    ).json()
+    assert body["configured"] is False
+    assert body["unreadable"] is False
+
+
+def test_a_malformed_tariff_is_refused_when_it_is_saved(client: Any) -> None:
+    # Not on the way out. Storing it and letting the Costs page discover the
+    # absence puts the error a page away from the box that caused it.
+    r = client.put("/api/settings", json={"tariff.bands": "Peak | xx:00-20:00 | 0.21"})
+    assert r.status_code == 400
+    assert "tariff.bands" in r.json()["detail"]
+
+
+def test_a_tariff_written_one_band_per_line_can_be_saved(client: Any) -> None:
+    # The help text says "one band per line" and parse_bands has always
+    # accepted newlines; it was the settings validator that refused them, so
+    # a tariff typed the way it reads could not be stored at all.
+    r = client.put(
+        "/api/settings",
+        json={"tariff.bands": "On-peak | 0.21 | 15:00-20:00\nOff-peak | 0.09 | 00:00-24:00"},
+    )
+    assert r.status_code == 200, r.json()
+    assert r.json()["changed"] == ["tariff.bands"]
+    # The tariff is read afresh on every costs request, so nothing restarts.
+    assert r.json()["restart_required"] is False
+
+
+def test_changing_how_the_collector_connects_does_need_a_restart(client: Any) -> None:
+    r = client.put("/api/settings", json={"connection.dongle_host": "192.168.1.77"})
+    assert r.status_code == 200
+    assert r.json()["restart_required"] is True
+
+
+def test_costs_reports_hours_no_band_covers(client: Any) -> None:
+    # A tariff with a hole in it prices less than the month used. Saying how
+    # much of the day falls outside every band is the difference between a
+    # small bill and a wrong one.
+    client.put("/api/settings", json={"tariff.bands": "Daytime | 0.15 | 08:00-20:00"})
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-07-16T00:00:00Z",
+            "tz": "America/Chicago",
+        },
+    ).json()
+    assert body["unpriced_minutes"] == 12 * 60
+
+
+def test_the_settings_page_is_served(client: Any) -> None:
+    # The tariff, the connection and the poll interval are all database
+    # settings with a PUT endpoint, and until this route existed there was no
+    # page anywhere that wrote to it — so the Costs page's own empty state
+    # pointed the owner at somewhere they could not enter a tariff.
+    r = client.get("/settings")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+    assert "/api/settings" in r.text

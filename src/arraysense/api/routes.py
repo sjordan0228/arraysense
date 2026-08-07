@@ -24,14 +24,21 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
-from arraysense.costs import period_energy
+from arraysense.costs import period_energy, unpriced_minutes
 from arraysense.energy import ENERGY_FIELDS, Period, energy_totals, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SettingsStore, describe, lookup_setting
 from arraysense.store.schema import module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
-from arraysense.tariff import compute_cost, estimate_bill, load_tariff
+from arraysense.tariff import (
+    CostResult,
+    PeriodEnergy,
+    Tariff,
+    compute_cost,
+    estimate_bill,
+    load_tariff,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +67,18 @@ _CALIBRATION_TIER = "minute"
 # once a day, so this covers well over a month of candidates while bounding the
 # per-window module reads that follow.
 _MAX_WINDOWS_EXAMINED = 40
+
+# How far before a costed period to start reading its counters. The first
+# interval needs an earlier reading to be measured *from*; without one it
+# starts at whatever row happens to fall inside it, and the first stretch of
+# every month comes back short. Two hours matches the widening the energy
+# endpoint does for the same reason.
+COUNTER_LEAD = timedelta(hours=2)
+
+# Settings the collector reads once, when it starts. Everything else — the
+# tariff, the display defaults — is read afresh on each request that needs it,
+# and takes effect as soon as it is saved.
+RESTART_PREFIXES = ("connection.", "collector.")
 
 
 class YieldRequest(BaseModel):
@@ -240,7 +259,11 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "changed": changed,
-        "restart_required": any(not k.startswith("display.") for k in changed),
+        # Only what the collector reads once, at startup. The tariff is read on
+        # every costs request and the display settings on every page load, so
+        # telling the owner to restart after changing either is advice that
+        # does nothing — and advice that does nothing is ignored when it counts.
+        "restart_required": any(k.startswith(RESTART_PREFIXES) for k in changed),
         "values": settings.public(),
     }
 
@@ -282,11 +305,29 @@ async def costs(
     zone = resolve_zone(tz)
 
     if tariff is None:
-        return {"currency": None, "configured": False, "cost": None, "bill": None}
+        # Two different situations, and conflating them tells somebody staring
+        # at the tariff they just typed that they have not entered one. Text
+        # is stored but unusable only for a value saved before the grammar was
+        # checked at write time, which is why the reason is worth carrying.
+        stored = str(settings.all().get("tariff.bands") or "").strip()
+        return {
+            "currency": None,
+            "configured": False,
+            "unreadable": bool(stored),
+            "cost": None,
+            "bill": None,
+        }
 
-    rows = store.query(list(ENERGY_FIELDS.values()), start, end, tier="minute") or store.query(
-        list(ENERGY_FIELDS.values()), start, end, tier="full"
-    )
+    # Read back before the period starts so its first interval has a reading to
+    # be measured *from*, rather than starting at whatever row happens to fall
+    # inside it. Without the lead, the first stretch of every month is short by
+    # however long it took the first sample to arrive.
+    lead = start - COUNTER_LEAD
+    tier = "minute"
+    rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=tier)
+    if not rows:
+        tier = "full"
+        rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=tier)
     try:
         energy = period_energy(tariff, rows, start, end, zone)
     except ValueError as exc:
@@ -294,13 +335,73 @@ async def costs(
 
     result = compute_cost(tariff, energy)
     bill = estimate_bill(tariff, energy)
+
+    # The page needs more than the priced totals to be honest about them: the
+    # hours each band covers so it can be labelled, the house energy behind the
+    # counterfactual, and whether any of the period fell outside every band.
+    # Sending them from here keeps the page from deriving any of it a second
+    # time, which is how the two implementations diverged in the first place.
     return {
         "currency": tariff.currency,
         "configured": True,
         "timezone": str(zone),
+        "tier": tier,
         "cost": asdict(result) if result else None,
         "bill": asdict(bill) if bill else None,
+        "rows": _band_rows(tariff, energy, result),
+        "measured_minutes": energy.measured_minutes,
+        "elapsed_minutes": energy.elapsed_minutes,
+        "unpriced_minutes": round(unpriced_minutes(tariff, start, end, zone)),
     }
+
+
+def _band_rows(
+    tariff: Tariff, energy: PeriodEnergy, result: CostResult | None
+) -> list[dict[str, Any]]:
+    """One finished row per band: its label, its energy, and every figure in money.
+
+    Assembled here rather than in the page because the page multiplying a rate
+    by a kilowatt-hour is the same mistake as the page parsing a tariff, only
+    smaller and harder to spot. Every number below is either measured or
+    absent; none of them is a zero standing in for something nobody knew.
+    """
+    if result is None:
+        return []
+    house = dict(energy.load_kwh or {})
+    battery = dict(energy.battery_discharge_kwh or {})
+    by_name = {band.name: band for band in tariff.bands}
+
+    rows: list[dict[str, Any]] = []
+    for priced in result.bands:
+        band = by_name.get(priced.name)
+        house_kwh = house.get(priced.name)
+        battery_kwh = battery.get(priced.name)
+        house_cost = None if house_kwh is None else round(house_kwh * priced.price_per_kwh, 2)
+        rows.append(
+            {
+                "name": priced.name,
+                "price_per_kwh": priced.price_per_kwh,
+                # A season is part of a band's identity: a peak window the
+                # reader is not currently in, shown without saying so, reads as
+                # a rate they are being charged today.
+                "hours": ", ".join(r.label for r in band.hours) if band else "",
+                "months": sorted(band.months) if band and band.months else None,
+                "import_kwh": priced.kwh,
+                "cost": priced.cost,
+                "house_kwh": house_kwh,
+                "house_cost": house_cost,
+                "battery_kwh": battery_kwh,
+                "battery_value": (
+                    None if battery_kwh is None else round(battery_kwh * priced.price_per_kwh, 2)
+                ),
+                "saved": (
+                    None
+                    if house_cost is None or priced.cost is None
+                    else round(house_cost - priced.cost, 2)
+                ),
+            }
+        )
+    return rows
 
 
 @router.get("/history")

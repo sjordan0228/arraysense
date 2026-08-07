@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings · Solar ArraySense</title>
+<!-- Every control on this page is built from what /api/settings describes.
+     Nothing here names a setting, states a bound, or lists a choice: the
+     registry in settings.py does all three, and a page that repeated any of
+     them would drift from the validation the moment either changed. The drift
+     always looks the same from the outside — a control offering a value the
+     server then refuses. -->
+<script src="/common.js"></script>
+<style>
+  .grp{margin-bottom:12px}
+  .grp .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;margin:0 0 14px}
+  .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
+  @media(max-width:760px){.fields{grid-template-columns:1fr}}
+  /* A field whose value is long prose — the rate bands — needs the row to
+     itself; sat in a 50% column it wraps every band onto three lines. */
+  .fields .wide{grid-column:1/-1}
+  .f{display:flex;flex-direction:column;gap:5px;min-width:0}
+  .f .lbl{display:block}
+  .f input,.f select,.f textarea{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
+    color:var(--ink);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;width:100%;
+    font-variant-numeric:tabular-nums}
+  .f textarea{resize:vertical;min-height:74px;line-height:1.55;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .f input:focus,.f select:focus,.f textarea:focus{outline:2px solid var(--pv);outline-offset:1px;
+    border-color:transparent}
+  .f .help{font-size:11px;color:var(--ink3);line-height:1.55}
+  /* A field the server rejected. The message sits with the control that caused
+     it: a single banner saying "invalid" leaves the reader hunting ten fields
+     for the one at fault. */
+  .f.bad input,.f.bad select,.f.bad textarea{border-color:var(--bad)}
+  .f .err{font-size:11px;color:var(--bad);line-height:1.55}
+  .f .err[hidden]{display:none}
+  .actions{display:flex;align-items:center;gap:11px;flex-wrap:wrap;margin-top:2px}
+  .actions .grow{margin-left:auto}
+  #save{background:var(--pv);border-color:transparent;color:#1a1204;font-weight:600;font-size:13px;
+    padding:6px 16px}
+  #save:hover{background:#e08c33;color:#1a1204}
+  #save:disabled{opacity:.45;cursor:default}
+  .said{font-size:12px;line-height:1.55}
+  .said.ok{color:var(--good)}
+  .said.bad{color:var(--bad)}
+  .said.warn{color:var(--warn)}
+  /* The identifying values come back from the service with their middles
+     replaced. Saying so beside them stops the mask reading as a corrupt value. */
+  .masknote{font-size:11px;color:var(--ink3);line-height:1.6;margin:12px 0 0;max-width:80ch}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div class="conn" id="stamp"></div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="p pn" id="pnote" hidden></div>
+
+  <form id="form" autocomplete="off"></form>
+
+  <section class="p">
+    <div class="actions">
+      <button class="iconbtn" id="save" type="button" disabled>Save changes</button>
+      <button class="iconbtn" id="revert" type="button" disabled>Discard</button>
+      <span class="said" id="said"></span>
+      <span class="muted grow" style="font-size:11px">
+        Stored in the database on the service, not in this browser.
+      </span>
+    </div>
+  </section>
+
+  <details>
+    <summary>Where these live, and what reads them</summary>
+    <p class="masknote" id="about"></p>
+  </details>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// State. `fields` is the registry as the service describes it; `saved` is what
+// the service currently holds. Nothing else is remembered — after a write the
+// service's own reply becomes the new `saved`, so the page can never believe a
+// value the service did not accept.
+// ---------------------------------------------------------------------------
+
+let fields = [];
+let saved = {};
+
+// The groups, in the order they are shown, keyed by the prefix of the settings
+// that belong to each. A prefix with no entry here still renders — under its
+// own name — so adding a setting to the registry can never make it invisible.
+const GROUPS = [
+  {
+    prefix: 'tariff',
+    title: 'What electricity costs',
+    intro: 'The Costs page prices nothing until these are entered — a rate nobody supplied is '
+      + 'a rate the page would be inventing, and an invented rate produces a savings figure '
+      + 'that reads as though it had been measured.',
+  },
+  {
+    prefix: 'connection',
+    title: 'The inverter',
+    intro: 'How the collector reaches the dongle. Changing any of these needs the collector '
+      + 'restarted before it takes effect.',
+  },
+  {
+    prefix: 'collector',
+    title: 'Collection',
+    intro: 'How often the inverter is read. The dongle accepts one connection at a time, so '
+      + 'this is the whole of what the installation asks of it.',
+  },
+  {
+    prefix: 'display',
+    title: 'Display',
+    intro: 'Defaults for every browser that opens this installation. A device that has picked '
+      + 'its own units on the dashboard keeps them; anything that has not follows what is set '
+      + 'here.',
+  },
+];
+
+const groupOf = (key) => key.split('.')[0];
+
+// ---------------------------------------------------------------------------
+// Rendering. One control per registry entry, chosen from its declared kind.
+// ---------------------------------------------------------------------------
+
+// Whether the value is a paragraph rather than a line — declared by the
+// registry, not guessed from the key. Guessing means the page decides which
+// settings may contain a newline while the server decides separately, and the
+// two then disagree: the tariff got a textarea here and was refused there for
+// containing a control character.
+const isLong = (spec) => spec.kind === 'str' && spec.multiline === true;
+
+function control(spec, value) {
+  const id = `f_${spec.key.replace(/\W/g, '_')}`;
+  const shown = value === null || value === undefined ? '' : String(value);
+  if (spec.choices && spec.choices.length) {
+    const options = spec.choices.map((c) =>
+      `<option value="${esc(c)}"${c === shown ? ' selected' : ''}>${esc(c)}</option>`).join('');
+    return `<select id="${id}" data-key="${esc(spec.key)}">${options}</select>`;
+  }
+  // Every cap and bound below comes from the registry, so the control refuses
+  // exactly what the server refuses rather than approximately.
+  const cap = spec.max_length ? ` maxlength="${esc(String(spec.max_length))}"` : '';
+  if (isLong(spec)) {
+    return `<textarea id="${id}" data-key="${esc(spec.key)}" spellcheck="false"${cap}`
+      + `>${esc(shown)}</textarea>`;
+  }
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    const step = spec.kind === 'int' ? '1' : 'any';
+    const lo = spec.lower === null ? '' : ` min="${esc(String(spec.lower))}"`;
+    const hi = spec.upper === null ? '' : ` max="${esc(String(spec.upper))}"`;
+    return `<input id="${id}" data-key="${esc(spec.key)}" type="number" step="${step}"`
+      + `${lo}${hi} value="${esc(shown)}" inputmode="decimal">`;
+  }
+  return `<input id="${id}" data-key="${esc(spec.key)}" type="text"${cap} value="${esc(shown)}">`;
+}
+
+// What is wrong with a value, in the server's own terms, or null if nothing is.
+// Checked here as well as there so a mistake is caught beside the control that
+// made it — the server validates every value before writing any of them, so
+// one bad field otherwise means a whole form rejected with a single message.
+function fault(spec, value) {
+  if (value === undefined) return null;
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    if (!Number.isFinite(value)) return `${spec.label} must be a number.`;
+    if (spec.kind === 'int' && !Number.isInteger(value)) {
+      return `${spec.label} must be a whole number.`;
+    }
+    if (spec.lower !== null && value < spec.lower) {
+      return `${spec.label} must be at least ${spec.lower}.`;
+    }
+    if (spec.upper !== null && value > spec.upper) {
+      return `${spec.label} must be at most ${spec.upper}.`;
+    }
+    return null;
+  }
+  if (spec.kind === 'str') {
+    if (spec.max_length && value.length > spec.max_length) {
+      return `${spec.label} is too long at ${value.length} characters, `
+        + `the limit is ${spec.max_length}.`;
+    }
+    // The same rule settings.py applies: a newline is content only where the
+    // registry says so, and nothing invisible is content anywhere. The allowed
+    // set has to be exempt from *every* test below, not just the whitespace
+    // one — a newline is also a control character, and checking that
+    // separately is how this rejected the very field it had just permitted.
+    const allowed = isLong(spec) ? ' \n' : ' ';
+    const bad = [...value].some((ch) => {
+      if (allowed.includes(ch)) return false;
+      const code = ch.charCodeAt(0);
+      return /\s/.test(ch) || code < 32 || code === 127
+        || (code >= 0x200b && code <= 0x200f) || code === 0xfeff;
+    });
+    if (bad) return `${spec.label} must not contain control or invisible characters.`;
+  }
+  return null;
+}
+
+function render() {
+  const blocks = [];
+  const known = new Set(GROUPS.map((g) => g.prefix));
+  const extras = [...new Set(fields.map((f) => groupOf(f.key)))].filter((p) => !known.has(p));
+  const order = [...GROUPS, ...extras.map((p) => ({ prefix: p, title: p, intro: '' }))];
+
+  for (const group of order) {
+    const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
+    if (!mine.length) continue;
+    const controls = mine.map((spec) => {
+      const help = [spec.help];
+      if (spec.kind === 'int' || spec.kind === 'float') {
+        if (spec.lower !== null && spec.upper !== null) {
+          help.push(`${spec.lower} to ${spec.upper}.`);
+        }
+      }
+      return `<div class="f${isLong(spec) ? ' wide' : ''}" data-for="${esc(spec.key)}">
+          <label class="lbl" for="f_${esc(spec.key.replace(/\W/g, '_'))}">${esc(spec.label)}</label>
+          ${control(spec, saved[spec.key])}
+          <span class="help">${esc(help.filter(Boolean).join(' '))}</span>
+          <span class="err" hidden></span>
+        </div>`;
+    }).join('');
+    blocks.push(`<section class="p grp">
+        <div class="chead"><h2>${esc(group.title)}</h2></div>
+        ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
+        <div class="fields">${controls}</div>
+      </section>`);
+  }
+  $('form').innerHTML = blocks.join('');
+  for (const el of $('form').querySelectorAll('[data-key]')) {
+    el.addEventListener('input', dirtyCheck);
+    el.addEventListener('change', dirtyCheck);
+  }
+  dirtyCheck();
+
+  const secret = fields.filter((f) => f.secret).map((f) => f.label);
+  $('about').textContent = 'These are held in the service’s own database rather than in a '
+    + 'file beside it, so they survive a reinstall and are the same for every browser that '
+    + 'opens the installation. The collector reads them at startup, which is why changing how '
+    + 'it connects needs a restart.'
+    + (secret.length
+      ? ` ${secret.join(' and ')} come back from the service with their middles replaced. `
+        + 'Leave a masked value alone and it is left alone; retype it in full to change it.'
+      : '');
+}
+
+// ---------------------------------------------------------------------------
+// Reading the form back.
+// ---------------------------------------------------------------------------
+
+// What a control currently holds, typed as the registry says it should be. A
+// number left blank is absent rather than zero, and is not submitted at all —
+// clearing a box is not the same as asking for nought watts.
+function currentValue(spec) {
+  const el = document.querySelector(`[data-key="${CSS.escape(spec.key)}"]`);
+  if (!el) return undefined;
+  const text = el.value;
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    if (String(text).trim() === '') return undefined;
+    const n = Number(text);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return text;
+}
+
+// Only what actually differs from what the service holds. Posting the whole
+// form back would rewrite the masked serials with their masks, and the service
+// discards those — but it would also make every save look like a change to
+// settings the collector has to restart for.
+function pending() {
+  const out = {};
+  for (const spec of fields) {
+    const now = currentValue(spec);
+    if (now === undefined) continue;
+    const was = saved[spec.key];
+    if (String(now) !== String(was === null || was === undefined ? '' : was)) out[spec.key] = now;
+  }
+  return out;
+}
+
+function dirtyCheck() {
+  const count = Object.keys(pending()).length;
+  $('save').disabled = count === 0;
+  $('revert').disabled = count === 0;
+  $('save').textContent = count === 0 ? 'Save changes'
+    : `Save ${count} change${count === 1 ? '' : 's'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Talking to the service.
+// ---------------------------------------------------------------------------
+
+function say(text, kind) {
+  const el = $('said');
+  el.textContent = text || '';
+  el.className = `said${kind ? ` ${kind}` : ''}`;
+}
+
+function pageNote(text) {
+  const box = $('pnote');
+  box.textContent = text || '';
+  box.hidden = !text;
+}
+
+function clearErrors() {
+  for (const box of $('form').querySelectorAll('.f')) {
+    box.classList.remove('bad');
+    const err = box.querySelector('.err');
+    err.textContent = '';
+    err.hidden = true;
+  }
+}
+
+// Put a message on the control that caused it. A single banner saying
+// "invalid" leaves the reader hunting ten fields for the one at fault.
+function markFault(key, message) {
+  const box = document.querySelector(`.f[data-for="${CSS.escape(key)}"]`);
+  if (!box) return false;
+  box.classList.add('bad');
+  const err = box.querySelector('.err');
+  err.textContent = message;
+  err.hidden = false;
+  return true;
+}
+
+function focusField(key) {
+  const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (el) el.focus();
+}
+
+// The service names the offending setting in its message. Finding it there and
+// marking that control beats a banner the reader has to match up by hand — and
+// when no key is recognisable the message still gets shown, in full, rather
+// than swallowed for not fitting the shape this expects.
+function showRejection(detail) {
+  clearErrors();
+  const hit = fields.find((f) => detail.includes(f.key));
+  if (hit && markFault(hit.key, detail)) {
+    focusField(hit.key);
+    say(`${hit.label} was not accepted. Nothing was saved.`, 'bad');
+    return;
+  }
+  say(`Not saved: ${detail}`, 'bad');
+}
+
+async function save() {
+  const changes = pending();
+  if (!Object.keys(changes).length) return;
+
+  // Nothing is sent until every changed value would be accepted. The server
+  // validates the whole batch before writing any of it, so one bad field
+  // means none of the others were saved either — and a reader who fixed ten
+  // settings and mistyped the eleventh deserves to be told which.
+  clearErrors();
+  const faults = fields
+    .filter((spec) => spec.key in changes)
+    .map((spec) => [spec, fault(spec, changes[spec.key])])
+    .filter(([, message]) => message);
+  if (faults.length) {
+    for (const [spec, message] of faults) markFault(spec.key, message);
+    const [[first, message]] = faults;
+    say(faults.length === 1 ? message
+      : `${message} ${faults.length - 1} other field`
+        + `${faults.length === 2 ? '' : 's'} also need attention. Nothing was sent.`, 'bad');
+    focusField(first.key);
+    dirtyCheck();
+    return;
+  }
+
+  $('save').disabled = true;
+  say('Saving…', '');
+  let response;
+  try {
+    response = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(changes),
+    });
+  } catch (e) {
+    say(`Could not reach the service: ${e.message}. Nothing was saved.`, 'bad');
+    dirtyCheck();
+    return;
+  }
+
+  let body = null;
+  try { body = await response.json(); } catch (e) { body = null; }
+  if (!response.ok) {
+    // The service validates every value before writing any of them, so a
+    // rejection means nothing at all was stored. Saying so matters: a reader
+    // told only "invalid" reasonably assumes the other nine went through.
+    showRejection((body && body.detail) || `the service answered ${response.status}`);
+    dirtyCheck();
+    return;
+  }
+
+  clearErrors();
+  saved = (body && body.values) || saved;
+  const changed = (body && body.changed) || [];
+  render();
+  applyDisplay(saved);
+  if (!changed.length) {
+    say('Nothing to change — those were already the stored values.', '');
+  } else if (body.restart_required) {
+    say(`Saved ${changed.length} change${changed.length === 1 ? '' : 's'}. `
+      + 'Restart the collector for the connection and collection settings to take effect.', 'warn');
+  } else {
+    say(`Saved ${changed.length} change${changed.length === 1 ? '' : 's'}.`, 'ok');
+  }
+  stamp();
+}
+
+// A display default reaches this browser immediately rather than at the next
+// reload, but never over a choice this device made for itself: the dashboard's
+// own toggle is a per-device override and setting an installation default must
+// not silently undo it.
+function applyDisplay(values) {
+  if (localStorage.getItem('as.tempUnit') === null) {
+    const unit = values['display.temperature_unit'];
+    if (unit === 'F' || unit === 'C') settings.tempUnit = unit;
+  }
+  if (localStorage.getItem('as.refreshSecs') === null) {
+    const secs = Number(values['display.refresh_seconds']);
+    if (Number.isFinite(secs) && secs > 0) settings.refreshSecs = secs;
+  }
+}
+
+async function load() {
+  try {
+    const response = await fetch('/api/settings');
+    if (!response.ok) throw new Error(`the service answered ${response.status}`);
+    const body = await response.json();
+    fields = (body && body.fields) || [];
+    saved = (body && body.values) || {};
+  } catch (e) {
+    pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
+      + 'service answers.');
+    return;
+  }
+  pageNote('');
+  render();
+  applyDisplay(saved);
+  stamp();
+}
+
+function stamp() {
+  $('stamp').textContent = `read ${new Date().toLocaleTimeString()}`;
+}
+
+// Boot. Everything above is definitions; nothing runs until here. This page
+// does not poll: settings change when somebody changes them, and a background
+// refresh would overwrite a half-typed form.
+drawNav('settings');
+$('save').onclick = save;
+$('revert').onclick = () => { render(); clearErrors(); say('', ''); };
+load();
+</script>
+</body>
+</html>

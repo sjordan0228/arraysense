@@ -180,6 +180,35 @@ function saveSetting(name, value) {
   localStorage.setItem('as.' + name, String(value));
 }
 
+// The service holds the same two display settings, and they are the
+// installation's defaults rather than a competing source of truth: a device
+// that has never chosen for itself follows them, and one that has chosen keeps
+// its choice. Without this the settings page would write a temperature unit
+// into the database that no other page ever read, which is the same shape of
+// defect as a rollup builder nothing calls.
+//
+// Awaited before a page's first render. It fails quietly — a service that will
+// not answer leaves this browser on its own defaults, and every page has
+// bigger problems to report by then.
+async function syncDisplayDefaults() {
+  let values;
+  try {
+    const response = await fetch('/api/settings');
+    if (!response.ok) return;
+    values = (await response.json()).values || {};
+  } catch (err) {
+    return;
+  }
+  if (localStorage.getItem('as.tempUnit') === null) {
+    const unit = values['display.temperature_unit'];
+    if (unit === 'F' || unit === 'C') settings.tempUnit = unit;
+  }
+  if (localStorage.getItem('as.refreshSecs') === null) {
+    const secs = Number(values['display.refresh_seconds']);
+    if (Number.isFinite(secs) && secs > 0) settings.refreshSecs = secs;
+  }
+}
+
 const tempOf = (c) => c === null || c === undefined ? null
   : (settings.tempUnit === 'F' ? c * 9/5 + 32 : c);
 const tempStr = (c) => {
@@ -209,6 +238,7 @@ const NAV = [
   { key:'graphs',  label:'Graphs',      href:'/graphs' },
   { key:'history', label:'History',     href:'/history' },
   { key:'costs',   label:'Costs',       href:'/costs' },
+  { key:'settings', label:'Settings',   href:'/settings' },
 ];
 
 // Called again whenever the current view changes, not only at boot: on the

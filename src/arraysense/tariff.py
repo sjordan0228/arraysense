@@ -117,6 +117,18 @@ class TimeRange:
         # Wrapping, or a full day when the two ends coincide.
         return moment >= self.start or moment < self.end
 
+    @property
+    def label(self) -> str:
+        """How to write this range for a reader.
+
+        A whole day is stored with both ends at midnight, which spelled out
+        literally reads "00:00-00:00" — an empty range, and the opposite of
+        what it means.
+        """
+        if self.start == self.end:
+            return "all day"
+        return f"{self.start:%H:%M}\N{EN DASH}{self.end:%H:%M}"
+
 
 @dataclass(frozen=True)
 class RateBand:
@@ -199,7 +211,12 @@ class Tariff:
         while moment < end:
             months.add(moment.month)
             moment += timedelta(days=1)
-        months.add(end.month)
+        # The last instant *inside* the period, not ``end`` itself. ``end`` is
+        # exclusive, and adding its month unconditionally meant a query for a
+        # whole month — 1 October to 1 November — claimed November's bands too.
+        # On a seasonal tariff that band has no energy, absent propagates, and
+        # every completed month priced as a dash.
+        months.add((end - timedelta(microseconds=1)).month)
         return tuple(band for band in self.bands if band.months is None or band.months & months)
 
     def band_at(self, moment: datetime) -> RateBand | None:
@@ -254,6 +271,13 @@ class PeriodEnergy:
     whole house, which is what the counterfactual bill is priced from;
     ``grid_export_kwh`` needs no band split until a tariff pays differently for
     export by hour.
+
+    Nobody meters the bank, so ``battery_discharge_kwh`` is priced by nothing —
+    but it is what the system carried through the expensive hours, and valuing
+    it at the band's own rate is the only way to say what those hours would
+    otherwise have cost. ``measured_minutes`` against ``elapsed_minutes`` says
+    how much of the period the collector was running for, so a total shortened
+    by an outage can be shown as short rather than as a quiet month.
     """
 
     start: datetime
@@ -261,6 +285,9 @@ class PeriodEnergy:
     grid_import_kwh: Mapping[str, float | None]
     load_kwh: Mapping[str, float | None] | None = None
     grid_export_kwh: float | None = None
+    battery_discharge_kwh: Mapping[str, float | None] | None = None
+    measured_minutes: float | None = None
+    elapsed_minutes: float | None = None
 
     def __post_init__(self) -> None:
         """Reject naive bounds and a period that runs backwards.
@@ -343,6 +370,7 @@ class BillEstimate:
     projected_export_credit: float | None
     fixed_charge: float
     estimated_total: float | None
+    season_changes: bool = False
 
 
 def _parse_clock(token: str, entry: str) -> time:
@@ -744,6 +772,10 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     The fixed charge is added once, whole. The export credit, where the tariff
     pays one, is netted off — a bill that ignores money the supplier pays back
     is not the bill that arrives.
+
+    ``season_changes`` warns that the projection's own premise fails: the rest
+    of the month is priced by a different set of bands than the part measured,
+    so scaling one to the other is arithmetic on two different tariffs.
     """
     if tariff is None:
         return None
@@ -754,10 +786,23 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     covered = _elapsed(energy.start, energy.end)
 
     fraction = min(max(_elapsed(month_start, energy.end) / month_seconds, 0.0), 1.0)
-    imported = _by_band(energy.grid_import_kwh, tariff.bands, "grid import")
-    _, so_far = _price(tariff.bands, imported)
+    # Only the bands the measured period could have entered — the same set
+    # compute_cost prices. Pricing all of them instead makes an out-of-season
+    # band permanently unmeasured, which makes the total permanently absent:
+    # on the reference installation's own seasonal tariff this endpoint could
+    # never once produce an estimated bill.
+    active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
+    imported = _by_band(energy.grid_import_kwh, active, "grid import")
+    _, so_far = _price(active, imported)
+    whole_month = tariff.bands_in_effect(month_start, month_end) or tariff.bands
 
-    scale = max(month_seconds / covered, 1.0) if covered > 0 else None
+    # Scaled by what was *watched*, not by what was asked for. A collector that
+    # ran for twelve hours of a day the caller requested in full has measured
+    # half a day's energy, and dividing it by the whole day projects a month at
+    # half the rate the house actually uses. Falls back to the requested span
+    # when nothing said how much was observed.
+    observed = covered if energy.measured_minutes is None else energy.measured_minutes * 60
+    scale = max(month_seconds / observed, 1.0) if observed > 0 else None
     projected = None if so_far is None or scale is None else so_far * scale
 
     credit: float | None = None
@@ -783,4 +828,5 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
         projected_export_credit=None if credit is None else _money(credit),
         fixed_charge=_money(tariff.fixed_monthly),
         estimated_total=total,
+        season_changes={b.key for b in whole_month} != {b.key for b in active},
     )

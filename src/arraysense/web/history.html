@@ -623,13 +623,18 @@ function showSpans() {
 }
 
 // Boot. Everything above is definitions; nothing runs until here.
-drawNav('history');
-current = SPANS.find((s) => s.key === localStorage.getItem('as.histSpan')) || SPANS[0];
-$('zoomReset').onclick = resetZoom;
-setInterval(refreshZoomState, 900);
-showSpans();
-applyTitles();
-load();
+async function boot() {
+  await syncDisplayDefaults();
+  drawNav('history');
+  current = SPANS.find((s) => s.key === localStorage.getItem('as.histSpan')) || SPANS[0];
+  $('zoomReset').onclick = resetZoom;
+  setInterval(refreshZoomState, 900);
+  showSpans();
+  applyTitles();
+  load();
+}
+
+boot();
 // Energy counters move slowly and a bucket only closes at midnight, so five
 // minutes is ample. Polling this as often as the live page would re-read a
 // month of stored rows to watch one number creep.

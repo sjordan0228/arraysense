@@ -169,7 +169,15 @@
   <div class="p cal" id="cal" hidden></div>
 
   <div class="p" id="settings" hidden>
-    <div class="chead"><h2>Settings</h2><span class="legend muted">stored in this browser</span></div>
+    <!-- Two of these three also exist as installation settings on the service.
+         The pair here override them for this device only, which is why they
+         say so: a wall tablet showing Fahrenheit must not change the laptop
+         beside it. Everything that belongs to the installation rather than to
+         a browser — the tariff, the dongle, the poll interval — is on /settings
+         and is linked rather than duplicated. -->
+    <div class="chead"><h2>This device</h2>
+      <span class="legend muted">overrides for this browser only ·
+        <a href="/settings">installation settings</a></span></div>
     <div class="setgrid">
       <label class="set">
         <span class="lbl">Temperature</span>
@@ -1195,17 +1203,24 @@ async function loadHistory() {
   }
 }
 
-// Boot. Everything above is definitions; nothing runs until here.
-wireSettings();
-wireDetail();
-wireTabs();
-$('zoomReset').onclick = resetZoom;
-setInterval(refreshZoomState, 900);
-showRanges();
-loadLive();
-loadHistory();
-scheduleLive();
-setInterval(loadHistory, 60000);
+// Boot. Everything above is definitions; nothing runs until here. The display
+// defaults are adopted before the first render rather than after it, so a
+// dashboard configured in Celsius does not flash Fahrenheit on the way in.
+async function boot() {
+  await syncDisplayDefaults();
+  wireSettings();
+  wireDetail();
+  wireTabs();
+  $('zoomReset').onclick = resetZoom;
+  setInterval(refreshZoomState, 900);
+  showRanges();
+  loadLive();
+  loadHistory();
+  scheduleLive();
+  setInterval(loadHistory, 60000);
+}
+
+boot();
 </script>
 </body>
 </html>

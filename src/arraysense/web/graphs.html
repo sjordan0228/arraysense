@@ -578,6 +578,7 @@ async function pollInterval() {
 
 // Boot. Everything above is definitions; nothing runs until here.
 async function boot() {
+  await syncDisplayDefaults();
   drawNav('graphs');
   buildSections();
   $('zoomReset').onclick = resetZoom;

@@ -569,3 +569,103 @@ def test_a_month_that_is_not_a_month_is_refused() -> None:
 
     with pytest.raises(ValueError, match="smarch"):
         parse_bands("Bad | 0.12 | 00:00-24:00 | smarch")
+
+
+def test_a_whole_day_band_is_not_written_as_an_empty_range() -> None:
+    # A 24-hour band is stored with both ends at midnight, and spelling that
+    # out literally gives "00:00-00:00" — which reads as no hours at all.
+    (band,) = parse_bands("Flat | 0.12 | 00:00-24:00")
+    assert band.hours[0].label == "all day"
+
+
+def test_an_ordinary_window_keeps_its_times() -> None:
+    (band,) = parse_bands("Peak | 0.21 | 15:00-20:00")
+    assert band.hours[0].label == "15:00\N{EN DASH}20:00"
+
+
+def test_a_seasonal_tariff_can_still_be_projected() -> None:
+    # The bug this guards: the projection priced every band in the tariff
+    # while the cost priced only the bands in season, so the out-of-season
+    # band was permanently unmeasured, the total permanently absent, and the
+    # reference installation could never once see an estimated bill.
+    tariff = Tariff(
+        bands=parse_bands(
+            "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+            "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+            "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+        ),
+        fixed_monthly=15.0,
+    )
+    tz = ZoneInfo("America/Chicago")
+    energy = PeriodEnergy(
+        start=datetime(2026, 8, 1, tzinfo=tz),
+        end=datetime(2026, 8, 11, tzinfo=tz),
+        grid_import_kwh={"On-peak": 10.0, "Off-peak": 100.0},
+    )
+    bill = estimate_bill(tariff, energy)
+    assert bill is not None
+    assert bill.energy_cost_so_far is not None
+    assert bill.estimated_total is not None
+    # Ten days of a thirty-one day month, so roughly three times the cost.
+    measured = 10 * 0.210321 + 100 * 0.086709
+    assert bill.projected_energy_cost == pytest.approx(measured * 3.1, rel=0.01)
+    assert bill.season_changes is False
+
+
+def test_a_month_that_changes_season_says_the_projection_cannot_hold() -> None:
+    # October runs on the summer tariff and November on the winter one, so
+    # scaling what October cost across the rest of the month is arithmetic on
+    # two different tariffs. Projecting anyway is defensible; doing it without
+    # saying so is not.
+    tariff = Tariff(
+        bands=parse_bands(
+            "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+            "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+            "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+        ),
+    )
+    tz = ZoneInfo("America/Chicago")
+    energy = PeriodEnergy(
+        start=datetime(2026, 10, 1, tzinfo=tz),
+        end=datetime(2026, 10, 20, tzinfo=tz),
+        grid_import_kwh={"On-peak": 10.0, "Off-peak": 100.0},
+    )
+    october = estimate_bill(tariff, energy)
+    assert october is not None
+    assert october.season_changes is False
+
+    # A period that genuinely reaches into November does straddle, and says so.
+    across = PeriodEnergy(
+        start=datetime(2026, 10, 25, tzinfo=tz),
+        end=datetime(2026, 11, 2, tzinfo=tz),
+        grid_import_kwh={"On-peak": 5.0, "Off-peak": 50.0, "Winter": 8.0},
+    )
+    straddling = estimate_bill(tariff, across)
+    assert straddling is not None
+    assert straddling.season_changes is True
+
+
+def test_a_completed_month_can_be_priced_on_a_seasonal_tariff() -> None:
+    # The exclusive end of a whole-month range used to pull in the next
+    # month's bands, so October priced against a Winter band that had no
+    # energy — and absent propagated to the whole month's cost.
+    tariff = Tariff(
+        bands=parse_bands(
+            "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+            "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+            "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+        ),
+    )
+    tz = ZoneInfo("America/Chicago")
+    october = (datetime(2026, 10, 1, tzinfo=tz), datetime(2026, 11, 1, tzinfo=tz))
+    assert [b.name for b in tariff.bands_in_effect(*october)] == ["On-peak", "Off-peak"]
+    result = compute_cost(
+        tariff,
+        PeriodEnergy(
+            start=october[0],
+            end=october[1],
+            grid_import_kwh={"On-peak": 30.0, "Off-peak": 300.0},
+        ),
+    )
+    assert result is not None
+    assert result.energy_cost == pytest.approx(30 * 0.210321 + 300 * 0.086709, abs=0.02)
