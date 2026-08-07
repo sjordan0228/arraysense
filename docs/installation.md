@@ -185,6 +185,41 @@ processes. The one thing that needs care is the yield endpoint, which reaches
 into the running collector to hand the dongle over for a firmware update; across
 processes that needs a control channel rather than a method call.
 
+### Upgrading a database written before readings had a device
+
+Every stored reading now records which inverter produced it, so that a parallel
+stack does not need one database per unit. A database created before that
+change is keyed on time alone and cannot be opened by the current service: it
+says so and stops, rather than starting and failing on the first write.
+
+Stop the service, take a copy of the database, and run the migration:
+
+```bash
+sudo systemctl stop arraysense
+sudo cp /var/lib/arraysense/arraysense.db /var/lib/arraysense/arraysense.db.bak
+sudo -u arraysense /opt/arraysense/.venv/bin/python -m arraysense \
+    --config /etc/arraysense/config.toml --migrate
+sudo systemctl start arraysense
+```
+
+It stamps every existing row with `inverter_serial` from your config, prints how
+many rows it moved per table, and is safe to run twice — a database that has
+already been migrated is left alone. Everything happens in one transaction, so a
+power cut in the middle leaves the database exactly as it was and the migration
+can simply be run again.
+
+Two things to plan for. It is quick — a reference installation of 796,156 rows
+took 3.6 seconds, and that is the whole downtime. But it rewrites every table,
+and the file roughly doubles in size, because the space the old tables used is
+left free inside it rather than returned to the disk. On that same installation
+134 MB became 277 MB. The space is reused by later writes, and
+`sqlite3 arraysense.db VACUUM` reclaims it now if you would rather have it back.
+
+Check the free space against the size SQLite sees, not against `du`. On a
+compressing filesystem such as ZFS or Btrfs the two differ a lot — the 134 MB
+database above shows as 27 MB to `du`, which would make the headroom look five
+times better than it is.
+
 ## Next
 
 Configuration options are described in [configuration.md](configuration.md).

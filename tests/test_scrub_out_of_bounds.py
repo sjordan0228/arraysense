@@ -17,6 +17,7 @@ from pathlib import Path
 
 from arraysense.metrics import INVERTER_METRICS, lookup
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 from scrub_out_of_bounds import Column, clear, columns_to_check, find, stored_bounds
 
 # The instant of the first bad row, and the integer an old registry stored for a
@@ -28,7 +29,7 @@ LEGACY_VOLTS = 245000
 def _database(tmp_path: Path) -> Path:
     """Create an empty database with the current schema, and close the store."""
     path = tmp_path / "arraysense.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.close()
     return path
 
@@ -46,7 +47,8 @@ def test_a_reading_stored_at_a_legacy_scale_is_found_and_reported_decoded(tmp_pa
     # see it is to decode what is stored and check that.
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.commit()
@@ -65,9 +67,10 @@ def test_a_reading_inside_its_bounds_is_never_touched(tmp_path: Path) -> None:
     # a database full of these and change nothing.
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v, battery_voltage_v, pv1_voltage_v) "
-        "VALUES (?, ?, ?, ?)",
-        (BAD_AT, 2450, 530, 2153),
+        "INSERT INTO inverter_raw "
+        "(timestamp, device, grid_voltage_v, battery_voltage_v, pv1_voltage_v) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (BAD_AT, TEST_DEVICE, 2450, 530, 2153),
     )
     conn.commit()
 
@@ -88,7 +91,8 @@ def test_no_registered_bound_is_itself_reported_as_impossible(tmp_path: Path) ->
         names = ", ".join(name for name, _ in specs)
         holes = ", ".join("?" for _ in specs)
         conn.execute(
-            f"INSERT INTO inverter_raw (timestamp, {names}) VALUES (?, {holes})",
+            f"INSERT INTO inverter_raw (timestamp, device, {names}) "
+            f"VALUES (?, '{TEST_DEVICE}', {holes})",
             (BAD_AT + offset, *(value for _, value in specs)),
         )
     conn.commit()
@@ -102,7 +106,8 @@ def test_one_step_past_a_bound_is_reported(tmp_path: Path) -> None:
 
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, battery_max_cell_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, battery_max_cell_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, 4201),
     )
     conn.commit()
@@ -116,7 +121,11 @@ def test_a_grid_voltage_of_zero_is_kept_because_an_outage_reads_zero(tmp_path: P
     # the inverter genuinely measures 0 V, and that is the event the owner most
     # wants recorded.
     conn = sqlite3.connect(_database(tmp_path))
-    conn.execute("INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, 0)", (BAD_AT,))
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', 0)",
+        (BAD_AT,),
+    )
     conn.commit()
 
     assert find(conn) == []
@@ -127,7 +136,9 @@ def test_an_absent_reading_is_not_an_offender(tmp_path: Path) -> None:
     # bounds nor a zero, and a predicate that coalesced it to zero would report
     # every unreported metric in the database as a fault.
     conn = sqlite3.connect(_database(tmp_path))
-    conn.execute("INSERT INTO inverter_raw (timestamp) VALUES (?)", (BAD_AT,))
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device) VALUES (?, '{TEST_DEVICE}')", (BAD_AT,)
+    )
     conn.commit()
 
     assert find(conn) == []
@@ -136,7 +147,8 @@ def test_an_absent_reading_is_not_an_offender(tmp_path: Path) -> None:
 def test_clearing_writes_null_and_never_zero(tmp_path: Path) -> None:
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.commit()
@@ -148,7 +160,8 @@ def test_clearing_writes_null_and_never_zero(tmp_path: Path) -> None:
 def test_clearing_is_re_runnable(tmp_path: Path) -> None:
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v, battery_soc_pct) VALUES (?, ?, 66)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v, battery_soc_pct) "
+        f"VALUES (?, '{TEST_DEVICE}', ?, 66)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.commit()
@@ -166,7 +179,8 @@ def test_a_row_rewritten_since_the_scan_is_left_alone(tmp_path: Path) -> None:
     # exact integer it expects to replace.
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.commit()
@@ -194,8 +208,9 @@ def test_every_tier_is_covered_not_only_the_raw_one(tmp_path: Path) -> None:
     conn = sqlite3.connect(_database(tmp_path))
     for table in ("inverter_minute", "inverter_hourly"):
         conn.execute(
-            f"INSERT INTO {table} (timestamp, grid_voltage_v, sample_count) VALUES (?, ?, 1)",
-            (BAD_AT, LEGACY_VOLTS),
+            f"INSERT INTO {table} (timestamp, device, grid_voltage_v, sample_count) "
+            "VALUES (?, ?, ?, 1)",
+            (BAD_AT, TEST_DEVICE, LEGACY_VOLTS),
         )
     conn.commit()
 
@@ -208,14 +223,19 @@ def test_a_module_reading_is_cleared_on_its_own_row_only(tmp_path: Path) -> None
     # Module tables are keyed by (timestamp, module_id), so an update that
     # matched on the timestamp alone would blank every pack in the bank.
     conn = sqlite3.connect(_database(tmp_path))
-    conn.execute("INSERT INTO serials (id, serial) VALUES (1, 'BA00000001')")
-    conn.execute("INSERT INTO serials (id, serial) VALUES (2, 'BA00000002')")
+    conn.execute(
+        f"INSERT INTO serials (id, device, serial) VALUES (1, '{TEST_DEVICE}', 'BA00000001')"
+    )
+    conn.execute(
+        f"INSERT INTO serials (id, device, serial) VALUES (2, '{TEST_DEVICE}', 'BA00000002')"
+    )
     # voltage_v scales by 100, so a legacy scale of 1000 is ten times too large.
     # Both packs carry the identical bad integer, so nothing but the module id
     # can tell the two rows apart.
     for module_id in (1, 2):
         conn.execute(
-            "INSERT INTO module_raw (timestamp, module_id, voltage_v) VALUES (?, ?, 53000)",
+            f"INSERT INTO module_raw (timestamp, device, module_id, voltage_v) "
+            f"VALUES (?, '{TEST_DEVICE}', ?, 53000)",
             (BAD_AT, module_id),
         )
     conn.commit()
@@ -237,13 +257,14 @@ def test_the_invalid_readings_flags_are_left_alone(tmp_path: Path) -> None:
     # taken. Erasing both leaves no trace that anything happened.
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.execute(
-        "INSERT INTO invalid_readings (timestamp, metric, value, serial) "
-        "VALUES (?, 'battery_temperature_c', 11880.0, NULL)",
-        (BAD_AT,),
+        "INSERT INTO invalid_readings (timestamp, device, metric, value, serial) "
+        "VALUES (?, ?, 'battery_temperature_c', 11880.0, NULL)",
+        (BAD_AT, TEST_DEVICE),
     )
     conn.commit()
 
@@ -257,7 +278,8 @@ def test_a_database_missing_a_registry_column_is_scrubbed_not_refused(tmp_path: 
     # store next opens it. The tool should scrub what is there rather than fail.
     conn = sqlite3.connect(_database(tmp_path))
     conn.execute(
-        "INSERT INTO inverter_raw (timestamp, grid_voltage_v) VALUES (?, ?)",
+        f"INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) "
+        f"VALUES (?, '{TEST_DEVICE}', ?)",
         (BAD_AT, LEGACY_VOLTS),
     )
     conn.commit()
@@ -280,3 +302,30 @@ def test_every_registered_metric_is_covered_by_the_scan(tmp_path: Path) -> None:
 
     modules = {c.column for c in columns_to_check() if c.table == "module_raw"}
     assert modules == set(module_metric_columns())
+
+
+def test_clearing_one_inverter_leaves_the_others_reading_alone(tmp_path: Path) -> None:
+    # Both units reported at the same instant and only one of them is impossible.
+    # An update keyed on the timestamp alone would NULL a real reading on the
+    # healthy machine, and there is no getting it back.
+    other = "CE00000001"
+    conn = sqlite3.connect(_database(tmp_path))
+    conn.execute(
+        "INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) VALUES (?, ?, ?)",
+        (BAD_AT, TEST_DEVICE, LEGACY_VOLTS),
+    )
+    conn.execute(
+        "INSERT INTO inverter_raw (timestamp, device, grid_voltage_v) VALUES (?, ?, ?)",
+        (BAD_AT, other, 2450),
+    )
+    conn.commit()
+
+    offenders = find(conn)
+    assert [o.device for o in offenders] == [TEST_DEVICE]
+    assert clear(conn, offenders) == 1
+
+    rows = conn.execute(
+        "SELECT device, grid_voltage_v FROM inverter_raw ORDER BY device"
+    ).fetchall()
+    conn.close()
+    assert rows == [(TEST_DEVICE, None), (other, 2450)]

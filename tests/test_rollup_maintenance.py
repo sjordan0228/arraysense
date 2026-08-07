@@ -9,10 +9,11 @@ from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.models import Sample
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 def _store(tmp_path: Path) -> SqliteStore:
-    return SqliteStore(str(tmp_path / "roll.db"))
+    return SqliteStore(str(tmp_path / "roll.db"), device=TEST_DEVICE)
 
 
 async def test_the_coarse_tiers_are_built_without_anyone_asking(tmp_path: Path) -> None:

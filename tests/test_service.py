@@ -14,10 +14,11 @@ import pytest
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 def _service(tmp_path: Path, **kwargs: object) -> tuple[CollectorService, SqliteStore]:
-    store = SqliteStore(str(tmp_path / "svc.db"))
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
     source = kwargs.pop("source", None) or FakeSource()
     svc = CollectorService(source=source, store=store, interval=0.01, **kwargs)  # type: ignore[arg-type]
     return svc, store
@@ -153,7 +154,7 @@ async def test_the_loop_collects_repeatedly(tmp_path: Path) -> None:
 
 
 async def test_interval_must_be_positive(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "x.db"))
+    store = SqliteStore(str(tmp_path / "x.db"), device=TEST_DEVICE)
     with pytest.raises(ValueError, match="interval"):
         CollectorService(source=FakeSource(), store=store, interval=0)
     store.close()
@@ -331,7 +332,7 @@ async def test_a_write_that_fails_is_recorded_and_survived(tmp_path: Path) -> No
 
     svc, store = _service(tmp_path)
 
-    def wedged(sample: object) -> None:
+    def wedged(sample: object, device: str | None = None) -> None:
         raise sqlite3.OperationalError("database is locked")
 
     svc._store.append = wedged  # type: ignore[method-assign]
@@ -353,11 +354,11 @@ async def test_the_loop_keeps_running_through_a_wedged_database(tmp_path: Path) 
     real = svc._store.append
     calls = {"n": 0}
 
-    def sometimes(sample: object) -> None:
+    def sometimes(sample: object, device: str | None = None) -> None:
         calls["n"] += 1
         if calls["n"] <= 2:
             raise sqlite3.OperationalError("database is locked")
-        real(sample)  # type: ignore[arg-type]
+        real(sample, device=device)  # type: ignore[arg-type]
 
     svc._store.append = sometimes  # type: ignore[method-assign]
     await svc.start()
@@ -376,10 +377,40 @@ async def test_a_wedged_database_does_not_report_the_inverter_as_gone(tmp_path: 
 
     svc, store = _service(tmp_path)
 
-    def wedged(sample: object) -> None:
+    def wedged(sample: object, device: str | None = None) -> None:
         raise sqlite3.OperationalError("database is locked")
 
     svc._store.append = wedged  # type: ignore[method-assign]
     await svc.poll_once()
     assert svc.status.connected is True
     store.close()
+
+
+async def test_a_reading_is_filed_under_the_source_not_the_stores_default(
+    tmp_path: Path,
+) -> None:
+    # The store's default is for readers. What a poll records has to be the
+    # inverter that answered, or a second collector writing through the same
+    # store would file its readings under the first one's serial.
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
+    svc = CollectorService(source=FakeSource(device="CE00000001"), store=store, interval=0.01)
+    sample = await svc.poll_once()
+    assert sample is not None
+    rows = store._conn.execute("SELECT DISTINCT device FROM inverter_raw").fetchall()
+    store.close()
+    assert rows == [("CE00000001",)]
+
+
+async def test_a_recorded_gap_names_the_inverter_that_went_quiet(tmp_path: Path) -> None:
+    # An outage stamped with the wrong serial reports the fault on a machine
+    # that was working.
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
+    svc = CollectorService(
+        source=FakeSource(fail_on_read=ConnectionError("gone"), device="CE00000001"),
+        store=store,
+        interval=0.01,
+    )
+    await svc.poll_once()
+    rows = store._conn.execute("SELECT device, error FROM inverter_raw").fetchall()
+    store.close()
+    assert rows == [("CE00000001", "ConnectionError: gone")]

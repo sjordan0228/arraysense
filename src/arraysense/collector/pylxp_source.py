@@ -4,7 +4,7 @@ This is the only module that knows what the inverter library calls things.
 Everything downstream sees the metric names registered in arraysense.metrics,
 so a change of library, transport or inverter family stops here.
 
-Two properties of the library shape the whole mapping.
+Three properties of the library shape the whole mapping.
 
 Its runtime object declares a field for every register any supported inverter
 might expose, and a real read populates a handful of them: the reference 18kPV
@@ -18,6 +18,14 @@ so an unpopulated slot arrives looking like a healthy module sitting at 0% SOC.
 The distinguishing mark is the serial number, which is empty for a slot that
 holds nothing — and identity is the serial anyway, so a module without one is
 dropped.
+
+And a few of the numbers it hands over are not readings at all. It substitutes
+100 for a state of health of 0, defaults per-module fault and warning codes to
+0 and never fills them, and computes remaining capacity from state of charge.
+The first two are absences wearing the most reassuring value available, so they
+are refused here — a metric that is never written stores as NULL, which is what
+"nobody measured this" looks like. The third is real arithmetic on real inputs
+and is kept, labelled at its mapping so it is not mistaken for a second opinion.
 """
 
 from __future__ import annotations
@@ -109,20 +117,26 @@ _RUNTIME_METRICS: tuple[tuple[str, str], ...] = (
 )
 
 # Battery readings as the *inverter* measures them, at its own terminals, and
-# the BMS figures it relays. They survive a CAN dropout that silences the bank
-# object, which is why they are mapped at all; the bank's own figures below
-# overwrite them whenever the BMS answered.
+# the BMS figures it relays. They arrive on the runtime read, which does not
+# depend on the bank object existing at all — a poll that comes back with no
+# bank still carries them, which is why they are mapped; the bank's own figures
+# below overwrite them whenever the BMS answered.
+#
+# What they hold while the BMS is silent is *not* established. The library
+# decodes registers rather than reporting absence, and no capture in this
+# repository covers a CAN dropout, so treat "these survive a dropout" as
+# unproven rather than as a reason to trust them during one.
 #
 # battery_temperature_c comes from the hottest cell, not from the library's
 # ``battery_temperature`` field. That field returned 11880 against real
 # hardware — an undecoded register, not a temperature — while the cell extremes
 # beside it read a correct 39 and 38 °C.
+#
+# State of health is deliberately not here; see ``_measured_soh``.
 _RUNTIME_BATTERY_METRICS: tuple[tuple[str, str], ...] = (
     ("battery_voltage_v", "battery_voltage"),
     ("battery_current_a", "battery_current"),
     ("battery_soc_pct", "battery_soc"),
-    ("battery_soh_pct", "battery_soh"),
-    ("battery_voltage_inv_sample_v", "battery_voltage_inv_sample"),
     ("battery_temperature_c", "bms_max_cell_temperature"),
     ("battery_min_cell_temperature_c", "bms_min_cell_temperature"),
     ("battery_max_cell_voltage_v", "bms_max_cell_voltage"),
@@ -144,13 +158,17 @@ _BANK_METRICS: tuple[tuple[str, str], ...] = (
     ("battery_voltage_v", "voltage"),
     ("battery_current_a", "current"),
     ("battery_soc_pct", "soc"),
-    ("battery_soh_pct", "soh"),
     ("battery_voltage_inv_sample_v", "battery_voltage_inv_sample"),
     ("battery_temperature_c", "max_cell_temperature"),
     ("battery_min_cell_temperature_c", "min_cell_temperature"),
     ("battery_max_cell_voltage_v", "max_cell_voltage"),
     ("battery_min_cell_voltage_v", "min_cell_voltage"),
     ("battery_cycle_count", "cycle_count"),
+    # Not a register. The library computes it as
+    # ``round(max_capacity * battery_soc / 100)`` (0.9.38, data.py:1670-1672),
+    # so it is battery_soc_pct restated in amp-hours and cannot disagree with
+    # the column above it. Useful as a size, useless as corroboration — never
+    # read it as a second opinion on state of charge.
     ("battery_remaining_capacity_ah", "current_capacity"),
     ("battery_full_capacity_ah", "max_capacity"),
     ("battery_module_count", "battery_count"),
@@ -270,6 +288,56 @@ def _int_reading(source: object, attribute: str) -> int | None:
     """
     value = _reading(source, attribute)
     return None if value is None else round(value)
+
+
+# The state of health the library will invent, and the only one it invents:
+# every rewrite named in _measured_soh assigns this literal.
+_FABRICATED_SOH = 100.0
+
+
+def _measured_soh(source: object, attribute: str) -> float | None:
+    """Read a state of health, refusing the one value the library fabricates.
+
+    pylxpweb turns a reported 0 into 100 on every path that produces SOH. In
+    0.9.38: ``transports/data.py:635-636`` on the runtime object, ``:1292`` per
+    module, ``:1705-1707`` on the bank, and ``:1048`` once more in
+    ``BatteryData.__post_init__``, where ``_clamp_percentage(...) or 100``
+    converts any 0 that got that far. Two of the four say why in a comment —
+    "Default to 100% if not reported" and "0 is invalid, assume healthy".
+
+    Zero is what a BMS that is not answering reports, so the rewrite fires in
+    precisely the case where nothing is known and substitutes the most
+    reassuring number available. On the one column whose job is to warn about a
+    degrading bank, that is this project's central rule inverted.
+
+    It cannot be undone downstream — the fabrication is a 100 and a healthy bank
+    is also a 100 — so the value is refused rather than reconstructed. Every
+    other reading is kept, because the rewrite only ever assigns the literal
+    100. That leaves a column where anything stored is a measurement, and where
+    the falling figure the column exists for still arrives.
+
+    What it costs is real and worth stating plainly: a bank whose BMS genuinely
+    reports 100% stores NULL and the page shows a dash. The alternative is a
+    column reading 100 whether the packs are new or the CAN link is down, and a
+    dash meaning "not established" is the honest one of the two.
+
+    Zero is refused at this end too, and for the same reason rather than a
+    different one. The rewrite is what turns most zeros into 100, but not every
+    path applies it, so a raw 0 still arrives sometimes — and a bank reporting
+    0% state of health is the reading that means the BMS said nothing, not a
+    bank with no health left. Storing it would be the original error wearing the
+    opposite number: refusing 100 while keeping 0 rejects the reassuring
+    fabrication and keeps the alarming one.
+
+    One helper serves all three objects, but not because they share a register.
+    The runtime and bank paths do — both decode ``soc_soh_packed``, register 5,
+    high byte — while a module's comes from offset 8 of its own register block.
+    What they share is the rewrite.
+    """
+    soh = _reading(source, attribute)
+    if soh is None or soh == _FABRICATED_SOH or soh <= 0.0:
+        return None
+    return soh
 
 
 def _signed_pair(source: object, positive: str, negative: str) -> float | None:
@@ -424,7 +492,7 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
         serial=serial,
         slot=index + 1,
         soc_pct=_reading(module, "soc"),
-        soh_pct=_reading(module, "soh"),
+        soh_pct=_measured_soh(module, "soh"),
         voltage_v=_reading(module, "voltage"),
         current_a=_reading(module, "current"),
         temperature_c=_reading(module, "temperature"),
@@ -437,13 +505,21 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
         cell_min_voltage_num=_int_reading(module, "min_cell_num_voltage"),
         cell_max_temperature_num=_int_reading(module, "max_cell_num_temp"),
         cell_min_temperature_num=_int_reading(module, "min_cell_num_temp"),
+        # Derived, not measured: ``max_capacity * soc / 100`` (data.py:1281).
+        # It is this module's SOC in amp-hours and cannot corroborate it.
         remaining_capacity_ah=_reading(module, "current_capacity"),
         full_capacity_ah=_reading(module, "max_capacity"),
         charge_current_limit_a=_reading(module, "charge_current_limit"),
         discharge_current_limit_a=_reading(module, "discharge_current_limit"),
         status_code=_int_reading(module, "status"),
-        fault_code=_int_reading(module, "fault_code"),
-        warning_code=_int_reading(module, "warning_code"),
+        # fault_code and warning_code are deliberately not mapped. BatteryData
+        # declares both as ``int = 0`` (data.py:1031-1032) and
+        # ``from_modbus_registers`` passes neither, because none of the 21
+        # entries in BATTERY_REGISTERS carries either quantity. Every module of
+        # every poll therefore arrives with a zero that means "never read",
+        # while a stored 0 in a fault column means "no fault" — health asserted
+        # about a pack nobody asked. ``status`` above is different: the
+        # constructor sets it from the slot's status header register.
     )
 
 
@@ -465,9 +541,8 @@ def sample_from_pylxp(
     time is taken here instead and an explicit one has to be timezone-aware.
 
     A bank whose CAN link is down arrives as None, and that is an absence
-    rather than a failed poll. The sample then carries the inverter's own
-    terminal readings, which survive the dropout, with no battery state
-    invented to fill the hole.
+    rather than a failed poll. The sample then carries whatever the inverter's
+    own runtime read returned, with no battery state invented to fill the hole.
 
     Raises:
         ValueError: a battery record claims a slot outside 1-4, or an explicit
@@ -483,6 +558,10 @@ def sample_from_pylxp(
     if load is not None:
         readings["load_power_w"] = load
 
+    # State of health is filtered rather than mapped, on both objects, so it
+    # sits outside the tables above. See ``_measured_soh``.
+    soh = _measured_soh(runtime, "battery_soh")
+
     battery_power = _signed_pair(runtime, "battery_charge_power", "battery_discharge_power")
     modules: tuple[BatteryModuleSample, ...] = ()
 
@@ -496,6 +575,9 @@ def sample_from_pylxp(
             bank_power = _signed_pair(bank, "charge_power", "discharge_power")
             if bank_power is not None:
                 battery_power = bank_power
+            bank_soh = _measured_soh(bank, "soh")
+            if bank_soh is not None:
+                soh = bank_soh
         records = getattr(bank, "batteries", None) or ()
         modules = tuple(
             sample for sample in (_module_sample(record) for record in records) if sample
@@ -503,6 +585,8 @@ def sample_from_pylxp(
 
     if battery_power is not None:
         readings["battery_power_w"] = battery_power
+    if soh is not None:
+        readings["battery_soh_pct"] = soh
 
     return Sample(
         timestamp=timestamp if timestamp is not None else datetime.now(tz=UTC),
@@ -584,6 +668,20 @@ class PylxpSource:
         # runs at INFO, so the healthy and failing cases look identical from
         # outside. What rate is normal on this hardware has not been measured.
         self._misroutes = 0
+
+    @property
+    def device(self) -> str:
+        """The configured inverter serial, which is what stored rows are filed under.
+
+        Not read off the wire, though the wire could answer: the transport has
+        a ``read_serial_number()`` and holding register 112 carries the system
+        type, and the collector reads no holding registers at all today.
+        Trusting the configured value is safe here for a reason particular to
+        this transport — it authenticates every read with that serial, so a
+        wrong one fails the read rather than filing this inverter's data under
+        another unit's identity.
+        """
+        return self._config.inverter_serial
 
     async def connect(self) -> None:
         """Claim the inverter's single client slot.

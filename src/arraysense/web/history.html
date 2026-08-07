@@ -304,6 +304,13 @@ const cell = (v, places) => (v === null
   ? `<td class="muted">${DASH}</td>`
   : `<td>${esc(gnum(v, places))}</td>`);
 
+// A footer cell, which can be a dash for a reason worth telling: the column
+// held numbers and could still not be totalled. The body's dash means nobody
+// recorded the figure, and these two must not read alike.
+const totalCell = (v, places, why) => (v === null
+  ? `<td class="muted"${why ? ` title="${esc(why)}"` : ''}>${DASH}</td>`
+  : `<td>${esc(gnum(v, places))}</td>`);
+
 // The money cell. A bucket the service could not price is a dash and never a
 // zero — a day whose peak hours nobody recorded did not cost nothing, it cost
 // an amount no one can state — and the currency comes from the reply rather
@@ -333,10 +340,36 @@ function drawTable(span, rows) {
   drawTotals(span, rows, places);
 }
 
+// One column's total across the periods the footer covers, and whether any of
+// them had nothing to contribute to it.
+//
+// A row counts as reported when *any* of its columns holds a number, so a day
+// whose load counter never arrived is still one of the days the footer says it
+// covers. Adding the columns that did arrive and stepping over that null makes
+// a thirty-day load total out of twenty-nine days of load, and the figure that
+// comes out looks exactly like a quiet month. Absent is not zero, and it is not
+// "leave it out of the sum" either: a column short of even one period counted
+// here has no total, and says so.
+function columnTotal(rows, key) {
+  let sum = null;
+  let missing = false;
+  for (const r of rows) {
+    const v = r.totals[key];
+    if (v === null) { missing = true; continue; }
+    // Counters carry one decimal, so every total is a whole number of tenths.
+    // Rounding to that clears the float noise a month of additions leaves.
+    sum = Math.round(((sum === null ? 0 : sum) + v) * 10) / 10;
+  }
+  // Two different dashes. `held` is a column that has numbers above it and
+  // still cannot be added up, which needs explaining; a column no period
+  // reported at all is the ordinary absence the body already draws.
+  return { value: missing ? null : sum, held: missing && sum !== null };
+}
+
 // The totals row, and what it covers said in those words. A figure labelled
 // "30 days" that quietly adds up twenty-seven of them is the same lie as a
-// missing day rendered as zero, so the count, the holes and the partials are
-// spelled out beside it. A column nothing reported stays a dash.
+// missing day rendered as zero, so the count, the holes, the partials and any
+// column that could not be added are spelled out beside it.
 //
 // The kilowatt-hour columns are added up here and the money columns are not.
 // Counters carry one decimal, so a column of tenths adds to a tenth and the
@@ -346,21 +379,22 @@ function drawTable(span, rows) {
 function drawTotals(span, rows, places) {
   const reported = rows.filter((r) => r.reported);
   if (!reported.length) { $('hist').querySelector('tfoot').innerHTML = ''; return; }
+  const unit = span.whenHeading.toLowerCase();
+  let held = 0;
   const cells = COLUMNS.map((c) => {
-    let sum = null;
-    for (const r of reported) {
-      const v = r.totals[c.key];
-      if (v !== null) sum = sum === null ? v : sum + v;
-    }
-    // Counters carry one decimal, so every total is a whole number of tenths.
-    // Rounding to that clears the float noise a month of additions leaves.
-    return cell(sum === null ? null : Math.round(sum * 10) / 10, places[c.key]);
+    const total = columnTotal(reported, c.key);
+    if (total.held) held += 1;
+    return totalCell(total.value, places[c.key], total.held
+      ? `Not every ${unit} counted below reported ${c.label.toLowerCase()}, so this column `
+        + 'cannot be totalled. The periods that did report it are in the rows above.'
+      : '');
   }).join('');
   const missing = rows.length - reported.length;
   const partial = reported.filter((r) => r.partial).length;
   const notes = [`${reported.length} of ${rows.length} ${span.unitName}`];
   if (missing) notes.push(`${missing} with no data`);
   if (partial) notes.push(`${partial} partial`);
+  if (held) notes.push(`${held} column${held === 1 ? '' : 's'} not totalled`);
   const unpriced = priced.configured ? reported.filter((r) => r.cost === null).length : 0;
   if (unpriced) notes.push(`${unpriced} not priced`);
   // Priced by the service over these same buckets, from the kilowatt-hours

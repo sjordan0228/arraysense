@@ -10,6 +10,14 @@ resolution is 43,200 points for a chart perhaps a thousand pixels wide, which
 measured at 107 ms against roughly 2 ms for the hourly tier and looked
 identical. The chosen tier comes back in the response so a caller can tell what
 it actually got.
+
+Every reading in the store belongs to one inverter, and every endpoint here
+answers about the one the store was opened for unless told otherwise. The
+reads that map straight onto a store query take an optional ``device``, so a
+second inverter's rows are reachable the day it starts recording; the derived
+endpoints — cost, energy, calibration — do not, because each of them is an
+interpretation of one system and would need more thought than a query
+parameter to mean anything across two. No page sends the parameter.
 """
 
 from __future__ import annotations
@@ -106,6 +114,23 @@ def _parse_metrics(raw: str, known: frozenset[str] | set[str], kind: str) -> lis
     return names
 
 
+def _device(device: str | None) -> str | None:
+    """Normalise a ``device`` query parameter, refusing a blank one.
+
+    A browser sends ``?device=`` readily — an empty input, a cleared select, a
+    hand-built URL. Passing that through reached the store as a device nothing
+    has ever recorded, which answered with no rows and no error and read as an
+    inverter that had stopped reporting. The store refuses it now, so without
+    this the same request became a 500. It is the caller's mistake either way,
+    and a 400 that names it is the useful answer.
+    """
+    if device is None:
+        return None
+    if not device.strip():
+        raise HTTPException(status_code=400, detail="device must not be blank")
+    return device
+
+
 def _check_range(start: datetime, end: datetime) -> None:
     """Reject a range that ends before it starts."""
     if end <= start:
@@ -145,15 +170,19 @@ async def status(request: Request) -> dict[str, Any]:
 
 
 @router.get("/live")
-async def live(request: Request) -> dict[str, Any]:
+async def live(request: Request, device: str | None = None) -> dict[str, Any]:
     """The most recent inverter reading and every battery module's latest.
 
     What a wall display polls. Absent values stay null — a battery block empty
     because CAN is down must not arrive as 0% state of charge.
+
+    ``device`` names an inverter and defaults to the configured one, so a page
+    that sends nothing gets exactly what it always got.
     """
     store = request.app.state.store
-    inverter = store.latest(list(_LIVE_INVERTER))
-    modules = store.latest_modules(list(module_metric_columns()))
+    device = _device(device)
+    inverter = store.latest(list(_LIVE_INVERTER), device=device)
+    modules = store.latest_modules(list(module_metric_columns()), device=device)
     # Named here rather than in the browser. Which flow is powering the house
     # is an interpretation of five readings, and an interpretation computed in
     # two places drifts — the Costs page already proved that with money. The
@@ -479,13 +508,17 @@ async def history(
     end: datetime,
     metrics: str,
     width: int = Query(default=1000, ge=1, le=10000),
+    device: str | None = None,
 ) -> dict[str, Any]:
-    """Inverter metrics over a range, at a resolution that suits the chart."""
+    """One inverter's metrics over a range, at a resolution that suits the chart.
+
+    ``device`` defaults to the configured inverter.
+    """
     _check_range(start, end)
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
-    rows = request.app.state.store.query(names, start, end, tier=tier)
+    rows = request.app.state.store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
@@ -497,18 +530,23 @@ async def battery_history(
     metrics: str = "soc_pct",
     width: int = Query(default=1000, ge=1, le=10000),
     serial: str | None = None,
+    device: str | None = None,
 ) -> dict[str, Any]:
-    """Per-module battery readings over a range, keyed by serial.
+    """One inverter's per-module battery readings over a range, keyed by serial.
 
     Modules are identified by serial rather than slot, so a bank that rotates
     modules through the inverter's four register slots neither splits one
-    battery into two series nor merges two into one.
+    battery into two series nor merges two into one. ``device`` picks the
+    inverter whose bank is being asked about and defaults to the configured
+    one; a serial is unique within a device, not across them.
     """
     _check_range(start, end)
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
-    rows = request.app.state.store.query_modules(names, start, end, tier=tier, serial=serial)
+    rows = request.app.state.store.query_modules(
+        names, start, end, tier=tier, serial=serial, device=_device(device)
+    )
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 

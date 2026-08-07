@@ -433,6 +433,7 @@ def _encode(metric: str, value: float | None) -> int | None:
 def write_tier(
     conn: sqlite3.Connection,
     table: str,
+    device: str,
     origin: int,
     span: int,
     step: int,
@@ -440,27 +441,31 @@ def write_tier(
     counters: dict[str, dict[int, float]],
     counter_step: int,
 ) -> int:
-    """Write one tier's rows, oldest first.
+    """Write one tier's rows, oldest first, all under one inverter's serial.
 
     Out-of-bounds readings are stored as NULL rather than clamped. A value the
     registry calls impossible is not a reading, and clamping it into range would
     launder a decode fault into a plausible number.
+
+    ``device`` is in the conflict target because it is in the key: an import
+    run twice replaces its own rows, and never another inverter's readings for
+    the same instant.
     """
     policy = {m.name: m.aggregation for m in INVERTER_METRICS}
     metrics = sorted(accumulators)
     energy_metrics = sorted(counters)
-    columns = ["timestamp", *metrics, *energy_metrics, "sample_count"]
+    columns = ["timestamp", "device", *metrics, *energy_metrics, "sample_count"]
     sql = (
         f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' * len(columns))}) "
-        f"ON CONFLICT(timestamp) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}" for c in columns[1:])
+        f"ON CONFLICT(timestamp,device) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in columns[2:])
     )
 
     rows: list[tuple[object, ...]] = []
     written = 0
     for slot in range(span):
         at = (origin + slot) * step
-        values: list[object] = [at]
+        values: list[object] = [at, device]
         samples = 0
         for metric in metrics:
             acc = accumulators[metric]
@@ -470,7 +475,9 @@ def write_tier(
         hour = at // counter_step
         for metric in energy_metrics:
             values.append(_encode(metric, counters[metric].get(hour)))
-        if samples == 0 and all(v is None for v in values[1:]):
+        # From index 2: timestamp and device are always set, so a slice that
+        # started at 1 would find the device string and never skip a row.
+        if samples == 0 and all(v is None for v in values[2:]):
             continue
         values.append(samples)
         rows.append(tuple(values))
@@ -487,6 +494,7 @@ def write_tier(
 def write_raw(
     conn: sqlite3.Connection,
     table: str,
+    device: str,
     readings: dict[int, dict[str, float]],
     counters: dict[str, dict[int, float]],
 ) -> int:
@@ -502,17 +510,17 @@ def write_raw(
         return 0
     metrics = sorted({m for row in readings.values() for m in row})
     energy_metrics = sorted(counters)
-    columns = ["timestamp", *metrics, *energy_metrics]
+    columns = ["timestamp", "device", *metrics, *energy_metrics]
     sql = (
         f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' * len(columns))}) "
-        f"ON CONFLICT(timestamp) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}" for c in columns[1:])
+        f"ON CONFLICT(timestamp,device) DO UPDATE SET "
+        + ",".join(f"{c}=excluded.{c}" for c in columns[2:])
     )
     rows: list[tuple[object, ...]] = []
     written = 0
     for at in sorted(readings):
         row = readings[at]
-        values: list[object] = [at]
+        values: list[object] = [at, device]
         values.extend(_encode(m, row.get(m)) for m in metrics)
         hour = at // HOUR
         values.extend(_encode(m, counters[m].get(hour)) for m in energy_metrics)
@@ -527,26 +535,32 @@ def write_raw(
     return written
 
 
-def read_anchor(db: Path) -> tuple[dict[str, float], int]:
-    """The earliest real counter reading in the store, and the hour holding it.
+def read_anchor(db: Path, device: str) -> tuple[dict[str, float], int]:
+    """The earliest real counter reading for one inverter, and the hour holding it.
 
     The import has to end where live collection begins, so the anchor is the
     *first* thing the collector recorded, not the newest. Without a live reading
     there is nothing to anchor to and the caller must be told rather than handed
     a counter starting at zero.
+
+    Narrowed to the device being imported for. The counters are lifetime totals
+    belonging to one inverter, and anchoring a stack's history to whichever unit
+    happened to record first would shift every kilowatt-hour of it.
     """
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     wanted = sorted(HOURLY_ENERGY.values())
     where = " OR ".join(f"{c} IS NOT NULL" for c in wanted)
     row = conn.execute(
-        f"SELECT timestamp,{','.join(wanted)} FROM inverter_raw WHERE {where} "
-        f"ORDER BY timestamp ASC LIMIT 1"
+        f"SELECT timestamp,{','.join(wanted)} FROM inverter_raw WHERE device = ? AND ({where}) "
+        f"ORDER BY timestamp ASC LIMIT 1",
+        (device,),
     ).fetchone()
     if row is None:
         row = conn.execute(
-            f"SELECT timestamp,{','.join(wanted)} FROM inverter_hourly WHERE {where} "
-            f"ORDER BY timestamp ASC LIMIT 1"
+            f"SELECT timestamp,{','.join(wanted)} FROM inverter_hourly "
+            f"WHERE device = ? AND ({where}) ORDER BY timestamp ASC LIMIT 1",
+            (device,),
         ).fetchone()
     conn.close()
     if row is None:
@@ -563,6 +577,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("exports", nargs="+", type=Path)
     ap.add_argument("--db", required=True, type=Path)
+    ap.add_argument(
+        "--device",
+        required=True,
+        help="serial of the inverter this history belongs to; must match the "
+        "inverter_serial the collector runs with, or the imported years and the "
+        "live readings become two separate machines",
+    )
     ap.add_argument(
         "--raw-days",
         type=int,
@@ -585,7 +606,7 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
 
-    anchor, anchor_hour = read_anchor(args.db)
+    anchor, anchor_hour = read_anchor(args.db, args.device)
     logger.info(
         "anchored to the first live reading at %s", datetime.fromtimestamp(anchor_hour * HOUR, UTC)
     )
@@ -608,6 +629,7 @@ def main() -> int:
     hourly_written = write_tier(
         conn,
         tiers["hourly"],
+        args.device,
         buckets.origin_hour,
         buckets.hours,
         HOUR,
@@ -620,6 +642,7 @@ def main() -> int:
     minute_written = write_tier(
         conn,
         tiers["minute"],
+        args.device,
         buckets.origin_minute,
         buckets.minutes,
         MINUTE,
@@ -629,7 +652,7 @@ def main() -> int:
     )
     logger.info("minute tier: %s rows", f"{minute_written:,}")
 
-    raw_written = write_raw(conn, tiers["full"], buckets.raw, counters)
+    raw_written = write_raw(conn, tiers["full"], args.device, buckets.raw, counters)
     logger.info("raw tier: %s rows", f"{raw_written:,}")
 
     conn.close()

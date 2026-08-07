@@ -12,11 +12,12 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> SettingsStore:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     return SettingsStore(store)
 
 
@@ -33,10 +34,10 @@ def test_a_stored_value_wins_over_the_default(settings: SettingsStore) -> None:
 
 
 def test_a_setting_survives_reopening_the_database(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     SettingsStore(store).set("display.temperature_unit", "C")
     store.close()
-    reopened = SqliteStore(str(tmp_path / "s.db"))
+    reopened = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     assert SettingsStore(reopened).get("display.temperature_unit") == "C"
     reopened.close()
 

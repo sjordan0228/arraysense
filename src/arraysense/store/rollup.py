@@ -17,6 +17,12 @@ two-row bucket would be weighted as though it appeared twice, and weighting
 would multiply already-rounded minute values. Building from raw lets ``AVG``
 ignore absent readings per metric, correctly and without weighting.
 
+Every rebuild groups by device as well as by bucket. Two inverters averaged
+into one row is worse than no rollup at all: the coarse tiers outlive the raw
+rows behind them, so nothing downstream could ever tell that the hour it is
+drawing is the mean of two machines, and no later pass would undo it. The same
+applies one level down to modules, which group by device, bucket and pack.
+
 Two rules keep a rebuild correct and repeatable.
 
 - A bucket's timestamp is the start of the period it covers, derived
@@ -132,12 +138,15 @@ def _last_rn_expr(column: str, bucket_seconds: int, module: bool) -> str:
     policy rests on that distinction: it keeps a value an earlier row reported
     even when the closing row omits it.
 
-    Module tiers are normalised, so ``module`` adds ``module_id`` to the
-    partition; without it one pack's reading would decide another pack's
-    rolled-up value. The expression comes back unaliased because the alias has
-    to match the one handed to ``_agg_expr``, and only the caller knows it.
+    The partition always carries ``device``: a metric one inverter stopped
+    reporting must not take its rolled-up value from another inverter that
+    kept reporting it. Module tiers are normalised, so ``module`` adds
+    ``module_id`` too; without it one pack's reading would decide another
+    pack's rolled-up value. The expression comes back unaliased because the
+    alias has to match the one handed to ``_agg_expr``, and only the caller
+    knows it.
     """
-    part = _floor_div("timestamp", bucket_seconds)
+    part = f"{_floor_div('timestamp', bucket_seconds)}, device"
     partition = f"{part}, module_id" if module else part
     return (
         f"ROW_NUMBER() OVER (PARTITION BY {partition} "
@@ -172,6 +181,11 @@ def _rebuild_inverter(
     honest answer: a bucket averaging an outage into the readings around it
     would draw a chart that never lost contact with the inverter.
 
+    Every device in the range is rebuilt, not one: the delete clears the whole
+    range and the insert refills it for whichever devices have source rows,
+    which is what keeps the pass a single scan however many inverters are
+    stacked. A per-device pass would read the raw tier once per unit.
+
     ``sample_count`` records how many successful source rows the bucket
     covers, and is a record of coverage only — every tier is built from raw, so
     nothing downstream ever weights by it.
@@ -192,11 +206,11 @@ def _rebuild_inverter(
         inner += f", {last_aliases}"
     inner += f" FROM {source} WHERE timestamp >= ? AND timestamp < ? AND {_ERROR_FILTER}"
     select = (
-        f"SELECT {part} * {bucket_seconds} AS timestamp, "
+        f"SELECT {part} * {bucket_seconds} AS timestamp, device, "
         f"COUNT(*) AS sample_count, {agg} "
-        f"FROM ({inner}) GROUP BY bucket"
+        f"FROM ({inner}) GROUP BY bucket, device"
     )
-    cols_sql = ", ".join(("timestamp", "sample_count", *columns))
+    cols_sql = ", ".join(("timestamp", "device", "sample_count", *columns))
     with conn:
         cur = conn.cursor()
         cur.execute(
@@ -221,8 +235,11 @@ def _rebuild_module(
     """Rebuild a normalised module tier from raw over [start, end).
 
     Module tables are normalised — one row per module per timestamp — so the
-    aggregation groups by module as well as by time: four packs in one hour
-    produce four rows, and one pack's readings never average into another's.
+    aggregation groups by module and by device as well as by time: four packs
+    in one hour produce four rows, and one pack's readings never average into
+    another's. Grouping by device is belt as well as braces here, since a
+    serials id already belongs to one inverter, but the destination key holds
+    the device and a rollup that did not select it could not fill it.
     Module source rows are all successful ones, because a failed poll writes
     none, so no error filter applies here. As with the inverter tiers the
     delete and the reinsert share one transaction, which is what makes a
@@ -256,11 +273,11 @@ def _rebuild_module(
         inner += f", {last_aliases}"
     inner += f" FROM {source} WHERE timestamp >= ? AND timestamp < ?"
     select = (
-        f"SELECT {part} * {bucket_seconds} AS timestamp, module_id, "
+        f"SELECT {part} * {bucket_seconds} AS timestamp, device, module_id, "
         f"COUNT(*) AS sample_count, {agg} "
-        f"FROM ({inner}) GROUP BY bucket, module_id"
+        f"FROM ({inner}) GROUP BY bucket, device, module_id"
     )
-    cols_sql = ", ".join(("timestamp", "module_id", "sample_count", *columns))
+    cols_sql = ", ".join(("timestamp", "device", "module_id", "sample_count", *columns))
     with conn:
         cur = conn.cursor()
         cur.execute(

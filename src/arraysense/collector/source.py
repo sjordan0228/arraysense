@@ -37,6 +37,26 @@ class InverterSource(Protocol):
     dead poll loop.
     """
 
+    @property
+    def device(self) -> str:
+        """The serial of the inverter this source reads.
+
+        Identity belongs here rather than on the sample or on the service,
+        because this is the only object that knows which physical unit it is
+        talking to. Everything above stamps what it stores with whatever this
+        says, so two sources polling two inverters into one store keep their
+        readings apart without either of them coordinating.
+
+        It is not read off the wire today. Holding register 112 and the
+        transport's ``read_serial_number()`` exist — see
+        docs/pylxpweb-inventory.md — but the collector reads no holding
+        registers at all, so the configured serial is the identity for now.
+        The configured value is already checked against the inverter on every
+        read, which is what makes trusting it defensible: a mismatch fails the
+        read rather than filing the data under the wrong unit.
+        """
+        ...
+
     async def connect(self) -> None:
         """Establish the connection, claiming the dongle's single client slot."""
         ...
@@ -79,6 +99,7 @@ class FakeSource:
         fail_on_connect: Exception | None = None,
         fail_on_read: Exception | None = None,
         modules: int = 4,
+        device: str = "CE00000000",
     ) -> None:
         """Configure the fake.
 
@@ -92,10 +113,15 @@ class FakeSource:
         ``modules=0`` reproduces a bank running without closed-loop CAN, where
         the inverter reports no per-module data whatsoever. That is the case
         that must come out as absent rather than as four packs at 0%.
+
+        ``device`` is the serial the fake claims to be. It is a made-up value
+        in the shape of a real one, and the default is deliberately not a
+        serial from the reference installation: this repository is public.
         """
         self.fail_on_connect = fail_on_connect
         self.fail_on_read = fail_on_read
         self.modules = modules
+        self.device = device
         self.connected = False
         self.reads = 0
 

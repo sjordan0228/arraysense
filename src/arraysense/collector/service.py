@@ -286,14 +286,20 @@ class CollectorService:
         return sample
 
     def _store_failure(self, sample: Sample) -> str | None:
-        """Write a sample, returning the reason it could not be written.
+        """Write a sample against this source's inverter, returning why it could not be.
 
         Exists so the two write sites in ``poll_once`` cannot differ, and so a
         storage error reaches the same counters and the same status line as a
         transport error rather than escaping into ``_loop``.
+
+        The device comes from the source rather than from the store's default.
+        The source is the only thing here that knows which inverter answered,
+        and a recorded gap has to be filed under the unit that went quiet — a
+        gap stamped with whatever the store was opened for would report an
+        outage on the wrong machine.
         """
         try:
-            self._store.append(sample)
+            self._store.append(sample, device=self._source.device)
         except STORE_ERRORS as exc:
             reason = f"{type(exc).__name__}: {exc}"
             logger.warning("could not store reading: %s", reason)

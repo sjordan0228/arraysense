@@ -26,6 +26,7 @@ from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import Sample
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 # The reference installation's own tariff: time-of-use May to October, one flat
 # rate the rest of the year, and a connection charge every month regardless.
@@ -63,7 +64,7 @@ def _counters(store: SqliteStore, first: datetime, last: datetime, skip: Any = N
 
 
 def _client(tmp_path: Path, build: Any) -> Any:
-    store = SqliteStore(str(tmp_path / "energy.db"))
+    store = SqliteStore(str(tmp_path / "energy.db"), device=TEST_DEVICE)
     build(store)
     config = Config(
         dongle_host="h",
@@ -182,7 +183,7 @@ def test_a_period_nothing_could_be_priced_in_has_no_total_rather_than_zero(
 def test_an_install_with_no_tariff_is_told_no_total_at_all(tmp_path: Path) -> None:
     # Not zero and not a dash: with no rates entered there is nothing to say
     # about money, and the page has no total row to draw.
-    store = SqliteStore(str(tmp_path / "energy.db"))
+    store = SqliteStore(str(tmp_path / "energy.db"), device=TEST_DEVICE)
     _counters(store, JULY - timedelta(hours=2), AUGUST)
     config = Config(
         dongle_host="h",

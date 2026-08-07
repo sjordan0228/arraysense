@@ -77,10 +77,16 @@ class Offender:
     Holds the stored integer rather than only the decoded float, because the
     update that clears it names that integer to prove the row has not changed
     underneath us.
+
+    ``device`` is part of the row's identity, not decoration: without it the
+    update that clears one inverter's impossible reading clears the same column
+    on every other inverter that reported at that instant, and a real reading
+    turned to NULL is unrecoverable.
     """
 
     column: Column
     timestamp: int
+    device: str
     module_id: int | None
     stored: int
 
@@ -172,7 +178,9 @@ def scan_table(conn: sqlite3.Connection, table: str, columns: Sequence[Column]) 
         return []
 
     keyed_by_module = checked[0].keyed_by_module
-    key_columns = ["timestamp", "module_id"] if keyed_by_module else ["timestamp"]
+    key_columns = ["timestamp", "device"]
+    if keyed_by_module:
+        key_columns.append("module_id")
     selected = [*key_columns, *(c.column for c in checked)]
     predicate = " OR ".join(f"({c.column} < ? OR {c.column} > ?)" for c in checked)
     params: list[int] = []
@@ -183,14 +191,15 @@ def scan_table(conn: sqlite3.Connection, table: str, columns: Sequence[Column]) 
     sql = f"SELECT {', '.join(selected)} FROM {table} WHERE {predicate}"
     for row in conn.execute(sql, params):
         timestamp = int(row[0])
-        module_id = int(row[1]) if keyed_by_module else None
+        device = str(row[1])
+        module_id = int(row[2]) if keyed_by_module else None
         for column, value in zip(checked, row[len(key_columns) :], strict=True):
             if value is None:
                 continue
             stored = int(value)
             if column.spec.within_bounds(column.spec.decode(stored)):
                 continue
-            offenders.append(Offender(column, timestamp, module_id, stored))
+            offenders.append(Offender(column, timestamp, device, module_id, stored))
     return offenders
 
 
@@ -230,8 +239,11 @@ def clear(conn: sqlite3.Connection, offenders: Sequence[Offender]) -> int:
     with conn:
         for offender in offenders:
             column = offender.column
-            sql = f"UPDATE {column.table} SET {column.column} = NULL WHERE timestamp = ?"
-            params: list[int] = [offender.timestamp]
+            sql = (
+                f"UPDATE {column.table} SET {column.column} = NULL "
+                "WHERE timestamp = ? AND device = ?"
+            )
+            params: list[object] = [offender.timestamp, offender.device]
             if column.keyed_by_module and offender.module_id is not None:
                 sql += " AND module_id = ?"
                 params.append(offender.module_id)

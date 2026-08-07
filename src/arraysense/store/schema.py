@@ -15,6 +15,38 @@ them when more than four are present, so a slot is not a battery; slot-named
 columns would let a long chart average two different physical batteries
 together, and a rollup would make that permanent.
 
+Every stored reading carries a ``device``: the serial of the inverter that
+produced it. EG4 18kPVs stack in parallel, so a single installation can hold
+several, and a schema keyed on time alone gives the second one's readings to
+the first. It is the same rule that already governs battery modules — identity
+is a serial, never a position — and it applies to the serials table too, so a
+pack is "this device's pack with this serial" rather than a serial floating
+free of the inverter that reported it.
+
+``device`` comes *after* ``timestamp`` in every primary key. These are WITHOUT
+ROWID tables, so the primary key is the storage order, and the rollup — the
+one query that runs every sixty seconds while holding the write lock the poll
+loop needs — asks a bare time range with no device in it. Timestamp first
+keeps that a plain index range. Device first can answer it only by skipping
+over each device prefix in turn, and SQLite picks that plan reliably only when
+ANALYZE statistics say the leading column has few distinct values; nothing here
+runs ANALYZE, so it does not get them.
+
+Measured on a synthetic database with the reference installation's row counts
+(792,510 rows, 103 MB), one maintenance pass: 220 ms with this key order,
+219 ms device-first with ANALYZE run, 243 ms device-first without statistics —
+which is the state a real database is in. So the penalty is about a tenth,
+not the collapse the shape of the problem suggests: SQLite skip-scans it
+competently even unaided. Timestamp first is still the right way round, but on
+this evidence rather than on the argument above, and the difference is small
+enough that it should not be treated as settling anything larger.
+
+The cost of choosing this way is in ``latest``, which walks the key backwards
+looking for one device's newest row. A device that has never recorded anything
+walks the whole tier: 9 ms against 0.001 ms with a device-first key on the same
+data. A device that is reporting costs 0.004 ms either way, so what this buys
+the rollup is paid for only when asking about an inverter with no rows at all.
+
 Retention tiers are described here and realised as one table per tier. The
 DDL is idempotent — every statement is CREATE ... IF NOT EXISTS — so running
 it twice is safe.
@@ -65,10 +97,15 @@ MODULE_TIERS: tuple[Tier, ...] = (
     Tier("hourly", "module_hourly", None),
 )
 
-_SERIALS_TABLE = "serials"
-_INVALID_TABLE = "invalid_readings"
+SERIALS_TABLE = "serials"
+INVALID_TABLE = "invalid_readings"
 
 _MODULE_PREFIX = re.compile(r"^battery_module\d+_")
+
+# The column naming which inverter a row came from. Named once because the
+# store, the rollups, the migration and the tools all have to spell it the
+# same, and a second spelling is a silent second device.
+DEVICE = "device"
 
 # How many source rows a rollup bucket covers. A record of coverage only:
 # every tier derives from raw, so nothing weights by it.
@@ -108,26 +145,40 @@ def module_metric_columns() -> tuple[str, ...]:
     return tuple(cols)
 
 
-def _serials_ddl() -> str:
-    """Return the DDL for the serial-number-to-integer-id mapping table."""
+def _serials_ddl(as_name: str) -> str:
+    """Return the DDL for the serial-number-to-integer-id mapping table.
+
+    A serial is unique per device rather than globally, so the same pack seen
+    by two inverters gets two ids and two histories. That is deliberate: the
+    row it identifies records what one inverter's BMS said, and merging two
+    inverters' views of one pack under a single id would be the slot mistake
+    at a larger scale. Serial is still a plain column, so a caller that wants
+    to follow a pack across a swap can join on it.
+    """
     return (
-        f"CREATE TABLE IF NOT EXISTS {_SERIALS_TABLE} (\n"
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
         "    id INTEGER PRIMARY KEY,\n"
-        "    serial TEXT NOT NULL UNIQUE\n"
+        f"    {DEVICE} TEXT NOT NULL,\n"
+        "    serial TEXT NOT NULL,\n"
+        f"    UNIQUE ({DEVICE}, serial)\n"
         ")"
     )
 
 
-def _invalid_readings_ddl() -> str:
+def _invalid_readings_ddl(as_name: str) -> str:
     """Return the DDL for the failed-plausibility-check table.
 
     Records the raw reading that failed its check, not the scaled integer —
     the check happens on the real-world value before encoding. ``serial`` is
-    NULL for an inverter reading and set for a module reading.
+    NULL for an inverter reading and set for a module reading, and ``device``
+    names the inverter either way — a decode fault is evidence about one
+    inverter or about our scaling of it, and evidence that cannot be
+    attributed to a unit is evidence about nothing.
     """
     return (
-        f"CREATE TABLE IF NOT EXISTS {_INVALID_TABLE} (\n"
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
         "    timestamp INTEGER NOT NULL,\n"
+        f"    {DEVICE} TEXT NOT NULL,\n"
         "    metric TEXT NOT NULL,\n"
         "    value REAL,\n"
         "    serial TEXT\n"
@@ -135,12 +186,17 @@ def _invalid_readings_ddl() -> str:
     )
 
 
-def _inverter_tier_ddl(tier: Tier, metric_names: tuple[str, ...]) -> str:
+def _inverter_tier_ddl(tier: Tier, metric_names: tuple[str, ...], as_name: str) -> str:
     """Return the DDL for one inverter-tier wide-row table.
 
     A wide row costs the same to ask for one metric as for all of them. The
     ``error`` column marks a failed poll and carries its reason; NULL means the
     poll succeeded.
+
+    The key is (timestamp, device): one row per inverter per instant, so two
+    units in a parallel stack neither overwrite each other nor need two
+    databases. Why timestamp leads, and what that costs, is measured in the
+    module docstring.
 
     Every tier but the raw one is a rollup destination, so it carries
     ``SAMPLE_COUNT``: how many source rows the bucket covers. Without it a
@@ -150,36 +206,36 @@ def _inverter_tier_ddl(tier: Tier, metric_names: tuple[str, ...]) -> str:
     nothing weights by it. Raw rows are one sample each and carry no such
     column.
     """
-    cols = ["    timestamp INTEGER NOT NULL"]
+    cols = ["    timestamp INTEGER NOT NULL", f"    {DEVICE} TEXT NOT NULL"]
     cols.extend(f"    {name} INTEGER" for name in metric_names)
     if tier.name != "full":
         cols.append(f"    {SAMPLE_COUNT} INTEGER NOT NULL")
     cols.append("    error TEXT")
-    cols.append("    PRIMARY KEY (timestamp)")
-    return (
-        f"CREATE TABLE IF NOT EXISTS {tier.table} (\n" + ",\n".join(cols) + f"\n) {_TABLE_OPTIONS}"
-    )
+    cols.append(f"    PRIMARY KEY (timestamp, {DEVICE})")
+    return f"CREATE TABLE IF NOT EXISTS {as_name} (\n" + ",\n".join(cols) + f"\n) {_TABLE_OPTIONS}"
 
 
-def _module_tier_ddl(tier: Tier, metric_names: tuple[str, ...]) -> str:
+def _module_tier_ddl(tier: Tier, metric_names: tuple[str, ...], as_name: str) -> str:
     """Return the DDL for one module-tier normalised table.
 
-    One row per module per timestamp: the row references an integer id in the
-    serials table, never a slot number. Rollup tiers (everything but raw)
-    carry ``SAMPLE_COUNT`` for the same reason as the inverter tiers: a bucket
-    must record how many source rows it covers. It is a record of coverage
-    only — rollups build directly from raw, never by recombining counts, so
-    nothing weights by it.
+    One row per module per timestamp per device: the row references an integer
+    id in the serials table, never a slot number. ``device`` is in the key even
+    though the serials id already implies it, because a key that has to be
+    derived through a join is a key nothing can filter on cheaply — every read
+    here narrows by device first.
+
+    Rollup tiers (everything but raw) carry ``SAMPLE_COUNT`` for the same
+    reason as the inverter tiers: a bucket must record how many source rows it
+    covers. It is a record of coverage only — rollups build directly from raw,
+    never by recombining counts, so nothing weights by it.
     """
-    cols = ["    timestamp INTEGER NOT NULL"]
-    cols.append(f"    module_id INTEGER NOT NULL REFERENCES {_SERIALS_TABLE}(id)")
+    cols = ["    timestamp INTEGER NOT NULL", f"    {DEVICE} TEXT NOT NULL"]
+    cols.append(f"    module_id INTEGER NOT NULL REFERENCES {SERIALS_TABLE}(id)")
     cols.extend(f"    {name} INTEGER" for name in metric_names)
     if tier.name != "full":
         cols.append(f"    {SAMPLE_COUNT} INTEGER NOT NULL")
-    cols.append("    PRIMARY KEY (timestamp, module_id)")
-    return (
-        f"CREATE TABLE IF NOT EXISTS {tier.table} (\n" + ",\n".join(cols) + f"\n) {_TABLE_OPTIONS}"
-    )
+    cols.append(f"    PRIMARY KEY (timestamp, {DEVICE}, module_id)")
+    return f"CREATE TABLE IF NOT EXISTS {as_name} (\n" + ",\n".join(cols) + f"\n) {_TABLE_OPTIONS}"
 
 
 def _index_ddl(table: str, columns: str) -> str:
@@ -194,14 +250,81 @@ def _index_ddl(table: str, columns: str) -> str:
     return f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
 
 
+def ddl_for(table: str, as_name: str | None = None) -> str:
+    """Return the CREATE TABLE for one table of the schema, under any name.
+
+    Every table's shape is defined once and asked for by name here, so the
+    startup DDL and the device migration in ``arraysense.store.migrate`` build
+    the same table rather than two that drift. ``as_name`` is what the
+    migration needs: it creates the new shape beside the old one under a
+    temporary name, copies, and renames.
+
+    Raises:
+        KeyError: ``table`` is not part of the schema.
+    """
+    name = table if as_name is None else as_name
+    if table == SERIALS_TABLE:
+        return _serials_ddl(name)
+    if table == INVALID_TABLE:
+        return _invalid_readings_ddl(name)
+    for tier in INVERTER_TIERS:
+        if tier.table == table:
+            return _inverter_tier_ddl(tier, tuple(spec.name for spec in INVERTER_METRICS), name)
+    for tier in MODULE_TIERS:
+        if tier.table == table:
+            return _module_tier_ddl(tier, module_metric_columns(), name)
+    raise KeyError(f"unknown table: {table!r}")
+
+
+def indexes_for(table: str) -> tuple[str, ...]:
+    """Return the index statements belonging to one table.
+
+    Kept beside ``ddl_for`` because a table recreated by the migration has to
+    get its indexes back — dropping the old table drops them with it, and a
+    tier that came back without them would still answer every query, only
+    slowly enough that nobody would connect it to a migration run months
+    earlier.
+    """
+    if table == INVALID_TABLE:
+        # Appending clears a timestamp's stale flags before rewriting them.
+        # Without this index that delete scans the whole table, so a sustained
+        # decoder fault — precisely what this table is here to preserve — would
+        # make every later write slower while holding the single writer lock.
+        return (_index_ddl(table, f"timestamp, {DEVICE}, serial"),)
+    # Inverter tables need no separate timestamp index: the primary key leads
+    # with timestamp and already provides one, and a duplicate index would cost
+    # a write on every sample for nothing.
+    if any(tier.table == table for tier in MODULE_TIERS):
+        # The primary key serves time-range queries. This reverses it to serve
+        # "one module over time", which is the per-module history view; the
+        # serials id already implies the device, so device is not repeated.
+        return (_index_ddl(table, "module_id, timestamp"),)
+    return ()
+
+
+# Every table that carries a device column, in an order safe to create in:
+# the module tiers reference the serials table.
+DEVICED_TABLES: tuple[str, ...] = (
+    SERIALS_TABLE,
+    INVALID_TABLE,
+    *(tier.table for tier in INVERTER_TIERS),
+    *(tier.table for tier in MODULE_TIERS),
+)
+
+
 def expected_columns() -> dict[str, tuple[str, ...]]:
-    """Return the columns each tier table should have, keyed by table name.
+    """Return the metric columns each tier table should have, keyed by table name.
 
     This is what a live database gets measured against, so one created before a
     metric was added to the registry — or before a rollup tier gained
     ``SAMPLE_COUNT`` — is detected on open and repaired, rather than accepted
     and then failing on the first write. Metric columns come out in registry
     order, with ``SAMPLE_COUNT`` appended for every tier but ``full``.
+
+    Only the columns ``migration_ddl`` can add with an ALTER are here.
+    ``device`` is not among them: SQLite cannot ALTER a primary key, so giving
+    a database its device identity means recreating every table, which is
+    ``arraysense.store.migrate`` and not something to do behind an open.
     """
     inverter = tuple(spec.name for spec in INVERTER_METRICS)
     module = module_metric_columns()
@@ -261,30 +384,16 @@ def schema_ddl() -> str:
     the alternative is a hand-written schema that drifts away from the registry
     silently. The text is idempotent, every statement being
     CREATE ... IF NOT EXISTS, so it can be run on every startup rather than
-    guarded by a "have we set up yet" flag that can be wrong. Each tier table
-    carries an index on its timestamp so the time-series range queries the
-    charts issue stay on an index.
-    """
-    inverter_columns = tuple(spec.name for spec in INVERTER_METRICS)
-    module_columns = module_metric_columns()
+    guarded by a "have we set up yet" flag that can be wrong.
 
-    statements = [_serials_ddl(), _invalid_readings_ddl()]
-    # Appending clears a timestamp's stale flags before rewriting them. Without
-    # this index that delete scans the whole table, so a sustained decoder
-    # fault — precisely what this table is here to preserve — would make every
-    # later write slower while holding the single writer lock.
-    statements.append(_index_ddl(_INVALID_TABLE, "timestamp, serial"))
-    # Inverter tables need no separate timestamp index: the primary key on
-    # timestamp already provides one, and a duplicate index would cost a write
-    # on every sample for nothing.
-    for tier in INVERTER_TIERS:
-        statements.append(_inverter_tier_ddl(tier, inverter_columns))
-    # Module tables key on (timestamp, module_id), which serves time-range
-    # queries. The extra index reverses that order to serve "one module over
-    # time", which is the per-module history view.
-    for tier in MODULE_TIERS:
-        statements.append(_module_tier_ddl(tier, module_columns))
-        statements.append(_index_ddl(tier.table, "module_id, timestamp"))
+    Note what idempotent does not cover: a table that already exists with a
+    different key is left exactly as it is, silently. That is why the device
+    column arrived as an explicit migration rather than as an edit here.
+    """
+    statements: list[str] = []
+    for table in DEVICED_TABLES:
+        statements.append(ddl_for(table))
+        statements.extend(indexes_for(table))
     # Each statement ends on its own line; a trailing semicolon per statement
     # makes the whole text executable as a single script.
     return ";\n".join(statements) + ";\n"

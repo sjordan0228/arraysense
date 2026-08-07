@@ -26,13 +26,14 @@ from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 T0 = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture
 def client(tmp_path: Path) -> Any:
-    store = SqliteStore(str(tmp_path / "api.db"))
+    store = SqliteStore(str(tmp_path / "api.db"), device=TEST_DEVICE)
     for minute, pv in ((0, 1000.0), (1, 2000.0), (2, 3000.0)):
         store.append(
             Sample(
@@ -68,7 +69,7 @@ def client(tmp_path: Path) -> Any:
 @pytest.fixture
 def empty_client(tmp_path: Path) -> Any:
     """A store with no readings at all — a service that has never polled."""
-    store = SqliteStore(str(tmp_path / "empty.db"))
+    store = SqliteStore(str(tmp_path / "empty.db"), device=TEST_DEVICE)
     config = Config(
         dongle_host="h",
         dongle_serial="s",
@@ -277,7 +278,7 @@ def _bank(store: SqliteStore, when: datetime, volts: float, socs: dict[str, floa
 
 
 def _calibration_client(tmp_path: Path, build: Any) -> Any:
-    store = SqliteStore(str(tmp_path / "cal.db"))
+    store = SqliteStore(str(tmp_path / "cal.db"), device=TEST_DEVICE)
     build(store)
     from arraysense.store.rollup import rebuild_inverter_minute
 
@@ -799,7 +800,7 @@ def _counters(store: SqliteStore, first: datetime, last: datetime, skip: Any = N
 
 
 def _energy_client(tmp_path: Path, build: Any, bands: str | None = COSERV_BANDS) -> Any:
-    store = SqliteStore(str(tmp_path / "energy.db"))
+    store = SqliteStore(str(tmp_path / "energy.db"), device=TEST_DEVICE)
     build(store)
     config = Config(
         dongle_host="h",
@@ -1197,3 +1198,98 @@ def test_status_says_nothing_about_misroutes_a_source_cannot_count(
     # error as rendering a missing reading as 0.
     body = client.get("/api/status").json()
     assert body["misroutes"] is None
+
+
+SECOND_DEVICE = "CE00000001"
+
+
+def _two_device_client(tmp_path: Path) -> Any:
+    """A store holding two inverters, served by a page that knows about one."""
+    store = SqliteStore(str(tmp_path / "stack.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=T0,
+            readings={"pv_total_power_w": 1000.0},
+            battery_modules=(BatteryModuleSample(serial="AAA", slot=1, soc_pct=90.0),),
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=T0,
+            readings={"pv_total_power_w": 9000.0},
+            battery_modules=(BatteryModuleSample(serial="ZZZ", slot=1, soc_pct=10.0),),
+        ),
+        device=SECOND_DEVICE,
+    )
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "stack.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    return TestClient(create_app(store=store, service=service, config=config))
+
+
+def test_a_second_inverter_is_invisible_to_a_page_that_asks_for_nothing(
+    tmp_path: Path,
+) -> None:
+    # The point of the whole change landing quietly: an existing page sends no
+    # device and sees exactly the inverter it always saw.
+    with _two_device_client(tmp_path) as c:
+        live = c.get("/api/live").json()
+        history = c.get(
+            "/api/history",
+            params={
+                "start": (T0 - timedelta(minutes=1)).isoformat(),
+                "end": (T0 + timedelta(minutes=1)).isoformat(),
+                "metrics": "pv_total_power_w",
+            },
+        ).json()
+    assert live["inverter"]["pv_total_power_w"] == 1000.0
+    assert [m["serial"] for m in live["modules"]] == ["AAA"]
+    assert [p["pv_total_power_w"] for p in history["points"]] == [1000.0]
+
+
+def test_naming_the_second_inverter_returns_its_readings(tmp_path: Path) -> None:
+    with _two_device_client(tmp_path) as c:
+        live = c.get("/api/live", params={"device": SECOND_DEVICE}).json()
+        battery = c.get(
+            "/api/battery/history",
+            params={
+                "start": (T0 - timedelta(minutes=1)).isoformat(),
+                "end": (T0 + timedelta(minutes=1)).isoformat(),
+                "device": SECOND_DEVICE,
+            },
+        ).json()
+    assert live["inverter"]["pv_total_power_w"] == 9000.0
+    assert [m["serial"] for m in live["modules"]] == ["ZZZ"]
+    assert [p["serial"] for p in battery["points"]] == ["ZZZ"]
+
+
+def test_an_unknown_device_returns_nothing_rather_than_somebody_elses_rows(
+    tmp_path: Path,
+) -> None:
+    with _two_device_client(tmp_path) as c:
+        live = c.get("/api/live", params={"device": "CE99999999"}).json()
+    assert live["inverter"] is None
+    assert live["modules"] == []
+
+
+def test_a_blank_device_is_a_client_error_not_a_server_one(client: Any) -> None:
+    # A browser sends ?device= readily — a cleared input, a hand-built URL.
+    # It used to reach the store as a device nothing had ever recorded, which
+    # answered with no rows and no error and read as an inverter that had
+    # stopped reporting. The store refuses it now, so the same request would
+    # otherwise be a 500. It is the caller's mistake either way.
+    for query in ("?device=", "?device=%20"):
+        assert client.get("/api/live" + query).status_code == 400
+
+
+def test_naming_the_configured_device_answers_as_usual(client: Any) -> None:
+    # The parameter has to be usable, not merely validated. A page that does
+    # send it must get exactly what a page that does not send it gets.
+    plain = client.get("/api/live").json()
+    named = client.get("/api/live", params={"device": client.app.state.store.device}).json()
+    assert named["inverter"] == plain["inverter"]

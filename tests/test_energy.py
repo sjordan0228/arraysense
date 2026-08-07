@@ -33,6 +33,7 @@ from arraysense.energy import (
 from arraysense.models import Sample
 from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 NY = ZoneInfo("America/New_York")
 
@@ -62,7 +63,7 @@ def _counters(
 
 def _store(tmp_path: Path, samples: Iterable[Sample]) -> SqliteStore:
     """Open a temporary store holding ``samples``."""
-    store = SqliteStore(str(tmp_path / "energy.db"))
+    store = SqliteStore(str(tmp_path / "energy.db"), device=TEST_DEVICE)
     for sample in samples:
         store.append(sample)
     return store
@@ -553,7 +554,7 @@ def test_resolve_zone_falls_back_to_the_host_when_asked_for_nothing() -> None:
 
 @pytest.fixture
 def client(tmp_path: Path) -> Any:
-    store = SqliteStore(str(tmp_path / "api.db"))
+    store = SqliteStore(str(tmp_path / "api.db"), device=TEST_DEVICE)
     for sample in _counters(datetime(2026, 7, 1, tzinfo=NY), hours=38):
         store.append(sample)
     config = Config(

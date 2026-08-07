@@ -7,11 +7,18 @@ mappings this file guards were wrong in ways only real hardware exposed.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
+from pylxpweb.transports.data import (
+    BatteryBankData,
+    InverterEnergyData,
+    InverterRuntimeData,
+)
 from pylxpweb.transports.exceptions import TransportError
 
+from arraysense.collector import pylxp_source
 from arraysense.collector.pylxp_source import PylxpSource, sample_from_pylxp
 from arraysense.config import Config
 from arraysense.metrics import lookup
@@ -223,6 +230,106 @@ def test_a_module_holding_only_zeroes_is_dropped_even_with_a_serial() -> None:
     assert [m.serial for m in modules] == ["Battery_ID_01"]
 
 
+def test_a_state_of_health_of_exactly_100_is_not_stored() -> None:
+    # pylxpweb rewrites a reported 0 to 100 on every path that produces SOH.
+    # In 0.9.38: transports/data.py:635-636 on the runtime path, :1292 per
+    # module, :1705-1707 on the bank. Zero is what a silent BMS reports, so a
+    # stored 100 could be a healthy bank or one that answered nothing, and
+    # nothing downstream can tell which.
+    runtime = _runtime(battery_soh=100)
+    assert "battery_soh_pct" not in sample_from_pylxp(runtime, bank=None).readings
+
+
+def test_a_state_of_health_below_100_is_stored() -> None:
+    # The rewrite only ever produces the literal 100, so every other value is a
+    # measurement — including the falling one the column exists to show.
+    readings = sample_from_pylxp(_runtime(battery_soh=97), bank=None).readings
+    assert readings["battery_soh_pct"] == 97.0
+
+
+def _healthy_bank(**overrides: object) -> SimpleNamespace:
+    fields: dict[str, object] = {
+        "max_cell_voltage": 3.364,
+        "min_cell_voltage": 3.358,
+        "max_capacity": 1120.0,
+        "batteries": [],
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_the_banks_state_of_health_is_refused_on_the_same_terms() -> None:
+    # The bank decodes the same register 5 the runtime path does, through the
+    # same rewrite, so it inherits the same ambiguity.
+    assert "battery_soh_pct" not in sample_from_pylxp(_runtime(), _healthy_bank(soh=100)).readings
+    kept = sample_from_pylxp(_runtime(), _healthy_bank(soh=94)).readings
+    assert kept["battery_soh_pct"] == 94.0
+
+
+def test_a_modules_state_of_health_is_refused_on_the_same_terms() -> None:
+    def module(soh: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            serial_number="Battery_ID_01",
+            battery_index=0,
+            soc=64,
+            soh=soh,
+            max_cell_voltage=3.364,
+            min_cell_voltage=3.358,
+            max_capacity=280.0,
+        )
+
+    (silent,) = sample_from_pylxp(
+        _runtime(), _healthy_bank(batteries=[module(100)])
+    ).battery_modules
+    assert silent.soh_pct is None
+    (worn,) = sample_from_pylxp(_runtime(), _healthy_bank(batteries=[module(91)])).battery_modules
+    assert worn.soh_pct == 91.0
+
+
+def test_module_fault_and_warning_codes_are_not_stored_at_all() -> None:
+    # BatteryData declares both as int = 0 (data.py:1031-1032) and
+    # from_modbus_registers passes neither, because no entry in
+    # BATTERY_REGISTERS carries either quantity. Storing the default asserts
+    # "no fault" about a pack nobody asked.
+    record = SimpleNamespace(
+        serial_number="Battery_ID_03",
+        battery_index=2,
+        soc=57,
+        max_cell_voltage=3.364,
+        min_cell_voltage=3.358,
+        max_capacity=280.0,
+        fault_code=0,
+        warning_code=0,
+    )
+    (module,) = sample_from_pylxp(_runtime(), _healthy_bank(batteries=[record])).battery_modules
+    assert module.fault_code is None
+    assert module.warning_code is None
+
+
+def test_every_mapped_attribute_exists_on_the_class_it_is_read_from() -> None:
+    # _reading asks with a default, so a mapping naming an attribute that does
+    # not exist contributes nothing and says nothing about it — for as long as
+    # nobody checks. battery_voltage_inv_sample sat in the runtime table that
+    # way: register 107 reaches us only through the bank, and RUNTIME_FIELD
+    # maps its name to None.
+    runtime = {f.name for f in fields(InverterRuntimeData)}
+    bank = {f.name for f in fields(BatteryBankData)}
+    energy = {f.name for f in fields(InverterEnergyData)}
+    tables: tuple[tuple[str, tuple[tuple[str, str], ...], set[str]], ...] = (
+        ("_RUNTIME_METRICS", pylxp_source._RUNTIME_METRICS, runtime),
+        ("_RUNTIME_BATTERY_METRICS", pylxp_source._RUNTIME_BATTERY_METRICS, runtime),
+        ("_RUNTIME_FLAGS", pylxp_source._RUNTIME_FLAGS, runtime),
+        ("_BANK_METRICS", pylxp_source._BANK_METRICS, bank),
+        ("_BANK_FLAGS", pylxp_source._BANK_FLAGS, bank),
+        ("_ENERGY_METRICS", pylxp_source._ENERGY_METRICS, energy),
+    )
+    for label, table, declared in tables:
+        for _, attribute in table:
+            assert attribute in declared, f"{label} names {attribute}, which does not exist"
+    for _, positive, negative in pylxp_source._RUNTIME_SIGNED_PAIRS:
+        assert positive in runtime and negative in runtime
+
+
 class _CrossedTransport:
     """A dongle that answers the wrong register a fixed number of times first.
 
@@ -305,3 +412,18 @@ async def test_a_closed_socket_is_not_retried_at_all() -> None:
     with pytest.raises(ConnectionError):
         await _source(transport).read()
     assert transport.calls == 1
+
+
+def test_a_state_of_health_of_zero_is_absence_not_a_dead_bank() -> None:
+    # The filter refused the library's fabricated 100 and let a raw 0 through,
+    # which is the same error wearing the opposite number. Zero is what a BMS
+    # that answered nothing reports, not a bank with no health left — and
+    # storing it would put an alarming figure on a column nobody measured.
+    from arraysense.collector.pylxp_source import _measured_soh
+
+    assert _measured_soh(SimpleNamespace(soh=0.0), "soh") is None
+    assert _measured_soh(SimpleNamespace(soh=100.0), "soh") is None
+    assert _measured_soh(SimpleNamespace(soh=None), "soh") is None
+    # Everything a real degrading bank reports still arrives.
+    assert _measured_soh(SimpleNamespace(soh=97.0), "soh") == 97.0
+    assert _measured_soh(SimpleNamespace(soh=1.0), "soh") == 1.0

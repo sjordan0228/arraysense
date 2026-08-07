@@ -131,12 +131,19 @@ sample is what the reconstructed counters are anchored to.
 
 ```bash
 uv run python tools/import_solar_assistant.py \
-  sa-history.lp.gz sa-delta.lp.gz --db /var/lib/arraysense/arraysense.db
+  sa-history.lp.gz sa-delta.lp.gz --db /var/lib/arraysense/arraysense.db \
+  --device CE12345678
 ```
 
 Pass both files; they are read in order and may overlap. The import prints what
 it anchored to, how many points it read, and how many rows it wrote to each
 tier.
+
+`--device` is the inverter's serial and must be the same value as
+`inverter_serial` in your config. Every stored reading is filed under the
+inverter that produced it, so history imported under a different serial belongs
+to a different machine as far as every page is concerned: it will not appear
+beside your live readings and the counters will not join up.
 
 It fills the tiers to their own retention: full cadence for the last thirty
 days, per minute for the last year, hourly for everything older. `--raw-days`

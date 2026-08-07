@@ -69,12 +69,26 @@
   </section>
 
   <section class="p">
-    <div class="chead"><h2>Battery packs</h2>
+    <div class="chead"><h2>Battery pack temperature</h2>
       <span class="legend muted">one band per pack, named by serial</span>
     </div>
-    <!-- Bank temperature above is the hottest cell anywhere in the bank, which
-         is not any one pack's reading. These are the packs themselves. -->
     <div id="packBands"><div class="empty">waiting for per-pack readings</div></div>
+    <!-- Two same-coloured traces, and a third column deliberately not drawn,
+         both need saying out loud once. The alternative to the first is a
+         second hue, and the palette has four that were checked against each
+         other; a fifth would be one nobody checked. -->
+    <p class="why">Two traces to a pack, in one colour because they are one
+      quantity from one battery: its hottest cell solid, its coldest dashed. The
+      hottest cannot sit below the coldest, so position separates the pair and
+      the dash only confirms it. There is no third trace for the pack's own
+      <code>temperature_c</code>, because pylxpweb fills a module's temperature
+      from its hottest cell — it would be the solid line drawn twice. It is read
+      out on hover beside the other two instead, which is where that can be
+      checked. Over a range long enough to be served from a rollup the pair
+      spreads apart, since the extremes then aggregate as a maximum and a
+      minimum across each bucket rather than each sample; the header says which
+      tier arrived. The bank band above is a different register again — the
+      hottest cell anywhere in the bank, not in any one pack.</p>
   </section>
 
   <section class="p">
@@ -329,10 +343,38 @@ const WANTED = [
 ];
 const METRICS = [...new Set(WANTED)].join(',');
 
+// What a pack band holds, in the order the columns are stacked into the data.
+// Both drawn traces are temperatures of the same battery from the same BMS, so
+// they share the band's one hue and are separated by dash and by position: a
+// pack's hottest cell cannot be below its coldest. Colour carries nothing here,
+// which is the point.
+//
+// temperature_c is fetched and read out but never drawn, because it is not a
+// third reading. pylxpweb fills a module's temperature from its hottest cell —
+// transports/data.py, BatteryModuleData.from_registers, where `temperature` and
+// `max_cell_temperature` are both assigned the same max_cell_temp; the RS485
+// master protocol sets all three from its one register. A trace for it would be
+// the solid line drawn a second time under a name implying another sensor.
+// Carried rather than dropped so the hover still answers for the column the
+// store actually keeps, and so the duplication is something a reader can see.
+//
+// The names are the bare module metrics /api/battery/history takes. The store
+// keeps them in slot-numbered columns — battery_module1_temperature_c and its
+// siblings — and hands the bare name back against a serial, which is the only
+// mapping this page wants: a slot is a register position and not a battery, and
+// the inverter rotates modules through the four of them.
+const PACK_LINES = [
+  { metric: 'cell_max_temperature_c', label: 'Hottest cell', width: 1.4 },
+  { metric: 'cell_min_temperature_c', label: 'Coldest cell', dash: [5, 3], width: 1 },
+  { metric: 'temperature_c', label: 'Pack temperature', carry: true },
+];
+
+const PACK_METRICS = PACK_LINES.map((l) => l.metric).join(',');
+
 // The pack bands are built from whatever serials the store answers with, so
 // they cannot be listed above. Modules are identified by serial and never by
-// slot: the inverter rotates them through four register slots, and numbering
-// the bands would reintroduce exactly the identity this project refuses.
+// slot, so the label is the serial and nothing else; numbering the bands would
+// reintroduce exactly the identity this project refuses.
 let packBands = [];
 let packKey = '';
 
@@ -379,17 +421,28 @@ function buildSections() {
   }
 }
 
-// One band. The values arrive already in the unit the band is drawn in, and a
-// band with nothing in it says so rather than drawing an empty plot — a flat
-// line on an axis is a reading of nothing, and nothing recorded is not that.
-function paintBand(b, xs, values) {
+// What a band holds, one entry per column. Every band but the pack ones is a
+// single series and does not say so; giving them all an explicit list would be
+// two dozen copies of the same line for the sake of the ones that differ.
+const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
+
+// One band, and one column per trace. The values arrive already in the unit the
+// band is drawn in, and a band with nothing in any of its columns says so
+// rather than drawing an empty plot — a flat line on an axis is a reading of
+// nothing, and nothing recorded is not that.
+function paintBand(b, xs, cols) {
   const k = kindOf(b);
-  if (!anyReading(values)) { chartMessage(b.id, 'nothing recorded in this range'); return; }
-  const plugins = [readout(b.id, [[b.label, 1, b.fmt || k.fmt]])];
+  const lines = linesOf(b);
+  if (!anyReading(...cols)) { chartMessage(b.id, 'nothing recorded in this range'); return; }
+  const fmt = b.fmt || k.fmt;
+  // Every trace in the readout, in the order they are stacked, so a pack's
+  // three temperatures are read off one hover rather than three.
+  const plugins = [readout(b.id, lines.map((l, i) => [l.label, i + 1, fmt]))];
   if (b.signed) plugins.unshift(zeroRule());
   // Built up rather than written out, because uPlot fills its axis defaults in
   // with Object.assign: a key present and undefined overwrites the default
-  // with undefined, and the first thing to call axis.splits() then throws.
+  // with undefined, and the first thing to call axis.splits() then throws. The
+  // series extras below are assembled the same way and for the same reason.
   const yAxis = { size: 46, gap: 6, values: k.values };
   if (k.splits) yAxis.splits = k.splits;
   paint(b.id, {
@@ -404,13 +457,15 @@ function paintBand(b, xs, values) {
         isLast(b) ? timeAxis() : axis({ size: 10, values: (u, splits) => splits.map(() => '') }),
         axis(yAxis),
       ],
-      series: [
-        {},
-        trace(b.label, b.ink, 1.4, b.fill ? { fill: b.fill, fillTo: () => 0 } : null),
-      ],
+      // A carried line is in the data and in the readout and nowhere on the
+      // canvas, so it also takes no part in ranging the scale.
+      series: [{}, ...lines.map((l) => (l.carry ? carried()
+        : trace(l.label, b.ink, l.width, Object.assign({},
+          b.fill ? { fill: b.fill, fillTo: () => 0 } : null,
+          l.dash ? { dash: l.dash } : null))))],
       plugins,
     }),
-  }, [xs, values]);
+  }, [xs, ...cols]);
 }
 
 // A band's own values, converted into the unit it is drawn in. tempOf answers
@@ -424,14 +479,19 @@ function valuesFor(b, f) {
 function drawInverter(body) {
   if (!body) return;
   const f = frame(body.points || []);
-  for (const b of BANDS) paintBand(b, f.xs, valuesFor(b, f));
+  for (const b of BANDS) paintBand(b, f.xs, [valuesFor(b, f)]);
 }
 
 // Per-pack rows are one stream with the packs interleaved — a row per pack per
-// timestamp — so they have to be pivoted onto a shared time axis before they
-// are four series. frame() cannot do it: it turns one row into one point.
+// timestamp, each carrying all three temperatures — so they have to be pivoted
+// onto a shared time axis before they are series at all. frame() cannot do it:
+// it turns one row into one point.
+//
 // A pack that did not report at an instant gets a null there, which draws as a
-// hole in that pack's line and leaves the others alone.
+// hole in that pack's line and leaves the others alone. So does one reading
+// missing from a row that carries the others: the endpoint returns a row per
+// pack per timestamp with each absent reading as its own null, so filling any
+// of them in would put an invented temperature on the chart.
 function packSeries(points, serials) {
   const stamps = new Set();
   for (const p of points) {
@@ -440,12 +500,14 @@ function packSeries(points, serials) {
   }
   const xs = [...stamps].sort((a, b) => a - b);
   const at = new Map(xs.map((t, i) => [t, i]));
-  const cols = new Map(serials.map((s) => [s, new Array(xs.length).fill(null)]));
+  const cols = new Map(serials.map(
+    (s) => [s, PACK_LINES.map(() => new Array(xs.length).fill(null))]));
   for (const p of points) {
     const t = Date.parse(p && p.timestamp);
-    const col = cols.get(p && p.serial);
-    if (!col || !Number.isFinite(t)) continue;
-    col[at.get(t / 1000)] = numOrNull(p.temperature_c);
+    const pack = cols.get(p && p.serial);
+    if (!pack || !Number.isFinite(t)) continue;
+    const i = at.get(t / 1000);
+    PACK_LINES.forEach((l, n) => { pack[n][i] = numOrNull(p[l.metric]); });
   }
   return { xs, cols };
 }
@@ -463,8 +525,12 @@ function forgetPacks() {
 function rebuildPacks(serials) {
   forgetPacks();
   packBands = serials.map((serial, i) => ({
-    sec: 'packs', id: 'pack' + i, label: 'Pack ' + serial, source: 'temperature_c',
-    kind: 'temp', ink: '--batt',
+    // The id is a DOM handle and nothing more — it is rebuilt from scratch
+    // whenever the set of serials changes, so it never outlives the pack it
+    // was handed to and is not an identity anything reads back.
+    sec: 'packs', id: 'pack' + i, label: 'Pack ' + serial,
+    source: PACK_LINES.map((l) => l.metric).join(', '),
+    kind: 'temp', ink: '--batt', lines: PACK_LINES,
   }));
   packKey = packKeyOf(serials);
   $('packBands').innerHTML = packBands.map(bandHtml).join('');
@@ -482,8 +548,11 @@ function drawPacks(body) {
   if (packKeyOf(serials) !== packKey) rebuildPacks(serials);
   const series = packSeries(points, serials);
   packBands.forEach((b, i) => {
-    const raw = series.cols.get(serials[i]) || [];
-    paintBand(b, series.xs, raw.map(tempOf));
+    const raw = series.cols.get(serials[i]) || PACK_LINES.map(() => []);
+    // tempOf answers an absent reading with null, so absent survives the
+    // conversion — the same guarantee valuesFor() relies on for the inverter
+    // bands, and the reason a silent pack cannot arrive on the axis at zero.
+    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)));
   });
 }
 
@@ -515,7 +584,7 @@ async function load() {
   const problems = [];
   const [inv, packs] = await Promise.all([
     get(`/api/history?${when}&metrics=${METRICS}&width=${width}`).catch(() => null),
-    get(`/api/battery/history?${when}&metrics=temperature_c&width=${width}`).catch(() => null),
+    get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${width}`).catch(() => null),
   ]);
   // A failed poll must not tear the charts down: destroying them takes the
   // owner's zoom with it over a problem that usually lasts one request, and

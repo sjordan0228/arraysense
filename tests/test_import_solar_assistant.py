@@ -21,6 +21,7 @@ from arraysense.metrics import lookup
 from arraysense.models import Sample
 from arraysense.store.schema import INVERTER_TIERS
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 from import_solar_assistant import (
     HOURLY_ENERGY,
     SOURCES,
@@ -179,7 +180,7 @@ def test_a_day_read_back_matches_what_the_source_recorded(tmp_path: Path) -> Non
     # The whole point of the migration, end to end: hourly means in, the same
     # day's energy out through the code the pages actually call.
     db = tmp_path / "s.db"
-    store = SqliteStore(str(db))
+    store = SqliteStore(str(db), device=TEST_DEVICE)
     anchor_at = datetime(2026, 3, 2, 6, 0, tzinfo=UTC)
     store.append(
         Sample(
@@ -202,7 +203,7 @@ def test_a_day_read_back_matches_what_the_source_recorded(tmp_path: Path) -> Non
         lines.append(f"PV\\ power combined=500i {at}000000000")
     export = _write(tmp_path / "e.lp.gz", lines)
 
-    anchor, anchor_hour = read_anchor(db)
+    anchor, anchor_hour = read_anchor(db, TEST_DEVICE)
     last = anchor_hour * HOUR
     buckets = scan([export], last - 86400 * 30, last, last - 86400 * 30, last - 86400 * 30)
     counters = synthesise_counters(buckets, anchor, anchor_hour)
@@ -211,6 +212,7 @@ def test_a_day_read_back_matches_what_the_source_recorded(tmp_path: Path) -> Non
     write_tier(
         conn,
         tiers["hourly"],
+        TEST_DEVICE,
         buckets.origin_hour,
         buckets.hours,
         HOUR,
@@ -229,6 +231,6 @@ def test_the_import_refuses_to_run_without_a_live_reading_to_anchor_to(tmp_path:
     # Without one there is nothing to join to, and a counter starting at zero
     # would put the entire lifetime of the system into the hour of cutover.
     db = tmp_path / "empty.db"
-    SqliteStore(str(db))
+    SqliteStore(str(db), device=TEST_DEVICE)
     with pytest.raises(SystemExit, match="anchor"):
-        read_anchor(db)
+        read_anchor(db, TEST_DEVICE)

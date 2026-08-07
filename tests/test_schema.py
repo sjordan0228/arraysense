@@ -140,19 +140,28 @@ def test_inverter_tiers_reject_duplicate_timestamps() -> None:
     # the rollups would then double-count it into a corrupted average.
     conn = sqlite3.connect(":memory:")
     conn.executescript(schema_ddl())
-    conn.execute("INSERT INTO inverter_raw (timestamp, pv_total_power_w) VALUES (100, 5)")
+    conn.execute(
+        "INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) VALUES (100, 'CE0', 5)"
+    )
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO inverter_raw (timestamp, pv_total_power_w) VALUES (100, 9)")
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) VALUES (100, 'CE0', 9)"
+        )
     conn.close()
 
 
 def test_module_tiers_reject_duplicate_timestamp_and_module() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(schema_ddl())
-    conn.execute("INSERT INTO serials (id, serial) VALUES (1, 'BA00000001')")
-    conn.execute("INSERT INTO module_raw (timestamp, module_id, soc_pct) VALUES (100, 1, 94)")
+    conn.execute("INSERT INTO serials (id, device, serial) VALUES (1, 'CE0', 'BA00000001')")
+    conn.execute(
+        "INSERT INTO module_raw (timestamp, device, module_id, soc_pct) VALUES (100, 'CE0', 1, 94)"
+    )
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO module_raw (timestamp, module_id, soc_pct) VALUES (100, 1, 93)")
+        conn.execute(
+            "INSERT INTO module_raw (timestamp, device, module_id, soc_pct) "
+            "VALUES (100, 'CE0', 1, 93)"
+        )
     conn.close()
 
 
@@ -161,9 +170,12 @@ def test_same_timestamp_different_modules_is_allowed() -> None:
     conn = sqlite3.connect(":memory:")
     conn.executescript(schema_ddl())
     for i in range(1, 5):
-        conn.execute("INSERT INTO serials (id, serial) VALUES (?, ?)", (i, f"BA0000000{i}"))
         conn.execute(
-            "INSERT INTO module_raw (timestamp, module_id, soc_pct) VALUES (100, ?, ?)",
+            "INSERT INTO serials (id, device, serial) VALUES (?, 'CE0', ?)", (i, f"BA0000000{i}")
+        )
+        conn.execute(
+            "INSERT INTO module_raw (timestamp, device, module_id, soc_pct) "
+            "VALUES (100, 'CE0', ?, ?)",
             (i, 90 + i),
         )
     assert conn.execute("SELECT COUNT(*) FROM module_raw WHERE timestamp=100").fetchone()[0] == 4
@@ -181,7 +193,9 @@ def test_null_timestamp_is_rejected() -> None:
     # INTEGER PRIMARY KEY aliases the rowid and would silently assign one.
     conn = _open()
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute("INSERT INTO inverter_raw (timestamp, pv_total_power_w) VALUES (NULL, 5)")
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) VALUES (NULL, 'CE0', 5)"
+        )
     conn.close()
 
 
