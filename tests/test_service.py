@@ -264,3 +264,45 @@ async def test_a_yielded_dongle_is_not_a_stall(tmp_path: Path) -> None:
     svc.status.started_at = now - timedelta(hours=2)
     assert svc.stalled_for(now) is None
     store.close()
+
+
+async def test_a_dead_loop_is_a_stall_even_though_running_went_false(tmp_path: Path) -> None:
+    # The case the watchdog exists for, and the one it missed. `_loop` clears
+    # `running` before re-raising, so a check that stood down when running was
+    # False stood down precisely when the loop had died — leaving the web server
+    # serving stale pages over a collector that had stopped, forever.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    async def boom() -> None:
+        # A locked database, which is what a long scrub does to a live poll and
+        # is not among the transport errors poll_once recovers from.
+        raise sqlite3.OperationalError("database is locked")
+
+    await svc.start()
+    await asyncio.sleep(0.05)
+    svc._source.read = boom  # type: ignore[method-assign, assignment]
+    await asyncio.sleep(0.15)
+
+    assert svc._task is not None and svc._task.done(), "the loop should have died"
+    assert svc.status.running is False
+    assert svc.stalled_for() is not None, "a dead loop must read as stalled"
+    store.close()
+
+
+async def test_a_service_that_was_never_started_is_not_a_stall(tmp_path: Path) -> None:
+    # Quiet on purpose. There is no loop to be dead.
+    svc, store = _service(tmp_path)
+    assert svc.stalled_for() is None
+    store.close()
+
+
+async def test_a_stopped_service_is_not_a_stall(tmp_path: Path) -> None:
+    # Also quiet on purpose: somebody asked it to stop.
+    svc, store = _service(tmp_path)
+    await svc.start()
+    await asyncio.sleep(0.02)
+    await svc.stop()
+    assert svc.stalled_for() is None
+    store.close()

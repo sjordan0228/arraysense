@@ -272,11 +272,31 @@ class CollectorService:
         should ever take.
 
         Returns None while yielding, when the dongle has been handed over
-        deliberately and no polling is expected.
+        deliberately and no polling is expected, and when nothing was ever
+        started. Those are the only two ways to be quiet on purpose.
+
+        What it deliberately does *not* consult is ``status.running``. That flag
+        is the first thing the dying loop clears — ``_loop`` sets it False and
+        then re-raises — so a check that stood down when it was False stood down
+        exactly when the loop had died, which is the case this exists for. It
+        was written that way and shipped that way, and a test that killed the
+        loop and asked three hours later got None.
         """
-        if not self.status.running or self.status.yielding:
+        if self.status.yielding:
             return None
         now = now or datetime.now(tz=UTC)
+        # Asked before the running flag, deliberately. A dead loop clears that
+        # flag on its way out, so consulting it first is what made this return
+        # None in the one case it was written for.
+        if self._task is not None and self._task.done():
+            # Nothing will move the timestamps again, so there is no waiting to
+            # be done and no threshold to clear.
+            since = self.status.last_success or self.status.last_failure or self.status.started_at
+            return now - since if since else self._stall_after
+        # Never started, or stopped on purpose. Both leave the flag False and
+        # both are silence somebody asked for.
+        if not self.status.running:
+            return None
         marks = [t for t in (self.status.last_success, self.status.last_failure) if t is not None]
         since = max(marks) if marks else self.status.started_at
         if since is None:
