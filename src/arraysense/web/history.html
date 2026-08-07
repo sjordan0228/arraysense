@@ -252,14 +252,22 @@ function buildRows(span, buckets) {
 // because the first week of a new installation is a handful of kWh whichever
 // bucket it is filed under.
 function decimals(rows) {
-  let biggest = 0;
-  for (const r of rows) {
-    for (const c of COLUMNS) {
+  // One digit count per COLUMN, not one for the whole table. A single count
+  // taken from the largest value anywhere rounds a real 0.4 kWh of export down
+  // to a bare "0" — visually identical to a month that exported nothing, on a
+  // page whose whole premise is that those two must never look alike. The
+  // reference system has exported 4.7 kWh in its life, so every month of it
+  // was reading zero.
+  const places = {};
+  for (const c of COLUMNS) {
+    let biggest = 0;
+    for (const r of rows) {
       const v = r.totals[c.key];
-      if (v !== null) biggest = Math.max(biggest, Math.abs(v));
+      if (v !== null && v !== undefined) biggest = Math.max(biggest, Math.abs(v));
     }
+    places[c.key] = biggest >= WHOLE_NUMBER_ABOVE ? 0 : 1;
   }
-  return biggest >= WHOLE_NUMBER_ABOVE ? 0 : 1;
+  return places;
 }
 
 const cell = (v, places) => (v === null
@@ -279,7 +287,7 @@ function drawTable(span, rows) {
         ? '<span class="tag" title="Only part of this period was collected, so these totals are not the whole of it">partial</span>'
         : '';
     return `<tr${r.reported ? '' : ' class="absent"'}><td>${esc(r.label)}${tag}</td>`
-      + COLUMNS.map((c) => cell(r.totals[c.key], places)).join('')
+      + COLUMNS.map((c) => cell(r.totals[c.key], places[c.key])).join('')
       + '</tr>';
   }).join('');
   drawTotals(span, rows, places);
@@ -300,7 +308,7 @@ function drawTotals(span, rows, places) {
     }
     // Counters carry one decimal, so every total is a whole number of tenths.
     // Rounding to that clears the float noise a month of additions leaves.
-    return cell(sum === null ? null : Math.round(sum * 10) / 10, places);
+    return cell(sum === null ? null : Math.round(sum * 10) / 10, places[c.key]);
   }).join('');
   const missing = rows.length - reported.length;
   const partial = reported.filter((r) => r.partial).length;

@@ -545,3 +545,62 @@ def test_a_non_finite_setting_is_a_400_not_a_500(client: Any) -> None:
         headers={"Content-Type": "application/json"},
     )
     assert r.status_code == 400, r.text
+
+
+# --- costs -------------------------------------------------------------------
+
+
+def test_costs_shows_no_money_at_all_without_a_tariff(client: Any) -> None:
+    # Not zero, and not a guessed rate. An install that has never entered a
+    # tariff shows its energy and says so.
+    body = client.get(
+        "/api/costs",
+        params={"start": "2026-07-15T00:00:00Z", "end": "2026-07-16T00:00:00Z"},
+    ).json()
+    assert body["configured"] is False
+    assert body["cost"] is None
+    assert body["bill"] is None
+    assert body["currency"] is None
+
+
+def test_costs_prices_the_seasonal_tariff_the_page_could_not_read(client: Any) -> None:
+    # The blocking defect: the browser's own parser required exactly three
+    # pipe-separated fields and rejected the season, so the reference
+    # installation's own tariff priced nothing at all. Pricing server-side
+    # means one grammar and one meaning.
+    client.put(
+        "/api/settings",
+        json={
+            "tariff.bands": (
+                "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+                "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+                "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+            ),
+            "tariff.fixed_monthly": 15.0,
+        },
+    )
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-07-16T00:00:00Z",
+            "tz": "America/Chicago",
+        },
+    ).json()
+    assert body["configured"] is True
+    assert body["currency"] == "$"
+
+
+def test_costs_refuses_a_period_too_long_to_price(client: Any) -> None:
+    r = client.get(
+        "/api/costs",
+        params={"start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+    )
+    # Without a tariff there is nothing to scan, so configure one first.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    r = client.get(
+        "/api/costs",
+        params={"start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+    )
+    assert r.status_code == 400
+    assert "days" in r.json()["detail"]

@@ -32,7 +32,7 @@ import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time, timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,28 @@ class Tariff:
     fixed_monthly: float = 0.0
     currency: str = DEFAULT_CURRENCY
     export_per_kwh: float | None = None
+
+    def bands_in_effect(self, start: datetime, end: datetime) -> tuple[RateBand, ...]:
+        """The bands that could apply at all between two instants.
+
+        A seasonal band outside its season is not an unknown quantity, it is an
+        inapplicable one, and the difference decides whether a bill can be
+        priced. Treating a winter rate as unmeasured all summer nulls the whole
+        period — which is how the estimated bill came to read as a dash every
+        month of the year, telling the owner to come back tomorrow.
+
+        Months are compared rather than the clock, since a band's hours can be
+        empty on a given day without the band being out of season.
+        """
+        if end <= start:
+            return ()
+        months: set[int] = set()
+        moment = start
+        while moment < end:
+            months.add(moment.month)
+            moment += timedelta(days=1)
+        months.add(end.month)
+        return tuple(band for band in self.bands if band.months is None or band.months & months)
 
     def band_at(self, moment: datetime) -> RateBand | None:
         """Return the band pricing this moment, or None if no band covers it.
@@ -678,11 +700,16 @@ def compute_cost(tariff: Tariff | None, energy: PeriodEnergy) -> CostResult | No
     if tariff is None:
         return None
 
-    imported = _by_band(energy.grid_import_kwh, tariff.bands, "grid import")
-    breakdown, energy_cost = _price(tariff.bands, imported)
+    # Only the bands the period could actually have entered. A band out of
+    # season has nothing to report and reporting nothing is not the same as
+    # failing to measure it.
+    active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
 
-    consumed = _by_band(energy.load_kwh, tariff.bands, "house load")
-    _, no_solar = _price(tariff.bands, consumed)
+    imported = _by_band(energy.grid_import_kwh, active, "grid import")
+    breakdown, energy_cost = _price(active, imported)
+
+    consumed = _by_band(energy.load_kwh, active, "house load")
+    _, no_solar = _price(active, consumed)
 
     fixed = apportion_fixed(tariff.fixed_monthly, energy.start, energy.end)
 

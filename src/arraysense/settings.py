@@ -56,6 +56,11 @@ class SettingSpec:
     lower: float | None = None
     upper: float | None = None
     secret: bool = False
+    # Length cap for text. The default suits a hostname or a serial; anything
+    # holding a structured value needs its own, and getting this wrong is not
+    # theoretical — a flat 128 rejected the reference installation's own tariff
+    # at 130 characters, which is three bands with their seasons.
+    max_length: int = 128
 
     def validate(self, value: object) -> object:
         """Return ``value`` coerced to this setting's type, or raise ValueError.
@@ -84,8 +89,11 @@ class SettingSpec:
             # that only looks blank would override a working one.
             if any(ch.isspace() or not ch.isprintable() for ch in value if ch != " "):
                 raise ValueError(f"{self.key} must not contain control or invisible characters")
-            if len(value) > 128:
-                raise ValueError(f"{self.key} is too long at {len(value)} characters")
+            if len(value) > self.max_length:
+                raise ValueError(
+                    f"{self.key} is too long at {len(value)} characters, "
+                    f"the limit is {self.max_length}"
+                )
             return value
         # Booleans are integers in Python, so they have to be excluded before
         # the numeric check or `true` would quietly become 1.
@@ -159,6 +167,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
     # because a guessed rate produces a savings figure that reads as measured.
     SettingSpec(
         key="tariff.bands",
+        # Several bands, each with a name, a price, its hours and its season.
+        max_length=2000,
         kind="str",
         default="",
         label="Rate bands",

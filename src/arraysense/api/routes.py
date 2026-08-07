@@ -24,12 +24,14 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
-from arraysense.energy import Period, energy_totals, resolve_zone, with_zone
+from arraysense.costs import period_energy
+from arraysense.energy import ENERGY_FIELDS, Period, energy_totals, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SettingsStore, describe, lookup_setting
 from arraysense.store.schema import module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
+from arraysense.tariff import compute_cost, estimate_bill, load_tariff
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +257,50 @@ def _is_mask(key: str, value: object) -> bool:
     except KeyError:
         return False
     return spec.secret and isinstance(value, str) and "\N{BULLET}" in value
+
+
+@router.get("/costs")
+async def costs(
+    request: Request,
+    start: datetime,
+    end: datetime,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """What the period cost, what it would have cost without solar, and the bill.
+
+    The pricing lives here rather than in the page because a tariff has exactly
+    one grammar and one meaning. When the browser had its own copy the two
+    drifted immediately: the page rejected the seasonal band format the parser
+    accepts, and then applied a summer peak window to a January evening.
+
+    Money is absent, not zero, when no tariff is configured. An install that
+    has never entered one shows its energy and says so.
+    """
+    store = request.app.state.store
+    settings = SettingsStore(store)
+    tariff = load_tariff(settings.all())
+    zone = resolve_zone(tz)
+
+    if tariff is None:
+        return {"currency": None, "configured": False, "cost": None, "bill": None}
+
+    rows = store.query(list(ENERGY_FIELDS.values()), start, end, tier="minute") or store.query(
+        list(ENERGY_FIELDS.values()), start, end, tier="full"
+    )
+    try:
+        energy = period_energy(tariff, rows, start, end, zone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    result = compute_cost(tariff, energy)
+    bill = estimate_bill(tariff, energy)
+    return {
+        "currency": tariff.currency,
+        "configured": True,
+        "timezone": str(zone),
+        "cost": asdict(result) if result else None,
+        "bill": asdict(bill) if bill else None,
+    }
 
 
 @router.get("/history")
