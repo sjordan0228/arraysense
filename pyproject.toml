@@ -36,10 +36,13 @@ artifacts = ["src/arraysense/web/*.html", "src/arraysense/web/uPlot.*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+# tools/ holds the one-time migration scripts. They are shipped, so they are
+# tested, and that means they have to be importable by name.
+pythonpath = ["tools"]
 
 [tool.ruff]
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "tools"]
 # Plans and specs contain illustrative code blocks; they are documents, not source.
 extend-exclude = ["docs"]
 
@@ -59,7 +62,7 @@ convention = "google"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "tools"]
 
 [[tool.mypy.overrides]]
 module = "pylxpweb.*"

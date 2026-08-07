@@ -112,11 +112,20 @@ _ZONEINFO_DIR = "/zoneinfo/"
 # the hourly tier is the only one that outlives a year at all.
 _PERIOD_TIER: Mapping[Period, str] = {"day": "minute", "month": "hourly"}
 
-# What to fall back to when the preferred tier has nothing. The coarse tiers
+# Where to look when the preferred tier has nothing, in order. The coarse tiers
 # are rollup destinations, so a database whose rollup has not run yet has empty
 # ones, and answering "no energy" from an empty tier while the readings sit in
 # the raw table would be the worst of both.
-_FALLBACK_TIER = "full"
+#
+# A daily view tries hourly before raw, which matters for history older than the
+# minute tier's year: imported history and any install past its first birthday
+# keep only the hourly tier back there, and falling straight to raw finds
+# nothing because raw is thirty days. The answer was a blank chart over data
+# that existed.
+_FALLBACK_TIERS: Mapping[Period, tuple[str, ...]] = {
+    "day": ("hourly", "full"),
+    "month": ("full",),
+}
 
 
 @dataclass(frozen=True)
@@ -449,8 +458,9 @@ def energy_totals(
     thirty days of raw readings is a quarter of a million rows to produce
     thirty numbers. A coarser tier moves at most one bucket edge's worth of
     energy between neighbouring buckets and loses none, since the totals
-    telescope. An empty coarse tier means the rollup has not run, and the read
-    falls back to raw rather than reporting a year of nothing.
+    telescope. An empty preferred tier means either that the rollup has not run
+    or that the range is older than that tier is kept for, so the read falls
+    back through the coarser ones rather than reporting a year of nothing.
     """
     zone = zone or host_zone()
     start, end = with_zone(start, zone), with_zone(end, zone)
@@ -458,7 +468,9 @@ def energy_totals(
     metrics = list(ENERGY_FIELDS.values())
     tier = _PERIOD_TIER[period]
     rows = store.query(metrics, edges[0] - max_gap, edges[-1] + max_gap, tier=tier)
-    if not rows and tier != _FALLBACK_TIER:
-        logger.debug("%s tier empty over the range; falling back to %s", tier, _FALLBACK_TIER)
-        rows = store.query(metrics, edges[0] - max_gap, edges[-1] + max_gap, tier=_FALLBACK_TIER)
+    for coarser in _FALLBACK_TIERS[period]:
+        if rows or coarser == tier:
+            break
+        logger.debug("%s tier empty over the range; trying %s", tier, coarser)
+        rows = store.query(metrics, edges[0] - max_gap, edges[-1] + max_gap, tier=coarser)
     return bucket_totals(rows, edges, max_gap)

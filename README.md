@@ -105,6 +105,8 @@ from it, so adding a metric is a one-line change there.
 - [docs/api.md](docs/api.md) — HTTP API reference
 - [docs/troubleshooting.md](docs/troubleshooting.md) — dongle connection problems,
   missing battery data, and other things people run into
+- [docs/migrating-from-solar-assistant.md](docs/migrating-from-solar-assistant.md) —
+  bringing your SolarAssistant history across, so switching does not cost you it
 
 ## Licence
 
