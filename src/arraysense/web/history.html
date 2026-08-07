@@ -130,8 +130,11 @@ const SPANS = [
     key: '13m', label: '13 months', period: 'month', count: 13,
     chartTitle: 'Energy, last 13 months', tableTitle: 'Month by month',
     whenHeading: 'Month', unitName: 'months',
-    tableNote: 'kWh · newest first · thirteen, so this month has the same month last year beside it',
-    costNote: 'cost includes the monthly connection charge',
+    tableNote: 'kWh past 13 months',
+    // Nothing appended here. The daily view says the standing charge is shared
+    // across its rows because that is surprising; on a month it simply falls
+    // where it is billed, and saying so is noise.
+    costNote: '',
   },
 ];
 
@@ -663,7 +666,7 @@ function applyTitles() {
   // trusting the column and one wondering why a day with no import still cost
   // half a dollar.
   $('tableNote').textContent = current.tableNote
-    + (priced.configured ? ` · ${current.costNote}` : '');
+    + (priced.configured && current.costNote ? ` · ${current.costNote}` : '');
 }
 
 // Drawn as .rng buttons so the switch looks like the range picker on every
