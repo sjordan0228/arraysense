@@ -60,6 +60,20 @@ MAX_BACKOFF_SECONDS = 300.0
 # a bug in our own code and should surface rather than be recorded as a gap.
 TRANSPORT_ERRORS = (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError)
 
+# Writing can fail too, and for reasons that pass. SQLite raises
+# OperationalError on a database held by another writer past the busy timeout,
+# which the scrub tool in tools/ can do because it clears in one transaction.
+# Nothing above catches that — sqlite3.Error is not an OSError — so a write that
+# failed took the whole poll loop with it, and the service went on serving pages
+# over a collector that had stopped. A busy database is a temporary condition
+# and belongs with the other temporary conditions.
+STORE_ERRORS = (sqlite3.Error,)
+
+# How many times the backoff may double before the cap is certain to have been
+# reached. 2**40 seconds is longer than the age of the universe in any interval
+# anyone would configure, so no reachable setting is capped early by this.
+_MAX_DOUBLINGS = 40
+
 
 @dataclass
 class ServiceStatus:
@@ -212,8 +226,12 @@ class CollectorService:
         """Read once and store the result, returning what was stored.
 
         A transport failure is not raised — it is written as a gap, because a
-        chart that quietly skips an outage is worse than one that shows it.
-        Returns None only while yielding, when no read was attempted at all.
+        chart that quietly skips an outage is worse than one that shows it. A
+        *storage* failure is not raised either, for the same reason a read
+        failure is not: a database busy for a few seconds is a passing
+        condition, and the loop that backs off and tries again outlives it.
+        Returns None while yielding, when no read was attempted at all, and
+        when a reading was taken but could not be stored.
         """
         if self.status.yielding:
             return None
@@ -225,24 +243,58 @@ class CollectorService:
         except TRANSPORT_ERRORS as exc:
             reason = f"{type(exc).__name__}: {exc}"
             gap = Sample.failed(timestamp, reason)
-            self._store.append(gap)
+            # No second reason if the gap itself cannot be written. The read
+            # already failed and that is what gets recorded; a database that is
+            # also busy just means this outage goes unmarked.
+            self._store_failure(gap)
             self.status.connected = False
-            self.status.last_failure = timestamp
-            self.status.last_error = reason
-            self.status.consecutive_failures += 1
-            self.status.total_failures += 1
-            logger.warning(
-                "poll failed (%d consecutive): %s", self.status.consecutive_failures, reason
-            )
+            self._count_failure(timestamp, reason)
             return gap
 
-        self._store.append(sample)
+        # Set before the write is attempted, because it is the read that
+        # establishes it and the read has already happened. Leaving it to the
+        # end meant a service whose first poll hit a busy database reported the
+        # inverter as unreachable, sending whoever read that after the dongle,
+        # the WiFi and the breaker while the actual problem was the disk.
         self.status.connected = True
+
+        failed = self._store_failure(sample)
+        if failed is not None:
+            # The inverter answered, so the connection is fine. What is lost is
+            # this reading. Counted as a failure all the same, so the loop backs
+            # off instead of hammering a database that is busy — and so the
+            # watchdog sees the silence if it never clears.
+            self._count_failure(timestamp, failed)
+            return None
+
         self.status.last_success = timestamp
         self.status.last_error = None
         self.status.consecutive_failures = 0
         self.status.total_samples += 1
         return sample
+
+    def _store_failure(self, sample: Sample) -> str | None:
+        """Write a sample, returning the reason it could not be written.
+
+        Exists so the two write sites in ``poll_once`` cannot differ, and so a
+        storage error reaches the same counters and the same status line as a
+        transport error rather than escaping into ``_loop``.
+        """
+        try:
+            self._store.append(sample)
+        except STORE_ERRORS as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("could not store reading: %s", reason)
+            return reason
+        return None
+
+    def _count_failure(self, timestamp: datetime, reason: str) -> None:
+        """Record a failed poll against the status, whatever it failed at."""
+        self.status.last_failure = timestamp
+        self.status.last_error = reason
+        self.status.consecutive_failures += 1
+        self.status.total_failures += 1
+        logger.warning("poll failed (%d consecutive): %s", self.status.consecutive_failures, reason)
 
     def _backoff(self) -> float:
         """How long to wait before the next poll, given recent failures.
@@ -252,7 +304,16 @@ class CollectorService:
         """
         if self.status.consecutive_failures == 0:
             return self._interval
-        grown = self._interval * float(2**self.status.consecutive_failures)
+        # Capped before the exponent, not after. Doubling first builds an
+        # integer that only grows: at 1024 consecutive failures 2**n is too
+        # large to be a float at all and raises OverflowError, which kills the
+        # loop. At the five-minute cap that is about eighty-five hours of an
+        # unreachable inverter — a long holiday, a tripped breaker — and the
+        # loop would die at exactly the moment it had been working correctly
+        # the whole time. Once doubling has passed the cap the answer is the
+        # cap, so there is nothing to learn from computing the rest of it.
+        doublings = min(self.status.consecutive_failures, _MAX_DOUBLINGS)
+        grown = self._interval * float(2**doublings)
         return float(min(grown, self._max_backoff))
 
     def stalled_for(self, now: datetime | None = None) -> timedelta | None:

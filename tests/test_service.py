@@ -306,3 +306,80 @@ async def test_a_stopped_service_is_not_a_stall(tmp_path: Path) -> None:
     await svc.stop()
     assert svc.stalled_for() is None
     store.close()
+
+
+async def test_backoff_survives_an_inverter_that_is_gone_for_days(tmp_path: Path) -> None:
+    # 2**consecutive_failures is evaluated before the cap is applied, so it
+    # grows an integer nobody needs: at 1024 failures it is too large to be a
+    # float and raises. With a five-minute cap that is about eighty-five hours
+    # of an unreachable inverter — a long holiday, a tripped breaker — after
+    # which the loop dies rather than carrying on retrying every five minutes.
+    svc, store = _service(tmp_path, max_backoff=300.0)
+    for failures in (1, 10, 100, 1024, 5000, 100_000):
+        svc.status.consecutive_failures = failures
+        assert svc._backoff() == pytest.approx(300.0) or failures < 20
+    store.close()
+
+
+async def test_a_write_that_fails_is_recorded_and_survived(tmp_path: Path) -> None:
+    # store.append sits outside the handler that recovers from transport
+    # errors, and sqlite3.OperationalError is not among them — so a database
+    # held by something else long enough to exhaust the busy timeout takes the
+    # whole collector with it. The scrub tool clears in a single transaction
+    # and can do exactly that.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    def wedged(sample: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    svc._store.append = wedged  # type: ignore[method-assign]
+    # It must come back rather than raise, and count as a failure so the loop
+    # backs off instead of hammering a database that is busy.
+    await svc.poll_once()
+    assert svc.status.consecutive_failures == 1
+    assert svc.status.last_error is not None
+    assert "locked" in svc.status.last_error
+    store.close()
+
+
+async def test_the_loop_keeps_running_through_a_wedged_database(tmp_path: Path) -> None:
+    # The point of the above: the loop is still alive afterwards, so when the
+    # database frees up the next poll simply works.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+    real = svc._store.append
+    calls = {"n": 0}
+
+    def sometimes(sample: object) -> None:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        real(sample)  # type: ignore[arg-type]
+
+    svc._store.append = sometimes  # type: ignore[method-assign]
+    await svc.start()
+    await asyncio.sleep(0.2)
+    assert svc._task is not None and not svc._task.done(), "the loop must survive"
+    await svc.stop()
+    assert calls["n"] > 2, "it should have gone on trying"
+    store.close()
+
+
+async def test_a_wedged_database_does_not_report_the_inverter_as_gone(tmp_path: Path) -> None:
+    # The read succeeded and only the write failed, so the connection is fine.
+    # Saying otherwise sends whoever is reading the status page after the
+    # dongle, the WiFi and the breaker while the actual problem is the disk.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    def wedged(sample: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    svc._store.append = wedged  # type: ignore[method-assign]
+    await svc.poll_once()
+    assert svc.status.connected is True
+    store.close()
