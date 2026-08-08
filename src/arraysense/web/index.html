@@ -1453,11 +1453,13 @@ async function loadHistory() {
   const bandNote = document.getElementById('bandNote');
   if (bandNote) {
     const priced = bands ? new Set(bands.filter((w) => w.band).map((w) => w.band)) : new Set();
-    // "brighter", not "darker". The wash is white on a dark panel, so more
-    // opacity reads lighter — the dearer the band, the more it stands out.
-    // Saying darker would send the reader looking at exactly the wrong hours.
+    // Says which way round the shading goes, in words somebody reads once and
+    // does not have to decode. "brighter" and not "darker" because the wash is
+    // white on a dark panel, so more opacity reads lighter — naming it the wrong
+    // way would send the reader to exactly the wrong hours. "higher rate" rather
+    // than a shorter word for it: this sits on a dashboard, not in a style guide.
     bandNote.textContent = priced.size
-      ? `shading: ${[...priced].join(' · ')} — brighter is dearer`
+      ? `shading: ${[...priced].join(' · ')} — brighter = higher rate`
       : '';
   }
 
