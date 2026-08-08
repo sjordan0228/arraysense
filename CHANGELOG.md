@@ -7,7 +7,38 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 0.5.1 — 7 August 2026
+## 0.5.1 — 8 August 2026
+
+Closes every open item in 0.5.0's known issues except the rollup migration,
+which is a decision about existing rows rather than a defect in the code.
+
+### Added
+
+- **Drivers declare what they produce, and the API can say what a device
+  supports** ([#11](https://github.com/sjordan0228/arraysense/issues/11)).
+  Every metric used to become a column on every installation, which is right
+  only for as long as every installation is an 18kPV: on a machine with one PV
+  string a column of NULLs would mean both "this inverter has no third string"
+  and "this inverter's third string reported nothing", and those are not the
+  same claim. Each driver now names the subset of the registry it produces,
+  new databases are built from that declaration, and `GET /api/capabilities`
+  reports per device what it can measure. `metrics.py` remains the single
+  source of truth for what a metric is called, how it scales and what values
+  are plausible, and adding an inverter metric is still a one-line change
+  there. **An existing database is untouched**: reopening one under a
+  declaration adds and removes nothing, and every reading already stored stays
+  readable.
+- **The Graphs page draws how far the packs disagree, in charge and in
+  voltage** ([#26](https://github.com/sjordan0228/arraysense/issues/26)). Two
+  bands under Battery: the spread in state of charge across the packs, which
+  is fuel gauges drifting apart and collapses when one completes a full
+  charge, and the spread in terminal voltage, which should sit near zero
+  because parallel packs are physically forced to share it. Read side by side
+  they are the difference between a bank whose gauges are lying and a bank
+  with resistance somewhere it should not be — the diagnosis the calibration
+  card could previously only state for the current instant. A spread is drawn
+  only where every known pack reported: taken across whichever packs happened
+  to answer it would be a distance that never existed.
 
 ### Fixed
 
