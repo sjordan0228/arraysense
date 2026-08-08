@@ -17,6 +17,7 @@ from arraysense.tariff import (
     SETTING_CURRENCY,
     SETTING_EXPORT_PER_KWH,
     SETTING_FIXED_MONTHLY,
+    EnergyShortfall,
     PeriodEnergy,
     Tariff,
     apportion_fixed,
@@ -52,9 +53,10 @@ def band_name(loaded: Tariff, moment: datetime) -> str | None:
 
 
 def january(
-    grid_import_kwh: Mapping[str, float],
-    load_kwh: Mapping[str, float] | None = None,
+    grid_import_kwh: Mapping[str, float | None],
+    load_kwh: Mapping[str, float | None] | None = None,
     grid_export_kwh: float | None = None,
+    shortfall: Mapping[str, EnergyShortfall] | None = None,
 ) -> PeriodEnergy:
     """The first fifteen days of January: fifteen days of a thirty-one day month."""
     return PeriodEnergy(
@@ -63,6 +65,7 @@ def january(
         grid_import_kwh=grid_import_kwh,
         load_kwh=load_kwh,
         grid_export_kwh=grid_export_kwh,
+        shortfall=shortfall,
     )
 
 
@@ -346,6 +349,218 @@ def test_grid_charging_the_battery_can_show_as_a_loss_rather_than_be_hidden() ->
     )
     assert result is not None
     assert result.savings == pytest.approx(-6.6)
+
+
+# --- Partial figures that say so (#23) ----------------------------------------
+#
+# The owner's decision after two reverted attempts: show the figure with a
+# label saying what it covers, and dash only when nothing in the period was
+# measured. The shortfall mapping is what authorises a partial total — without
+# one, an unknown band still poisons, because nobody accounted for what the
+# partial figure would be missing.
+
+
+def _entry(
+    attributed: float = 0.0, unattributed: float = 0.0, unknowable: bool = False
+) -> EnergyShortfall:
+    return EnergyShortfall(
+        attributed_kwh=attributed, unattributed_kwh=unattributed, unknowable=unknowable
+    )
+
+
+def test_a_shortfall_entry_prices_the_bands_that_reported() -> None:
+    # Off-peak occurred and reported nothing; its energy is in the entry. The
+    # figure is the measured part, and the flag is what stops it reading whole.
+    result = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 10.0, "Off-peak": None},
+            shortfall={"grid_import": _entry(10.0, 4.0)},
+        ),
+    )
+    assert result is not None
+    assert result.energy_cost == pytest.approx(3.4)
+    assert result.cost_is_short is True
+
+
+def test_without_an_entry_an_unknown_band_still_poisons() -> None:
+    # The same period with no accounting: nobody can say what the partial
+    # figure misses, so it must not be shown as one.
+    result = compute_cost(tariff(), january(grid_import_kwh={"Peak": 10.0, "Off-peak": None}))
+    assert result is not None
+    assert result.energy_cost is None
+    assert result.cost_is_short is False
+
+
+def test_partial_pricing_is_gated_per_counter_not_per_mapping() -> None:
+    # Import carries an entry, load does not. An accounted import must not
+    # authorise a partial house figure whose shortfall nobody computed.
+    result = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 10.0, "Off-peak": 5.0},
+            load_kwh={"Peak": None, "Off-peak": 8.0},
+            shortfall={"grid_import": _entry(15.0, 0.0)},
+        ),
+    )
+    assert result is not None
+    assert result.cost is not None
+    assert result.no_solar_cost is None
+    assert result.savings is None
+
+
+def test_a_clean_entry_changes_no_figure_and_raises_no_flag() -> None:
+    accounted = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 40.0, "Off-peak": 0.0},
+            load_kwh={"Peak": 100.0, "Off-peak": 0.0},
+            shortfall={"grid_import": _entry(40.0), "load": _entry(100.0)},
+        ),
+    )
+    bare = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 40.0, "Off-peak": 0.0},
+            load_kwh={"Peak": 100.0, "Off-peak": 0.0},
+        ),
+    )
+    assert accounted is not None and bare is not None
+    assert accounted.energy_cost == bare.energy_cost
+    assert accounted.no_solar_cost == bare.no_solar_cost
+    assert accounted.savings == bare.savings
+    assert accounted.cost_is_short is False
+    assert accounted.savings_is_short is False
+
+
+def test_every_band_unknown_is_still_a_dash_with_the_flag_up() -> None:
+    # Nothing attributable at all: there is no partial to show. The dash
+    # stands, and the flag plus the entry are what the caption beside it says.
+    result = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": None, "Off-peak": None},
+            shortfall={"grid_import": _entry(0.0, 24.0)},
+        ),
+    )
+    assert result is not None
+    assert result.energy_cost is None
+    assert result.cost is None
+    assert result.cost_is_short is True
+
+
+def test_savings_is_flagged_from_either_side() -> None:
+    import_short = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 10.0, "Off-peak": 5.0},
+            load_kwh={"Peak": 20.0, "Off-peak": 10.0},
+            shortfall={"grid_import": _entry(15.0, 3.0), "load": _entry(30.0)},
+        ),
+    )
+    load_short = compute_cost(
+        tariff(),
+        january(
+            grid_import_kwh={"Peak": 10.0, "Off-peak": 5.0},
+            load_kwh={"Peak": 20.0, "Off-peak": 10.0},
+            shortfall={"grid_import": _entry(15.0), "load": _entry(30.0, 0.0, True)},
+        ),
+    )
+    assert import_short is not None and load_short is not None
+    assert import_short.cost_is_short is True
+    assert import_short.no_solar_is_short is False
+    assert import_short.savings_is_short is True
+    assert load_short.cost_is_short is False
+    assert load_short.no_solar_is_short is True
+    assert load_short.savings_is_short is True
+
+
+def test_a_partial_export_is_credited_and_flagged() -> None:
+    result = compute_cost(
+        tariff(**{SETTING_EXPORT_PER_KWH: 0.08}),
+        january(
+            grid_import_kwh={"Peak": 0.0, "Off-peak": 0.0},
+            grid_export_kwh=50.0,
+            shortfall={"grid_export": _entry(50.0, 10.0)},
+        ),
+    )
+    assert result is not None
+    assert result.export_credit == 4.0
+    assert result.export_is_short is True
+
+
+FLAT: dict[str, object] = {
+    SETTING_BANDS: "Flat | 0.10 | 00:00-24:00",
+    SETTING_FIXED_MONTHLY: 0.0,
+}
+
+
+def test_the_projection_restores_the_energy_the_bands_are_missing() -> None:
+    # Fifteen of thirty-one days measured, 10 kWh priced and 5 more that
+    # crossed a gap. The estimate assumes the missing energy was priced like
+    # the rest: $1.00 so far, times 31/15 for the month, times 15/10 kWh.
+    bill = estimate_bill(
+        tariff(**FLAT),
+        january(grid_import_kwh={"Flat": 10.0}, shortfall={"grid_import": _entry(10.0, 5.0)}),
+    )
+    assert bill is not None
+    assert bill.projected_energy_cost == pytest.approx(1.0 * (31 / 15) * 1.5, abs=0.01)
+    assert bill.is_short is True
+    assert bill.assumed_kwh == pytest.approx(5.0)
+
+
+def test_a_projection_with_nothing_attributed_does_not_divide() -> None:
+    # A solar fortnight: every band priced zero while a gap swallowed the only
+    # import. There is no observed blend to price the missing energy at, so
+    # the correction is skipped and the flag is what says the figure is not
+    # the whole story.
+    bill = estimate_bill(
+        tariff(**FLAT),
+        january(grid_import_kwh={"Flat": 0.0}, shortfall={"grid_import": _entry(0.0, 4.2)}),
+    )
+    assert bill is not None
+    assert bill.projected_energy_cost == pytest.approx(0.0)
+    assert bill.is_short is True
+    assert bill.assumed_kwh is None
+
+
+def test_an_unknowable_shortfall_flags_without_inventing_a_correction() -> None:
+    bill = estimate_bill(
+        tariff(**FLAT),
+        january(
+            grid_import_kwh={"Flat": 10.0},
+            shortfall={"grid_import": _entry(10.0, 0.0, unknowable=True)},
+        ),
+    )
+    assert bill is not None
+    assert bill.projected_energy_cost == pytest.approx(1.0 * (31 / 15), abs=0.01)
+    assert bill.is_short is True
+    assert bill.assumed_kwh is None
+
+
+def test_the_rider_is_projected_on_the_restored_energy() -> None:
+    # PCRF and SCRF are flat per-kilowatt-hour, so the missing energy needs no
+    # blend at all: the kilowatt-hours are known and every one will be metered.
+    bill = estimate_bill(
+        tariff(**FLAT, **{SETTING_ADJUSTMENTS: "2026-01 | 0.001 | 0.002"}),
+        january(grid_import_kwh={"Flat": 10.0}, shortfall={"grid_import": _entry(10.0, 5.0)}),
+    )
+    assert bill is not None
+    assert bill.projected_adjustment == pytest.approx(round(15.0 * 0.003 * (31 / 15), 2), abs=0.01)
+
+
+def test_the_export_credit_is_projected_on_the_restored_export() -> None:
+    bill = estimate_bill(
+        tariff(**FLAT, **{SETTING_EXPORT_PER_KWH: 0.08}),
+        january(
+            grid_import_kwh={"Flat": 10.0},
+            grid_export_kwh=50.0,
+            shortfall={"grid_import": _entry(10.0), "grid_export": _entry(50.0, 10.0)},
+        ),
+    )
+    assert bill is not None
+    assert bill.projected_export_credit == pytest.approx(round(60.0 * 0.08 * (31 / 15), 2))
+    assert bill.is_short is True
 
 
 # --- Export credit ----------------------------------------------------------

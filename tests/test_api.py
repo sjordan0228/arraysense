@@ -885,6 +885,15 @@ def test_costs_carries_everything_the_page_would_otherwise_derive_twice(client: 
     for key in ("tier", "unpriced_minutes", "measured_minutes"):
         assert key in body, key
     assert body["elapsed_minutes"] == pytest.approx(1440.0)
+    # The shortfall block, per counter, is what the labels are drawn from —
+    # deriving "is this figure whole" from the minutes above is exactly the
+    # mistake the second attempt at #23 shipped.
+    for counter in ("grid_import", "load", "grid_export"):
+        entry = body["shortfall"][counter]
+        for key in ("attributed_kwh", "unattributed_kwh", "unknowable"):
+            assert key in entry, key
+    assert body["cost"]["cost_is_short"] is True
+    assert body["bill"]["is_short"] is True
 
 
 def test_costs_says_whether_a_stored_tariff_is_merely_absent_or_unreadable(client: Any) -> None:
@@ -1087,11 +1096,14 @@ def test_an_install_with_no_tariff_gets_energy_and_no_money_at_all(tmp_path: Pat
         assert key not in body["buckets"][0], key
 
 
-def test_a_day_whose_peak_hours_were_never_recorded_is_priced_as_absent(tmp_path: Path) -> None:
-    # The collector was down across the peak window on the 15th. That day's
-    # cost is unknown, and unknown has to arrive as null rather than as the
-    # off-peak part of it — which would read as a cheap day and be wrong by
-    # every peak kilowatt-hour nobody saw.
+def test_a_day_whose_peak_hours_were_never_recorded_is_priced_partial_and_flagged(
+    tmp_path: Path,
+) -> None:
+    # The collector was down across the peak window on the 15th. The old rule
+    # made that day a dash; #23's decision is the measured part with its
+    # qualification riding beside it, so the page can label instead of
+    # withhold. The days either side stay unflagged — a flag that fires
+    # everywhere says nothing.
     def build(store: SqliteStore) -> None:
         _counters(
             store,
@@ -1105,9 +1117,13 @@ def test_a_day_whose_peak_hours_were_never_recorded_is_priced_as_absent(tmp_path
     with _energy_client(tmp_path, build) as c:
         body = _july(c, period="day", priced=True)
     by_day = {b["start"][:10]: b for b in body["buckets"]}
-    assert by_day["2026-07-15"]["cost"] is None
+    assert by_day["2026-07-15"]["cost"] is not None
+    assert by_day["2026-07-15"]["cost_short"] is True
+    assert by_day["2026-07-15"]["saved_short"] is True
+    assert by_day["2026-07-15"]["shortfall"]["grid_import"]["unattributed_kwh"] > 0
     assert by_day["2026-07-14"]["cost"] is not None
-    # The energy that was recorded is still reported; only the money is absent.
+    assert by_day["2026-07-14"]["cost_short"] is False
+    # The energy columns are untouched by any of this.
     assert by_day["2026-07-15"]["grid_imported_kwh"] is not None
 
 
@@ -1204,10 +1220,12 @@ def test_the_day_in_progress_is_priced_and_both_endpoints_say_the_same(tmp_path:
     assert day["cost"] == costs["cost"]["cost"]
 
 
-def test_a_completed_day_whose_peak_went_unwatched_is_still_a_dash(tmp_path: Path) -> None:
-    # The other half of the same rule. This peak window did happen and nobody
-    # recorded it, so the day cannot be priced — and pricing it anyway would
-    # bill only the cheap hours and read as a bargain.
+def test_a_day_complete_in_energy_can_still_be_short_in_money(tmp_path: Path) -> None:
+    # Reverted finding 4, at the endpoint. The gap sits wholly inside the
+    # 20th, so the day's *energy* is exact — the counters span the hole — and
+    # ``complete`` is rightly true. Its *cost* is short by every peak hour
+    # nobody can place. The two flags answer different questions, and the
+    # second attempt at #23 died of reading the first as if it answered both.
     def build(store: SqliteStore) -> None:
         _counters(
             store,
@@ -1221,7 +1239,9 @@ def test_a_completed_day_whose_peak_went_unwatched_is_still_a_dash(tmp_path: Pat
     with _energy_client(tmp_path, build) as c:
         body = _july(c, period="day", priced=True)
     by_day = {b["start"][:10]: b for b in body["buckets"]}
-    assert by_day["2026-07-20"]["cost"] is None
+    assert by_day["2026-07-20"]["complete"] is True
+    assert by_day["2026-07-20"]["cost"] is not None
+    assert by_day["2026-07-20"]["cost_short"] is True
 
 
 def test_costs_reads_a_month_older_than_the_minute_tier_keeps(client: Any) -> None:

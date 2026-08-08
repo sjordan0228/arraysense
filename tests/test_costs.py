@@ -18,6 +18,8 @@ from arraysense.costs import (
 )
 from arraysense.energy import bucket_edges
 from arraysense.tariff import (
+    BillEstimate,
+    CostResult,
     PeriodEnergy,
     Tariff,
     compute_cost,
@@ -268,14 +270,20 @@ def test_a_bucket_with_nothing_in_it_does_not_shift_the_rest_into_other_bands() 
     assert total <= 24.0
 
 
-def test_a_band_measured_once_and_missed_once_is_unknown_not_partial() -> None:
+def test_a_band_measured_once_and_missed_once_is_partial_and_says_so() -> None:
     # Off-peak runs before the peak window and again after it. Measuring the
-    # first stretch and not the second must not leave the first standing as the
-    # band's total: that is a missing reading rendered as zero, in the one
-    # place where it turns into money.
+    # first stretch and not the second used to null the band — #23's decision
+    # is the opposite: the measured stretch stands, and the shortfall entry is
+    # what stops it reading as the band's whole total. Readings stop at 16:00,
+    # so how much the evening held is not knowable, and the entry says that
+    # rather than inventing an amount.
     start, end = _day(2026, 7, 1), _day(2026, 7, 2)
     energy = period_energy(STARK, _counter(start, (0, 8, 16)), start, end, TZ)
-    assert energy.grid_import_kwh["Off"] is None
+    assert energy.grid_import_kwh["Off"] == pytest.approx(8.0)
+    assert energy.shortfall is not None
+    entry = energy.shortfall["grid_import"]
+    assert entry.unknowable is True
+    assert entry.unattributed_kwh == pytest.approx(0.0)
 
 
 def test_coverage_reports_the_part_of_the_period_actually_observed() -> None:
@@ -422,39 +430,51 @@ def _exporting_rows(
     return rows
 
 
-def test_export_measured_across_part_of_a_period_is_unknown_not_the_part() -> None:
+def test_export_measured_across_part_of_a_period_is_the_part_with_the_rest_named() -> None:
     # Nothing at all recorded between two in the afternoon and nine at night.
-    # The stretches either side exported 14 and 3 kilowatt-hours, and the meter
-    # says the day exported 24 — so summing the two that were read reports 17 as
-    # confidently as if the hole had never happened. It is not a smaller export;
-    # it is an export nobody knows.
+    # The stretches either side exported 14 and 3 kilowatt-hours and the hole
+    # held 7 — both its bracketing readings exist, so the amount is exact. The
+    # old rule nulled the day; #23's decision is the part plus an accounting
+    # of the rest, so the page can label rather than withhold.
     start, end = _day(2026, 7, 15), _day(2026, 7, 16)
     full = _exporting_rows(start, 24)
     holed = full[:15] + full[21:]
-    assert period_energy(COSERV, holed, start, end, TZ).grid_export_kwh is None
+    energy = period_energy(COSERV, holed, start, end, TZ)
+    assert energy.grid_export_kwh == pytest.approx(17.0)
+    assert energy.shortfall is not None
+    assert energy.shortfall["grid_export"].unattributed_kwh == pytest.approx(7.0)
 
-    # And a day read end to end still reports the whole of it.
-    assert period_energy(COSERV, full, start, end, TZ).grid_export_kwh == pytest.approx(24.0)
+    # And a day read end to end still reports the whole of it, unflagged.
+    whole = period_energy(COSERV, full, start, end, TZ)
+    assert whole.grid_export_kwh == pytest.approx(24.0)
+    assert whole.shortfall is not None
+    assert whole.shortfall["grid_export"].short is False
 
 
-def test_an_export_counter_that_goes_quiet_alone_still_leaves_it_unknown() -> None:
+def test_an_export_counter_that_goes_quiet_alone_is_flagged_alone() -> None:
     # The harder shape, because everything else about the day is measured: the
     # import counter arrives all day and only the export register goes quiet
-    # through the peak window. Every band prices, the bill looks complete, and
-    # the export figure riding along with it was summed from the hours that
-    # happened to answer.
+    # through the peak window. Minute coverage reads complete — this is the
+    # shape that broke the second attempt at #23 — and the per-counter entry
+    # is what still catches it: import clean, export short by a known amount.
     start, end = _day(2026, 7, 15), _day(2026, 7, 16)
     quiet = _exporting_rows(start, 24, frozenset(range(16, 21)))
     energy = period_energy(COSERV, quiet, start, end, TZ)
     assert energy.grid_import_kwh["On-peak"] == pytest.approx(5.0)
     assert energy.grid_import_kwh["Off-peak"] == pytest.approx(19.0)
-    assert energy.grid_export_kwh is None
+    assert energy.grid_export_kwh == pytest.approx(18.0)
+    assert energy.shortfall is not None
+    assert energy.shortfall["grid_import"].short is False
+    assert energy.shortfall["grid_export"].unattributed_kwh == pytest.approx(6.0)
 
 
-def test_an_unmeasured_export_earns_no_credit_and_tells_no_bill() -> None:
-    # What the unknown is for. The tariff pays for export, so a credit invented
-    # from the hours that answered is money on the page nobody can check, and a
-    # month projected from it quotes a total the supplier will not send.
+def test_a_partially_measured_export_credits_the_part_and_flags_the_figure() -> None:
+    # The tariff pays for export and five peak hours of the register went
+    # unread — 6 kWh, known exactly from the readings either side. The credit
+    # prices what was measured and says it is short; the projection restores
+    # the missing kilowatt-hours at the flat export rate, which needs no
+    # assumption at all. The old behaviour nulled the credit and the whole
+    # estimated bill, which is the attempt-one shape the owner rejected.
     paying = replace(COSERV, export_per_kwh=0.05)
     start, end = _day(2026, 7, 15), _day(2026, 7, 16)
     quiet = _exporting_rows(start, 24, frozenset(range(16, 21)))
@@ -462,28 +482,35 @@ def test_an_unmeasured_export_earns_no_credit_and_tells_no_bill() -> None:
 
     result = price_period(paying, energy)
     assert result is not None
-    # The import side is fully measured, so the day itself still prices. Only
-    # the credit is absent, which is exactly the claim being made.
     assert result.cost is not None
-    assert result.export_credit is None
+    assert result.cost_is_short is False
+    assert result.export_credit == pytest.approx(18.0 * 0.05)
+    assert result.export_is_short is True
 
     bill = estimate_bill(paying, energy)
     assert bill is not None
-    assert bill.projected_export_credit is None
-    assert bill.estimated_total is None
+    # One July day scaled to the month, with the quiet stretch's 6 kWh back
+    # in: 24 kWh at five cents, thirty-one days.
+    assert bill.projected_export_credit == pytest.approx(24.0 * 0.05 * 31, rel=0.01)
+    assert bill.estimated_total is not None
+    assert bill.is_short is True
 
 
-def test_the_bucket_path_calls_the_same_export_unknown() -> None:
+def test_the_bucket_path_reports_the_same_partial_export() -> None:
     # The History page prices its days through the other entry point, and a
-    # figure that is unknown on the Costs page and a number on the History page
-    # is the disagreement this module exists to prevent.
+    # figure that is flagged on the Costs page and unqualified on the History
+    # page is the disagreement this module exists to prevent.
     start, end = _day(2026, 7, 14), _day(2026, 7, 17)
     full = _exporting_rows(start, 72)
     # Hours 39 to 44 are the second day's peak window, and nothing was recorded
     # in them. The days either side are read end to end.
     days = bucket_energy(COSERV, full[:39] + full[45:], bucket_edges(start, end, "day", TZ), TZ)
     assert days[0].grid_export_kwh == pytest.approx(24.0)
-    assert days[1].grid_export_kwh is None
+    assert days[0].shortfall is not None
+    assert days[0].shortfall["grid_export"].short is False
+    assert days[1].grid_export_kwh == pytest.approx(24.0 - 7.0)
+    assert days[1].shortfall is not None
+    assert days[1].shortfall["grid_export"].unattributed_kwh == pytest.approx(7.0)
     assert days[2].grid_export_kwh == pytest.approx(24.0)
 
 
@@ -581,8 +608,9 @@ def test_a_bucket_nobody_measured_is_absent_rather_than_free() -> None:
     rows = _rows(start, 24, 1.0) + _rows(_day(2026, 7, 16), 24, 1.0)
     edges = bucket_edges(start, end, "day", TZ)
     middle = bucket_energy(COSERV, rows, edges, TZ)[1]
-    assert compute_cost(COSERV, middle) is not None
-    assert compute_cost(COSERV, middle).cost is None  # type: ignore[union-attr]
+    result = compute_cost(COSERV, middle)
+    assert result is not None
+    assert result.cost is None
 
 
 def test_the_months_priced_together_add_up_to_the_range_priced_whole() -> None:
@@ -639,19 +667,26 @@ def test_a_morning_is_priced_before_its_peak_window_arrives() -> None:
     assert result.energy_cost == pytest.approx(9 * 0.086709, abs=0.01)
 
 
-def test_a_peak_window_that_happened_and_went_unmeasured_still_reads_unknown() -> None:
-    # The distinction that has to survive. Readings stop at two in the
-    # afternoon and resume at nine, so the whole peak window happened with
-    # nobody watching. Its energy is unknown, and a day priced without it would
-    # read as cheap — which is a missing reading rendered as zero, in the one
-    # place where it becomes money.
+def test_a_peak_window_that_happened_and_went_unmeasured_prices_partial_and_flagged() -> None:
+    # The distinction that has to survive, in its new form. Readings stop at
+    # two in the afternoon and resume at nine, so the whole peak window
+    # happened with nobody watching. The band itself stays None — nothing of
+    # it was measured, and a number there would be a missing reading rendered
+    # small. But the day now prices what was measured, and the flag plus the
+    # counted delta are what keep the partial from reading as a cheap day.
+    # (The second _rows helper restarts its counters at 1000, so the counter
+    # steps backwards across the gap and even the gap's amount is unknowable.)
     start, end = _day(2026, 7, 15), _day(2026, 7, 16)
     rows = _rows(start, 14, 1.0) + _rows(_day(2026, 7, 15, 21), 3, 1.0)
     energy = period_energy(COSERV, rows, start, end, TZ)
     assert energy.grid_import_kwh["On-peak"] is None
+    assert energy.shortfall is not None
+    assert energy.shortfall["grid_import"].short is True
     result = price_period(COSERV, energy)
     assert result is not None
-    assert result.cost is None
+    assert result.cost is not None
+    assert result.cost_is_short is True
+    assert result.energy_cost == pytest.approx((14.0 + 3.0) * 0.086709, abs=0.01)
 
 
 def test_a_period_that_entered_no_band_at_all_is_still_not_free() -> None:
@@ -671,3 +706,307 @@ def test_without_a_tariff_there_is_no_priced_period_at_all() -> None:
     # Not zero, and not an empty breakdown either.
     start, end = _day(2026, 7, 15), _day(2026, 7, 16)
     assert price_period(None, period_energy(COSERV, [], start, end, TZ)) is None
+
+
+# --- the shortfall: issue #23's verification cases ------------------------------
+#
+# Consumption is identical in every case — only the recording differs — so the
+# clean case's figures are the truth the others are checked against. Import
+# climbs faster through the peak window so a misplaced kilowatt-hour is visible
+# in the total, and load climbs faster than import so the savings side is real.
+
+START_23 = _day(2026, 7, 1)
+END_23 = _day(2026, 7, 5)
+
+
+def _case_rows(
+    drop_all: frozenset[tuple[int, int]] = frozenset(),
+    drop_import: frozenset[tuple[int, int]] = frozenset(),
+) -> list[dict[str, object]]:
+    """Hourly counters from two hours before the period to its end.
+
+    ``drop_all`` removes whole rows (a poll gap, the shape yield mode makes);
+    ``drop_import`` removes only the import counter (the register going quiet
+    while polls continue, the shape that broke the second attempt). Keys are
+    (day, hour) local.
+    """
+    rows: list[dict[str, object]] = []
+    when = START_23 - timedelta(hours=2)
+    imported, load = 1000.0, 4000.0
+    while when <= END_23:
+        local = when.astimezone(TZ)
+        peak = 15 <= local.hour < 20
+        imported += 2.5 if peak else 0.8
+        load += 4.0 if peak else 1.5
+        key = (local.day, local.hour)
+        if key not in drop_all:
+            row: dict[str, object] = {
+                "timestamp": when,
+                "load_energy_total_kwh": round(load, 1),
+                "grid_export_energy_total_kwh": 5.0,
+            }
+            if key not in drop_import:
+                row["grid_import_energy_total_kwh"] = round(imported, 1)
+            rows.append(row)
+        when += timedelta(hours=1)
+    return rows
+
+
+def _priced(
+    rows: list[dict[str, object]],
+) -> tuple[PeriodEnergy, CostResult | None, BillEstimate | None]:
+    energy = period_energy(COSERV, rows, START_23, END_23, TZ)
+    return energy, price_period(COSERV, energy, fixed_charge=15.0), estimate_bill(COSERV, energy)
+
+
+def test_case_one_a_clean_period_is_unchanged_and_unflagged() -> None:
+    energy, cost, bill = _priced(_case_rows())
+    assert energy.grid_import_kwh["Off-peak"] == pytest.approx(67.6)
+    assert energy.grid_import_kwh["On-peak"] == pytest.approx(43.2)
+    assert energy.shortfall is not None
+    # The battery counter is deliberately absent from these rows, so its own
+    # entry is honestly unknowable; the money counters are the clean claim.
+    assert all(energy.shortfall[k].short is False for k in ("grid_import", "load", "grid_export"))
+    assert cost is not None and bill is not None
+    assert cost.energy_cost == pytest.approx(14.95, abs=0.01)
+    assert cost.savings == pytest.approx(10.53, abs=0.01)
+    assert cost.cost_is_short is False
+    assert bill.estimated_total == pytest.approx(130.84, abs=0.05)
+    assert bill.is_short is False
+
+
+def test_case_two_a_gap_across_a_band_edge_is_quantified_and_flagged() -> None:
+    # Five hours of polls lost on 2 July, 17:00 to 22:00, across the 20:00
+    # edge. The counters bracket the hole: 7.4 kWh of import and 12.5 of load
+    # crossed it, so both figures show the measured part and say what is
+    # missing. Attributed plus unattributed is the clean total — nothing
+    # vanishes, it just stops being silent.
+    energy, cost, bill = _priced(_case_rows(drop_all=frozenset((2, h) for h in (18, 19, 20, 21))))
+    assert energy.shortfall is not None
+    imported = energy.shortfall["grid_import"]
+    assert imported.unattributed_kwh == pytest.approx(7.4)
+    assert imported.unknowable is False
+    assert imported.attributed_kwh + imported.unattributed_kwh == pytest.approx(110.8)
+    assert energy.shortfall["load"].unattributed_kwh == pytest.approx(12.5)
+    assert cost is not None and bill is not None
+    # The figures themselves are what the silent version showed — the change
+    # is that they are flagged now.
+    assert cost.energy_cost == pytest.approx(13.59, abs=0.01)
+    assert cost.cost_is_short is True
+    # Savings is where the overstatement hid in the reverted attempt, so its
+    # value is stated, not just its flag: both sides lost the same gap here,
+    # and the partial counterfactual minus the partial cost is 9.63 against a
+    # clean 10.53.
+    assert cost.savings == pytest.approx(9.63, abs=0.01)
+    assert cost.savings_is_short is True
+    # The projection restores the missing 7.4 kWh at the blended rate of the
+    # 103.4 it priced: 13.59 x 7.75 x (110.8 / 103.4). The truth is 115.84 and
+    # the silent figure was 105.31 — the residual 2.6% is the stated
+    # assumption itself, since the missing energy was peak-heavier than the
+    # blend it was priced at.
+    assert bill.is_short is True
+    assert bill.assumed_kwh == pytest.approx(7.4)
+    assert bill.projected_energy_cost is not None
+    assert bill.projected_energy_cost == pytest.approx(112.85, abs=0.05)
+    assert bill.projected_energy_cost > 105.31
+    assert bill.estimated_total == pytest.approx(127.85, abs=0.05)
+
+
+def test_case_three_the_same_gap_inside_one_band_raises_nothing() -> None:
+    # The identical five-hour hole, 02:00 to 07:00, wholly inside the
+    # off-peak stretch. The counter delta spans it exactly, so every figure is
+    # byte-identical to the clean case and no flag or label may appear — a
+    # caption here was finding 2 of the reverted attempt.
+    energy, cost, bill = _priced(_case_rows(drop_all=frozenset((2, h) for h in (3, 4, 5, 6))))
+    clean_energy, clean_cost, clean_bill = _priced(_case_rows())
+    assert energy.shortfall is not None
+    assert all(energy.shortfall[k].short is False for k in ("grid_import", "load", "grid_export"))
+    assert dict(energy.grid_import_kwh) == dict(clean_energy.grid_import_kwh)
+    assert cost is not None and clean_cost is not None
+    assert cost.cost == clean_cost.cost
+    assert cost.savings == clean_cost.savings
+    assert cost.cost_is_short is False
+    assert bill is not None and clean_bill is not None
+    assert bill.estimated_total == clean_bill.estimated_total
+    assert bill.is_short is False
+
+
+def test_case_three_holds_when_the_band_runs_through_midnight() -> None:
+    # STARK's off band runs 16:00 to 08:00 straight through midnight, so a
+    # five-hour hole across midnight crosses a calendar day and no band edge.
+    # period_energy cuts at band changes only: nothing drops, nothing flags.
+    start, end = _day(2026, 7, 1), _day(2026, 7, 3)
+    hours = tuple(h for h in range(49) if not 22 <= h <= 26)
+    energy = period_energy(STARK, _counter(start, hours), start, end, TZ)
+    assert energy.shortfall is not None
+    assert energy.shortfall["grid_import"].short is False
+    assert sum(v for v in energy.grid_import_kwh.values() if v is not None) == pytest.approx(48.0)
+
+
+def test_case_four_a_quiet_counter_is_flagged_though_the_clock_reads_covered() -> None:
+    # The import register alone says nothing for twenty-one hours while polls
+    # keep arriving — the exact shape that broke attempt two, whose coverage
+    # read 100% while the savings overstated by 14%. The minutes still read
+    # covered; the energy accounting is what catches it.
+    energy, cost, bill = _priced(_case_rows(drop_import=frozenset((2, h) for h in range(3, 24))))
+    assert energy.measured_minutes == pytest.approx(energy.elapsed_minutes)
+    assert energy.shortfall is not None
+    imported = energy.shortfall["grid_import"]
+    assert imported.unattributed_kwh == pytest.approx(26.1)
+    assert imported.attributed_kwh + imported.unattributed_kwh == pytest.approx(110.8)
+    assert energy.shortfall["load"].short is False
+    # The band the quiet stretch swallowed whole keeps its measured days —
+    # each day's peak interval attributes 10.8 kWh (four peak increments and
+    # the reading on the 20:00 edge closing it).
+    assert energy.grid_import_kwh["On-peak"] == pytest.approx(43.2 - 10.8)
+    assert cost is not None and bill is not None
+    assert cost.energy_cost == pytest.approx(11.35, abs=0.01)
+    assert cost.cost_is_short is True
+    # Savings shows and is flagged: 14.13 against a true 10.53 — overstated,
+    # which is exactly why the label exists, and the page words the direction
+    # from the import-side entry.
+    assert cost.savings == pytest.approx(14.13, abs=0.01)
+    assert cost.savings_is_short is True
+    # The projection restores the 26.1 kWh at the blended measured rate:
+    # 11.35 x 7.75 x (110.8 / 84.7) = 115.06, against a truth of 115.84.
+    assert bill.is_short is True
+    assert bill.assumed_kwh == pytest.approx(26.1)
+    assert bill.projected_energy_cost == pytest.approx(115.06, abs=0.05)
+    assert bill.estimated_total == pytest.approx(130.06, abs=0.05)
+
+
+def test_case_five_an_emptied_band_inside_the_tolerance_is_unknowable() -> None:
+    # Codex's reproduction: a one-hour band, and the only readings around it
+    # exactly MAX_EDGE_GAP apart. No pair is dropped — the tolerance attributes
+    # the whole delta to the neighbouring band — so the kilowatt-hours conserve
+    # while the money is wrong. The band that occurred and reported nothing
+    # against an otherwise clean entry is the tell.
+    spiky = Tariff(bands=parse_bands("Spike | 1.00 | 16:00-17:00; Rest | 0.10 | 17:00-16:00"))
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    rows = [
+        {
+            "timestamp": start + timedelta(hours=h, minutes=30 if h in (15, 17) else 0),
+            "grid_import_energy_total_kwh": 100.0 + h,
+            "grid_export_energy_total_kwh": 300.0 + h,
+        }
+        for h in range(25)
+        if h not in (16,)
+    ]
+    energy = period_energy(spiky, rows, start, end, TZ)
+    assert energy.grid_import_kwh["Spike"] is None
+    assert energy.shortfall is not None
+    entry = energy.shortfall["grid_import"]
+    assert entry.unattributed_kwh == pytest.approx(0.0)
+    assert entry.unknowable is True
+    # Export rides the same readings through the same emptied interval and is
+    # NOT flagged: it takes no band split, so a flat rate prices its total and
+    # the total is exact — an interval-level emptiness means nothing for it.
+    assert energy.grid_export_kwh == pytest.approx(24.0)
+    assert energy.shortfall["grid_export"].short is False
+    result = price_period(spiky, energy)
+    assert result is not None
+    assert result.cost is not None
+    assert result.cost_is_short is True
+
+
+def test_a_flat_counter_across_an_emptied_band_prices_exact_and_unflagged() -> None:
+    # The import counter sits still from 15:00 to 18:00 straight across the
+    # one-hour Spike band. Monotonicity proves the band used exactly nothing,
+    # so the day's cost is exact — the zero-delta span is the proof, and it
+    # must read as coverage, never as a shortfall.
+    spiky = Tariff(bands=parse_bands("Spike | 1.00 | 16:00-17:00; Rest | 0.10 | 17:00-16:00"))
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    # No readings at 16:00 or 17:00: the flat stretch is one three-hour pair
+    # crossing both of the band's edges, which is a dropped span of zero.
+    rows = [
+        {
+            "timestamp": start + timedelta(hours=h),
+            "grid_import_energy_total_kwh": 100.0 + min(h, 15) + max(h - 18, 0),
+        }
+        for h in range(25)
+        if h not in (16, 17)
+    ]
+    energy = period_energy(spiky, rows, start, end, TZ)
+    assert energy.grid_import_kwh["Spike"] is None
+    assert energy.shortfall is not None
+    entry = energy.shortfall["grid_import"]
+    assert entry.unattributed_kwh == pytest.approx(0.0)
+    assert entry.unknowable is False
+    result = price_period(spiky, energy)
+    assert result is not None
+    assert result.cost_is_short is False
+    assert result.energy_cost == pytest.approx(21.0 * 0.10, abs=0.01)
+
+
+def test_two_outages_sharing_a_reading_stay_quantified() -> None:
+    # A lone reading between two gaps splits what would be one dropped pair
+    # into two spans sharing that instant. Together they bracket everything
+    # between their outer readings and their energies sum exactly — asking
+    # whether one span alone covers the emptied band said no, and flagged a
+    # shortfall that was in fact exact.
+    tariff = Tariff(
+        bands=parse_bands(
+            "Night | 0.05 | 00:00-05:00; Mid | 0.30 | 05:00-06:00; Day | 0.10 | 06:00-24:00"
+        )
+    )
+    start, end = _day(2026, 7, 1), _day(2026, 7, 2)
+    rows = [
+        {"timestamp": start + timedelta(hours=h), "grid_import_energy_total_kwh": 100.0 + h}
+        for h in (0, 1, 2, *range(9, 25))
+    ]
+    rows.append(
+        {
+            "timestamp": start + timedelta(hours=5, minutes=30),
+            "grid_import_energy_total_kwh": 105.5,
+        }
+    )
+    energy = period_energy(tariff, rows, start, end, TZ)
+    assert energy.shortfall is not None
+    entry = energy.shortfall["grid_import"]
+    assert entry.unattributed_kwh == pytest.approx(7.0)
+    assert entry.unknowable is False
+
+
+def test_a_counter_that_dies_and_never_resumes_is_flagged_by_its_bounds() -> None:
+    # Import answers its last poll at noon on the 2nd and never again, while
+    # load carries on. No pair exists past the last answer, so no span does
+    # either — the counter's own reach is the only evidence, and it must be
+    # enough to keep three unmeasured days from pricing as cheap ones.
+    quiet = frozenset((d, h) for d in (2, 3, 4, 5) for h in range(24) if (d, h) > (2, 12))
+    energy, cost, _ = _priced(_case_rows(drop_import=quiet))
+    assert energy.shortfall is not None
+    imported = energy.shortfall["grid_import"]
+    assert imported.unknowable is True
+    assert energy.shortfall["load"].short is False
+    assert cost is not None
+    assert cost.cost_is_short is True
+
+
+def test_an_outage_across_the_period_edge_is_unknowable_not_counted() -> None:
+    # A gap from 23:00 on 30 June to 03:00 on 1 July straddles the period's
+    # own start. The delta across it is known but includes June's energy, so
+    # counting it would overstate July's shortfall — the entry says inexact
+    # instead of naming a number that is wrong.
+    rows = _case_rows(drop_all=frozenset({(1, 0), (1, 1), (1, 2)}))
+    energy = period_energy(COSERV, rows, START_23, END_23, TZ)
+    assert energy.shortfall is not None
+    imported = energy.shortfall["grid_import"]
+    assert imported.unknowable is True
+    assert imported.unattributed_kwh == pytest.approx(0.0)
+
+
+def test_the_bucket_path_flags_the_day_whose_money_is_short() -> None:
+    # Reverted finding 4: a yield session from 17:00 to 22:00 sits wholly
+    # inside 2 July, so the day's energy total is exact — the counters span
+    # the hole — while its cost is short by the peak hours nobody can place.
+    # The day's shortfall is what carries that to a badge.
+    rows = _case_rows(drop_all=frozenset((2, h) for h in (18, 19, 20, 21)))
+    edges = bucket_edges(START_23, END_23, "day", TZ)
+    days = bucket_energy(COSERV, rows, edges, TZ)
+    assert days[1].shortfall is not None
+    assert days[1].shortfall["grid_import"].unattributed_kwh == pytest.approx(7.4)
+    second = price_period(COSERV, days[1])
+    first = price_period(COSERV, days[0])
+    assert second is not None and first is not None
+    assert second.cost_is_short is True
+    assert first.cost_is_short is False

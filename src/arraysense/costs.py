@@ -35,11 +35,19 @@ from zoneinfo import ZoneInfo
 from arraysense.energy import (
     ENERGY_FIELDS,
     MAX_EDGE_GAP,
+    EnergyAttribution,
     EnergyBucket,
-    bucket_totals,
+    attribute_energy,
     with_zone,
 )
-from arraysense.tariff import CostResult, PeriodEnergy, RateBand, Tariff, compute_cost
+from arraysense.tariff import (
+    CostResult,
+    EnergyShortfall,
+    PeriodEnergy,
+    RateBand,
+    Tariff,
+    compute_cost,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -367,26 +375,24 @@ class _BandSplit:
 
 
 def _whole_export(buckets: Sequence[EnergyBucket | None]) -> float | None:
-    """Total the period's export, or None if any stretch of it went unread.
+    """Total the export that was read, or None when none of it was.
 
-    Export takes no band split — no tariff here prices it by the hour — but it
-    is still a sum, and a sum is only as complete as the stretches it was added
-    from. Dropping the ones nobody measured and totalling the rest is the same
-    missing reading rendered as zero that the band split refuses, one field
-    along: a day with a seven-hour hole in it reported 17 kWh as confidently as
-    the 24 the meter actually holds, and a tariff that pays for export then
-    credits the difference to nobody.
-
-    A stretch no band covers still counts. Its energy is unpriced, not
-    unexported, and leaving it out would understate the total for a reason that
-    has nothing to do with the meter.
+    Export takes no band split — no tariff here prices it by the hour — so
+    this is a sum of stretches. It used to null the moment any stretch went
+    unread, which on a tariff paying for export nulled the estimated bill
+    with it: the attempt-one shape the owner rejected in #23. The rule now is
+    the owner's: the measured part stands, the shortfall entry beside it says
+    what the meter counted that this sum does not, and only a period with
+    nothing read at all is None. Nothing downstream *enforces* that for a
+    scalar — the credit prices whatever export figure a period carries — so a
+    hand-built ``PeriodEnergy`` with a partial sum here is the builder's own
+    claim; every path from real readings attaches the accounting beside it.
     """
     total: float | None = None
     for bucket in buckets:
         value = None if bucket is None else bucket.totals.get("grid_exported_kwh")
-        if value is None:
-            return None
-        total = (total or 0.0) + value
+        if value is not None:
+            total = (total or 0.0) + value
     return total
 
 
@@ -398,6 +404,19 @@ def _band_split(
     Shared by the single-period and the per-bucket paths so there is one answer
     to what "the peak band used" means. Two of them would drift, and this is
     the step where kilowatt-hours become money.
+
+    An interval nobody measured no longer nulls its band — the deliberate
+    change of #23. Its energy is not lost from the books: it is in the dropped
+    spans and bounds the shortfall is built from, so the band's measured
+    stretches can stand and the figure priced from them can say what it is
+    missing. The band stays None only when *no* interval of it reported,
+    because "occurred and never measured" must stay distinguishable from a
+    small number — that None is what keeps a wholly unwatched peak window from
+    pricing as a cheap one, and downstream it is priced only under a shortfall
+    that accounts for it — up to the same ``max_gap`` edge tolerances every
+    figure here accepts: a band lying wholly inside the two hours past a
+    counter's last reading is unmeasured and unflagged, exactly as that tail
+    itself is.
     """
     totals: dict[str, dict[str, float | None]] = {field: {} for field in _SPLIT_FIELDS}
     for interval, bucket in zip(intervals, buckets, strict=True):
@@ -409,20 +428,188 @@ def _band_split(
         for key, into in totals.items():
             value = None if bucket is None else bucket.totals.get(key)
             if value is None:
-                # Unknown, and unknown wins. A band occurs more than once in a
-                # day — off-peak runs before the evening peak and again after
-                # it — so keeping an earlier stretch as the band's total is a
-                # missing reading rendered as zero, in the one place where it
-                # becomes money.
-                into[interval.band] = None
-            elif into.get(interval.band, 0.0) is not None:
-                into[interval.band] = (into.get(interval.band) or 0.0) + value
+                # The band occurred here even if nothing was measured; the
+                # key with None is that fact, and three consumers read it.
+                into.setdefault(interval.band, None)
+            else:
+                running = into.get(interval.band)
+                into[interval.band] = value if running is None else running + value
     return _BandSplit(
         imported=totals["grid_imported_kwh"],
         load=totals["load_kwh"],
         discharged=totals["battery_discharged_kwh"],
         exported=_whole_export(buckets),
     )
+
+
+# Which shortfall entry each bucket field feeds. PeriodEnergy speaks the left
+# names; the buckets and dropped spans speak ENERGY_FIELDS'.
+_SHORTFALL_FIELDS: Mapping[str, str] = {
+    "grid_import": "grid_imported_kwh",
+    "load": "load_kwh",
+    "grid_export": "grid_exported_kwh",
+    "battery_discharge": "battery_discharged_kwh",
+}
+
+
+def _shortfall(
+    attribution: EnergyAttribution,
+    intervals: Sequence[BandInterval],
+    buckets: Sequence[EnergyBucket | None],
+    split: _BandSplit,
+    start: datetime,
+    end: datetime,
+    max_gap: timedelta,
+) -> dict[str, EnergyShortfall]:
+    """Account, per counter, for the energy this period's figures do not hold.
+
+    The quantified part is the dropped spans lying wholly inside the period:
+    both their readings exist, so their energy is exact, and it is exactly
+    what the band totals are short by. Everything else is a flag, because a
+    number would be invented — a span straddling the period's edge carries
+    foreign energy, a reset lost an unknowable amount, and a period reaching
+    more than ``max_gap`` past the counter's first or last reading has
+    stretches no reading ever bounded.
+
+    The last check walks the intervals that reported nothing and asks whether
+    something already accounts for each — a dropped span bracketing it, or
+    the counter's reach ending before it. One shape has neither: a pair
+    within ``max_gap`` crossing a short band's edges hands the whole delta to
+    the neighbouring interval, so the kilowatt-hours conserve, no span
+    exists, and the band that occurred priced nothing. That was a permanent
+    dash before #23 and would otherwise become a confidently wrong figure;
+    the flag is what makes it a labelled one.
+
+    Everything is compared as instants. The spans carry the rows' own
+    timestamps and the period bounds arrive in the owner's zone, and two
+    aware datetimes only compare correctly across a fold when they do not
+    share a tzinfo — going through UTC sidesteps the question entirely.
+    """
+    lo, hi = start.astimezone(UTC), end.astimezone(UTC)
+    values: dict[str, Mapping[str, float | None]] = {
+        "grid_import": split.imported,
+        "load": split.load,
+        "battery_discharge": split.discharged,
+    }
+    out: dict[str, EnergyShortfall] = {}
+    for name, field in _SHORTFALL_FIELDS.items():
+        spans = [s for s in attribution.dropped if s.field == field]
+        unattributed = 0.0
+        unknowable = False
+        inside: list[tuple[datetime, datetime]] = []
+        for span in spans:
+            span_lo, span_hi = span.start.astimezone(UTC), span.end.astimezone(UTC)
+            if span_hi <= lo or span_lo >= hi:
+                continue
+            if span.kwh == 0.0:
+                # Pure coverage. A monotone counter that did not move between
+                # two readings proves zero energy everywhere between them, so
+                # the window is accounted for wherever it falls — including
+                # straddling the period's edge — and can never raise a flag.
+                inside.append((span_lo, span_hi))
+                continue
+            if span.kwh is not None and lo <= span_lo and span_hi <= hi:
+                unattributed += span.kwh
+            else:
+                unknowable = True
+            inside.append((span_lo, span_hi))
+
+        bounds = attribution.bounds.get(field)
+        if bounds is None:
+            unknowable = True
+            reach = None
+        else:
+            first, last = bounds
+            reach = (first.astimezone(UTC), last.astimezone(UTC))
+            if reach[0] - lo > max_gap or hi - reach[1] > max_gap:
+                unknowable = True
+
+        if name == "grid_export":
+            attributed = split.exported or 0.0
+        else:
+            attributed = sum(v for v in values[name].values() if v is not None)
+
+        # Export takes no band split, so an interval-level emptiness means
+        # nothing for it: a flat rate prices the total, and the total is
+        # already accounted for by the spans and bounds above. Running the
+        # check anyway flagged provably exact export credits.
+        if not unknowable and name != "grid_export":
+            covered = _coalesced(inside)
+            unknowable = any(
+                _unexplained(interval, bucket, field, covered, reach)
+                for interval, bucket in zip(intervals, buckets, strict=True)
+            )
+        out[name] = EnergyShortfall(
+            attributed_kwh=attributed, unattributed_kwh=unattributed, unknowable=unknowable
+        )
+    return out
+
+
+def _coalesced(spans: Sequence[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    """Merge touching spans into one stretch of accounted-for time.
+
+    Two outages separated by a single reading are two spans sharing that
+    reading's instant, and together they account for everything between their
+    outer readings — their energies were counted separately and sum exactly.
+    Asking whether one span alone brackets an interval said no, and flagged a
+    shortfall that was in fact exact.
+    """
+    merged: list[tuple[datetime, datetime]] = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(hi, merged[-1][1]))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _unexplained(
+    interval: BandInterval,
+    bucket: EnergyBucket | None,
+    field: str,
+    spans: Sequence[tuple[datetime, datetime]],
+    reach: tuple[datetime, datetime] | None,
+) -> bool:
+    """Whether an interval that reported nothing has no account of its energy.
+
+    Explained means a dropped span brackets the whole interval — the energy
+    is in the shortfall already — or the interval lies wholly beyond the
+    counter's readings, where the period-edge tolerance governs. What is left
+    is energy that conserved into a neighbouring interval at a different
+    rate, which no number can state and only a flag can say.
+    """
+    value = None if bucket is None else bucket.totals.get(field)
+    if value is not None:
+        return False
+    interval_lo = interval.start.astimezone(UTC)
+    interval_hi = interval.end.astimezone(UTC)
+    if reach is None or interval_hi <= reach[0] or interval_lo >= reach[1]:
+        return False
+    return not any(span_lo <= interval_lo and interval_hi <= span_hi for span_lo, span_hi in spans)
+
+
+def _log_dropped(attribution: EnergyAttribution) -> None:
+    """Say what could not be placed, so a labelled figure can be traced.
+
+    The page shows a total; the log answers "why is this labelled short",
+    which otherwise takes a debugger and a copy of the walk. Debug rather
+    than info: every open page re-prices its period every few minutes, so an
+    old outage would otherwise re-announce itself forever — and the label on
+    the page is the durable trace, not the log line.
+    """
+    for span in attribution.dropped:
+        if span.kwh == 0.0:
+            # Coverage evidence, not loss; announcing it as unattributable
+            # would be the log contradicting the arithmetic.
+            continue
+        amount = "an unknowable amount" if span.kwh is None else f"{span.kwh:.1f} kWh"
+        logger.debug(
+            "%s of %s between %s and %s could not be attributed",
+            amount,
+            span.field,
+            span.start,
+            span.end,
+        )
 
 
 def period_energy(
@@ -453,8 +640,11 @@ def period_energy(
         return PeriodEnergy(start=local_start, end=local_end, grid_import_kwh={})
 
     edges = [intervals[0].start, *(i.end for i in intervals)]
-    split = _band_split(intervals, _aligned(intervals, bucket_totals(rows, edges, max_gap)))
+    attribution = attribute_energy(rows, edges, max_gap)
+    aligned = _aligned(intervals, attribution.buckets)
+    split = _band_split(intervals, aligned)
     moments = _reading_moments(rows, local_start, local_end)
+    _log_dropped(attribution)
 
     return PeriodEnergy(
         start=local_start,
@@ -466,6 +656,9 @@ def period_energy(
         measured_minutes=_observed_minutes(moments, max_gap),
         counted_minutes=_counted_minutes(moments),
         elapsed_minutes=_real_minutes(intervals[0].start, intervals[-1].end),
+        shortfall=_shortfall(
+            attribution, intervals, aligned, split, intervals[0].start, intervals[-1].end, max_gap
+        ),
     )
 
 
@@ -518,16 +711,25 @@ def bucket_energy(
     # last interval ends where the next bucket's first begins — so this is
     # ascending and every bucket edge is in it.
     sub_edges = [flat[0].start, *(interval.end for interval in flat)]
-    aligned = _aligned(flat, bucket_totals(rows, sub_edges, max_gap))
+    attribution = attribute_energy(rows, sub_edges, max_gap)
+    aligned = _aligned(flat, attribution.buckets)
+    _log_dropped(attribution)
 
     out: list[PeriodEnergy] = []
     at = 0
     for (first, last), group in zip(spans, groups, strict=True):
-        split = _band_split(group, aligned[at : at + len(group)])
+        chunk = aligned[at : at + len(group)]
+        split = _band_split(group, chunk)
         at += len(group)
         # ``last`` is always after ``first``: the edges come from the calendar
         # and ``until`` is the end of the range they were built to cover, so
         # every bucket begins before it.
+        #
+        # An outage crossing a *bucket* boundary reads differently here than
+        # the same outage asked of the whole range at once: its span is wholly
+        # inside neither bucket, so each is unknowable where the range would
+        # quantify it exactly. Both are true at their own grain — which day
+        # paid for an overnight gap genuinely is not knowable.
         out.append(
             PeriodEnergy(
                 start=_local(first, zone),
@@ -536,6 +738,13 @@ def bucket_energy(
                 load_kwh=split.load or None,
                 grid_export_kwh=split.exported,
                 battery_discharge_kwh=split.discharged or None,
+                shortfall=(
+                    _shortfall(
+                        attribution, group, chunk, split, group[0].start, group[-1].end, max_gap
+                    )
+                    if group
+                    else None
+                ),
             )
         )
     return out
@@ -563,9 +772,11 @@ def price_period(
     fifteen hours of every day, and so did the Costs page asked about today.
 
     A band that *did* occur is still named by the split, carrying None when
-    nobody measured it, so a completed day with a hole in its peak window
-    prices as unknown exactly as before. That is the distinction worth keeping
-    and the only one this changes.
+    nobody measured it. What that means downstream moved with #23: under a
+    shortfall that accounts for the hole, a completed day with an unwatched
+    peak window prices its measured part and is flagged, where it used to
+    null; without one it still nulls. Either way the band's None survives —
+    it is what keeps "occurred and unmeasured" from becoming a small number.
     """
     if tariff is None or not energy.grid_import_kwh:
         return compute_cost(tariff, energy, fixed_charge)
