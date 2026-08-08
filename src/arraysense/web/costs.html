@@ -151,6 +151,9 @@
       with no system at all. On the right, the part of it that was paid to the grid, and the
       part the array and the bank covered. The connection charge is not in either: it is
       payable whatever the roof does.
+      <span class="warn" id="sankeyShort" hidden>This month the diagram is drawn from a partial
+      measurement — energy the meter counted could not all be placed in a band, and the cards
+      above say what is missing.</span>
     </span>
   </section>
 
@@ -308,6 +311,51 @@ function pageNote(text) {
 
 const MONTH_FMT = { month: 'long', year: 'numeric' };
 
+// ---------------------------------------------------------------------------
+// Saying what a figure covers.
+//
+// The rule from #23, settled after two reverted attempts: never present a
+// partial figure as a complete one — show it with a label saying what it
+// covers, and dash only when nothing was measured. The server decides WHETHER
+// a figure is short; these decide only the words. A known amount of missing
+// energy is named in kilowatt-hours. An unknowable loss must claim no number
+// and no direction — a counter that stepped backwards inflates the next delta
+// rather than losing one — so it only says the figure may not be exact.
+// ---------------------------------------------------------------------------
+
+const entryOf = (p, name) => (p.shortfall && p.shortfall[name]) || null;
+// The same predicate the server's flags are computed from — the page decides
+// wording, never shortness, and a threshold of its own here once left a
+// server-flagged figure with a dot and no sentence to explain it.
+const entryShort = (e) => e !== null
+  && (numOrNull(e.unattributed_kwh) > 0 || e.unknowable === true);
+// An amount worth printing. Below a twentieth of a kWh the number reads as
+// zero at one decimal, so the sentence falls back to words without it.
+const knownMissing = (e) => {
+  const v = e === null ? null : numOrNull(e.unattributed_kwh);
+  return v !== null && v > 0.05 ? v : null;
+};
+
+// One sentence for one counter: what this figure does not hold.
+function shortNote(entry, what) {
+  if (!entryShort(entry)) return '';
+  const missing = knownMissing(entry);
+  const parts = [];
+  if (missing !== null) {
+    parts.push(`another <b>${esc(uStr(missing, 1, 'kWh'))}</b> of ${esc(what)} passed the meter `
+      + 'but could not be placed in a rate band, and is not in this figure');
+  }
+  if (entry.unknowable === true) {
+    parts.push(`part of the ${esc(what)} measurement could not be fully read, so this figure `
+      + 'may not be exact');
+  }
+  if (!parts.length) {
+    // Short by less than the display precision: still true, said in words.
+    parts.push(`a sliver of ${esc(what)} could not be placed in a rate band`);
+  }
+  return `<span class="warn">Not the whole story:</span> ${parts.join('; and ')}.`;
+}
+
 function renderMonth(win, priced) {
   $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
   const days = Math.round(elapsed(win.start, win.end) / 86400000);
@@ -366,7 +414,8 @@ function renderCards(p) {
   } else {
     costBits.push('no connection charge on this tariff');
   }
-  $('costSub').innerHTML = `${costBits.join(' · ')}.`;
+  const costNote = p.costShort ? ` ${shortNote(entryOf(p, 'grid_import'), 'grid import')}` : '';
+  $('costSub').innerHTML = `${costBits.join(' · ')}.${costNote}`;
 
   $('billV').innerHTML = bigMoney(p.estimatedTotal, cur);
   if (p.estimatedTotal === null) {
@@ -391,27 +440,98 @@ function renderCards(p) {
         + 'guides.'
       : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
         + 'one has so far.';
-    $('billSub').innerHTML = `${bits.join(' · ')}. ${caveat}`;
+    $('billSub').innerHTML = `${bits.join(' · ')}. ${caveat}${billCoverage(p)}`;
   }
 
   const saved = $('saveV');
   saved.innerHTML = bigMoney(p.savings, cur);
   saved.className = p.savings !== null && p.savings < 0 ? 'v neg' : 'v';
+  const savedNote = p.savings !== null && p.savingsShort ? savedShortNote(p) : '';
   if (p.savings === null) {
     $('saveSub').innerHTML = 'Absent until both the house and the grid counters have been '
       + 'recorded across every rate band.';
   } else if (p.savings < 0) {
     $('saveSub').innerHTML = 'The grid supplied more than the house used: the bank was charged '
       + `from it. The same use would have cost <b>${esc(money(p.noSolarCost, cur))}</b> with no `
-      + 'system at all.';
+      + `system at all.${savedNote}`;
   } else {
     const share = p.noSolarCost > 0 ? p.savings / p.noSolarCost : null;
     const bits = [`The same use from the grid alone would have cost `
       + `<b>${esc(money(p.noSolarCost, cur))}</b>`];
     if (share !== null) bits.push(`the system covered <b>${esc(pctStr(share))}</b> of it`);
     $('saveSub').innerHTML = `${bits.join(' · ')}. The connection charge is payable either way, `
-      + 'so it is not counted here.';
+      + `so it is not counted here.${savedNote}`;
   }
+}
+
+// The saving subtracts one partial figure from another, so which way it is
+// wrong depends on which side is short. The direction is claimed only when it
+// is certain: exactly one side short, and that side short by a counted amount
+// rather than an unknowable one — an unknowable loss can push either way.
+function savedDirection(p) {
+  const imp = entryOf(p, 'grid_import');
+  const load = entryOf(p, 'load');
+  const impShort = entryShort(imp);
+  const loadShort = entryShort(load);
+  if (impShort && !loadShort && imp.unknowable !== true) {
+    return 'the true saving is lower than shown';
+  }
+  if (loadShort && !impShort && load.unknowable !== true) {
+    return 'the true saving is higher than shown';
+  }
+  return 'the true saving may sit either side of it';
+}
+
+// The coverage line: the bill is the figure most sensitive to coverage, and
+// it was the only money figure without one. Built per counter, because the
+// projection did different things with each: quantified import is assumed at
+// the measured blend, quantified export is restored exactly at the flat rate,
+// and an unknowable loss on either is not included because nothing can size
+// it. Collapsing those into one sentence once claimed an exactly-restored
+// export "could not be included", which was simply false.
+function billCoverage(p) {
+  if (!p.billShort) return '';
+  const imp = entryOf(p, 'grid_import');
+  const exp = entryOf(p, 'grid_export');
+  const parts = [];
+  const missingImport = knownMissing(imp);
+  if (p.assumedKwh !== null) {
+    parts.push(`it assumes the ${esc(uStr(p.assumedKwh, 1, 'kWh'))} of import that could not `
+      + 'be placed in a band were priced like the rest');
+  } else if (missingImport !== null) {
+    // Counted but unpriceable: nothing was priced this period, so there is
+    // no blend to price the missing share at. Its size is known; its cost
+    // is not — which is a different admission from "cannot size".
+    parts.push(`the ${esc(uStr(missingImport, 1, 'kWh'))} of import that could not be placed `
+      + 'is left out — nothing else was priced to give it a rate');
+  }
+  const missingExport = knownMissing(exp);
+  if (missingExport !== null) {
+    // Exact regardless of anything else the export measurement suffered:
+    // the flat rate needs no blend, only the counted kilowatt-hours.
+    parts.push(`the ${esc(uStr(missingExport, 1, 'kWh'))} of export the collector missed is `
+      + 'restored at the export rate, which is exact');
+  }
+  if ((imp !== null && imp.unknowable === true) || (exp !== null && exp.unknowable === true)) {
+    parts.push('part of what the meter counted could not be fully read, and the projection '
+      + 'cannot include what nothing measured');
+  }
+  if (!parts.length) return '';
+  const joined = parts.join('; ');
+  return ` <span class="warn">${joined.charAt(0).toUpperCase()}${joined.slice(1)}.</span>`;
+}
+
+function savedShortNote(p) {
+  const missing = [];
+  const impMissing = knownMissing(entryOf(p, 'grid_import'));
+  const loadMissing = knownMissing(entryOf(p, 'load'));
+  if (impMissing !== null) missing.push(`${uStr(impMissing, 1, 'kWh')} of grid import`);
+  if (loadMissing !== null) missing.push(`${uStr(loadMissing, 1, 'kWh')} of house load`);
+  const what = missing.length
+    ? `${missing.join(' and ')} could not be placed in a rate band`
+    : 'part of the measurement could not be fully read';
+  return ` <span class="warn">Not the whole story:</span> ${esc(what)}, so `
+    + `${savedDirection(p)}.`;
 }
 
 // The dashboard's energy Sankey, in currency. Same geometry: a stack of
@@ -454,8 +574,13 @@ function drawSankey(p) {
   }
   wait.hidden = true;
   $('sankeyCap').hidden = false;
+  // A picture presents a partial figure as confidently as a numeral does, so
+  // it carries the same qualification the cards do.
+  const short = p.costShort || p.savingsShort;
+  $('sankeyShort').hidden = !short;
   $('sankeyTotal').textContent =
-    `${money(p.noSolarCost, cur)} of electricity at grid rates this month`;
+    `${money(p.noSolarCost, cur)} of electricity at grid rates this month`
+    + (short ? ' · not the whole month' : '');
 
   const total = p.noSolarCost;
   const XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
@@ -578,13 +703,25 @@ function renderBands(p) {
       <td>${esc(money(r.saved, cur))}</td>
     </tr>`;
   }).join('');
+  // The month-to-date kilowatt-hours come from the reply's own accounting,
+  // not from summing the column: a band that occurred and was never measured
+  // is a dash in its row, and summing around it would either dash the total
+  // beside a priced cost or quietly skip the hole. Zero attributed alongside
+  // an absent cost stays a dash — nothing measured is not a total of nought.
+  const importMtd = p.energyCost === null ? null
+    : attributedOr(entryOf(p, 'grid_import'), () => sumOrNull(p.rows.map((r) => r.importKwh)));
+  const houseMtd = p.noSolarCost === null ? null
+    : attributedOr(entryOf(p, 'load'), () => sumOrNull(p.rows.map((r) => r.houseKwh)));
+  const loadShort = entryShort(entryOf(p, 'load'));
+  const mark = (short) => (short
+    ? ' class="part" title="Not the whole month — see the note below the table"' : '');
   const totals = `<tr>
       <td><b>Month to date</b></td><td></td>
-      <td>${esc(uStr(sumOrNull(p.rows.map((r) => r.importKwh)), 1, 'kWh'))}</td>
-      <td><b>${esc(money(p.energyCost, cur))}</b></td>
-      <td>${esc(uStr(sumOrNull(p.rows.map((r) => r.houseKwh)), 1, 'kWh'))}</td>
-      <td>${esc(money(p.noSolarCost, cur))}</td>
-      <td><b>${esc(money(p.savings, cur))}</b></td>
+      <td${mark(p.costShort)}>${esc(uStr(importMtd, 1, 'kWh'))}</td>
+      <td${mark(p.costShort)}><b>${esc(money(p.energyCost, cur))}</b></td>
+      <td${mark(loadShort)}>${esc(uStr(houseMtd, 1, 'kWh'))}</td>
+      <td${mark(loadShort)}>${esc(money(p.noSolarCost, cur))}</td>
+      <td${mark(p.savingsShort)}><b>${esc(money(p.savings, cur))}</b></td>
     </tr>`;
   $('bandTable').querySelector('tbody').innerHTML = body + totals;
   renderSplit(p);
@@ -621,12 +758,22 @@ function renderBands(p) {
       + 'every figure here. Widen a band, or add one covering the rest of the day.');
   }
   if (p.rows.some((r) => r.importKwh === null)) {
-    notes.push('A band showing ' + DASH + ' was not measured across the whole month: the '
-      + 'collector stopped across one of its boundaries, and which side of that boundary the '
-      + 'energy fell on is not knowable. It is left out rather than guessed at, so the totals '
-      + 'above are absent too.');
+    notes.push('A band showing ' + DASH + ' occurred and was never measured. Nothing of it is '
+      + 'invented into the totals; what the meter counted meanwhile is in the notes on the '
+      + 'cards above.');
+  }
+  if (p.costShort || p.savingsShort) {
+    notes.push('<span class="warn">The bars and the table draw from a partial measurement '
+      + 'this month</span> — the cards above say what is missing from it.');
   }
   $('bandCap').innerHTML = notes.join(' ');
+}
+
+// The reply's own kilowatt-hour total for a counter, or whatever the caller
+// falls back to when the reply carries no accounting at all.
+function attributedOr(entry, fallback) {
+  const value = entry === null ? null : numOrNull(entry.attributed_kwh);
+  return value === null ? fallback() : value;
 }
 
 // Absent propagates: a total that leaves out a band nobody measured is not a
@@ -748,6 +895,15 @@ function fromQuote(quote) {
     energyCost: numOrNull(cost.energy_cost),
     noSolarCost: numOrNull(cost.no_solar_cost),
     savings: numOrNull(cost.savings),
+    // The qualification, decided server-side with the pricing. The wording
+    // below distinguishes a known number of missing kilowatt-hours from a
+    // measurement that may not be exact — deriving either from the minutes
+    // instead is the mistake that overstated the savings by 14% (#23).
+    costShort: cost.cost_is_short === true,
+    savingsShort: cost.savings_is_short === true,
+    billShort: bill.is_short === true,
+    assumedKwh: numOrNull(bill.assumed_kwh),
+    shortfall: (quote.shortfall && typeof quote.shortfall === 'object') ? quote.shortfall : null,
     // Absent, not zero. A connection charge nobody reported is unknown, and
     // rendering it as nought says the tariff has none — which is a different
     // claim, and one this page has no basis for making.

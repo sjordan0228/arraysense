@@ -45,11 +45,13 @@ from arraysense.store.tiers import select_tier
 from arraysense.tariff import (
     SETTING_BANDS,
     CostResult,
+    EnergyShortfall,
     PeriodEnergy,
     Tariff,
     apportion_fixed,
     estimate_bill,
     load_tariff,
+    merge_shortfalls,
 )
 
 if TYPE_CHECKING:
@@ -553,6 +555,12 @@ async def costs(
         "measured_minutes": energy.measured_minutes,
         "elapsed_minutes": energy.elapsed_minutes,
         "unpriced_minutes": round(unpriced_minutes(tariff, start, end, zone)),
+        # Per counter: what the figures hold, what the meter counted that they
+        # do not, and whether some loss has no statable size. The labels on
+        # every money figure are worded from this, never from the minutes
+        # above — minutes read fully covered while a counter sits silent,
+        # which is precisely how the previous attempt overstated the savings.
+        "shortfall": _shortfall_payload(energy.shortfall),
     }
 
 
@@ -776,7 +784,7 @@ async def energy(
                 "end": bucket.end.isoformat(),
                 "complete": bucket.complete,
                 **bucket.totals,
-                **_bucket_money(tariff, money.get(bucket.start)),
+                **_bucket_money(tariff, money.get(bucket.start), splits.get(bucket.start)),
             }
             for bucket in read.buckets
         ],
@@ -825,26 +833,41 @@ def _bucket_fixed(tariff: Tariff, period: Period, span: PeriodEnergy) -> float:
 
 def _merge_bands(
     parts: Iterable[Mapping[str, float | None] | None],
+    partial: bool = False,
 ) -> dict[str, float | None]:
-    """Add each band's kilowatt-hours across several buckets, keeping unknown unknown.
+    """Add each band's kilowatt-hours across several buckets.
 
-    A band one bucket could not measure makes that band unknown for the whole
-    run rather than the sum of the buckets that did report it — which would be
-    a missing reading rendered as a smaller number, at the point where it turns
-    into money. A band simply absent from a bucket is different and is skipped:
-    the day before the season turns never entered the peak window, so it has
-    nothing to contribute rather than something nobody watched.
+    Without ``partial``, a band one bucket could not measure makes that band
+    unknown for the whole run rather than the sum of the buckets that did
+    report it — a missing reading rendered as a smaller number, at the point
+    where it turns into money. With it, the reported buckets sum and the band
+    is None only when none of them reported: the caller carries a merged
+    shortfall saying what the sum is missing, which is what lets the History
+    footer show a labelled total instead of a dash over a column of flagged
+    numbers (#23). A band simply absent from a bucket contributes nothing
+    either way: the day before the season turns never entered the peak
+    window, so it has nothing to say rather than something nobody watched.
     """
     out: dict[str, float | None] = {}
     for part in parts:
         for name, kwh in (part or {}).items():
-            running = out.get(name, 0.0)
-            out[name] = None if kwh is None or running is None else running + kwh
+            if partial:
+                if kwh is None:
+                    out.setdefault(name, None)
+                else:
+                    running = out.get(name)
+                    out[name] = kwh if running is None else running + kwh
+            else:
+                running = out.get(name, 0.0)
+                out[name] = None if kwh is None or running is None else running + kwh
     return out
 
 
 def _price_together(
-    tariff: Tariff, spans: Sequence[PeriodEnergy], fixed_charge: float
+    tariff: Tariff,
+    spans: Sequence[PeriodEnergy],
+    fixed_charge: float,
+    shortfall: Mapping[str, EnergyShortfall] | None,
 ) -> CostResult | None:
     """Price a run of buckets as one period rather than adding up their costs.
 
@@ -854,21 +877,31 @@ def _price_together(
     is the trap every other duration in this project goes out of its way to
     avoid.
 
+    ``shortfall`` is the merge of the spans' own accounting, handed in rather
+    than derived here because the caller reports it beside the total. It has
+    to ride on the combined period: without it the pricing falls back to
+    poisoning, and the footer dashes while every row above it shows a flagged
+    number — a regression no clean-data test would catch.
+
     The connection charge is handed in rather than derived from ``spans``,
     because ``spans`` is only the part of the period that could be priced and
     the charge does not depend on that. See ``_period_total``.
     """
     if not spans:
         return None
+    partial = shortfall is not None
     return price_period(
         tariff,
         PeriodEnergy(
             start=spans[0].start,
             end=spans[-1].end,
-            grid_import_kwh=_merge_bands(span.grid_import_kwh for span in spans),
-            load_kwh=_merge_bands(span.load_kwh for span in spans) or None,
-            battery_discharge_kwh=_merge_bands(span.battery_discharge_kwh for span in spans)
+            grid_import_kwh=_merge_bands((span.grid_import_kwh for span in spans), partial),
+            load_kwh=_merge_bands((span.load_kwh for span in spans), partial) or None,
+            battery_discharge_kwh=_merge_bands(
+                (span.battery_discharge_kwh for span in spans), partial
+            )
             or None,
+            shortfall=shortfall,
         ),
         fixed_charge=fixed_charge,
     )
@@ -920,8 +953,20 @@ def _period_total(
     fixed = sum(_bucket_fixed(tariff, period, span) for span in spanned)
     costed = [energy for energy, result in buckets if result and result.cost is not None]
     saving = [energy for energy, result in buckets if result and result.savings is not None]
-    whole = _price_together(tariff, costed, fixed)
-    against = _price_together(tariff, saving, fixed)
+    whole = _price_together(tariff, costed, fixed, merge_shortfalls(costed))
+    against = _price_together(tariff, saving, fixed, merge_shortfalls(saving))
+    # Disclosure is merged over every bucket that carries accounting, not just
+    # the rows that priced. A day whose import all fell inside a gap is a dash
+    # in its row and absent from the money above — but its counted shortfall
+    # is real, and a footer that merged only the priced rows read clean over a
+    # month verifiably missing energy. The pricing basis stays the priced
+    # rows; only what the footer *says about itself* widens.
+    disclosure = merge_shortfalls([energy for energy, _ in buckets if energy.shortfall is not None])
+
+    def entry_short(key: str) -> bool:
+        entry = (disclosure or {}).get(key)
+        return entry is not None and entry.short
+
     return {
         "cost": whole.cost if whole else None,
         "energy_cost": whole.energy_cost if whole else None,
@@ -934,10 +979,40 @@ def _period_total(
         "adjustment_status": whole.adjustment_status if whole else None,
         "saved": against.savings if against else None,
         "no_solar_cost": against.no_solar_cost if against else None,
+        # The footer says what its rows say — including the dashed ones,
+        # whose accounting is in the disclosure merge even though their money
+        # is in no total. A null figure stays unflagged, as on the rows: the
+        # dash is its own qualification, and the gate is on the figure
+        # itself, since a run of priced months can still merge to a total
+        # nothing can state — differing riders do it — and that dash must not
+        # wear a dot.
+        "cost_short": whole is not None
+        and whole.cost is not None
+        and (whole.cost_is_short or entry_short("grid_import")),
+        "saved_short": against is not None
+        and against.savings is not None
+        and (against.savings_is_short or entry_short("grid_import") or entry_short("load")),
+        "shortfall": _shortfall_payload(disclosure),
     }
 
 
-def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str, Any]:
+def _shortfall_payload(
+    shortfall: Mapping[str, EnergyShortfall] | None,
+) -> dict[str, dict[str, Any]] | None:
+    """The per-counter accounting in wire form, or None where nobody computed it.
+
+    Forwarded whole rather than reduced to a boolean, because the brief's rule
+    is a label saying what the figure covers — a dot that only says "short"
+    cannot say 12.4 kWh, and the page must not derive the number itself.
+    """
+    if shortfall is None:
+        return None
+    return {name: asdict(entry) for name, entry in shortfall.items()}
+
+
+def _bucket_money(
+    tariff: Tariff | None, result: CostResult | None, split: PeriodEnergy | None
+) -> dict[str, Any]:
     """What one bucket cost, or nothing at all when there is no tariff.
 
     The keys are absent rather than null without a tariff, so a page cannot
@@ -975,6 +1050,11 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
             "adjustment_status": None,
             "saved": None,
             "no_solar_cost": None,
+            # A dash needs no flag — it is already not a figure — but the
+            # accounting still says why there is nothing to show.
+            "cost_short": False,
+            "saved_short": False,
+            "shortfall": _shortfall_payload(split.shortfall if split else None),
         }
     return {
         "cost": result.cost,
@@ -984,6 +1064,14 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
         "adjustment_status": result.adjustment_status,
         "saved": result.savings,
         "no_solar_cost": result.no_solar_cost,
+        # Which figures must not be read as whole, and the per-counter
+        # accounting the cell titles and the chart hover word themselves
+        # from. The reverted finding: a day can be complete in energy — the
+        # counters span a mid-day gap exactly — while its money is short by
+        # every peak hour inside that gap. These are the money's own flags.
+        "cost_short": result.cost_is_short,
+        "saved_short": result.savings_is_short,
+        "shortfall": _shortfall_payload(split.shortfall if split else None),
     }
 
 

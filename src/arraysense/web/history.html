@@ -25,6 +25,13 @@
   /* Money is the one column here that is not kilowatt-hours, so it is set
      apart by weight and a rule rather than by a colour the owner cannot see. */
   #hist td.cost,#hist th.cost{border-left:1px solid var(--panel-b);font-weight:600}
+  /* A money figure that is not the whole period carries a dot, the same mark
+     the Costs page uses. It is the money's own flag: a day can be complete in
+     energy — the counters span a mid-day gap exactly — while its cost is
+     short by every peak hour inside that gap, so the energy badge cannot
+     stand in for this. The title says what the figure covers. */
+  #hist td.part{position:relative;cursor:help}
+  #hist td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
   /* A bucket nothing was recorded for is drawn dim and dashed, never as a row
      of zeros. A month the house used nothing did not happen; a month we were
      not collecting did, and the two must not look alike. */
@@ -268,6 +275,12 @@ function buildRows(span, buckets) {
       // way all the way to the cell.
       cost: got ? numOrNull(got.cost) : null,
       saved: got ? numOrNull(got.saved) : null,
+      // The money's own qualification, separate from `partial` above: that
+      // one answers whether the energy totals cover the period, this one
+      // whether the money does, and issue #23 is the proof they diverge.
+      costShort: got ? got.cost_short === true : false,
+      savedShort: got ? got.saved_short === true : false,
+      shortfall: got && got.shortfall && typeof got.shortfall === 'object' ? got.shortfall : null,
     });
   }
   return rows;
@@ -314,9 +327,34 @@ const totalCell = (v, places, why) => (v === null
 // The money cell. A bucket the service could not price is a dash and never a
 // zero — a day whose peak hours nobody recorded did not cost nothing, it cost
 // an amount no one can state — and the currency comes from the reply rather
-// than from anything written here.
-const costCell = (v) => `<td class="cost${v === null ? ' muted' : ''}">`
+// than from anything written here. A figure the service says is short gets
+// the dot and a title saying what it covers, never a bare number (#23).
+const costCell = (v, short, why) => `<td class="cost${v === null ? ' muted' : ''}`
+  + `${short ? ' part' : ''}"${short ? ` title="${esc(why)}"` : ''}>`
   + `${esc(money(v, priced.currency))}</td>`;
+
+// What a short money figure covers, worded from the bucket's own accounting.
+// A counted amount is named per counter; an unknowable one claims no number
+// and no direction — a counter that stepped backwards inflates rather than
+// loses. The saved figure subtracts one partial from another, so it names
+// both sides and asserts no direction of its own: missing import overstates
+// it while missing load understates it, and the cell is too small to argue.
+function shortWhy(shortfall, kind) {
+  const counted = (name, label) => {
+    const entry = shortfall ? shortfall[name] : null;
+    const known = entry ? numOrNull(entry.unattributed_kwh) : null;
+    return known !== null && known > 0.05 ? `${gnum(known, 1)} kWh of ${label}` : null;
+  };
+  const parts = [counted('grid_import', 'grid import')];
+  if (kind === 'saved') parts.push(counted('load', 'house load'));
+  const named = parts.filter((p) => p !== null);
+  if (named.length) {
+    return `${named.join(' and ')} passed the meter but could not be placed in a rate band, `
+      + 'so this figure is not the whole story.';
+  }
+  return 'Part of what the meter counted could not be fully read, so this figure may not '
+    + 'be exact.';
+}
 
 function drawTable(span, rows) {
   const places = decimals(rows);
@@ -334,7 +372,10 @@ function drawTable(span, rows) {
         : '';
     return `<tr${r.reported ? '' : ' class="absent"'}><td>${esc(r.label)}${tag}</td>`
       + COLUMNS.map((c) => cell(r.totals[c.key], places[c.key])).join('')
-      + (priced.configured ? costCell(r.cost) + costCell(r.saved) : '')
+      + (priced.configured
+          ? costCell(r.cost, r.costShort, shortWhy(r.shortfall, 'cost'))
+            + costCell(r.saved, r.savedShort, shortWhy(r.shortfall, 'saved'))
+          : '')
       + '</tr>';
   }).join('');
   drawTotals(span, rows, places);
@@ -397,6 +438,12 @@ function drawTotals(span, rows, places) {
   if (held) notes.push(`${held} column${held === 1 ? '' : 's'} not totalled`);
   const unpriced = priced.configured ? reported.filter((r) => r.cost === null).length : 0;
   if (unpriced) notes.push(`${unpriced} not priced`);
+  // Counted separately from `partial`, which is about the energy: these are
+  // the rows whose money the service flagged, and a footer over a short row
+  // is short too — the flag on its own cells comes from the reply.
+  const short = priced.configured
+    ? reported.filter((r) => r.costShort || r.savedShort).length : 0;
+  if (short) notes.push(`money short on ${short}`);
   // Priced by the service over these same buckets, from the kilowatt-hours
   // behind them: a cell reads $0.48 because that is a cent-rounded thirty-first
   // of the connection charge, and thirty-one of those come to $14.88 against
@@ -406,7 +453,10 @@ function drawTotals(span, rows, places) {
   $('hist').querySelector('tfoot').innerHTML =
     `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}`
     + (priced.configured
-        ? costCell(numOrNull(total.cost)) + costCell(numOrNull(total.saved))
+        ? costCell(numOrNull(total.cost), total.cost_short === true,
+            shortWhy(total.shortfall, 'cost'))
+          + costCell(numOrNull(total.saved), total.saved_short === true,
+            shortWhy(total.shortfall, 'saved'))
         : '') + '</tr>';
 }
 
@@ -542,6 +592,17 @@ function bucketReadout() {
         // Absent stays absent in the readout too. A dash is a reading nobody
         // took and a zero is a reading of nothing, and on a page whose whole
         // argument is that difference they cannot be allowed to look alike.
+        // The hover shows the same money the cells do, so it carries the same
+        // qualification — the energy-level "partial" tag cannot stand in for
+        // it, since a day can be complete in energy and short in money (#23).
+        // The counted amount rides along where there is one; an unknowable
+        // loss claims neither a number nor a direction.
+        const missing = row.shortfall && row.shortfall.grid_import
+          ? numOrNull(row.shortfall.grid_import.unattributed_kwh) : null;
+        const shortMark = (flag) => (flag
+          ? (missing !== null && missing > 0.05
+            ? ` · short ${gnum(missing, 1)} kWh` : ' · may not be exact')
+          : '');
         const body = COLUMNS.map((c) => {
           const v = row.totals[c.key];
           const text = v === null
@@ -549,8 +610,10 @@ function bucketReadout() {
           return `<div class="row"><u>${esc(c.label)}</u><b>${esc(text)}</b></div>`;
         }).join('')
           + (priced.configured
-            ? `<div class="row"><u>Cost</u><b>${esc(money(row.cost, priced.currency))}</b></div>`
-              + `<div class="row"><u>Saved</u><b>${esc(money(row.saved, priced.currency))}</b></div>`
+            ? `<div class="row"><u>Cost</u><b>${esc(money(row.cost, priced.currency)
+                + shortMark(row.costShort))}</b></div>`
+              + `<div class="row"><u>Saved</u><b>${esc(money(row.saved, priced.currency)
+                + shortMark(row.savedShort))}</b></div>`
             : '');
         tip.innerHTML = `<div class="when">${esc(row.label)}${row.partial ? ' · partial' : ''}</div>${body}`;
         tip.classList.add('on');

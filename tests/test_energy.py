@@ -25,7 +25,9 @@ from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.energy import (
     EnergyBucket,
+    attribute_energy,
     bucket_edges,
+    bucket_totals,
     energy_totals,
     host_zone,
     resolve_zone,
@@ -521,6 +523,193 @@ def test_monthly_totals_read_from_the_hourly_rollup(tmp_path: Path) -> None:
 
     assert months["2026-02"].totals["load_kwh"] == 24.0 * 28
     assert months["2026-02"].complete is True
+
+
+# --- what the walk drops -------------------------------------------------------
+#
+# The pairwise walk cannot attribute a long pair that crosses a bucket edge, a
+# reset, or a pair straddling the final edge. It used to discard them; money
+# needs their energy, because a figure priced without it has to say so (#23).
+
+
+def _reading(when: datetime, value: float, metric: str = LOAD) -> dict[str, object]:
+    return {"timestamp": when.astimezone(UTC), metric: value}
+
+
+def _july_days(first: int, last: int) -> list[datetime]:
+    edges = bucket_edges(
+        datetime(2026, 7, first, tzinfo=NY), datetime(2026, 7, last, 12, tzinfo=NY), "day", NY
+    )
+    return edges
+
+
+def test_a_long_pair_crossing_an_edge_reports_the_energy_it_drops() -> None:
+    # Readings stop at 22:00 and resume at 03:00 across midnight. The five
+    # hours span the edge, so the 7 kWh between them belongs to neither day —
+    # and it used to vanish. Both readings exist, so the amount is exact.
+    edges = _july_days(1, 2)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [
+        _reading(day1 + timedelta(hours=21), 100.0),
+        _reading(day1 + timedelta(hours=22), 102.0),
+        _reading(day1 + timedelta(hours=27), 109.0),
+        _reading(day1 + timedelta(hours=28), 110.0),
+    ]
+    got = attribute_energy(rows, edges)
+    assert len(got.dropped) == 1
+    span = got.dropped[0]
+    assert span.field == "load_kwh"
+    assert span.start == day1.astimezone(UTC) + timedelta(hours=22)
+    assert span.end == day1.astimezone(UTC) + timedelta(hours=27)
+    assert span.kwh == pytest.approx(7.0)
+    # And the buckets are exactly what bucket_totals says: the walk changed
+    # nothing about attribution, it only stopped discarding what it knew.
+    assert got.buckets == bucket_totals(rows, edges)
+
+
+def test_the_same_gap_inside_one_bucket_drops_nothing() -> None:
+    # The identical five-hour hole in the middle of one day: the counter delta
+    # spans it exactly, nothing is lost, so there is nothing to report.
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [
+        _reading(day1 + timedelta(hours=2), 100.0),
+        _reading(day1 + timedelta(hours=3), 101.0),
+        _reading(day1 + timedelta(hours=8), 108.0),
+        _reading(day1 + timedelta(hours=9), 109.0),
+    ]
+    got = attribute_energy(rows, edges)
+    assert got.dropped == ()
+
+
+def test_a_reset_inside_a_dropped_pair_reports_no_amount() -> None:
+    # The counter restarted somewhere inside a pair that also crosses the
+    # edge. What it held before the restart is gone, so the span carries no
+    # number — reporting the post-reset climb as "the missing energy" would
+    # understate it by the whole pre-reset stretch.
+    edges = _july_days(1, 2)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [
+        _reading(day1 + timedelta(hours=21), 100.0),
+        _reading(day1 + timedelta(hours=22), 102.0),
+        _reading(day1 + timedelta(hours=27), 3.0),
+        _reading(day1 + timedelta(hours=28), 4.0),
+    ]
+    got = attribute_energy(rows, edges)
+    assert len(got.dropped) == 1
+    assert got.dropped[0].kwh is None
+
+
+def test_a_reset_that_crosses_no_edge_is_still_reported() -> None:
+    # A firmware update at noon. The post-reset climb is attributed exactly as
+    # before, but the hour the counter restarted in lost an unknowable amount,
+    # and a money figure for the day has to be able to say so.
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [
+        _reading(day1 + timedelta(hours=11), 1000.0),
+        _reading(day1 + timedelta(hours=12), 0.5),
+        _reading(day1 + timedelta(hours=13), 1.5),
+    ]
+    got = attribute_energy(rows, edges)
+    assert len(got.dropped) == 1
+    span = got.dropped[0]
+    assert span.kwh is None
+    assert span.start == day1.astimezone(UTC) + timedelta(hours=11)
+    assert span.end == day1.astimezone(UTC) + timedelta(hours=12)
+    # Attribution itself is unchanged: the climb since the restart still counts.
+    assert got.buckets[0].totals["load_kwh"] == pytest.approx(1.5)
+
+
+def test_a_long_pair_straddling_the_final_edge_is_recorded_not_swallowed() -> None:
+    # Readings at 21:30 and 00:45 bracket the range's last midnight across a
+    # real outage — yet the walk used to skip the pair entirely, so the
+    # 21:30-to-midnight energy was in no bucket and no flag. The buckets must
+    # not move; the record is what money reads.
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [_reading(day1 + timedelta(hours=h), 100.0 + h) for h in range(22)]
+    rows.append(_reading(day1 + timedelta(hours=21, minutes=30), 121.5))
+    rows.append(_reading(day1 + timedelta(hours=24, minutes=45), 124.0))
+    got = attribute_energy(rows, edges)
+    assert len(got.dropped) == 1
+    span = got.dropped[0]
+    assert span.start == day1.astimezone(UTC) + timedelta(hours=21, minutes=30)
+    assert span.kwh == pytest.approx(2.5)
+    assert got.buckets == bucket_totals(rows, edges)
+
+
+def test_an_ordinary_pair_straddling_the_final_edge_records_nothing() -> None:
+    # Every historical range asked about while later data exists has some
+    # pair straddling its final edge — at the poll cadence, an eleven-second
+    # one. Recording those flagged the last day of perfectly clean months, so
+    # within the edge tolerance the straddle is accepted exactly as the first
+    # edge's carry-in is, and only a straddle wider than the gap tolerance is
+    # a record.
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [_reading(day1 + timedelta(hours=h), 100.0 + h) for h in range(24)]
+    rows.append(_reading(day1 + timedelta(hours=23, minutes=45), 123.75))
+    rows.append(_reading(day1 + timedelta(hours=24, minutes=15), 124.25))
+    got = attribute_energy(rows, edges)
+    assert got.dropped == ()
+    assert got.buckets[0].complete is True
+
+
+def test_a_pair_that_moved_no_energy_is_recorded_as_proof_not_loss() -> None:
+    # A five-hour outage across midnight during which the counter did not
+    # move: the counter is monotonic, so zero between the readings proves
+    # zero everywhere between them. The span is kept with its zero — dropping
+    # it entirely lost the very evidence that the stretch was accounted for,
+    # and downstream a band emptied by a flat gap was flagged though its
+    # figure was provably exact.
+    edges = _july_days(1, 2)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [
+        _reading(day1 + timedelta(hours=21), 100.0),
+        _reading(day1 + timedelta(hours=22), 100.0),
+        _reading(day1 + timedelta(hours=27), 100.0),
+        _reading(day1 + timedelta(hours=28), 100.5),
+    ]
+    got = attribute_energy(rows, edges)
+    assert len(got.dropped) == 1
+    assert got.dropped[0].kwh == 0.0
+
+
+def test_bounds_say_how_far_each_counter_actually_reached() -> None:
+    # Export stops answering at 04:00 while load carries on. No later export
+    # reading exists, so no pair does either — the bounds are the only
+    # evidence that the export figure covers four hours of a full day.
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows: list[dict[str, object]] = []
+    for hour in range(25):
+        row = _reading(day1 + timedelta(hours=hour), 100.0 + hour)
+        if hour <= 4:
+            row[EXPORT] = 50.0 + hour
+        rows.append(row)
+    got = attribute_energy(rows, edges)
+    assert got.bounds["load_kwh"] == (
+        day1.astimezone(UTC),
+        day1.astimezone(UTC) + timedelta(hours=24),
+    )
+    assert got.bounds["grid_exported_kwh"] == (
+        day1.astimezone(UTC),
+        day1.astimezone(UTC) + timedelta(hours=4),
+    )
+    assert "solar_kwh" not in got.bounds
+    assert got.dropped == ()
+
+
+def test_a_clean_day_drops_nothing_and_buckets_are_identical() -> None:
+    edges = _july_days(1, 1)
+    day1 = datetime(2026, 7, 1, tzinfo=NY)
+    rows = [_reading(day1 + timedelta(hours=h), 100.0 + h) for h in range(25)]
+    got = attribute_energy(rows, edges)
+    assert got.dropped == ()
+    assert got.buckets == bucket_totals(rows, edges)
+    assert got.buckets[0].complete is True
+    assert got.buckets[0].totals["load_kwh"] == pytest.approx(24.0)
 
 
 # --- timezone resolution ------------------------------------------------------

@@ -7,6 +7,27 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.1 — 7 August 2026
+
+### Fixed
+
+- **A money figure is never again presented as whole when it is not**
+  ([#23](https://github.com/sjordan0228/arraysense/issues/23)). A gap in
+  collection that crossed a rate-band boundary used to price silently short —
+  reproduced at cost 9% low and the savings figure following it — and a
+  counter that went quiet while polls continued dashed the whole month, losing
+  even the days that were measured. The lifetime counters bracket every such
+  hole, so the energy that could not be placed in a band is now counted
+  exactly, carried to the pages, and said out loud: the Costs cards and the
+  History money cells show the measured figure with a label naming the
+  kilowatt-hours it is missing, and the estimated bill both corrects its
+  projection by that energy and says it did. A gap that crosses no band
+  boundary costs nothing and is deliberately not labelled — the counters span
+  it exactly. Dashes remain only where nothing attributable was measured, and
+  a dash beside counted-but-unplaceable energy now says so. The energy
+  columns are untouched: a gap inside a day never cost them anything, and a
+  day an outage crossed into already wore its partial badge.
+
 ## 0.5.0 — 7 August 2026
 
 **First beta.** The reference installation has been running on this exclusively

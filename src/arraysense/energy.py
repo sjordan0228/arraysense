@@ -129,6 +129,49 @@ _FALLBACK_TIERS: Mapping[Period, tuple[str, ...]] = {
 
 
 @dataclass(frozen=True)
+class DroppedSpan:
+    """One stretch of a counter's climb that no bucket could take.
+
+    ``start`` and ``end`` are the readings either side of the stretch, so the
+    span is real measurement, not inference. ``kwh`` is the climb between
+    them where the counter behaved, and None where it reset or stepped
+    backwards inside the span — the pre-reset energy is unknowable, and
+    reporting the post-reset climb as "the missing amount" would understate
+    it by everything the counter held before the restart.
+
+    The field is the bucket-total key from ``ENERGY_FIELDS``, not the metric
+    name, because that is the vocabulary everything downstream of a bucket
+    already speaks.
+    """
+
+    field: str
+    start: datetime
+    end: datetime
+    kwh: float | None
+
+
+@dataclass(frozen=True)
+class EnergyAttribution:
+    """What one walk of the counters attributed, and what it could not.
+
+    The buckets are exactly ``bucket_totals``'s — attribution does not move.
+    ``dropped`` is what used to be discarded: pairs too far apart across an
+    edge to place, resets, and the pair straddling the final edge that the
+    walk previously skipped without record. ``bounds`` is each counter's
+    first and last reading, the only evidence of a counter that went quiet
+    and never came back, since no pair exists past its last answer.
+
+    Money is why this exists (#23): a cost priced from the buckets alone is
+    short by every dropped span, and it was presented as whole because
+    nothing carried what the walk knew it had dropped.
+    """
+
+    buckets: list[EnergyBucket]
+    dropped: tuple[DroppedSpan, ...]
+    bounds: Mapping[str, tuple[datetime, datetime]]
+
+
+@dataclass(frozen=True)
 class EnergyBucket:
     """One calendar day or month, and the energy that passed through it.
 
@@ -333,6 +376,20 @@ def bucket_totals(
 ) -> list[EnergyBucket]:
     """Total each bucket's energy from counter readings, oldest bucket first.
 
+    The buckets from ``attribute_energy``, for the caller that wants no more —
+    the energy tables and charts, whose completeness question ``complete``
+    already answers. Money wants the rest; see ``EnergyAttribution``.
+    """
+    return attribute_energy(rows, edges, max_gap).buckets
+
+
+def attribute_energy(
+    rows: Sequence[Mapping[str, object]],
+    edges: Sequence[datetime],
+    max_gap: timedelta = MAX_EDGE_GAP,
+) -> EnergyAttribution:
+    """Attribute every counter's climb to buckets, and account for what cannot be.
+
     Every consecutive pair of readings of one counter is one interval of
     energy, credited to the bucket the interval *ends* in — the bucket holding
     the instant just before the later reading, so a reading exactly at midnight
@@ -347,7 +404,17 @@ def bucket_totals(
     one thing that cannot be attributed: the energy is real, but which side of
     midnight it happened on is not knowable. It is credited to neither bucket
     and both are marked incomplete, which is the difference between a day that
-    reads low and a day that reads like the outage never happened.
+    reads low and a day that reads like the outage never happened. What is new
+    here is that the pair is *recorded* rather than discarded — both readings
+    exist, so the amount that went unplaced is exact, and it is precisely what
+    a money figure priced from these buckets is short by. A reset is recorded
+    the same way with no amount, and so is the pair straddling the final edge,
+    which the walk previously skipped without a trace: its bucket could read
+    complete while the last stretch of the range sat in no bucket at all.
+
+    Attribution itself is unchanged by any of the recording, deliberately —
+    the History page's energy columns render these buckets, and #23 is about
+    the money, not about them.
 
     ``rows`` carry a ``timestamp`` and whichever of the counters named in
     ``ENERGY_FIELDS`` were reported; each counter is followed independently, so
@@ -356,11 +423,12 @@ def bucket_totals(
     of the result rather than returned as zero.
     """
     if len(edges) < 2:
-        return []
+        return EnergyAttribution(buckets=[], dropped=(), bounds={})
     ordered = sorted(rows, key=_row_time)
     count = len(edges) - 1
     totals: list[dict[str, float | None]] = [dict.fromkeys(ENERGY_FIELDS) for _ in range(count)]
     lost = [False] * count
+    dropped: list[DroppedSpan] = []
     series, moments = _counter_series(ordered)
 
     for field in ENERGY_FIELDS:
@@ -376,6 +444,19 @@ def bucket_totals(
                 passed += 1
             index = passed - 1
             if not 0 <= index < count:
+                # A pair ending past the final edge still began before it when
+                # ``before`` says so, and the stretch up to that edge belongs
+                # to the range. Skipping it silently left the last bucket
+                # short with no flag anywhere. Recorded — attributed nowhere,
+                # exactly because where the energy fell is unknown — but only
+                # beyond ``max_gap``: an ordinary cadence-width pair straddles
+                # this edge on every historical range ever asked about while
+                # later data exists, and recording those flagged the last day
+                # of perfectly clean months. Within the tolerance this edge
+                # loses at most what the first edge carries in, and both are
+                # accepted for the same reason.
+                if index == count and before < edges[-1] and after - before > max_gap:
+                    dropped.append(_span(field, before, previous, after, current))
                 continue
             # An interval that stays inside one bucket is attributable however
             # long it is; one that crosses a boundary is only attributable if
@@ -386,15 +467,20 @@ def bucket_totals(
             # measured day, not a lost one.
             if before < edges[index] and after - before > max_gap:
                 lost[index] = True
+                dropped.append(_span(field, before, previous, after, current))
                 continue
             energy, incomplete = _delta(previous, current)
             lost[index] = lost[index] or incomplete
+            if incomplete:
+                # A reset or backstep loses an unknowable amount wherever it
+                # happens; the post-reset climb below still counts, as ever.
+                dropped.append(DroppedSpan(field=field, start=before, end=after, kwh=None))
             if energy is None:
                 continue
             running = totals[index][field]
             totals[index][field] = energy if running is None else running + energy
 
-    return [
+    buckets = [
         EnergyBucket(
             start=edges[index],
             end=edges[index + 1],
@@ -411,6 +497,42 @@ def bucket_totals(
         for index in range(count)
         if any(value is not None for value in totals[index].values())
     ]
+    return EnergyAttribution(
+        buckets=buckets,
+        dropped=tuple(dropped),
+        bounds={
+            field: (readings[0][0], readings[-1][0])
+            for field, readings in series.items()
+            if readings
+        },
+    )
+
+
+def _span(
+    field: str, before: datetime, previous: float, after: datetime, current: float
+) -> DroppedSpan:
+    """Record one unattributable pair, with its energy only if the counter behaved.
+
+    Not ``_delta``: that returns the post-reset climb for a reset, which is
+    real energy for a bucket and the wrong number for a span — the span's
+    question is how much passed between the two readings, and across a reset
+    that includes everything the counter held before restarting, which is
+    unknowable.
+
+    A pair whose delta is exactly zero is recorded with ``kwh`` 0.0 and is
+    evidence rather than loss: the counter is monotonic, so zero between the
+    readings proves zero everywhere between them. Dropping such pairs
+    entirely lost that proof — a band emptied by a flat stretch could no
+    longer show its energy was accounted for, and exact figures were flagged.
+    The shortfall arithmetic treats a zero span as pure coverage: it adds
+    nothing and can never raise a flag.
+    """
+    return DroppedSpan(
+        field=field,
+        start=before,
+        end=after,
+        kwh=current - previous if current >= previous else None,
+    )
 
 
 def _row_time(row: Mapping[str, object]) -> datetime:

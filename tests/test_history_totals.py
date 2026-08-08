@@ -44,8 +44,20 @@ AUGUST = datetime(2026, 8, 1, tzinfo=CHICAGO)
 FIXED_MONTHLY = 15.0
 
 
-def _counters(store: SqliteStore, first: datetime, last: datetime, skip: Any = None) -> None:
-    """Hourly lifetime counters climbing between two instants."""
+def _counters(
+    store: SqliteStore,
+    first: datetime,
+    last: datetime,
+    skip: Any = None,
+    import_skip: Any = None,
+) -> None:
+    """Hourly lifetime counters climbing between two instants.
+
+    ``skip`` drops whole rows — a poll gap. ``import_skip`` drops only the
+    import counter from a row that otherwise reports, which is the register
+    going quiet while polls continue: the shape minute-based coverage cannot
+    see (#23).
+    """
     when = first
     imported, load = 1000.0, 4000.0
     while when < last:
@@ -53,16 +65,13 @@ def _counters(store: SqliteStore, first: datetime, last: datetime, skip: Any = N
         imported += 2.5 if peak else 0.8
         load += 4.0 if peak else 1.5
         if skip is None or not skip(when):
-            store.append(
-                Sample(
-                    timestamp=when,
-                    readings={
-                        "grid_import_energy_total_kwh": round(imported, 1),
-                        "load_energy_total_kwh": round(load, 1),
-                        "grid_export_energy_total_kwh": 5.0,
-                    },
-                )
-            )
+            readings: dict[str, float] = {
+                "load_energy_total_kwh": round(load, 1),
+                "grid_export_energy_total_kwh": 5.0,
+            }
+            if import_skip is None or not import_skip(when):
+                readings["grid_import_energy_total_kwh"] = round(imported, 1)
+            store.append(Sample(timestamp=when, readings=readings))
         when += timedelta(hours=1)
 
 
@@ -132,14 +141,14 @@ def test_the_total_of_the_days_is_the_month_priced_once(tmp_path: Path) -> None:
     assert sum(b["cost"] for b in daily["buckets"] if b["cost"] is not None) < month["cost"]
 
 
-def test_a_month_with_an_unpriced_day_still_owes_the_whole_connection_charge(
+def test_a_month_with_a_short_day_still_owes_the_whole_connection_charge(
     tmp_path: Path,
 ) -> None:
-    # The collector was down across the peak window on the 15th, so that day's
-    # energy costs an amount nobody can state and is left out of the energy
-    # total. The connection charge is not energy. It is owed for being
-    # connected, not for being observed, and the supplier bills the whole
-    # fifteen dollars for a July whether or not anybody watched the 15th.
+    # The collector was down across the peak window on the 15th, so that day
+    # prices its measured part and is flagged (#23). The connection charge is
+    # not energy either way: it is owed for being connected, not for being
+    # observed, and the supplier bills the whole fifteen dollars for a July
+    # whether or not anybody watched the 15th.
     def build(store: SqliteStore) -> None:
         _counters(
             store,
@@ -153,7 +162,11 @@ def test_a_month_with_an_unpriced_day_still_owes_the_whole_connection_charge(
     with _client(tmp_path, build) as c:
         body = _july(c, period="day", priced=True)
     priced = [b for b in body["buckets"] if b["cost"] is not None]
-    assert len(priced) == 30
+    # All thirty-one price now — the 15th as a flagged partial (#23) — and the
+    # charge was never in doubt either way.
+    assert len(priced) == 31
+    by_day = {b["start"][:10]: b for b in body["buckets"]}
+    assert by_day["2026-07-15"]["cost_short"] is True
     totals = body["totals"]
     assert totals["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
     # Each figure is rounded once from unrounded inputs, so the two parts can
@@ -161,9 +174,11 @@ def test_a_month_with_an_unpriced_day_still_owes_the_whole_connection_charge(
     # opposite habit, rounding first and adding after, that this fixes.
     parts = totals["energy_cost"] + totals["fixed_charge"]
     assert totals["cost"] == pytest.approx(parts, abs=0.02)
-    # Still the energy of thirty days, and still above the rounded column it
-    # replaces: each row lost a fraction of a cent of connection charge.
+    # Still above the rounded column it replaces: each row lost a fraction of
+    # a cent of connection charge. And the footer says what its rows say —
+    # one of them is short, so the total is too.
     assert totals["cost"] > sum(b["cost"] for b in priced)
+    assert totals["cost_short"] is True
 
 
 def test_a_whole_month_of_february_owes_the_same_charge_as_a_whole_july(
@@ -210,11 +225,15 @@ def test_a_day_nothing_was_recorded_for_at_all_does_not_discount_the_charge(
     assert body["totals"]["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
 
 
-def test_a_period_nothing_could_be_priced_in_has_no_total_rather_than_zero(
+def test_a_month_of_daily_gaps_prices_every_day_flagged_rather_than_dashing(
     tmp_path: Path,
 ) -> None:
-    # Every day unpriced is not a free month. The footer draws a dash from this
-    # and never a currency symbol in front of nothing.
+    # Seven hours lost across the peak window every single day — the shape a
+    # daily yield session makes. The old rule dashed the entire month, which
+    # is the attempt-one behaviour the owner rejected in #23: thirty-one real
+    # off-peak figures withheld because their peak hours were not watched.
+    # Every day prices its measured part, every day says it is short, and the
+    # footer says the same because its rows do.
     def build(store: SqliteStore) -> None:
         _counters(
             store,
@@ -225,11 +244,40 @@ def test_a_period_nothing_could_be_priced_in_has_no_total_rather_than_zero(
 
     with _client(tmp_path, build) as c:
         body = _july(c, period="day", priced=True)
-    assert all(b["cost"] is None for b in body["buckets"])
-    assert body["totals"]["cost"] is None
-    assert body["totals"]["energy_cost"] is None
-    assert body["totals"]["fixed_charge"] is None
-    assert body["totals"]["saved"] is None
+    assert all(b["cost"] is not None for b in body["buckets"])
+    assert all(b["cost_short"] is True for b in body["buckets"])
+    totals = body["totals"]
+    assert totals["cost"] is not None
+    assert totals["cost_short"] is True
+    assert totals["saved_short"] is True
+    assert totals["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
+
+
+def test_a_day_whose_money_is_a_dash_still_reaches_the_footers_disclosure(
+    tmp_path: Path,
+) -> None:
+    # The import register says nothing at all on the 15th while polls carry
+    # on. That day's cost is a dash — nothing of its import is attributable —
+    # so it is excluded from the money totals, and a footer that merged only
+    # the priced rows read clean over a month verifiably missing energy. The
+    # totals still price, and their flags carry the dashed day's accounting.
+    def build(store: SqliteStore) -> None:
+        _counters(
+            store,
+            JULY - timedelta(hours=2),
+            AUGUST,
+            import_skip=lambda w: w.astimezone(CHICAGO).day == 15,
+        )
+
+    with _client(tmp_path, build) as c:
+        body = _july(c, period="day", priced=True)
+    by_day = {b["start"][:10]: b for b in body["buckets"]}
+    assert by_day["2026-07-15"]["cost"] is None
+    assert by_day["2026-07-15"]["shortfall"]["grid_import"]["unknowable"] is True
+    totals = body["totals"]
+    assert totals["cost"] is not None
+    assert totals["cost_short"] is True
+    assert totals["saved_short"] is True
 
 
 def test_an_install_with_no_tariff_is_told_no_total_at_all(tmp_path: Path) -> None:
