@@ -5,6 +5,7 @@ Replace nothing here — add real tests alongside it as features land.
 """
 
 import importlib
+import re
 from pathlib import Path
 
 import pytest
@@ -79,10 +80,60 @@ def test_the_measured_battery_colours_are_pinned_in_common_js() -> None:
     common = (
         Path(__file__).resolve().parents[1] / "src" / "arraysense" / "web" / "common.js"
     ).read_text()
-    root = common.split(":root{", 1)[-1].split("}", 1)[0]
-    assert "--batt:#2aa198" in root, "the shipped :root palette no longer declares --batt"
-    assert "--batt-dis:#d1495b" in root, "the shipped :root palette no longer declares --batt-dis"
+    # Parsed rather than searched for a literal, and not by splitting on ":root{"
+    # — the stylesheet writes ":root {" with a space, so that split silently
+    # matched nothing and fell through to the whole file.
+    declared = dict(re.findall(r"(--[a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{6})", common))
+    assert declared.get("--batt") == "#2aa198", "the shipped palette no longer declares --batt"
+    assert declared.get("--batt-dis") == "#d1495b", (
+        "the shipped palette no longer declares --batt-dis"
+    )
     fallback = common.split("INK_FALLBACK", 1)[-1].split("};", 1)[0]
     assert "'--batt':'#2aa198'" in fallback and "'--batt-dis':'#d1495b'" in fallback, (
         "INK_FALLBACK has drifted from the :root palette it stands in for"
+    )
+
+
+def _web(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "src" / "arraysense" / "web" / name).read_text()
+
+
+_CHART_HUES = {
+    "--pv": "#cf7b26",
+    "--load": "#4678cc",
+    "--batt": "#2aa198",
+    "--grid": "#b0486e",
+    "--batt-dis": "#d1495b",
+}
+
+
+def test_the_power_flow_chart_fills_only_the_grid_series() -> None:
+    # Band shading is drawn behind the series, and it cannot be read under two
+    # competing area fills — on a sunny day the solar area covers most of the
+    # plot. Grid keeps its fill for a reason recorded beside gridFill: when the
+    # house runs on the grid, import equals house load to the watt, so a grid
+    # *line* lies exactly under the home line and vanishes beneath it. Solar has
+    # no such coincidence, so as a line it stays legible.
+    page = _web("index.html")
+    assert "gridFill" in page, "grid lost the fill that stops it vanishing under home"
+    assert "pvFill" not in page, "solar is still filled, so shading cannot be read beneath it"
+
+
+def test_pv_fill_is_kept_available_even_though_unused() -> None:
+    # Removed from the chart, not deleted from the codebase: the volume reading
+    # it gave is a real if minor loss and may be wanted back.
+    assert "function pvFill" in _web("common.js")
+
+
+def test_band_shading_adds_no_colour_to_the_palette() -> None:
+    # The whole point of shading by luminance rather than hue. The owner is
+    # colour blind and every hue has to be measured against every other, so a
+    # band that needed its own colour would be a hue nobody checked — and a
+    # tariff has as many bands as it likes, which two colours could never say.
+    declared = dict(re.findall(r"(--[a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{6})", _web("common.js")))
+    assert {k: v for k, v in declared.items() if k in _CHART_HUES} == _CHART_HUES, (
+        f"the chart palette changed; band shading must add no hue. found {declared}"
+    )
+    assert not [k for k in declared if k.startswith("--band")], (
+        "a per-band colour was added; shading must vary opacity, not hue"
     )

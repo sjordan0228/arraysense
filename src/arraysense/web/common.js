@@ -930,6 +930,84 @@ const zeroRule = () => ({
   },
 });
 
+// Band shading plugin. Draws tariff band windows as background shading, varying
+// opacity only — no new hue. The maintainer is colour blind and every hue has to
+// be measured against every other, so a band with its own colour would be one
+// nobody checked; a tariff also has as many bands as it likes, which two colours
+// could never say. Luminance carries it instead, and luminance is the one
+// distinction that survives every form of colour vision deficiency.
+//
+// The wash is white on a dark panel, so more opacity reads *brighter*. The
+// dearer the band, the more it stands out, which puts the eye on the costly
+// hours. The legend says "brighter is dearer" for that reason and the two must
+// not drift apart.
+//
+// ``getWindows`` is a function, not an array, and that is load-bearing. ``paint``
+// builds a chart once and afterwards only calls ``setData`` on it, so a plugin
+// rebuilt with fresh windows on a later draw is discarded — the chart keeps the
+// plugin it was constructed with. Closing over an array therefore froze the
+// shading at whatever range was drawn first: switching from 24 hours to 30 days
+// left twenty-nine of those days shaded from yesterday's windows, while the
+// legend beside it described the new ones. Reading through a function means the
+// one long-lived plugin always paints what was last fetched.
+//
+// Windows are handed in rather than fetched here because drawing is synchronous.
+// No shading at all when there are none; absent data is not zero.
+function bandShade(getWindows) {
+  const scale = (windows) => {
+    const prices = [...new Set(windows.map((w) => w.price_per_kwh))]
+      .filter((p) => p !== null && p !== undefined)
+      .sort((a, b) => a - b);
+    const out = {};
+    // Cheapest barely there, dearest clearly visible. Spread across however many
+    // distinct prices there are rather than capped at a fixed number of steps: a
+    // tariff may have four bands, and clamping would give the top two the same
+    // shade and quietly say they cost the same.
+    const LOW = 0.04;
+    const HIGH = 0.18;
+    const last = prices.length - 1;
+    prices.forEach((p, i) => {
+      out[p] = last <= 0 ? HIGH : LOW + ((HIGH - LOW) * i) / last;
+    });
+    return out;
+  };
+
+  return {
+    hooks: {
+      drawAxes: (u) => {
+        const windows = getWindows();
+        if (!windows || !windows.length) return;
+        const opacities = scale(windows);
+        const { left, top, width, height } = u.bbox;
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, width, height);
+        ctx.clip();
+
+        for (const w of windows) {
+          // A stretch no band covers comes back with a null band and no price —
+          // the endpoint returns it rather than dropping it, so unpriced energy
+          // shows up instead of quietly vanishing. It must not be shaded: any
+          // wash here would read as a band, and a middling one would read as a
+          // middling rate. Absent is absent, so it is left plain.
+          const opacity = opacities[w.price_per_kwh];
+          if (opacity === undefined) continue;
+
+          const x0 = Math.max(left, u.valToPos(new Date(w.start).getTime() / 1000, 'x', true));
+          const x1 = Math.min(left + width, u.valToPos(new Date(w.end).getTime() / 1000, 'x', true));
+          if (x1 <= x0) continue;
+
+          ctx.fillStyle = `rgba(255,255,255,${opacity})`;
+          ctx.fillRect(x0, top, x1 - x0, height);
+        }
+
+        ctx.restore();
+      },
+    },
+  };
+}
+
 // Which chart the pointer is on, if any. One variable rather than a flag per
 // chart, because the question is which chart owns the readout: the synced
 // crosshair is what puts the same instant on the others, and three tooltips
@@ -1007,8 +1085,13 @@ const trace = (label, name, width, extra) => Object.assign({
 // answers the reverse. A hidden series takes no part in ranging its scale.
 const carried = () => ({ show: false, scale: 'y', spanGaps: false });
 
-// Solar is what the array harvested, so it reads as volume rather than as a
-// line. Filled to the zero line rather than to the floor of the chart, or a
+// Kept, and no longer used on the Power flow chart. Solar read as volume there
+// rather than as a line, which was the better picture of a harvest — but two
+// area fills leave no room for the tariff shading behind them, and on a sunny
+// day this one covers most of the plot. Grid keeps its fill because a grid line
+// vanishes under the home line; solar has no such problem, so solar gave way.
+// Left defined because the volume reading is a real if minor loss and may be
+// wanted back. Filled to the zero line rather than the floor of the chart, or a
 // negative axis would put the fill on the wrong side of nothing.
 function pvFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
@@ -1017,7 +1100,7 @@ function pvFill(u) {
   return grad;
 }
 
-// Grid import is filled for the same reason solar is, and for one more: when
+// Grid import is filled, and it is now the only series here that is. When
 // the house runs on the grid, import *equals* house load to the watt, so a grid
 // line lies exactly under the home line and vanishes beneath it. An area cannot
 // vanish that way — the body of it shows below the coincident line even where
