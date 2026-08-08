@@ -263,6 +263,11 @@ const KINDS = {
   power: { unit: 'W', fmt: kw, range: aroundZero, values: wattTicks },
   current: { unit: 'A', fmt: (v) => uStr(v, 1, 'A'), range: aroundZero, values: plain },
   voltage: { unit: 'V', fmt: (v) => uStr(v, 1, 'V'), range: level, values: plain },
+  // A spread is a distance between packs, so zero is the meaningful floor and
+  // has to stay on the axis: a bank in perfect agreement must read as sitting
+  // on the line rather than filling the band with its own noise.
+  socSpread: { unit: 'pts', fmt: (v) => gnum(v, 1) + ' pts', range: aroundZero, values: plain },
+  mvSpread: { unit: 'mV', fmt: (v) => gnum(v, 0) + ' mV', range: aroundZero, values: plain },
   freq: { unit: 'Hz', fmt: (v) => uStr(v, 2, 'Hz'), range: level, values: hzTicks },
   // Readings are stored in Celsius because that is what the hardware reports.
   // The conversion happens once, on the way into the chart, so the axis and the
@@ -338,6 +343,20 @@ const BANDS = [
   // will read higher than most of them.
   { sec: 'battery', id: 'bankTemp', metric: 'battery_temperature_c',
     label: 'Bank temperature, hottest cell', kind: 'temp', ink: '--batt' },
+  // The two spreads. Not bank registers at all — they are derived across the
+  // packs, which is why they carry `derived` and are painted from the module
+  // endpoint rather than the inverter one. They are the pair calibration.py
+  // reasons about, drawn over time instead of only for this instant: charge
+  // spread is fuel gauges disagreeing, which is drift and recovers on a full
+  // charge, while voltage spread is the same packs disagreeing about a
+  // quantity parallel wiring physically forces them to share, which is
+  // resistance somewhere it should not be. Reading them side by side is the
+  // whole diagnosis — a bank that drifts with its voltages locked together is
+  // healthy, and the same drift with the voltages apart is not.
+  { sec: 'battery', id: 'socSpread', derived: 'soc_pct', label: 'Charge spread across packs',
+    source: 'max − min of soc_pct', kind: 'socSpread', ink: '--batt' },
+  { sec: 'battery', id: 'voltSpread', derived: 'voltage_v', label: 'Voltage spread across packs',
+    source: 'max − min of voltage_v', kind: 'mvSpread', ink: '--batt', scale: 1000 },
 
   // --- AC ------------------------------------------------------------------
   { sec: 'ac', id: 'loadP', metric: 'load_power_w', label: 'Load power, total',
@@ -420,7 +439,14 @@ const PACK_LINES = [
   { metric: 'temperature_c', label: 'Pack temperature', carry: true },
 ];
 
-const PACK_METRICS = PACK_LINES.map((l) => l.metric).join(',');
+// What the module endpoint is asked for: the per-pack temperature lines, plus
+// whatever the derived spread bands need. Assembled from the two declarations
+// rather than written out, so adding a spread band cannot leave its own metric
+// unfetched — which fails silently as an empty chart rather than as an error.
+const PACK_METRICS = [...new Set([
+  ...PACK_LINES.map((l) => l.metric),
+  ...BANDS.filter((b) => b.derived).map((b) => b.derived),
+])].join(',');
 
 // The pack bands are built from whatever serials the store answers with, so
 // they cannot be listed above. Modules are identified by serial and never by
@@ -530,7 +556,54 @@ function valuesFor(b, f) {
 function drawInverter(body) {
   if (!body) return;
   const f = frame(body.points || []);
-  for (const b of BANDS) paintBand(b, f.xs, [valuesFor(b, f)]);
+  // The spread bands sit in this section but are not inverter registers; they
+  // are painted from the module endpoint by drawSpreads.
+  for (const b of BANDS) if (!b.derived) paintBand(b, f.xs, [valuesFor(b, f)]);
+}
+
+// One spread series: the distance between the highest and lowest pack at each
+// instant, and null wherever that distance cannot be measured.
+//
+// The null rule is the whole of this function. A spread taken across only the
+// packs that happened to answer is a spread that never existed — calibration.py
+// refuses the same comparison for the same reason, because a pack that stopped
+// reporting an hour ago at 53.50 V against a live 53.80 V is 300 mV of nothing
+// and would send the owner after a lug over a battery that is merely quiet.
+// So a timestamp is measured only when every known pack reported a number
+// there; anything less is a hole in the line, which is what absence looks like
+// everywhere else on this page.
+//
+// One pack is a special case worth being explicit about: a bank of one has
+// nothing to disagree with, so its spread is a constant zero rather than a
+// measurement, and drawing that would invite reading agreement into a chart
+// that is only counting to one. It comes back empty instead.
+function spreadOf(points, serials, metric, scale) {
+  if (serials.length < 2) return { xs: [], values: [] };
+  const at = new Map();
+  for (const p of points) {
+    const t = Date.parse(p && p.timestamp);
+    if (!Number.isFinite(t) || !serials.includes(p.serial)) continue;
+    const v = numOrNull(p[metric]);
+    if (!at.has(t / 1000)) at.set(t / 1000, new Map());
+    if (v !== null) at.get(t / 1000).set(p.serial, v);
+  }
+  const xs = [...at.keys()].sort((a, b) => a - b);
+  const values = xs.map((t) => {
+    const seen = at.get(t);
+    if (seen.size !== serials.length) return null;
+    const vs = [...seen.values()];
+    return (Math.max(...vs) - Math.min(...vs)) * (scale || 1);
+  });
+  return { xs, values };
+}
+
+function drawSpreads(points, serials) {
+  for (const b of BANDS) {
+    if (!b.derived) continue;
+    const s = spreadOf(points, serials, b.derived, b.scale);
+    if (!s.xs.length) { chartMessage(b.id, 'needs two or more packs reporting'); continue; }
+    paintBand(b, s.xs, [s.values]);
+  }
 }
 
 // Per-pack rows are one stream with the packs interleaved — a row per pack per
@@ -605,6 +678,11 @@ function drawPacks(body) {
     // bands, and the reason a silent pack cannot arrive on the axis at zero.
     paintBand(b, series.xs, raw.map((col) => col.map(tempOf)));
   });
+  // The spreads are drawn from the same rows, up in the Battery section: they
+  // are a property of the bank rather than of any one pack, so they belong
+  // beside the bank's own state of charge and voltage and not among the
+  // per-pack bands.
+  drawSpreads(points, serials);
 }
 
 // ---------------------------------------------------------------------------
