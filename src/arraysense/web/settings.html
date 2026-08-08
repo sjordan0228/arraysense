@@ -559,10 +559,27 @@ function writeMonths(months) {
   return [...months].sort((a, b) => a - b).map((m) => MONTH_ABBR[m - 1]).join(',');
 }
 
+// Characters that mean something to the format itself: a pipe separates the
+// fields of a band and a semicolon or a newline separates one band from the
+// next. A name holding any of them does not produce a band with a funny name —
+// it produces a DIFFERENT SET OF BANDS. Naming a band "Cheap | 0.10 |
+// 00:00-16:00; Peak" composes text the service reads as two bands, one of them
+// priced at a rate the owner never typed, while this editor goes on showing one.
+// The service cannot catch it: the result is a perfectly valid tariff.
+//
+// So they are dropped here, at the point of serialisation, and said out loud
+// beside the name. This is not the page judging whether a tariff is valid —
+// that is still the service's alone. It is the page refusing to corrupt its own
+// serialisation, which is the one thing the service has no way to check.
+const DELIMITERS = /[|;\n\r]/g;
+
+const nameHasDelimiter = (name) => /[|;\n\r]/.test(name);
+
 function writeBand(band) {
   const hours = band.ranges.map((r) => `${HHMM(r.s)}-${HHMM(r.e)}`).join(', ');
   const season = writeMonths(band.months);
-  return [band.name, band.price, hours].concat(season ? [season] : []).join(' | ');
+  const name = band.name.replace(DELIMITERS, ' ').replace(/\s+/g, ' ').trim();
+  return [name, band.price, hours].concat(season ? [season] : []).join(' | ');
 }
 
 // A range the two dropdowns can be set to and the service will not take. The
@@ -806,6 +823,11 @@ function bandMarkup(item, index) {
     <p class="bandnote warn" data-role="dead" hidden>Every hour this band covers is already
       taken by a band above it, so nothing is ever priced at this rate. The bands are read in
       order and the first one that matches wins. This will still be saved.</p>
+    <p class="bandnote warn" data-role="delim" hidden>A band name cannot hold
+      <code>|</code>, <code>;</code> or a line break: those are what separate one band from
+      the next and one field from the next, so a name containing them would be stored as a
+      different set of bands than the one shown here. They are dropped from the name when it
+      is saved.</p>
     <div class="bandacts">
       <button type="button" class="iconbtn" data-role="drop">Remove this band</button>
     </div>
@@ -832,6 +854,13 @@ function markShadowed() {
   host.querySelectorAll('.band').forEach((el) => {
     const note = el.querySelector('[data-role="dead"]');
     if (note) note.hidden = !dead.has(Number(el.dataset.i));
+    // Said where the name is typed rather than after a save, because what is
+    // stored differs from what is on screen and nothing downstream can tell.
+    const delim = el.querySelector('[data-role="delim"]');
+    const item = bandState.items[Number(el.dataset.i)];
+    if (delim) {
+      delim.hidden = !(item && item.type !== 'raw' && nameHasDelimiter(item.name));
+    }
   });
 }
 

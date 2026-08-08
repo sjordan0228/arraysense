@@ -159,6 +159,7 @@ const currencyNow = () => '$';
 const api = new Function('esc', 'currencyNow', SOURCE + `
   ; return {
       bandItems, composeBands, bandMarkup, nextRange, newBand, toggleMonth, shadowedBands,
+      nameHasDelimiter,
       DAY_END, get state() { return bandState; }, set state(v) { bandState = v; },
     };`)(esc, currencyNow);
 
@@ -238,7 +239,26 @@ for (const text of JOB.texts) {
 const seeds = [];
 for (let e = 1; e <= api.DAY_END; e += 1) seeds.push(api.nextRange([{ s: 0, e }]));
 
-process.stdout.write(JSON.stringify({ tariffs: out, seeds, dayEnd: api.DAY_END }));
+// A name holding a delimiter does not make a band with a funny name, it makes
+// a different set of bands — and the service cannot tell, because what comes
+// out is a valid tariff. Composed here so the test can hand it to parse_bands.
+const injected = [];
+[
+  'Cheap | 0.10 | 00:00-16:00; Peak',
+  ';Peak',
+  'Peak | Summer',
+  'Peak' + String.fromCharCode(10) + 'Off',
+].forEach((name) => {
+  const one = load('Peak | 0.34 | 16:00-21:00');
+  one.items[0].name = name;
+  one.items[0].dirty = true;
+  one.changed = true;
+  injected.push({ name, text: api.composeBands(), flagged: api.nameHasDelimiter(name) });
+});
+
+process.stdout.write(JSON.stringify({
+  tariffs: out, seeds, dayEnd: api.DAY_END, injected,
+}));
 """
 
 
@@ -484,3 +504,22 @@ def test_the_click_handlers_decide_nothing_for_themselves() -> None:
         assert done_by_hand not in wiring, done_by_hand
     for named in ("nextRange(item.ranges)", "newBand()", "toggleMonth(", "monthOn("):
         assert named in wiring, named
+
+
+def test_a_band_name_cannot_restructure_the_tariff(report: dict[str, Any]) -> None:
+    # The defect the panel missed and codex found. A semicolon in a name is not
+    # a badly-named band: the service reads it as a band separator, so the text
+    # composed from ONE row on screen parses into two bands, one of them priced
+    # at a rate nobody typed. Nothing downstream can catch it, because what the
+    # service receives is a perfectly valid tariff.
+    for case in report["injected"]:
+        composed = case["text"]
+        bands = parse_bands(composed)
+        assert len(bands) == 1, (
+            f"name {case['name']!r} composed {composed!r}, which the service reads as "
+            f"{len(bands)} bands: {[b.name for b in bands]}"
+        )
+        assert bands[0].price_per_kwh == 0.34, case
+        # And the owner is told, rather than having the name silently changed
+        # under them.
+        assert case["flagged"] is True, case
