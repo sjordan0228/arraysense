@@ -4,41 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Solar ArraySense</title>
+<!-- uPlot is vendored and served from this app, never fetched from a CDN. The
+     collector runs on a home network that may have no route to the internet at
+     all, and a chart library that silently fails to load is a blank panel with
+     nothing on screen to say why. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<script src="/vendor/uPlot.iife.min.js"></script>
+<!-- The shared front end — palette, formatters, nav and the chart factory. It
+     injects the base stylesheet as it runs, so it has to load above this page's
+     own <style>: the page's rules then come second in the cascade and win. -->
+<script src="/common.js"></script>
 <style>
-  :root {
-    /* Validated against protanopia, deuteranopia and tritanopia across every
-       pair, not just adjacent ones — the previous grid violet and home blue sat
-       ΔE 1.9 apart under protan, which is indistinguishable, and 9.8 apart even
-       with full colour vision. These four are worst-pair ΔE 9.0 under CVD and
-       16.1 with normal vision, against this panel's own surface.
-       Charge and discharge deliberately share one hue: they are one series with
-       a sign, separated by the zero line, and position carries that far better
-       than a fifth colour could. */
-    --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
-    --batt-dis:#14625f;
-    --ink:#fff; --ink2:#c8cbd9; --ink3:#8d92a8;
-    --grid-line:rgba(255,255,255,.08);
-    --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
-    --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
-  }
-  * { box-sizing:border-box; }
-  body {
-    margin:0; min-height:100vh; color:var(--ink);
-    font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
-    background:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
-    background-attachment:fixed;
-  }
-  .sunglow{position:fixed;width:420px;height:420px;border-radius:50%;right:-140px;top:-160px;
-    background:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);filter:blur(16px);pointer-events:none}
-  main{position:relative;max-width:1180px;margin:0 auto;padding:22px 20px 40px}
-  header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
-  h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
-  .conn{font-size:11.5px;color:var(--ink3)}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
-  .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
-  .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
-     backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
-  .lbl{font-size:9.5px;letter-spacing:.17em;text-transform:uppercase;color:var(--ink3)}
   .toprow{display:grid;grid-template-columns:230px 1fr;gap:12px;margin-bottom:12px}
   @media(max-width:760px){.toprow{grid-template-columns:1fr}}
   .hero .v{font-size:46px;font-weight:250;letter-spacing:-.03em;line-height:1.05;margin-top:4px}
@@ -46,54 +22,58 @@
   .hero .today{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
     margin-top:11px;padding-top:9px;border-top:1px solid var(--panel-b)}
   .hero .today b{font-size:17px;font-weight:400;font-variant-numeric:tabular-nums}
-  .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+  /* Tracks are minmax(0,1fr) and never a bare 1fr. A bare 1fr means
+     minmax(auto,1fr), and that auto floor is the widest the content refuses to
+     shrink below — which a grid honours by growing past its own container
+     rather than by narrowing the track. The state of charge, the EST badge and
+     the serial sat on one unbreakable 150px line, which with the card's padding
+     floors a module at 184px, so on a 390px phone the two tracks resolved to
+     184px and 197px inside a 316px panel and the right-hand column ran off the
+     screen edge, cutting "100%" to "1" and "52.24 V" to "52.". A zero floor
+     lets the track win instead, and the card is then made to cope with the
+     width it is given. */
+  .flow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
   .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
-  section{margin-bottom:12px}
-  .chead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;flex-wrap:wrap;gap:8px}
-  .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
-  .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
-  .rng{display:flex;gap:6px}
-  .rng button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
-    border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
-  .rng button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink)}
-  svg{display:block;width:100%;height:auto;overflow:visible}
-  .tick{fill:var(--ink3);font-size:9.5px}
-  /* Hover readout. The tooltip is HTML rather than SVG so it can wrap, use the
-     page's own type, and sit above everything without fighting the viewBox. */
-  .chart{position:relative}
-  .chart svg{touch-action:pan-y}
-  .tipdot{pointer-events:none}
-  .tip{position:absolute;pointer-events:none;opacity:0;transition:opacity .09s;
-    background:rgba(6,8,18,.94);border:1px solid var(--panel-b);border-radius:9px;
-    padding:8px 10px;font-size:11.5px;line-height:1.5;white-space:nowrap;z-index:5;
-    box-shadow:0 6px 22px rgba(0,0,0,.45)}
-  .tip.on{opacity:1}
-  .tip .when{color:var(--ink3);font-size:10px;letter-spacing:.03em;margin-bottom:4px}
-  .tip .row{display:flex;justify-content:space-between;gap:14px;
+  /* The second line under each flow. Deliberately quieter than the number it
+     sits beneath: today's total is context for the reading, not a rival to it. */
+  .flow .sub{display:block;margin-top:5px;font-size:12px;opacity:.72;
     font-variant-numeric:tabular-nums}
-  .tip .row u{text-decoration:none;color:var(--ink2)}
-  .tip .row b{font-weight:500;color:var(--ink)}
-  .mods{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-  @media(max-width:860px){.mods{grid-template-columns:repeat(2,1fr)}}
-  .mod .top{display:flex;justify-content:space-between;align-items:baseline}
+  /* The state of the system, above everything it is inferred from. A row rather
+     than a badge, because the sentence is the point and a pill would crop it. */
+  .mode{display:flex;align-items:center;gap:9px;margin-bottom:12px;font-size:14px}
+  .mode b{font-weight:500}
+  .mode span:last-child{opacity:.72}
+  .mode .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--muted)}
+  /* Colour repeats the flow the words already name, so it is never the only
+     carrier — the palette is CVD-validated and the label stands without it. */
+  .mode.pv .dot{background:var(--pv)}
+  .mode.batt .dot{background:var(--batt)}
+  .mode.grid .dot{background:var(--grid)}
+  .mods{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+  @media(max-width:860px){.mods{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  /* Coping with it: the serial drops to a line of its own when the head row
+     cannot hold it beside the charge figure, because a serial is the one value
+     on the card nobody can infer from the others and truncating it loses the
+     only thing that names the pack. It stays right-aligned on whichever line it
+     lands on, and may break inside itself if some other vendor's pack reports a
+     serial longer than anything an EG4 does. */
+  .mod .top{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap}
   .mod .soc{font-size:22px;font-weight:300}
-  .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em}
+  .mod .sn{font-size:8.5px;color:var(--ink3);letter-spacing:.04em;
+    min-width:0;margin-left:auto;text-align:right;overflow-wrap:anywhere}
+  /* Eight readings on a quarter-width card. Two columns of four keeps the pack
+     legible at a glance without the card growing taller than the panels beside
+     it; below the breakpoint the cards are half-width and the rows go single
+     file, because two columns of a 150px card wraps every value onto its own
+     line anyway. */
+  .mod .kv{font-size:11px}
+  .mod .kv u{font-size:10px}
+  @media(min-width:861px){
+    .mod .face{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
+    .mod .face .kv{margin-top:4px}
+  }
   .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
   .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
-  .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
-  .kv u{text-decoration:none;color:var(--ink3)}
-  .warn{color:var(--warn);font-weight:600}
-  .muted{color:var(--ink3)}
-  /* Tabs. Two views of the same poll: what is happening now, and where the
-     day's energy went. Both read from /api/live, so switching costs nothing. */
-  .tabs{display:flex;gap:4px;margin-bottom:14px}
-  .tabs button{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
-    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
-    cursor:pointer;transition:background .12s,color .12s}
-  .tabs button:hover{color:var(--ink2)}
-  .tabs button[aria-selected="true"]{background:rgba(255,255,255,.17);color:var(--ink);font-weight:500}
-  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
-  .view[hidden]{display:none}
   .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
   .sank .nv{fill:var(--ink3);font:11px system-ui;font-variant-numeric:tabular-nums}
   .sankwait{color:var(--ink3);font-size:12.5px;padding:26px 0;text-align:center}
@@ -106,6 +86,12 @@
   .cal h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--ink2)}
   .cal p{margin:5px 0 0;font-size:12px;line-height:1.5;color:var(--ink3);max-width:82ch}
   .cal .calbody{min-width:0}
+  /* The dismiss control sits with the message rather than floating over it, so
+     it cannot land on the text at a narrow width. */
+  .cal .calhide{align-self:flex-start;flex:0 0 auto;background:rgba(255,255,255,.09);
+    border:1px solid var(--panel-b);color:var(--ink2);border-radius:7px;
+    padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
+  .cal .calhide:hover{background:rgba(255,255,255,.17);color:var(--ink)}
   .cal .calwhen{margin-top:7px;font-size:10px;letter-spacing:.02em}
   .cal .calmark{flex:0 0 auto;font-size:13px;line-height:1.65;color:var(--ink3)}
   .cal.sev-warning{border-left-color:var(--warn)}
@@ -136,7 +122,7 @@
   .agree{margin-bottom:11px;padding:11px 13px;border:1px solid var(--panel-b);
     border-radius:11px;background:rgba(255,255,255,.045)}
   .agree[hidden]{display:none}
-  .agree .pair{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px}
+  .agree .pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:8px}
   .agree .v{font-size:21px;font-weight:300;letter-spacing:-.02em;margin-top:2px}
   .agree .v span{font-size:11px;opacity:.6;font-weight:400;margin-left:4px}
   .agree .bar{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin-top:7px;overflow:hidden}
@@ -158,26 +144,14 @@
   .track i.odd{background:var(--warn)}
   .mod.est .track i{background:repeating-linear-gradient(112deg,var(--batt) 0 6px,rgba(25,158,112,.3) 6px 12px)}
   .mod.est .track i.odd{background:repeating-linear-gradient(112deg,var(--warn) 0 6px,rgba(250,178,25,.3) 6px 12px)}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid-line)}
-  th:first-child,td:first-child{text-align:left}
-  th{color:var(--ink3);font-weight:600;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
-  .iconbtn{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
-    border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.4}
-  .iconbtn:hover{background:rgba(255,255,255,.14);color:var(--ink)}
-  .iconbtn.wide{font-size:11px;flex:1}
   .setgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px}
   .set select{margin-top:5px;width:100%;background:rgba(9,11,24,.7);color:var(--ink);
     border:1px solid var(--panel-b);border-radius:8px;padding:5px 8px;font-family:inherit;font-size:12.5px}
-  details{margin-top:10px}
-  summary{cursor:pointer;font-size:11px;color:var(--ink3)}
-  .kv b{font-weight:500;font-variant-numeric:tabular-nums}
   /* Extended telemetry. The panels are organised around the comparisons that
      diagnose something — string against string, leg against leg, the BMS
      voltage against the inverter's — because two numbers side by side say
      what a register dump never does. Everything is scoped under .dtl so these
      class names cannot reach the bars and rows the rest of the page draws. */
-  .dtlsum{font-size:12.5px;color:var(--ink2);padding:3px 0}
   .dtl{margin-top:10px}
   .dtl .rel{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:10px}
   .dtl h3{font-size:11px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
@@ -235,10 +209,23 @@
     </div>
   </header>
 
+  <!-- Filled by drawNav(). It sits directly under the header on every page so
+       the marker is always in the same place, and above the advisory so a
+       warning appearing does not push the navigation down the screen. -->
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
   <div class="p cal" id="cal" hidden></div>
 
   <div class="p" id="settings" hidden>
-    <div class="chead"><h2>Settings</h2><span class="legend muted">stored in this browser</span></div>
+    <!-- Two of these three also exist as installation settings on the service.
+         The pair here override them for this device only, which is why they
+         say so: a wall tablet showing Fahrenheit must not change the laptop
+         beside it. Everything that belongs to the installation rather than to
+         a browser — the tariff, the dongle, the poll interval — is on /settings
+         and is linked rather than duplicated. -->
+    <div class="chead"><h2>This device</h2>
+      <span class="legend muted">overrides for this browser only ·
+        <a href="/settings">installation settings</a></span></div>
     <div class="setgrid">
       <label class="set">
         <span class="lbl">Temperature</span>
@@ -269,12 +256,7 @@
     </div>
   </div>
 
-  <div class="tabs" role="tablist">
-    <button role="tab" id="tabNow" aria-selected="true" aria-controls="viewNow">Now</button>
-    <button role="tab" id="tabFlow" aria-selected="false" aria-controls="viewFlow">Energy flow</button>
-  </div>
-
-  <div class="view" id="viewFlow" role="tabpanel" hidden>
+  <div class="view" id="viewFlow" hidden>
     <section class="p">
       <div class="chead"><h2>Where today's energy went</h2>
         <span class="legend"><span class="muted" id="flowTotal"></span></span>
@@ -288,7 +270,16 @@
     </section>
   </div>
 
-  <div class="view" id="viewNow" role="tabpanel">
+  <div class="view" id="viewInverter" hidden>
+    <div class="dtl" id="dtl"></div>
+  </div>
+
+  <div class="view" id="viewNow">
+  <!-- What the system is doing, in words, above the numbers that show it. The
+       judgement is made once in arraysense.mode and arrives with /api/live;
+       the title carries the readings it turned on, because a mode a reader
+       cannot check is one they have to take on trust. -->
+  <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span></div>
   <div class="toprow">
     <div class="p hero">
       <div class="lbl">Producing now</div>
@@ -300,10 +291,19 @@
       <div class="today"><span class="lbl">Today</span><b id="pvToday">—</b></div>
     </div>
     <div class="flow">
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b></div>
+      <!-- Today beside each flow comes from the inverter's own daily counters
+           for the same reason the solar one does, and it is why there is no
+           second request: /api/live already carries every column. -->
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b><span class="sub" id="battState">—</span></div>
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
+  </div>
+
+  <div class="chartbar">
+    <span class="note" id="chartNote" hidden></span>
+    <button id="zoomReset" hidden>Reset zoom</button>
+    <span class="zoomhint">drag across a chart to zoom</span>
   </div>
 
   <section class="p">
@@ -321,7 +321,7 @@
       </div>
       <div class="rng" id="ranges"></div>
     </div>
-    <div class="chart" id="powerWrap"><svg id="power" viewBox="0 0 900 230" role="img" aria-label="Power flow over the selected range"></svg><div class="tip" id="powerTip"></div></div>
+    <div class="chart" id="powerWrap" role="img" aria-label="Power flow over the selected range"></div>
     <details>
       <summary>Show as a table</summary>
       <div style="max-height:220px;overflow:auto;margin-top:8px">
@@ -337,25 +337,18 @@
         <span class="muted" id="battNow"></span>
       </div>
     </div>
-    <div class="chart" id="battpowerWrap"><svg id="battpower" viewBox="0 0 900 150" role="img" aria-label="Battery charge and discharge over the selected range"></svg><div class="tip" id="battpowerTip"></div></div>
+    <div class="chart" id="battpowerWrap" role="img" aria-label="Battery charge and discharge over the selected range"></div>
   </section>
 
   <section class="p">
     <div class="chead"><h2>Battery state of charge</h2><span class="legend" id="bankInfo"></span></div>
-    <div class="chart" id="socWrap"><svg id="soc" viewBox="0 0 900 130" role="img" aria-label="Battery state of charge over the selected range"></svg><div class="tip" id="socTip"></div></div>
-  </section>
-
-  </div><!-- /viewNow -->
-
-  <section>
-    <details id="detail">
-      <summary class="dtlsum">Detail — the rest of what the inverter reports</summary>
-      <div class="dtl" id="dtl"></div>
-    </details>
+    <div class="chart" id="socWrap" role="img" aria-label="Battery state of charge over the selected range"></div>
   </section>
 
   <section class="p">
-    <div class="chead"><h2>Battery modules</h2><span class="legend muted">per module, live</span></div>
+    <div class="chead"><h2>Battery modules</h2>
+      <span class="legend muted">per module, live
+        <button class="iconbtn" id="modMore" aria-pressed="false">Show more</button></span></div>
     <div class="agree" id="agree" hidden>
       <span class="lbl">Pack agreement</span>
       <div class="pair">
@@ -373,42 +366,23 @@
     </div>
     <div class="mods" id="mods"></div>
   </section>
+
+  </div><!-- /viewNow -->
 </main>
 
 <script>
-const PALETTE = { pv:'#c98500', load:'#3987e5', batt:'#199e70', grid:'#9085e9' };
-const RANGES = [
-  { key:'6h',  label:'6h',  seconds:6*3600 },
-  { key:'24h', label:'24h', seconds:24*3600 },
-  { key:'7d',  label:'7d',  seconds:7*86400 },
-  { key:'30d', label:'30d', seconds:30*86400 },
-];
+// Everything shared with the other pages — $, esc, numOrNull, DASH, the
+// formatters, the settings, the palette resolver and the chart factory — comes
+// from /common.js, which is loaded above. This file is only what is particular
+// to the dashboard.
+
 let range = RANGES[1];
 const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
 // Held between polls because it changes how the per-module cards draw, not just
 // what the badge says.
 let calibration = null;
 
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
-  (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-// A reading is a number or it is absent. Anything else — null, undefined, a
-// string, a NaN — is unknown, and unknown must never fall through to zero.
-const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 const trim = (v) => v.toFixed(v % 1 === 0 ? 0 : 1);
-
-// Readings are stored and served in Celsius because that is what the hardware
-// reports; converting only on display means changing this never rewrites data.
-const settings = {
-  tempUnit: localStorage.getItem('as.tempUnit') || 'F',
-  refreshSecs: Number(localStorage.getItem('as.refreshSecs') || 5),
-};
-const tempOf = (c) => c === null || c === undefined ? null
-  : (settings.tempUnit === 'F' ? c * 9/5 + 32 : c);
-const tempStr = (c) => {
-  const v = tempOf(c);
-  return v === null ? '—' : `${v.toFixed(1)} °${settings.tempUnit}`;
-};
 
 let liveTimer = null;
 function scheduleLive() {
@@ -421,13 +395,11 @@ function wireSettings() {
   $('refreshSecs').value = String(settings.refreshSecs);
   $('settingsBtn').onclick = () => { $('settings').hidden = !$('settings').hidden; };
   $('tempUnit').onchange = (e) => {
-    settings.tempUnit = e.target.value;
-    localStorage.setItem('as.tempUnit', settings.tempUnit);
+    saveSetting('tempUnit', e.target.value);
     loadLive();
   };
   $('refreshSecs').onchange = (e) => {
-    settings.refreshSecs = Number(e.target.value);
-    localStorage.setItem('as.refreshSecs', String(settings.refreshSecs));
+    saveSetting('refreshSecs', Number(e.target.value));
     scheduleLive();
   };
   $('yieldBtn').onclick = async () => {
@@ -440,13 +412,59 @@ function wireSettings() {
     loadLive();
   };
 }
-const kw = (w) => w === null || w === undefined ? '—' : (Math.abs(w) >= 1000 ? (w/1000).toFixed(2)+' kW' : Math.round(w)+' W');
 
-function drawRanges() {
-  $('ranges').innerHTML = RANGES.map(r =>
-    `<button data-k="${r.key}" aria-pressed="${r.key===range.key}">${r.label}</button>`).join('');
-  $('ranges').querySelectorAll('button').forEach(b =>
-    b.onclick = () => { range = RANGES.find(r => r.key === b.dataset.k); drawRanges(); loadHistory(); });
+// Redrawn on every pick so the pressed state follows, which is also why this
+// is a named function rather than a closure passed straight to drawRanges.
+function showRanges() {
+  drawRanges($('ranges'), range, (picked) => {
+    range = picked;
+    rangeChanged = true;
+    showRanges();
+    loadHistory();
+  });
+}
+
+// Today's total beside a flow, from the inverter's own daily counter. A
+// counter that has not been read yet, or has gone stale, shows a dash — zero
+// would read as a day on which the house used nothing.
+function showToday(id, value) {
+  const kwh = numOrNull(value);
+  $(id).textContent = kwh === null ? DASH : `${kwh.toFixed(1)} kWh`;
+}
+
+// Which flow the mode is about, for the dot. The words carry the meaning on
+// their own; this only repeats what they already say, because the palette is
+// CVD-validated and colour is never the sole encoding.
+const MODE_TINT = {
+  'Solar': 'pv',
+  'Solar and battery': 'pv',
+  'Battery discharging': 'batt',
+  'On grid': 'grid',
+  'Importing': 'grid',
+};
+
+// The system's state in words. Both halves come from /api/live, judged once in
+// arraysense.mode — the page prints the verdict and never recomputes it.
+function showMode(m, i) {
+  const row = $('mode');
+  if (!m || !m.known) {
+    // Nothing measured is not a state. Hiding the row is honest; naming a mode
+    // from an incomplete poll is the same error as drawing a missing reading
+    // as zero.
+    row.hidden = true;
+    $('battState').textContent = DASH;
+    return;
+  }
+  row.hidden = false;
+  row.className = 'mode ' + (MODE_TINT[m.mode] || '');
+  $('modeText').textContent = m.mode;
+  // The reason the mode was judged that way, on hover. It names the readings
+  // the decision turned on, so a reader can check it against the numbers
+  // directly below rather than take it on trust.
+  row.title = m.why;
+  const soc = numOrNull(i.battery_soc_pct);
+  $('modeBatt').textContent = soc === null ? '' : `· bank ${soc.toFixed(0)}%`;
+  $('battState').textContent = m.battery;
 }
 
 async function loadLive() {
@@ -468,6 +486,9 @@ async function loadLive() {
     // counters go stale — never a zero, which would read as a day with no sun.
     const made = numOrNull(i.pv_energy_today_kwh);
     $('pvToday').textContent = made === null ? DASH : `${made.toFixed(1)} kWh`;
+    showToday('loadToday', i.load_energy_today_kwh);
+    showToday('gridToday', i.grid_import_energy_today_kwh);
+    showMode(live.mode, i);
 
     const ok = status.connected && status.running;
     const colour = status.yielding ? 'var(--warn)' : ok ? 'var(--good)' : 'var(--bad)';
@@ -516,12 +537,41 @@ async function fetchCalibration() {
   }
 }
 
+// How long a dismissal lasts. The condition it reports takes weeks to change —
+// the only cure is charging the bank to full — so a banner that returned the
+// next morning would be nagging rather than informing, and one that never
+// returned would let a drifting bank quietly become a forgotten one.
+const CAL_SNOOZE_DAYS = 7;
+const CAL_SNOOZE_KEY = 'as.calDismissed';
+
+// A dismissal is per device and remembers *what* was dismissed, not merely
+// when. Something getting worse is news even inside the seven days: an owner
+// who waved away "may be drifting" has not thereby agreed to be told nothing
+// about a wiring fault. So a higher severity than the one dismissed comes back
+// immediately, and only the same or a milder one stays hidden.
+function calDismissed(sev) {
+  let held;
+  try { held = JSON.parse(localStorage.getItem(CAL_SNOOZE_KEY) || 'null'); } catch (e) { held = null; }
+  if (!held || typeof held !== 'object') return false;
+  if (!(Date.now() < held.until)) return false;
+  return CAL_SEVERITIES.indexOf(sev) <= CAL_SEVERITIES.indexOf(held.severity);
+}
+
+function dismissCal(sev) {
+  localStorage.setItem(CAL_SNOOZE_KEY, JSON.stringify({
+    severity: sev,
+    until: Date.now() + CAL_SNOOZE_DAYS * 86400000,
+  }));
+  $('cal').hidden = true;
+}
+
 function renderCalibration(cal) {
   const box = $('cal');
   const sev = cal && typeof cal === 'object' ? cal.severity : null;
   // "none" is not a quiet badge, it is no badge: a calibrated bank has nothing
   // to say and the slot should be empty.
   if (!CAL_SEVERITIES.includes(sev)) { box.hidden = true; box.className = 'p cal'; return; }
+  if (calDismissed(sev)) { box.hidden = true; return; }
   // The charge date belongs to the drift story only. Under a wiring alert the
   // detail text says charging will not fix this, and handing the owner a
   // charging date on the very next line folds back together the two conditions
@@ -533,7 +583,10 @@ function renderCalibration(cal) {
   // failing battery, and rephrasing it here would undo that.
   box.className = `p cal sev-${sev}`;
   box.innerHTML = `<div class="calmark">${sev === 'alert' ? '⚠' : '●'}</div>
-    <div class="calbody"><h2>${esc(cal.headline)}</h2><p>${esc(cal.detail)}</p>${stamp}</div>`;
+    <div class="calbody"><h2>${esc(cal.headline)}</h2><p>${esc(cal.detail)}</p>${stamp}</div>
+    <button class="calhide" id="calHide" type="button"
+      title="Hide this for ${CAL_SNOOZE_DAYS} days">Dismiss</button>`;
+  $('calHide').onclick = () => dismissCal(sev);
   box.hidden = false;
 }
 
@@ -611,15 +664,25 @@ function drawModules(mods) {
     const est = estimate && soc !== null;
     return `<div class="p mod${est ? ' est' : ''}">
       <div class="top"><span class="soc">${soc === null ? '—' : (est ? '≈' : '') + soc.toFixed(0) + '%'}${
-        est ? '<abbr class="est-tag" title="estimate">est</abbr>' : ''}</span>
+        // The badge is glued to the figure with no space between them, so on a
+        // narrow card there is nowhere for the line to break and the pair
+        // pushes out through the side. <wbr> offers the break and draws
+        // nothing, leaving the spacing on a wide card exactly as it was.
+        est ? '<wbr><abbr class="est-tag" title="estimate">est</abbr>' : ''}</span>
         <span class="sn">${esc(m.serial)}</span></div>
       <div class="track${soc === null ? ' unknown' : ''}">${soc === null ? ''
         : `<i class="${odd ? 'odd' : ''}" style="width:${Math.max(0,Math.min(100,soc))}%"></i>`}</div>
-      <div class="kv"><u>Cell &Delta;</u><span class="${odd?'warn':''}">${
-        d === null ? '—' : d.toFixed(3)+' V'+(odd?' ⚠':'')}</span></div>
+      <div class="face">
+      <div class="kv"><u>Health</u><span>${soh === null ? DASH : soh.toFixed(0) + '%'}</span></div>
+      <div class="kv"><u>Voltage</u><span>${uStr(numOrNull(m.voltage_v), 2, 'V')}</span></div>
+      <div class="kv"><u>Current</u><span>${uStr(numOrNull(m.current_a), 1, 'A')}</span></div>
       <div class="kv"><u>Temp</u><span>${tempStr(m.temperature_c)}</span></div>
-      <div class="kv"><u>SOH / cycles</u><span>${soh === null ? '—' : soh.toFixed(0)+'%'} / ${
-        cycles === null ? '—' : Math.round(cycles)}</span></div>
+      <div class="kv"><u>Cell high</u><span>${uStr(numOrNull(m.cell_max_voltage_v), 3, 'V')}</span></div>
+      <div class="kv"><u>Cell low</u><span>${uStr(numOrNull(m.cell_min_voltage_v), 3, 'V')}</span></div>
+      <div class="kv"><u>Cell &Delta;</u><span class="${odd ? 'warn' : ''}">${
+        d === null ? DASH : d.toFixed(3) + ' V' + (odd ? ' ⚠' : '')}</span></div>
+      <div class="kv"><u>Cycles</u><span>${cycles === null ? DASH : gnum(Math.round(cycles), 0)}</span></div>
+      </div>
       ${moduleDetail(m)}
     </div>`;
   }).join('');
@@ -642,14 +705,23 @@ function moduleDetail(m) {
     const k = numOrNull(index);
     return k === null ? value : `${value} · cell ${Math.round(k)}`;
   };
+  // Which cell, on its own. The voltages are on the card face now, so this
+  // answers the only question left once one of them looks wrong: which cell to
+  // open the pack and look at.
+  const cellNumber = (index) => {
+    const k = numOrNull(index);
+    return k === null ? DASH : `cell ${Math.round(k)}`;
+  };
   const status = numOrNull(m.status_code);
+  // Health, voltage, current, temperature and the cell extremes are on the card
+  // face now, so what is left here is the part that only matters once something
+  // is already wrong: which cell is the outlier, how hard the pack is throttling
+  // itself, and the codes.
   return `<div class="more">
-    ${kvRow('Voltage', uStr(numOrNull(m.voltage_v), 2, 'V'))}
     ${kvRow('Charge', charge)}
-    ${kvRow('Current', uStr(numOrNull(m.current_a), 1, 'A'))}
     ${kvRow('Limits chg / dis', limits)}
-    ${kvRow('Cell high', cell(uStr(numOrNull(m.cell_max_voltage_v), 3, 'V'), m.cell_max_voltage_num))}
-    ${kvRow('Cell low', cell(uStr(numOrNull(m.cell_min_voltage_v), 3, 'V'), m.cell_min_voltage_num))}
+    ${kvRow('Highest cell is', cellNumber(m.cell_max_voltage_num))}
+    ${kvRow('Lowest cell is', cellNumber(m.cell_min_voltage_num))}
     ${kvRow('Cell hottest', cell(tempStr(m.cell_max_temperature_c), m.cell_max_temperature_num))}
     ${kvRow('Cell coldest', cell(tempStr(m.cell_min_temperature_c), m.cell_min_temperature_num))}
     ${kvRow('Status', status === null ? DASH : gnum(Math.round(status), 0))}
@@ -669,23 +741,6 @@ function moduleDetail(m) {
 // data is not zero cannot afford a derived claim resting on an absent number.
 // ---------------------------------------------------------------------------
 
-const DASH = '—';
-// Fixed digit counts, so a column of readings does not change width as the
-// values move. Grouping separators come from the browser's own locale.
-const gnum = (v, d) => v.toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d});
-const wStr = (v) => v === null ? DASH : gnum(Math.round(v), 0) + ' W';
-const uStr = (v, d, unit) => v === null ? DASH : gnum(v, d) + (unit ? ' ' + unit : '');
-// A quantity shown to a tenth only when it has one, so a 200 A limit is not
-// dressed up as 200.0 and a 7.5 A one is not rounded away to 8.
-const qty = (v, unit) => v === null ? DASH
-  : gnum(v, Number.isInteger(v) ? 0 : 1) + (unit ? ' ' + unit : '');
-
-// A temperature difference is not a temperature. Three degrees Celsius apart
-// is 5.4 °F apart, not 37.4 — putting a delta through tempOf() is the version
-// of this bug that looks right until someone switches units.
-const tempDeltaStr = (dc) => dc === null ? DASH
-  : `${(settings.tempUnit === 'F' ? dc * 9/5 : dc).toFixed(1)} °${settings.tempUnit}`;
-
 const runtimeStr = (s) => {
   const t = Math.floor(s);
   return `${gnum(Math.floor(t / 86400), 0)} d ${Math.floor((t % 86400) / 3600)} h`;
@@ -698,9 +753,6 @@ function median(xs) {
   return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
 }
 
-const kvRow = (label, value, cls) =>
-  `<div class="kv"><u>${label}</u><b${cls ? ` class="${cls}"` : ''}>${value}</b></div>`;
-
 // A caption with nothing to say is no caption. Returning an empty string here
 // rather than a placeholder is what keeps a missing input from becoming a
 // sentence about an em dash.
@@ -709,6 +761,41 @@ const capOf = (text) => text ? `<span class="lbl cap">${esc(text)}</span>` : '';
 // Fault and warning registers are bitfields, not measurements. Zero is the
 // good case and says so in words; anything else is shown in decimal and hex
 // together, because the vendor's tables are indexed by bit.
+// Register 0 is an operating mode, not a fault, and it is almost never zero —
+// so running it through codeRow painted a perfectly healthy inverter in the
+// colour reserved for faults and invited the reader to worry about 136.
+//
+// The vendor publishes a "working modes table" that pylxpweb references and
+// does not include, so these bits were derived from this installation's own
+// readings rather than from a document. Three values appeared across an hour of
+// collection, and each matched one state exactly:
+//
+//   8   = 0b00001000  grid 1921 W, EPS 0 W, battery +2168  charging, not inverting
+//   136 = 0b10001000  grid 0 W, EPS 2218 W, battery +2587  inverting and charging
+//   192 = 0b11000000  grid 0 W, EPS 5384 W, battery -1391  inverting and discharging
+//
+// which puts charging on bit 3, discharging on bit 6 and inverting on bit 7.
+// Anything outside those three bits is reported as a raw number rather than
+// guessed at, because three samples is enough to name what was seen and not
+// enough to claim the table.
+const STATUS_BITS = [
+  [0x80, 'inverting'],
+  [0x40, 'discharging'],
+  [0x08, 'charging'],
+];
+
+function deviceStatus(v) {
+  if (v === null) return DASH;
+  const k = Math.round(v);
+  if (k === 0) return 'standby';
+  const named = STATUS_BITS.filter(([bit]) => k & bit).map(([, word]) => word);
+  const rest = k & ~STATUS_BITS.reduce((m, [bit]) => m | bit, 0);
+  // A bit nobody has seen before is shown, not swallowed. The alternative is a
+  // reassuring label over a state this has never observed.
+  if (rest) named.push(`plus 0x${rest.toString(16).toUpperCase()}`);
+  return `${named.join(' and ') || 'idle'} · ${gnum(k, 0)}`;
+}
+
 function codeRow(label, v) {
   if (v === null) return kvRow(label, DASH);
   const k = Math.round(v);
@@ -793,7 +880,7 @@ function detailStrings(i) {
       <div class="bar${r.p === null ? ' none' : ''}">${fill}<span>${wStr(r.p)}</span></div>
       <span class="sublab">${uStr(r.a, 2, 'A')} · ${uStr(r.v, 0, 'V')}</span></div>`;
   }).join('');
-  return `<div class="p"><h3>Strings — shade or a fault?</h3>${rows}${capOf(stringCaption(s))}</div>`;
+  return `<div class="p"><h3>PV Strings</h3>${rows}${capOf(stringCaption(s))}</div>`;
 }
 
 // The two legs of a split-phase backup circuit are wired independently and
@@ -879,16 +966,13 @@ function detailHeat(i) {
   // collapses to a single dash rather than to a unit with no number under it.
   const pair = (a, b) => a === null && b === null ? DASH
     : `${one(a)} · ${one(b)} °${settings.tempUnit}`;
-  // There is no fan-speed register on this hardware, so a heatsink climbing
-  // while output holds steady is the only warning of a failing fan or a
-  // blocked intake that exists to give. That is worth saying in the panel.
   const spread = r1 !== null && r2 !== null
-    ? `Radiators ${tempDeltaStr(Math.abs(r1 - r2))} apart. ` : '';
-  return `<div class="p"><h3>Heatsinks</h3>
+    ? `Heatsinks ${tempDeltaStr(Math.abs(r1 - r2))} apart. ` : '';
+  return `<div class="p"><h3>Inverter Temp</h3>
     <div class="pairbar">${bar(r1, hot)}${bar(r2, hot)}${bar(inner, cool)}${bar(board, cool)}</div>
     ${kvRow('H1 · H2', pair(r1, r2))}
     ${kvRow('Internal · board', pair(inner, board))}
-    ${capOf(spread + 'No fan-speed register exists — heatsink temperature is the only fan signal')}
+    ${capOf(spread)}
     </div>`;
 }
 
@@ -981,7 +1065,7 @@ function detailEnergy(i, mods) {
   const health = soh === null && cycles === null ? DASH
     : `${soh === null ? DASH : gnum(Math.round(soh), 0) + '%'} / ${
         cycles === null ? DASH : gnum(Math.round(cycles), 0)}`;
-  return `<div class="p"><h3>Energy, not percent</h3>
+  return `<div class="p"><h3>Energy</h3>
     <div class="delta"><em>${qty(rem)}</em>
       <span class="lbl">${full === null ? 'Ah in the bank' : `of ${qty(full)} Ah`}</span></div>
     <div class="bar${pct === null ? ' none' : ''}" style="margin-top:8px">${fill}</div>
@@ -1011,7 +1095,7 @@ function detailBms(i) {
   const force = flagOf(i.bms_force_charge);
   const forcePill = force === null ? '<span class="pill q">Unknown</span>'
     : force ? '<span class="pill w">Requested</span>' : '<span class="pill q">Off</span>';
-  return `<div class="p"><h3>What the BMS will allow</h3>
+  return `<div class="p"><h3>BMS</h3>
     ${permit('Charge', i.bms_allow_charge, numOrNull(i.bms_charge_current_limit_a))}
     ${permit('Discharge', i.bms_allow_discharge, numOrNull(i.bms_discharge_current_limit_a))}
     <div class="kv"><u>Force charge</u>${forcePill}</div>
@@ -1033,9 +1117,12 @@ function detailGrid(i) {
     ${kvRow('Frequency', uStr(numOrNull(i.grid_frequency_hz), 2, 'Hz'))}
     ${kvRow('Power factor', uStr(numOrNull(i.power_factor), 2))}
     ${kvRow('Inverter current', uStr(numOrNull(i.inverter_current_a), 2, 'A'))}
-    ${kvRow('Inverter power', wStr(numOrNull(i.inverter_power_w)))}
-    ${kvRow('Rectifier power', wStr(numOrNull(i.rectifier_power_w)))}
-    ${kvRow('AC couple power', wStr(numOrNull(i.ac_couple_power_w)))}</div>`;
+    ${kvRow('Exporting to grid', wStr(numOrNull(i.inverter_power_w)))}
+    ${kvRow('Grid charging bank', wStr(numOrNull(i.rectifier_power_w)))}
+    ${kvRow('AC couple power', wStr(numOrNull(i.ac_couple_power_w)))}
+    ${capOf('Both of those are grid-direction figures and read zero on this '
+      + 'installation: nothing is sold back, and the bank charges from the array '
+      + 'rather than from the mains. Neither is the inverter idling.')}</div>`;
 }
 
 function detailStatus(i) {
@@ -1043,7 +1130,7 @@ function detailStatus(i) {
   const run = numOrNull(i.inverter_run_time_s);
   const b1 = numOrNull(i.bus_voltage_1_v), b2 = numOrNull(i.bus_voltage_2_v);
   return `<div class="p"><h3>Status</h3>
-    ${codeRow('Device status', dev)}
+    ${kvRow('Doing now', deviceStatus(dev))}
     ${codeRow('Inverter fault', numOrNull(i.inverter_fault_code))}
     ${codeRow('Inverter warning', numOrNull(i.inverter_warning_code))}
     ${codeRow('Battery fault', numOrNull(i.battery_fault_code))}
@@ -1064,175 +1151,80 @@ function renderDetail(i, mods) {
 // opened it was diagnosing something, and closing it on every refresh would
 // mean opening it again on every refresh. The class on the root element is
 // what lets the per-module cards follow the same switch without a re-render.
+// The pack cards carry eight readings on the face and keep the rest — capacity,
+// the throttling limits, which cell is the outlier, the status codes — behind
+// this. They used to ride on the page-wide Detail disclosure, which is now a
+// view of its own; without a toggle of their own they would simply never
+// appear again.
 function wireDetail() {
-  const box = $('detail');
-  const open = localStorage.getItem('as.detailOpen') === '1';
-  box.open = open;
-  document.documentElement.classList.toggle('dtl-open', open);
-  box.addEventListener('toggle', () => {
-    localStorage.setItem('as.detailOpen', box.open ? '1' : '0');
-    document.documentElement.classList.toggle('dtl-open', box.open);
+  const button = $('modMore');
+  const apply = (open) => {
+    document.documentElement.classList.toggle('dtl-open', open);
+    button.setAttribute('aria-pressed', open ? 'true' : 'false');
+    button.textContent = open ? 'Show less' : 'Show more';
+  };
+  apply(localStorage.getItem('as.detailOpen') === '1');
+  button.addEventListener('click', () => {
+    const open = button.getAttribute('aria-pressed') !== 'true';
+    localStorage.setItem('as.detailOpen', open ? '1' : '0');
+    apply(open);
   });
 }
 
-function line(pts, colour, dash) {
-  if (pts.length < 2) return '';
-  return `<polyline fill="none" stroke="${colour}" stroke-width="2" stroke-linejoin="round"
-    stroke-linecap="round"${dash?` stroke-dasharray="${dash}"`:''} points="${pts.join(' ')}"/>`;
-}
-
-// What each chart is currently showing, so the hover can answer without
-// refetching. Replaced wholesale on every redraw rather than mutated, so a
-// pointer moving during a redraw reads one consistent set of points.
-const hovering = {};
-
-// Map a pointer position to the nearest sample. The SVG scales to its
-// container, so client pixels have to be converted back into viewBox units
-// before they mean anything — reading clientX directly is right only at one
-// window width, which is the sort of bug that looks like a rounding error.
-function attachHover(id, points, rows, geom) {
-  hovering[id] = { points, rows, geom };
-  const svg = $(id);
-  if (svg.dataset.hoverWired) return;
-  svg.dataset.hoverWired = '1';
-
-  const move = (ev) => {
-    const st = hovering[id];
-    const tip = $(`${id}Tip`);
-    if (!st || !st.points.length) { tip.classList.remove('on'); return; }
-    const box = svg.getBoundingClientRect();
-    if (!box.width) return;
-    const touch = ev.touches && ev.touches[0];
-    const vx = ((touch ? touch.clientX : ev.clientX) - box.left) / box.width * st.geom.W;
-    const { L, R, W } = st.geom;
-    const frac = (vx - L) / Math.max(W - L - R, 1);
-    const n = st.points.length;
-    const idx = Math.max(0, Math.min(n - 1, Math.round(frac * (n - 1))));
-    const pt = st.points[idx];
-
-    const parts = st.rows
-      .map(([label, key, fmt]) => {
-        const v = numOrNull(pt[key]);
-        return `<div class="row"><u>${esc(label)}</u><b>${v === null ? DASH : fmt(v)}</b></div>`;
-      }).join('');
-    const when = pt.timestamp ? new Date(pt.timestamp) : null;
-    tip.innerHTML = `<div class="when">${when ? esc(when.toLocaleString()) : ''}</div>${parts}`;
-    tip.classList.add('on');
-
-    // Keep the tooltip inside the chart rather than letting it push the page
-    // sideways — a wall tablet has no horizontal scrollbar to rescue it.
-    const px = (idx / Math.max(n - 1, 1)) * (box.width - (L + R) / st.geom.W * box.width)
-      + L / st.geom.W * box.width;
-    const tw = tip.offsetWidth || 150;
-    tip.style.left = `${Math.max(2, Math.min(box.width - tw - 2, px + 12))}px`;
-    tip.style.top = '6px';
-
-    const x = (L + (W - L - R) * idx / Math.max(n - 1, 1)).toFixed(1);
-    const g = svg.querySelector('#' + id + 'Cross');
-    if (g) g.innerHTML = `<line x1="${x}" y1="0" x2="${x}" y2="${st.geom.H}" `
-      + `stroke="rgba(255,255,255,.34)" stroke-width="1" class="tipdot"/>`;
-  };
-  const leave = () => {
-    $(`${id}Tip`).classList.remove('on');
-    const g = svg.querySelector('#' + id + 'Cross');
-    if (g) g.innerHTML = '';
-  };
-  svg.addEventListener('mousemove', move);
-  svg.addEventListener('mouseleave', leave);
-  svg.addEventListener('touchstart', move, { passive: true });
-  svg.addEventListener('touchmove', move, { passive: true });
-  svg.addEventListener('touchend', leave);
+// The same readings the chart is showing, for anyone who would rather read a
+// number than a pixel. Drawn whether or not the chart has anything to plot,
+// because a range with one lonely reading in it still has that reading.
+function powerTable(rows) {
+  $('powerTable').querySelector('tbody').innerHTML = rows.slice(-200).reverse().map((p) => `<tr>
+    <td>${esc(new Date(p.timestamp).toLocaleString())}</td>
+    <td>${kw(p.pv_total_power_w)}</td><td>${kw(p.load_power_w)}</td>
+    <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
 }
 
 function drawPower(points) {
-  const W=900,H=230,L=48,R=14,T=12,B=26;
-  const series = [
-    ['pv_total_power_w', PALETTE.pv, null],
-    ['load_power_w', PALETTE.load, null],
-    ['grid_power_w', PALETTE.grid, '4 3'],
-  ];
-  const vals = points.flatMap(p => series.map(([k]) => p[k]).filter(v => v !== null && v !== undefined));
-  if (!vals.length) { $('power').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`; return; }
-  const hi = Math.max(1000, ...vals), lo = Math.min(0, ...vals);
-  const pad = (hi-lo)*0.08 || 500;
-  const top = hi+pad, bot = lo-pad;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
-
-  let s = '';
-  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top-bot,1)))) / 2;
-  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
-    const y = sy(g);
-    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}"
-      stroke="${Math.abs(g)<1e-9?'rgba(255,255,255,.28)':'var(--grid-line)'}" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">${(g/1000).toFixed(g%1000?1:0)}</text>`;
-  }
-  s += `<text class="tick" x="${L-8}" y="${T+8}" text-anchor="end">kW</text>`;
-  const ticks = Math.min(6, points.length);
-  for (let t = 0; t < ticks; t++) {
-    const idx = Math.round(t*(points.length-1)/Math.max(ticks-1,1));
-    const when = new Date(points[idx].timestamp);
-    const label = range.seconds > 3*86400
-      ? when.toLocaleDateString(undefined,{month:'short',day:'numeric'})
-      : when.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
-    s += `<text class="tick" x="${sx(idx).toFixed(1)}" y="${H-8}" text-anchor="middle">${label}</text>`;
-  }
-  // Three series at equal weight is three things competing, and where they
-  // cross you lose which is which. So identity is carried by form as well as
-  // by hue — solar a filled area, home the heaviest line, grid a thin dashed
-  // trace — which also means the chart still reads when the colours do not.
-  s += `<defs><linearGradient id="pvfill" x1="0" y1="0" x2="0" y2="1">`
-    + `<stop offset="0%" stop-color="var(--pv)" stop-opacity="0.5"/>`
-    + `<stop offset="100%" stop-color="var(--pv)" stop-opacity="0.04"/></linearGradient></defs>`;
-
-  // Runs of consecutive readings. A gap is a break, never bridged: a comms
-  // outage has to look like one rather than a straight line across the hole.
-  const runsOf = (key) => {
-    const out = []; let run = [];
-    points.forEach((p, n) => {
-      const v = p[key];
-      if (v === null || v === undefined || p.is_gap) { if (run.length > 1) out.push(run); run = []; }
-      else run.push([sx(n), sy(v)]);
-    });
-    if (run.length > 1) out.push(run);
-    return out;
-  };
-
-  // Solar is what the array harvested, so it reads as volume rather than as a
-  // line. Filled to the zero line, not to the bottom of the chart, or a
-  // negative axis would put the fill on the wrong side of nothing.
-  const baseY = sy(Math.max(0, bot));
-  for (const run of runsOf('pv_total_power_w')) {
-    const d = run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-    s += `<polygon points="${run[0][0].toFixed(1)},${baseY.toFixed(1)} ${d} `
-      + `${run[run.length-1][0].toFixed(1)},${baseY.toFixed(1)}" fill="url(#pvfill)"/>`;
-  }
-
-  // Drawn last to first in importance: grid recedes, solar outlines its own
-  // fill, home sits on top because it is the one the owner acts on.
-  const stroke = (key, colour, width, dash) => {
-    for (const run of runsOf(key)) {
-      s += `<polyline points="${run.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ')}" `
-        + `fill="none" stroke="${colour}" stroke-width="${width}" stroke-linejoin="round"`
-        + `${dash ? ` stroke-dasharray="${dash}"` : ''}/>`;
-    }
-  };
-  stroke('grid_power_w', 'var(--grid)', 1.2, '4 3');
-  stroke('pv_total_power_w', 'var(--pv)', 1.6, null);
-  stroke('load_power_w', 'var(--load)', 2.1, null);
-  s += `<g id="powerCross"></g>`;
-  $('power').innerHTML = s;
-  attachHover('power', points, [
-    ['Solar', 'pv_total_power_w', kw],
-    ['Home', 'load_power_w', kw],
-    ['Grid', 'grid_power_w', kw],
-  ], { W, H, L, R });
-
-  const rows = points.slice(-200).reverse().map(p => `<tr>
-    <td>${new Date(p.timestamp).toLocaleString()}</td>
-    <td>${kw(p.pv_total_power_w)}</td><td>${kw(p.load_power_w)}</td>
-    <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
-  $('powerTable').querySelector('tbody').innerHTML = rows;
+  const f = frame(points);
+  const pv = f.of('pv_total_power_w');
+  const grid = f.of('grid_power_w');
+  const load = f.of('load_power_w');
+  powerTable(f.rows);
+  if (!anyReading(pv, grid, load)) { chartMessage('power', 'no data in this range'); return; }
+  paint('power', {
+    height: 230,
+    unit: 'kW',
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: powerRange } },
+      axes: [timeAxis(), kwAxis()],
+      // Three series at equal weight is three things competing, and where they
+      // cross you lose which is which. So identity is carried by form as well
+      // as by hue — solar a filled area because it is volume the array
+      // harvested, home the heaviest line because it is the one the owner
+      // acts on, grid a thin dashed trace because it is usually zero and only
+      // matters when it is not. The chart still reads when the colours do not.
+      //
+      // Grid is an area, not a line, and that is the second time this series
+      // has been re-drawn. When the house runs on the grid, import *is* the
+      // house load — the two agreed to the watt in 81% of the samples where the
+      // grid was supplying anything — so a grid line lies exactly beneath the
+      // home line and disappears under it. Drawing it on top as a dash fixed
+      // the geometry and failed the eye: a 1.5px dashed trace in this hue is
+      // barely visible to a reader with colour vision deficiency, which is the
+      // reader this palette exists for.
+      //
+      // An area cannot hide that way. Its body shows below the coincident line
+      // whatever the top edge is doing, and it says the same thing solar's fill
+      // says — volume, not rate. So the order returns to fills underneath and
+      // home over them, and home is again the line that is never obscured.
+      series: [
+        {},
+        trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
+        trace('Grid', '--grid', 1.4, { fill: gridFill, fillTo: () => 0 }),
+        trace('Home', '--load', 2.1),
+      ],
+      plugins: [zeroRule(), readout('power', [
+        ['Solar', 1, kw], ['Home', 3, kw], ['Grid', 2, kw],
+      ])],
+    }),
+  }, [f.xs, pv, grid, load]);
 }
 
 // Battery power is the one series with a meaningful zero: above it the bank is
@@ -1241,62 +1233,30 @@ function drawPower(points) {
 // production and share a direction, while this one changes sign several times a
 // day — which is what made the combined chart hard to read.
 function drawBattery(points) {
-  const W=900,H=150,L=48,R=14,T=12,B=24;
-  const vals = points.map(p => p.battery_power_w).filter(v => v !== null && v !== undefined);
-  if (!vals.length) {
-    $('battpower').innerHTML = `<text class="tick" x="${L}" y="40">no data in this range</text>`;
-    return;
-  }
-  // The scale is symmetric about zero on purpose. An asymmetric one would make
-  // a 3 kW charge and a 3 kW discharge draw different heights.
-  const mag = Math.max(1000, ...vals.map(Math.abs));
-  const top = mag * 1.08, bot = -top;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (top - v) / (top - bot);
-
-  let s = '';
-  const step = Math.pow(10, Math.floor(Math.log10(Math.max(top, 1)))) / 2;
-  for (let g = Math.ceil(bot/step)*step; g <= top; g += step) {
-    const y = sy(g);
-    const zero = Math.abs(g) < 1e-9;
-    s += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W-R}" y2="${y.toFixed(1)}" `
-      + `stroke="${zero ? 'rgba(255,255,255,.28)' : 'var(--grid-line)'}" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${(y+3).toFixed(1)}" text-anchor="end">`
-      + `${(g/1000).toFixed(Math.abs(g) >= 1000 || g === 0 ? 0 : 1)}</text>`;
-  }
-  s += `<text class="tick" x="${L}" y="9">kW</text>`;
-
-  // Filled to the zero line so the direction reads without consulting the
-  // legend, and split at the crossing so charge and discharge carry different
-  // colours. A gap breaks the fill rather than being bridged across.
-  let run = [];
-  const flush = () => {
-    if (run.length > 1) {
-      for (const [sign, colour] of [[1, PALETTE.batt], [-1, 'var(--batt-dis)']]) {
-        const clipped = run.map(([x, v]) => [x, sign > 0 ? Math.max(0, v) : Math.min(0, v)]);
-        if (!clipped.some(([, v]) => v !== 0)) continue;
-        const d = clipped.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
-        s += `<polygon points="${clipped[0][0].toFixed(1)},${sy(0).toFixed(1)} ${d} `
-          + `${clipped[clipped.length-1][0].toFixed(1)},${sy(0).toFixed(1)}" `
-          + `fill="${colour}" fill-opacity="0.30"/>`;
-      }
-      s += `<polyline points="${run.map(([x, v]) => `${x.toFixed(1)},${sy(v).toFixed(1)}`).join(' ')}" `
-        + `fill="none" stroke="var(--batt)" stroke-width="1.6" stroke-linejoin="round"/>`;
-    }
-    run = [];
-  };
-  points.forEach((p, n) => {
-    const v = p.battery_power_w;
-    if (v === null || v === undefined || p.is_gap) flush();
-    else run.push([sx(n), v]);
-  });
-  flush();
-  s += `<g id="battpowerCross"></g>`;
-  $('battpower').innerHTML = s;
-  attachHover('battpower', points, [
-    ['Battery', 'battery_power_w', (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v))],
-    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
-  ], { W, H, L, R });
+  const f = frame(points);
+  const batt = f.of('battery_power_w');
+  const soc = f.of('battery_soc_pct');
+  if (!anyReading(batt)) { chartMessage('battpower', 'no data in this range'); return; }
+  paint('battpower', {
+    height: 150,
+    unit: 'kW',
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: batteryRange } },
+      axes: [timeAxis(), kwAxis()],
+      // Filled to the zero line so the direction reads without consulting the
+      // legend, and split at the crossing so charging and discharging carry
+      // different shades of the one hue.
+      series: [
+        {},
+        trace('Battery', '--batt', 1.6, { fill: battFill, fillTo: () => 0 }),
+        carried(),
+      ],
+      plugins: [zeroRule(), readout('battpower', [
+        ['Battery', 1, (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v))],
+        ['State of charge', 2, (v) => `${v.toFixed(0)}%`],
+      ])],
+    }),
+  }, [f.xs, batt, soc]);
 }
 
 // Today's energy as a flow diagram, from the inverter's own counters. The two
@@ -1376,46 +1336,57 @@ function drawSankey(i) {
   $('sankey').innerHTML = `<g class="sank">${out}</g>`;
 }
 
+// Two views of the same poll: what is happening now, and where the day's energy
+// went. Both read from /api/live, so switching between them costs nothing and
+// they stay one document — which is why the nav reaches them by hash rather
+// than by path. The hash is authoritative when there is one, so a link from
+// another page lands on the view it named; the remembered choice only decides
+// what a bare "/" opens on.
 function wireTabs() {
-  const tabs = [['tabNow', 'viewNow'], ['tabFlow', 'viewFlow']];
+  const views = { now: 'viewNow', flow: 'viewFlow', inverter: 'viewInverter' };
   const show = (want) => {
-    for (const [t, v] of tabs) {
-      const on = v === want;
-      $(t).setAttribute('aria-selected', String(on));
-      $(v).hidden = !on;
-    }
+    for (const [key, id] of Object.entries(views)) $(id).hidden = key !== want;
+    drawNav(want);
     localStorage.setItem('as.tab', want);
     // The charts size themselves from the container, which is zero-width while
     // hidden, so anything revealed has to be redrawn rather than left stretched.
-    if (want === 'viewNow') loadHistory();
+    if (want === 'now') loadHistory();
   };
-  for (const [t, v] of tabs) $(t).onclick = () => show(v);
-  show(localStorage.getItem('as.tab') === 'viewFlow' ? 'viewFlow' : 'viewNow');
+  const wanted = () => {
+    const hash = location.hash.replace('#', '');
+    if (hash in views) return hash;
+    const held = localStorage.getItem('as.tab');
+    return held === 'flow' || held === 'viewFlow' ? 'flow' : 'now';
+  };
+  window.addEventListener('hashchange', () => show(wanted()));
+  show(wanted());
 }
 
 function drawSoc(points) {
-  const W=900,H=130,L=48,R=14,T=10,B=24;
-  const sx = (n) => L + (W-L-R) * n / Math.max(points.length-1, 1);
-  const sy = (v) => T + (H-T-B) * (100 - v) / 100;
-  let s = '';
-  for (const g of [0,25,50,75,100]) {
-    const y = sy(g);
-    s += `<line x1="${L}" y1="${y}" x2="${W-R}" y2="${y}" stroke="var(--grid-line)" stroke-width="1"/>`;
-    s += `<text class="tick" x="${L-8}" y="${y+3}" text-anchor="end">${g}%</text>`;
-  }
-  let run = [];
-  points.forEach((p, n) => {
-    const v = p.battery_soc_pct;
-    if (v === null || v === undefined || p.is_gap) { s += line(run, PALETTE.batt); run = []; }
-    else run.push(`${sx(n).toFixed(1)},${sy(v).toFixed(1)}`);
-  });
-  s += line(run, PALETTE.batt);
-  s += `<g id="socCross"></g>`;
-  $('soc').innerHTML = s;
-  attachHover('soc', points, [
-    ['State of charge', 'battery_soc_pct', (v) => `${v.toFixed(0)}%`],
-    ['Battery', 'battery_power_w', kw],
-  ], { W, H, L, R });
+  const f = frame(points);
+  const soc = f.of('battery_soc_pct');
+  const batt = f.of('battery_power_w');
+  if (!anyReading(soc)) { chartMessage('soc', 'no data in this range'); return; }
+  paint('soc', {
+    height: 130,
+    unit: '',
+    opts: chartBase({
+      // Nailed to nought and a hundred. Autoscaling this would draw a bank
+      // that sat between 61% and 64% all day as a dramatic climb up the full
+      // height of the panel, and the y axis is the whole reading here.
+      scales: { x: { time: true }, y: { range: () => [0, 100] } },
+      axes: [timeAxis(), axis({
+        size: 48, gap: 6,
+        splits: () => [0, 25, 50, 75, 100],
+        values: (u, splits) => splits.map((v) => `${v}%`),
+      })],
+      series: [{}, trace('State of charge', '--batt', 1.8), carried()],
+      plugins: [readout('soc', [
+        ['State of charge', 1, (v) => `${v.toFixed(0)}%`],
+        ['Battery', 2, kw],
+      ])],
+    }),
+  }, [f.xs, soc, batt]);
 }
 
 async function loadHistory() {
@@ -1424,24 +1395,53 @@ async function loadHistory() {
   const metrics = 'pv_total_power_w,load_power_w,battery_power_w,grid_power_w,battery_soc_pct';
   const width = Math.max(300, Math.min(4000, Math.round(document.body.clientWidth)));
   const url = `/api/history?start=${start.toISOString()}&end=${end.toISOString()}&metrics=${metrics}&width=${width}`;
+  // The read and the drawing are caught separately, and that separation is the
+  // whole point. With one try around both, an exception thrown while drawing —
+  // a renamed helper, a stale cached common.js against a fresh page — reported
+  // itself as "history unavailable". The fetch had succeeded; the note sent the
+  // reader to look at the network while the charts stayed blank for a reason
+  // sitting in the console.
+  let body;
   try {
-    const body = await fetch(url).then(r => r.json());
+    body = await fetch(url).then(r => r.json());
+  } catch (e) {
+    // A transient poll failure must not tear the charts down. Destroying them
+    // takes the owner's zoom with it, and the readings already on screen are
+    // still the last ones the inverter gave us — better a stale chart with a
+    // note than a blank panel every time the network hiccups.
+    note('history unavailable — showing the last successful read');
+    return;
+  }
+  try {
     drawPower(body.points || []);
     drawBattery(body.points || []);
     drawSoc(body.points || []);
+    rangeChanged = false;
+    refreshZoomState();
   } catch (e) {
-    $('power').innerHTML = `<text class="tick" x="48" y="40">history unavailable</text>`;
+    note(`the charts could not be drawn: ${e && e.message ? e.message : e}`);
+    console.error('drawing failed', e);
   }
 }
 
-wireSettings();
-wireDetail();
-wireTabs();
-drawRanges();
-loadLive();
-loadHistory();
-scheduleLive();
-setInterval(loadHistory, 60000);
+// Boot. Everything above is definitions; nothing runs until here. The display
+// defaults are adopted before the first render rather than after it, so a
+// dashboard configured in Celsius does not flash Fahrenheit on the way in.
+async function boot() {
+  await syncDisplayDefaults();
+  wireSettings();
+  wireDetail();
+  wireTabs();
+  $('zoomReset').onclick = resetZoom;
+  setInterval(refreshZoomState, 900);
+  showRanges();
+  loadLive();
+  loadHistory();
+  scheduleLive();
+  setInterval(loadHistory, 60000);
+}
+
+boot();
 </script>
 </body>
 </html>

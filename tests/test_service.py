@@ -14,10 +14,11 @@ import pytest
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 def _service(tmp_path: Path, **kwargs: object) -> tuple[CollectorService, SqliteStore]:
-    store = SqliteStore(str(tmp_path / "svc.db"))
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
     source = kwargs.pop("source", None) or FakeSource()
     svc = CollectorService(source=source, store=store, interval=0.01, **kwargs)  # type: ignore[arg-type]
     return svc, store
@@ -153,7 +154,7 @@ async def test_the_loop_collects_repeatedly(tmp_path: Path) -> None:
 
 
 async def test_interval_must_be_positive(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "x.db"))
+    store = SqliteStore(str(tmp_path / "x.db"), device=TEST_DEVICE)
     with pytest.raises(ValueError, match="interval"):
         CollectorService(source=FakeSource(), store=store, interval=0)
     store.close()
@@ -171,3 +172,245 @@ async def test_status_reports_what_happened(tmp_path: Path) -> None:
     store.close()
     assert svc.status.last_success is not None
     assert svc.status.last_error is None
+
+
+async def test_the_interval_is_a_cadence_not_a_pause_between_polls(tmp_path: Path) -> None:
+    # Sleeping the whole interval after each read makes the real spacing read
+    # time plus interval. On the reference dongle a read takes twelve to
+    # seventeen seconds, so an eleven second interval produced samples
+    # twenty-five seconds apart — under half the rate the setting asks for.
+    svc, store = _service(tmp_path)
+    loop = asyncio.get_running_loop()
+    interval = svc._backoff()
+
+    # A read that took two thirds of the interval leaves a third to wait.
+    started = loop.time() - interval * (2 / 3)
+    assert svc._wait_from(started) == pytest.approx(interval / 3, abs=interval / 20)
+
+    # One that took no time at all waits the whole interval.
+    assert svc._wait_from(loop.time()) == pytest.approx(interval, abs=interval / 20)
+    store.close()
+
+
+async def test_a_read_slower_than_its_interval_gets_no_sleep_rather_than_a_negative_one(
+    tmp_path: Path,
+) -> None:
+    # The cadence floor is what the dongle can answer at. Asking for eleven
+    # seconds when a read takes fourteen means fourteen, not a negative sleep.
+    svc, store = _service(tmp_path)
+    loop = asyncio.get_running_loop()
+    assert svc._wait_from(loop.time() - 10.0) == 0.0
+    store.close()
+
+
+async def test_backoff_still_wins_while_the_inverter_is_unreachable(tmp_path: Path) -> None:
+    # A failing read returns fast, so scheduling by cadence would retry a dead
+    # connection at full speed — which is the one thing backing off exists to
+    # prevent.
+    svc, store = _service(tmp_path)
+    svc.status.consecutive_failures = 3
+    loop = asyncio.get_running_loop()
+    assert svc._wait_from(loop.time() - 5.0) == pytest.approx(svc._backoff())
+    store.close()
+
+
+async def test_a_loop_that_stops_running_is_reported_as_stalled(tmp_path: Path) -> None:
+    # Restart=always covers a process that exits. It cannot see this process
+    # serving pages perfectly while collecting nothing, which is what a dead
+    # poll task or a read that never returns both look like from outside.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(minutes=90)
+
+    # Nothing at all since startup, well past the threshold.
+    assert svc.stalled_for(now) is not None
+
+    # A poll that succeeded a moment ago is fine.
+    svc.status.last_success = now - timedelta(seconds=30)
+    assert svc.stalled_for(now) is None
+    store.close()
+
+
+async def test_an_inverter_that_is_simply_absent_is_not_a_stall(tmp_path: Path) -> None:
+    # Every poll failing is the loop working: it records the gap and backs off.
+    # Restarting over that loses the backoff and thrashes for as long as the
+    # inverter is away, which is the opposite of what a watchdog is for.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(hours=6)
+    svc.status.last_success = now - timedelta(hours=5)
+    svc.status.last_failure = now - timedelta(seconds=20)
+    assert svc.stalled_for(now) is None
+    store.close()
+
+
+async def test_a_yielded_dongle_is_not_a_stall(tmp_path: Path) -> None:
+    # Polling has been handed over deliberately so the vendor's app can push a
+    # firmware update. Restarting mid-update would take the dongle back.
+    from datetime import UTC, datetime, timedelta
+
+    svc, store = _service(tmp_path)
+    svc._stall_after = timedelta(minutes=20)
+    svc.status.running = True
+    svc.status.yielding = True
+    now = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
+    svc.status.started_at = now - timedelta(hours=2)
+    assert svc.stalled_for(now) is None
+    store.close()
+
+
+async def test_a_dead_loop_is_a_stall_even_though_running_went_false(tmp_path: Path) -> None:
+    # The case the watchdog exists for, and the one it missed. `_loop` clears
+    # `running` before re-raising, so a check that stood down when running was
+    # False stood down precisely when the loop had died — leaving the web server
+    # serving stale pages over a collector that had stopped, forever.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    async def boom() -> None:
+        # A locked database, which is what a long scrub does to a live poll and
+        # is not among the transport errors poll_once recovers from.
+        raise sqlite3.OperationalError("database is locked")
+
+    await svc.start()
+    await asyncio.sleep(0.05)
+    svc._source.read = boom  # type: ignore[method-assign, assignment]
+    await asyncio.sleep(0.15)
+
+    assert svc._task is not None and svc._task.done(), "the loop should have died"
+    assert svc.status.running is False
+    assert svc.stalled_for() is not None, "a dead loop must read as stalled"
+    store.close()
+
+
+async def test_a_service_that_was_never_started_is_not_a_stall(tmp_path: Path) -> None:
+    # Quiet on purpose. There is no loop to be dead.
+    svc, store = _service(tmp_path)
+    assert svc.stalled_for() is None
+    store.close()
+
+
+async def test_a_stopped_service_is_not_a_stall(tmp_path: Path) -> None:
+    # Also quiet on purpose: somebody asked it to stop.
+    svc, store = _service(tmp_path)
+    await svc.start()
+    await asyncio.sleep(0.02)
+    await svc.stop()
+    assert svc.stalled_for() is None
+    store.close()
+
+
+async def test_backoff_survives_an_inverter_that_is_gone_for_days(tmp_path: Path) -> None:
+    # 2**consecutive_failures is evaluated before the cap is applied, so it
+    # grows an integer nobody needs: at 1024 failures it is too large to be a
+    # float and raises. With a five-minute cap that is about eighty-five hours
+    # of an unreachable inverter — a long holiday, a tripped breaker — after
+    # which the loop dies rather than carrying on retrying every five minutes.
+    svc, store = _service(tmp_path, max_backoff=300.0)
+    for failures in (1, 10, 100, 1024, 5000, 100_000):
+        svc.status.consecutive_failures = failures
+        assert svc._backoff() == pytest.approx(300.0) or failures < 20
+    store.close()
+
+
+async def test_a_write_that_fails_is_recorded_and_survived(tmp_path: Path) -> None:
+    # store.append sits outside the handler that recovers from transport
+    # errors, and sqlite3.OperationalError is not among them — so a database
+    # held by something else long enough to exhaust the busy timeout takes the
+    # whole collector with it. The scrub tool clears in a single transaction
+    # and can do exactly that.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    def wedged(sample: object, device: str | None = None) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    svc._store.append = wedged  # type: ignore[method-assign]
+    # It must come back rather than raise, and count as a failure so the loop
+    # backs off instead of hammering a database that is busy.
+    await svc.poll_once()
+    assert svc.status.consecutive_failures == 1
+    assert svc.status.last_error is not None
+    assert "locked" in svc.status.last_error
+    store.close()
+
+
+async def test_the_loop_keeps_running_through_a_wedged_database(tmp_path: Path) -> None:
+    # The point of the above: the loop is still alive afterwards, so when the
+    # database frees up the next poll simply works.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+    real = svc._store.append
+    calls = {"n": 0}
+
+    def sometimes(sample: object, device: str | None = None) -> None:
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise sqlite3.OperationalError("database is locked")
+        real(sample, device=device)  # type: ignore[arg-type]
+
+    svc._store.append = sometimes  # type: ignore[method-assign]
+    await svc.start()
+    await asyncio.sleep(0.2)
+    assert svc._task is not None and not svc._task.done(), "the loop must survive"
+    await svc.stop()
+    assert calls["n"] > 2, "it should have gone on trying"
+    store.close()
+
+
+async def test_a_wedged_database_does_not_report_the_inverter_as_gone(tmp_path: Path) -> None:
+    # The read succeeded and only the write failed, so the connection is fine.
+    # Saying otherwise sends whoever is reading the status page after the
+    # dongle, the WiFi and the breaker while the actual problem is the disk.
+    import sqlite3
+
+    svc, store = _service(tmp_path)
+
+    def wedged(sample: object, device: str | None = None) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    svc._store.append = wedged  # type: ignore[method-assign]
+    await svc.poll_once()
+    assert svc.status.connected is True
+    store.close()
+
+
+async def test_a_reading_is_filed_under_the_source_not_the_stores_default(
+    tmp_path: Path,
+) -> None:
+    # The store's default is for readers. What a poll records has to be the
+    # inverter that answered, or a second collector writing through the same
+    # store would file its readings under the first one's serial.
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
+    svc = CollectorService(source=FakeSource(device="CE00000001"), store=store, interval=0.01)
+    sample = await svc.poll_once()
+    assert sample is not None
+    rows = store._conn.execute("SELECT DISTINCT device FROM inverter_raw").fetchall()
+    store.close()
+    assert rows == [("CE00000001",)]
+
+
+async def test_a_recorded_gap_names_the_inverter_that_went_quiet(tmp_path: Path) -> None:
+    # An outage stamped with the wrong serial reports the fault on a machine
+    # that was working.
+    store = SqliteStore(str(tmp_path / "svc.db"), device=TEST_DEVICE)
+    svc = CollectorService(
+        source=FakeSource(fail_on_read=ConnectionError("gone"), device="CE00000001"),
+        store=store,
+        interval=0.01,
+    )
+    await svc.poll_once()
+    rows = store._conn.execute("SELECT device, error FROM inverter_raw").fetchall()
+    store.close()
+    assert rows == [("CE00000001", "ConnectionError: gone")]

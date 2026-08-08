@@ -19,9 +19,13 @@ they remain command-line arguments. Nothing sensitive lives in that set.
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+
+from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
 if TYPE_CHECKING:
     from arraysense.store.sqlite_store import SqliteStore
@@ -55,6 +59,24 @@ class SettingSpec:
     lower: float | None = None
     upper: float | None = None
     secret: bool = False
+    # Length cap for text. The default suits a hostname or a serial; anything
+    # holding a structured value needs its own, and getting this wrong is not
+    # theoretical — a flat 128 rejected the reference installation's own tariff
+    # at 130 characters, which is three bands with their seasons.
+    max_length: int = 128
+    # Whether a newline is content rather than corruption. False for everything
+    # that reaches a wire protocol; true for a value a person writes a line at
+    # a time. The tariff is the only one so far, and ``parse_bands`` has always
+    # accepted newlines between bands — it was this validator that refused
+    # them, so a tariff typed the way it reads could not be saved at all.
+    multiline: bool = False
+    # An extra check for a value whose grammar the scalar types cannot express.
+    # Raises ValueError with a message meant for the person typing. Without it
+    # a malformed tariff saved, reported itself as saved, and only failed at
+    # the far end — where the Costs page could tell it had no usable tariff but
+    # not that one had been entered, so it said "no tariff entered" to somebody
+    # looking straight at the one they had just typed.
+    check: Callable[[str], object] | None = None
 
     def validate(self, value: object) -> object:
         """Return ``value`` coerced to this setting's type, or raise ValueError.
@@ -78,11 +100,39 @@ class SettingSpec:
         if self.kind == "str":
             if not isinstance(value, str):
                 raise ValueError(f"{self.key} must be text, got {value!r}")
+            # These reach a wire protocol and a socket. A control character or
+            # a zero-width space is not a hostname or a serial, and a value
+            # that only looks blank would override a working one.
+            allowed = {" ", "\n"} if self.multiline else {" "}
+            if any(ch.isspace() or not ch.isprintable() for ch in value if ch not in allowed):
+                raise ValueError(f"{self.key} must not contain control or invisible characters")
+            if len(value) > self.max_length:
+                raise ValueError(
+                    f"{self.key} is too long at {len(value)} characters, "
+                    f"the limit is {self.max_length}"
+                )
+            if self.check is not None and value.strip():
+                try:
+                    self.check(value)
+                except ValueError as exc:
+                    raise ValueError(f"{self.key}: {exc}") from exc
             return value
         # Booleans are integers in Python, so they have to be excluded before
         # the numeric check or `true` would quietly become 1.
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ValueError(f"{self.key} must be a number, got {value!r}")
+        # NaN and the infinities pass every bounds check, because each
+        # comparison against NaN is false and infinity is only caught on one
+        # side. A NaN poll interval was accepted here, stored, and then killed
+        # the collector when it reached the event loop — with the HTTP API
+        # still up, so the service looked healthy while collecting nothing.
+        if not math.isfinite(value):
+            raise ValueError(f"{self.key} must be a finite number, got {value!r}")
+        # A whole-number setting given 5.5 was quietly stored as 5 — the same
+        # coercion this docstring disclaims two paragraphs up, and the reason
+        # the settings page and this validator disagreed about one field.
+        if self.kind == "int" and value != int(value):
+            raise ValueError(f"{self.key} must be a whole number, got {value!r}")
         number = int(value) if self.kind == "int" else float(value)
         if self.lower is not None and number < self.lower:
             raise ValueError(f"{self.key} must be at least {self.lower}, got {number}")
@@ -136,6 +186,92 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "Seconds between reads of the inverter. The dongle answers at its "
             "own pace, so asking faster than about ten seconds mostly produces "
             "reads that overlap the previous one."
+        ),
+    ),
+    # --- Tariff -------------------------------------------------------------
+    # What the owner pays. Nothing here has a default that prices anything: an
+    # install that has entered no tariff shows energy and no money at all,
+    # because a guessed rate produces a savings figure that reads as measured.
+    SettingSpec(
+        key="tariff.bands",
+        # Several bands, each with a name, a price, its hours and its season.
+        max_length=2000,
+        # The help text below says "one band per line", and it has to be true:
+        # parse_bands splits on newlines and always has.
+        multiline=True,
+        # Checked with the real parser, so the page reports a malformed band
+        # beside the box it was typed in rather than storing it and letting
+        # the Costs page discover it as an absence.
+        check=parse_bands,
+        kind="str",
+        default="",
+        label="Rate bands",
+        help=(
+            "One band per line, or separated by semicolons: name, price per "
+            "kWh, and the hours it applies to, separated by pipes. A band may "
+            "list several ranges separated by commas, and a range may run "
+            "through midnight. For example: "
+            "Peak | 0.34 | 16:00-21:00; Off-peak | 0.11 | 21:00-16:00 — "
+            "leave it empty and no money is shown anywhere."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.fixed_monthly",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=100000.0,
+        label="Fixed monthly charge",
+        help=(
+            "The connection or supply charge, payable whatever the usage. It "
+            "is shared across whatever period is being shown and added once to "
+            "an estimated bill. It never appears in the savings figure, since "
+            "no amount of solar avoids it."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.export_per_kwh",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=1000.0,
+        label="Export credit",
+        help=(
+            "What the supplier pays for a kWh sent back. Leave it at zero if "
+            "yours pays nothing, and no credit is shown rather than a zero one."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.adjustments",
+        # One line per billing month, at roughly thirty characters a line. A
+        # supplier publishes twelve a year and the old lines are what let an
+        # old month be re-priced, so this has to hold years of them.
+        max_length=4000,
+        multiline=True,
+        # Checked with the real parser, for the same reason the bands are: a
+        # month that stored but would not read is a bill silently unadjusted.
+        check=parse_adjustments,
+        kind="str",
+        default="",
+        label="Monthly adjustment factors",
+        help=(
+            "PCRF and SCRF, the per-kWh factors the supplier re-sets every "
+            "month and charges on top of the band rate. One line per billing "
+            "month: the month as YYYY-MM, then PCRF, then SCRF, separated by "
+            "pipes. PCRF is often negative. For example: "
+            f"{EXAMPLE_ADJUSTMENTS} — leave a factor empty if it has not been "
+            "published, and leave the whole box empty if your supplier charges "
+            "neither. A month with nothing recorded is priced at the base rate "
+            "and shown as unadjusted rather than as adjusted by nothing."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.currency",
+        kind="str",
+        default="$",
+        label="Currency",
+        help=(
+            "Written in front of every money figure. A symbol or a code — whatever your bill uses."
         ),
     ),
     # --- Connection ---------------------------------------------------------
@@ -328,6 +464,14 @@ class SettingsStore:
         Masking rather than blanking keeps the page usable: the owner can see
         which serial is configured and confirm it is the right one, without the
         value being readable by someone who did not already know it.
+
+        **This is form safety, not confidentiality, and the difference matters.**
+        The same unauthenticated endpoint accepts writes, so a client on the
+        network can point ``connection.dongle_host`` at a listener it controls
+        and read both serials off the wire at the next poll — the protocol
+        carries them in clear ASCII. Masking stops a serial being read off the
+        page; only authentication stops it being taken. Nothing here should be
+        described to an owner as protecting the value.
         """
         out: dict[str, object] = {}
         for spec in SETTINGS:
@@ -367,6 +511,12 @@ def describe() -> list[dict[str, object]]:
             "upper": spec.upper,
             "secret": spec.secret,
             "default": spec.default,
+            # Both are needed by a page that wants to refuse exactly what the
+            # server refuses. Without max_length a text box happily submits a
+            # value the server then rejects; without multiline it cannot tell
+            # which field is a line and which is a paragraph.
+            "max_length": spec.max_length,
+            "multiline": spec.multiline,
         }
         for spec in SETTINGS
     ]

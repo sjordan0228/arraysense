@@ -313,3 +313,84 @@ def test_a_single_pack_bank_has_no_spread_to_report() -> None:
     status = _at(2, modules=_modules(NOW, {"A": 61.0}))
     assert status.soc_spread_pct is None
     assert not status.wiring_suspect
+
+
+# --- findings from an independent review -------------------------------------
+
+
+def test_five_minute_holes_in_the_minute_tier_do_not_bridge() -> None:
+    # The tier this reads has one row per minute. Rows at 0, 5, 10, 15 and 20
+    # minutes were being credited as one unbroken twenty-minute absorb, when
+    # nothing at all is known about the four minutes between each of them.
+    rows = [
+        {
+            "timestamp": NOW + timedelta(minutes=5 * i),
+            "battery_voltage_v": ABSORB_V,
+            "bms_charge_voltage_ref_v": 56.0,
+            "error": None,
+        }
+        for i in range(5)
+    ]
+    assert full_charge_windows(rows) == []
+
+
+def test_ordinary_jitter_still_counts_as_one_run() -> None:
+    # The tolerance has to absorb a late write without bridging a real hole.
+    rows = _inverter(NOW, _charge())
+    rows[10]["timestamp"] += timedelta(seconds=40)
+    assert len(full_charge_windows(rows)) == 1
+
+
+def test_a_pack_read_minutes_ago_is_not_compared_against_live_ones() -> None:
+    # A spread asks whether the packs disagree at one instant. A fourteen-
+    # minute-old 53.50 V beside a live 53.80 V is 300 mV of elapsed time, and
+    # it was raising the wiring alarm over a pack that had simply gone quiet.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 60.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 61.0, "voltage_v": 53.79},
+        {
+            "timestamp": NOW - timedelta(minutes=14),
+            "serial": "C",
+            "soc_pct": 58.0,
+            "voltage_v": 53.50,
+        },
+    ]
+    status = _at(2, modules=modules)
+    assert not status.wiring_suspect
+    assert status.voltage_spread_mv == 10.0
+
+
+def test_packs_all_equally_old_are_still_compared_with_each_other() -> None:
+    # The skew is measured against the newest reading, not the clock, so a bank
+    # that went quiet together is still diagnosable from its last moment.
+    old = NOW - timedelta(minutes=10)
+    modules = [
+        {"timestamp": old, "serial": "A", "soc_pct": 60.0, "voltage_v": 53.80},
+        {"timestamp": old, "serial": "B", "soc_pct": 60.0, "voltage_v": 53.50},
+    ]
+    status = _at(2, modules=modules)
+    assert status.voltage_spread_mv == 300.0
+    assert status.wiring_suspect
+
+
+def test_a_wiring_alert_keeps_the_drift_verdict_beside_it() -> None:
+    # Both can be true at once, and an earlier version let the alert erase the
+    # ladder entirely — leaving no sign the counters were stale as well.
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 40.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 70.0, "voltage_v": 53.50},
+    ]
+    status = _at(120, modules=modules)
+    assert status.severity == "alert"
+    assert status.drift_severity == "elevated"
+    assert "stale as well" in status.detail
+
+
+def test_a_wiring_alert_on_a_freshly_charged_bank_says_nothing_about_drift() -> None:
+    modules = [
+        {"timestamp": NOW, "serial": "A", "soc_pct": 60.0, "voltage_v": 53.80},
+        {"timestamp": NOW, "serial": "B", "soc_pct": 60.0, "voltage_v": 53.50},
+    ]
+    status = _at(2, modules=modules)
+    assert status.drift_severity == "none"
+    assert "stale as well" not in status.detail

@@ -54,7 +54,13 @@ MIN_ABSORB = timedelta(minutes=20)
 # rows that are simply missing. Without an elapsed-time check, two one-minute
 # voltage blips hours apart merge into one long "absorb" and a bank that has
 # drifted for two months reports itself calibrated.
-MAX_SAMPLE_GAP = timedelta(minutes=5)
+#
+# Two minutes, not five. The tier this reads has one row per minute, so five
+# minutes of tolerance silently bridges four missing rows — rows at 0, 5, 10,
+# 15 and 20 minutes were being credited as one unbroken twenty-minute absorb
+# when nothing at all is known about the four minutes between each of them.
+# Two minutes still absorbs ordinary jitter and a single late write.
+MAX_SAMPLE_GAP = timedelta(minutes=2)
 
 # Charge current at the end of a window, above which the bank was still being
 # pushed rather than sitting full. Voltage alone can be held high by charge
@@ -65,9 +71,17 @@ FULL_CHARGE_TAPER_A = 25.0
 # How stale a module's last reading may be before it stops counting as present.
 # At an eleven-second poll this is some eighty missed reads, which is a dropped
 # CAN link rather than jitter. Without it a pack that fell off the bus keeps
-# contributing its final voltage forever, and the wiring alarm fires comparing
-# a week-old reading against three live ones.
+# contributing its final voltage forever.
 PACK_REPORT_MAX_AGE = timedelta(minutes=15)
+
+# How far apart two packs' readings may be and still be compared with each
+# other. Much tighter than the presence window above, and for a different
+# reason: presence asks "is this pack alive", while a voltage spread asks "do
+# these packs disagree *at the same instant*". A fourteen-minute-old 53.50 V
+# against a live 53.80 V is a 300 mV spread that never existed — and it would
+# raise the wiring alarm, sending the owner after a lug over a pack that simply
+# stopped answering. Two minutes is a handful of polls.
+PACK_COMPARE_MAX_SKEW = timedelta(minutes=2)
 
 # What a pack has to report for its counter to be considered reset. Not 100:
 # the BMS reports whole percent to an accuracy of five, and a pack that settles
@@ -104,6 +118,11 @@ class CalibrationStatus:
     """
 
     severity: Severity
+    # What the drift ladder said, independently of any wiring fault. A wiring
+    # alert takes over the headline because it is the more urgent thing and
+    # needs a different action — but it must not erase the fact that the
+    # counters are also stale, which an earlier version did.
+    drift_severity: Severity
     days_since: float | None
     last_full_charge: datetime | None
     searched_days: float
@@ -291,6 +310,38 @@ def _current(
     return fresh
 
 
+def _simultaneous(
+    modules: Sequence[dict[str, Any]], skew: timedelta = PACK_COMPARE_MAX_SKEW
+) -> list[dict[str, Any]]:
+    """Keep only the packs read at close enough to the same moment to compare.
+
+    A spread asks whether the packs disagree *at one instant*. Packs read
+    minutes apart have not been compared at all, and the difference between
+    them is elapsed time rather than a measurement — a fourteen-minute-old
+    53.50 V beside a live 53.80 V looks like 300 mV of resistance and would
+    raise the wiring alarm over a pack that simply stopped answering.
+
+    Anchored to the newest reading rather than to the clock, so a bank whose
+    readings are all equally old is still compared with itself.
+    """
+    stamped = [r for r in modules if isinstance(r.get("timestamp"), datetime)]
+    if not stamped:
+        return list(modules)
+    newest = max(r["timestamp"] for r in stamped)
+    kept = []
+    for row in modules:
+        when = row.get("timestamp")
+        if isinstance(when, datetime) and newest - when > skew:
+            logger.debug(
+                "pack %s read %s before the newest; not comparable",
+                row.get("serial"),
+                newest - when,
+            )
+            continue
+        kept.append(row)
+    return kept
+
+
 def _spreads(
     modules: Sequence[dict[str, Any]],
 ) -> tuple[float | None, float | None]:
@@ -338,7 +389,9 @@ def assess(
             reported recently are dropped before anything is compared.
     """
     reporting = _current(modules, now, PACK_REPORT_MAX_AGE)
-    soc_spread, volt_spread = _spreads(reporting)
+    # Present is not the same as comparable: a spread between readings taken
+    # minutes apart is elapsed time wearing the shape of a measurement.
+    soc_spread, volt_spread = _spreads(_simultaneous(reporting))
     wiring = volt_spread is not None and volt_spread >= VOLTAGE_SPREAD_ALARM_MV
     days = (now - last_full).total_seconds() / 86400 if last_full is not None else None
 
@@ -356,8 +409,18 @@ def assess(
     estimate = severity == "elevated"
 
     if wiring and volt_spread is not None:
+        drift_note = ""
+        if severity != "none":
+            drift_note = (
+                f" Separately, it has been {days:.0f} days since the bank last reached full,"
+                " so the per-pack percentages are stale as well."
+                if days is not None
+                else " Separately, no full charge was found in the searched history,"
+                " so the per-pack percentages are stale as well."
+            )
         return CalibrationStatus(
             severity="alert",
+            drift_severity=severity,
             days_since=days,
             last_full_charge=last_full,
             searched_days=searched_days,
@@ -369,7 +432,7 @@ def assess(
             detail=(
                 f"{volt_spread:.0f} mV between packs. Parallel packs are forced to the same "
                 "voltage, so this is resistance in a cable, a lug or a busbar — or a failing "
-                "pack. Charging will not fix it; check the connections."
+                "pack. Charging will not fix it; check the connections." + drift_note
             ),
         )
 
@@ -381,7 +444,7 @@ def assess(
     )
 
     if days is None:
-        headline = "State of charge may be drifting"
+        headline = "State of charge maybe drifting"
         detail = (
             f"No full charge found in the last {searched_days:.0f} days of history. "
             "Charging the bank to 100% resets each pack's counter."
@@ -405,6 +468,7 @@ def assess(
 
     return CalibrationStatus(
         severity=severity,
+        drift_severity=severity,
         days_since=days,
         last_full_charge=last_full,
         searched_days=searched_days,

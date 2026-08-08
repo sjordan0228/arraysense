@@ -1,0 +1,726 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Graphs — Solar ArraySense</title>
+<!-- uPlot is vendored and served from this app, never fetched from a CDN. The
+     collector runs on a home network that may have no route to the internet at
+     all, and a chart library that silently fails to load is a blank panel with
+     nothing on screen to say why. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<script src="/vendor/uPlot.iife.min.js"></script>
+<!-- The shared front end — palette, formatters, nav and the chart factory. It
+     injects the base stylesheet as it runs, so it has to load above this page's
+     own <style>: the page's rules then come second in the cascade and win. -->
+<script src="/common.js"></script>
+<style>
+  /* Small multiples. One band per series, all sharing a time axis and a
+     crosshair, each scaled to its own peak so nothing ever crosses anything.
+     The layout has to survive twenty-odd bands, so a band is as plain as it
+     can be: a label line and a short plot, repeated. */
+  .band{margin-bottom:7px}
+  .band:last-child{margin-bottom:0}
+  /* Indented past the y axis so the name sits over the plot rather than over
+     the tick labels, and lines up with the "nothing recorded" message that
+     replaces the plot when there is nothing to draw. */
+  .bandlab{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+    margin:0 2px 1px 48px}
+  .bandlab .bn{font-size:11.5px;color:var(--ink2)}
+  .bandlab .bs{font-size:9.5px;color:var(--ink3);letter-spacing:.02em;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
+  .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <!-- What the server actually served, not what was asked for. A chart drawn
+         from the minute rollup looks exactly like one drawn from raw samples,
+         so the resolution has to be stated rather than assumed. -->
+    <div class="conn" id="res">loading…</div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="chartbar">
+    <div class="rng" id="ranges"></div>
+    <span class="note" id="chartNote" hidden></span>
+    <button id="zoomReset" hidden>Reset zoom</button>
+    <span class="zoomhint">drag across any band to zoom them all</span>
+  </div>
+
+  <section class="p">
+    <div class="chead"><h2>Solar</h2>
+      <span class="legend muted">one band per series, each scaled to its own peak</span>
+    </div>
+    <div id="solarBands"></div>
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Battery</h2>
+      <span class="legend muted">the bank as a whole</span>
+    </div>
+    <div id="batteryBands"></div>
+  </section>
+
+  <section class="p">
+    <!-- This section states its own resolution rather than borrowing the one
+         in the header. The two endpoints choose a tier independently and out
+         of different lists, and the answers genuinely differ: a week arrives
+         as a minute rollup on the inverter side, and these bands have no
+         minute tier to land on at all. -->
+    <div class="chead"><h2>Battery pack temperature</h2>
+      <span class="legend muted" id="packRes">one band per pack, named by serial</span>
+    </div>
+    <div id="packBands"><div class="empty">waiting for per-pack readings</div></div>
+    <!-- Two same-coloured traces, and a third column deliberately not drawn,
+         both need saying out loud once. The alternative to the first is a
+         second hue, and the palette has four that were checked against each
+         other; a fifth would be one nobody checked. -->
+    <p class="why">Two traces to a pack, in one colour because they are one
+      quantity from one battery: its hottest cell solid, its coldest dashed. The
+      hottest cannot sit below the coldest, so position separates the pair and
+      the dash only confirms it. The pack's own <code>temperature_c</code> is
+      read out on hover rather than drawn, because it is not one thing: on a raw
+      sample it is the same number as the hottest cell, the inverter library
+      filling both from a single register, and on a rollup it is the bucket's
+      mean while the drawn pair are the bucket's maximum and minimum. That is
+      also where the pair spreads apart, and why the legend on this section
+      names the tier these bands came from rather than leaving the header to
+      speak for them — per-module readings are kept at full cadence and hourly
+      with nothing between, so the two halves of this page can be drawn from
+      different tiers of the same range. The bank band above is a different
+      register again: the hottest cell anywhere in the bank, not in any one
+      pack, which is exactly what a pack-by-pack chart is here to open up.</p>
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>AC</h2>
+      <span class="legend muted">grid, backup panel and the inverter itself</span>
+    </div>
+    <div id="acBands"></div>
+    <!-- Outside temperature and cloud cover belong beside the solar bands once
+         a weather source exists. Tracked as issue #5; the note that used to
+         stand here explaining their absence was longer than the absence. -->
+  </section>
+</main>
+
+<script>
+// Everything shared with the other pages — $, esc, numOrNull, DASH, the
+// formatters, the palette resolver, frame(), the range list and the chart
+// factory — comes from /common.js, which is loaded above. This file is only
+// what is particular to the graphs page.
+
+// ---------------------------------------------------------------------------
+// How much of the store this page is prepared to ask for.
+// ---------------------------------------------------------------------------
+
+// /api/history has no tier parameter: it picks the tier whose point count best
+// fits the width the caller asks for. The width is therefore less a statement
+// about pixels than a request for a resolution, and asking for exactly as many
+// as the span holds raw samples is how a short range lands on raw rather than
+// hoping for it.
+//
+// Past a few thousand that ask stops making sense. Thirty days holds 235,636
+// raw samples at an eleven-second cadence, and asking for a width to match —
+// or for the ten thousand the endpoint accepts as its maximum — makes the
+// minute rollup the closest fit: 43,154 rows and 26 MB of JSON across
+// twenty-odd bands, measured against this installation. Capping the ask lets
+// the endpoint answer thirty days from the hourly tier instead, 720 rows and
+// 0.4 MB, which is the whole reason it chooses rather than being told.
+//
+// This caps the ask, not the range. Every span the store retains stays
+// selectable; what the cap changes is the resolution that comes back, and the
+// readout in the header says which one did.
+const MAX_POINTS = 4000;
+
+// The per-pack side needs a cap of its own, because it is choosing between a
+// different pair of tiers. Per-module readings have no minute rollup — the
+// store keeps them at full cadence and hourly and nothing between — so a
+// middling width that would put the inverter side on its minute tier scores
+// full cadence here, there being nothing in the middle to score.
+//
+// Both endpoints score a tier by log distance from the requested width, so the
+// tie between two of them sits at the geometric mean of the point counts they
+// would return — for the module tiers, the span over sqrt(cadence × 3600). At
+// eleven seconds that boundary is a width of 434 for a day and 3,039 for a
+// week, and the cap has to fall between them: above the first so a day still
+// comes back at full cadence, below the second so a week does not.
+//
+// A point there is one instant, and this endpoint answers an instant with a
+// row per pack, so what arrives is four times that count on this bank. Worth
+// saying twice, because quoting a span's instant count as its row count is
+// exactly how the figures that used to stand here came out at a quarter of
+// what they should have been.
+//
+// Measured as response bytes against a rebuilt month at this cadence, the four
+// spans cost 1.14, 4.56, 0.11 and 0.47 MB — 7,856 and 31,420 rows at full
+// cadence, then 672 and 2,880 off the hourly tier. The week is what the cap is
+// for: uncapped it comes back at full cadence instead, 219,928 rows and 32 MB.
+//
+// The day is the heavier load, though, and neither cap changes what it costs —
+// both sides answer from full cadence with the caps on or off. Its 4.56 MB of
+// packs arrives beside 4.55 MB of inverter bands in the same pair of requests,
+// so one click on 24h pulls a little over nine megabytes: the two sides cost
+// the same despite the packs carrying three metric columns against the
+// inverter's twenty-three, because four rows to the instant is what that buys.
+const MODULE_MAX_POINTS = 1200;
+
+// Only reached when /api/settings cannot be read. The interval is configurable
+// and the widths below are computed from it, so guessing wrong here would ask
+// for a width that lands on the wrong tier.
+const DEFAULT_CADENCE = 11;
+let cadence = DEFAULT_CADENCE;
+
+// The span's own raw sample count while that is under the cap, the cap once it
+// is not. The inverter cap sits well clear of where raw stops winning: at this
+// cadence a width of four thousand against a day still scores the full tier
+// ahead of the minute rollup, so a day comes back raw despite asking for half
+// as many points as it holds.
+const askFor = (seconds, cap) => Math.max(1, Math.round(Math.min(seconds / cadence, cap)));
+const widthFor = (seconds) => askFor(seconds, MAX_POINTS);
+const moduleWidthFor = (seconds) => askFor(seconds, MODULE_MAX_POINTS);
+
+// Short enough that twenty-odd of them fit on a screen, tall enough that a
+// swing is a shape rather than a smudge. The last band in each section carries
+// the time labels and is taller by exactly what they take.
+const BAND_H = 66;
+const AXIS_H = 16;
+
+const REFRESH_MS = 60000;
+
+// ---------------------------------------------------------------------------
+// Scales. Each band is scaled to its own peak — that is the whole argument for
+// small multiples — so none of these floors the range at a round number the
+// way the dashboard's shared-axis charts have to.
+// ---------------------------------------------------------------------------
+
+// Anything that can be zero is drawn against zero: a house drawing 40 W and a
+// house drawing 12 kW should not both fill the band. Null bounds mean nothing
+// was read at all, which is not a range of zero — the band will have been
+// replaced by a message before this matters.
+function aroundZero(u, min, max) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
+  const hi = Math.max(0, max);
+  const lo = Math.min(0, min);
+  const pad = (hi - lo) * 0.08 || 1;
+  return [lo - pad, hi + pad];
+}
+
+// Symmetric about zero for a signed quantity, so a 3 kW charge and a 3 kW
+// discharge are drawn at the same height and the sign is carried by which side
+// of the line the trace is on. Not common.js's batteryRange, which floors the
+// magnitude at a kilowatt: right for a battery power chart, meaningless for
+// the amps and nonsense for a band scaled to its own peak.
+function mirrored(u, min, max) {
+  const seen = [min, max].filter(Number.isFinite).map(Math.abs);
+  if (!seen.length) return [-1, 1];
+  const mag = Math.max.apply(null, seen) || 1;
+  return [-mag * 1.08, mag * 1.08];
+}
+
+// A level, not a quantity: mains voltage sits near 240 all day and the reading
+// is the wobble, so forcing zero into the range would flatten the only thing
+// worth seeing. A dead-flat series still gets a band rather than a range of
+// nothing.
+function level(u, min, max) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
+  const pad = (max - min) * 0.12 || Math.max(Math.abs(max) * 0.02, 0.5);
+  return [min - pad, max + pad];
+}
+
+// ---------------------------------------------------------------------------
+// Units. One axis per band, because watts, volts, amps and degrees do not
+// share a scale and a dual axis is the most misleading thing a chart can do.
+// ---------------------------------------------------------------------------
+
+const tickNum = (v) => (v % 1 === 0 ? v.toFixed(0) : v.toFixed(1));
+const plain = (u, splits) => splits.map(tickNum);
+
+// Watts on the axis rather than kilowatts, unlike the dashboard. A band scaled
+// to its own peak may top out at 30 W, and in kilowatts every tick on it would
+// read 0.0. The readout still switches to kW where that reads better.
+//
+// Decimals come from the gap between ticks rather than from the value, because
+// a series that never moves off zero is drawn across a range of a watt or two
+// — and rounded to whole watts that axis reads 0, 0, 0, 1, 1.
+const wattTicks = (u, splits) => {
+  const step = splits.length > 1 ? Math.abs(splits[1] - splits[0]) : 1;
+  const digits = step >= 1 ? 0 : step >= 0.1 ? 1 : 2;
+  return splits.map((v) => v.toFixed(digits));
+};
+
+// Grid frequency lives inside a tenth of a hertz, so two decimals is not
+// fussiness — at one decimal the whole band reads 60.0.
+const hzTicks = (u, splits) => splits.map((v) => v.toFixed(2));
+
+const KINDS = {
+  power: { unit: 'W', fmt: kw, range: aroundZero, values: wattTicks },
+  current: { unit: 'A', fmt: (v) => uStr(v, 1, 'A'), range: aroundZero, values: plain },
+  voltage: { unit: 'V', fmt: (v) => uStr(v, 1, 'V'), range: level, values: plain },
+  freq: { unit: 'Hz', fmt: (v) => uStr(v, 2, 'Hz'), range: level, values: hzTicks },
+  // Readings are stored in Celsius because that is what the hardware reports.
+  // The conversion happens once, on the way into the chart, so the axis and the
+  // readout cannot disagree about which unit they are in — and the formatter
+  // below takes an already-converted value, which is why it is not tempStr().
+  temp: {
+    unit: () => '°' + settings.tempUnit,
+    conv: tempOf,
+    fmt: (v) => gnum(v, 1) + ' °' + settings.tempUnit,
+    range: level,
+    values: plain,
+  },
+  percent: {
+    unit: '%',
+    fmt: (v) => `${v.toFixed(0)}%`,
+    range: () => [0, 100],
+    splits: () => [0, 50, 100],
+    values: (u, splits) => splits.map((v) => `${v}%`),
+  },
+};
+
+// ---------------------------------------------------------------------------
+// The bands, in the order they are drawn. Data rather than markup: this page
+// is two dozen near-identical charts, and a page that spells each one out is a
+// page where the twelfth quietly differs from the other eleven.
+//
+// Colour is by what the series is about — solar, home, battery, grid — and
+// never by which band it is. Four hues, validated against protanopia,
+// deuteranopia and tritanopia; a fifth would be a hue nobody checked.
+// ---------------------------------------------------------------------------
+
+const BANDS = [
+  // --- Solar ---------------------------------------------------------------
+  { sec: 'solar', id: 'pvTotal', metric: 'pv_total_power_w', label: 'PV power, total',
+    kind: 'power', ink: '--pv', fill: pvFill },
+  { sec: 'solar', id: 'pv1p', metric: 'pv1_power_w', label: 'String 1 power',
+    kind: 'power', ink: '--pv', fill: pvFill },
+  { sec: 'solar', id: 'pv2p', metric: 'pv2_power_w', label: 'String 2 power',
+    kind: 'power', ink: '--pv', fill: pvFill },
+  { sec: 'solar', id: 'pv3p', metric: 'pv3_power_w', label: 'String 3 power',
+    kind: 'power', ink: '--pv', fill: pvFill },
+  { sec: 'solar', id: 'acPv', metric: 'ac_couple_power_w', label: 'AC-coupled PV power',
+    kind: 'power', ink: '--pv', fill: pvFill },
+  // Voltage and current beside the power they multiply out to. Power falling
+  // with the voltage held up means the current is gone — shade, or a soiled
+  // panel. Power falling with the current held up means a string has partly
+  // disconnected. Neither reads off the power band alone.
+  { sec: 'solar', id: 'pv1v', metric: 'pv1_voltage_v', label: 'MPPT 1 voltage',
+    kind: 'voltage', ink: '--pv' },
+  { sec: 'solar', id: 'pv2v', metric: 'pv2_voltage_v', label: 'MPPT 2 voltage',
+    kind: 'voltage', ink: '--pv' },
+  { sec: 'solar', id: 'pv3v', metric: 'pv3_voltage_v', label: 'MPPT 3 voltage',
+    kind: 'voltage', ink: '--pv' },
+  { sec: 'solar', id: 'pv1i', metric: 'pv1_current_a', label: 'MPPT 1 current',
+    kind: 'current', ink: '--pv' },
+  { sec: 'solar', id: 'pv2i', metric: 'pv2_current_a', label: 'MPPT 2 current',
+    kind: 'current', ink: '--pv' },
+  { sec: 'solar', id: 'pv3i', metric: 'pv3_current_a', label: 'MPPT 3 current',
+    kind: 'current', ink: '--pv' },
+
+  // --- Battery bank --------------------------------------------------------
+  { sec: 'battery', id: 'battP', metric: 'battery_power_w', label: 'Battery power',
+    kind: 'power', ink: '--batt', fill: battFill, signed: true,
+    fmt: (v) => (v >= 0 ? 'charging ' : 'discharging ') + kw(Math.abs(v)) },
+  { sec: 'battery', id: 'battI', metric: 'battery_current_a', label: 'Battery current',
+    kind: 'current', ink: '--batt', signed: true },
+  { sec: 'battery', id: 'battV', metric: 'battery_voltage_v', label: 'Battery voltage',
+    kind: 'voltage', ink: '--batt' },
+  { sec: 'battery', id: 'battSoc', metric: 'battery_soc_pct', label: 'State of charge',
+    kind: 'percent', ink: '--batt' },
+  // Named for what it is. This register is the hottest cell anywhere in the
+  // bank, which is a different quantity from any one pack's temperature and
+  // will read higher than most of them.
+  { sec: 'battery', id: 'bankTemp', metric: 'battery_temperature_c',
+    label: 'Bank temperature, hottest cell', kind: 'temp', ink: '--batt' },
+
+  // --- AC ------------------------------------------------------------------
+  { sec: 'ac', id: 'loadP', metric: 'load_power_w', label: 'Load power, total',
+    kind: 'power', ink: '--load' },
+  // A hybrid inverter has two AC outputs. The backup output stays energised
+  // through an outage; the grid-passthrough output drops the moment the grid
+  // does. These two bands answer "what actually stays on when the power goes
+  // out", and the answer changes the day a circuit lands on the wrong panel.
+  { sec: 'ac', id: 'loadEss', metric: 'eps_power_w',
+    label: 'Load power, essential (backup panel)', kind: 'power', ink: '--load' },
+  // The grid-passthrough side has no register of its own: the inverter reports
+  // the whole house and the backup panel, and what is left is on the other
+  // panel. Both terms come from the same read, so the subtraction is exact —
+  // and absent the moment either term is, because a difference with a missing
+  // operand is a guess.
+  { sec: 'ac', id: 'loadNon', source: 'load_power_w − eps_power_w',
+    label: 'Load power, non-essential (grid passthrough)', kind: 'power', ink: '--load',
+    values: (f) => minus(f.of('load_power_w'), f.of('eps_power_w')) },
+  { sec: 'ac', id: 'gridP', metric: 'grid_power_w', label: 'Grid power',
+    kind: 'power', ink: '--grid', signed: true,
+    fmt: (v) => (v >= 0 ? 'importing ' : 'exporting ') + kw(Math.abs(v)) },
+  { sec: 'ac', id: 'acV', metric: 'eps_voltage_v',
+    label: 'AC output voltage (backup panel)', kind: 'voltage', ink: '--load' },
+  { sec: 'ac', id: 'gridV', metric: 'grid_voltage_v', label: 'Grid voltage',
+    kind: 'voltage', ink: '--grid' },
+  { sec: 'ac', id: 'gridHz', metric: 'grid_frequency_hz', label: 'Grid frequency',
+    kind: 'freq', ink: '--grid' },
+  { sec: 'ac', id: 'invTemp', metric: 'inverter_temperature_c', label: 'Inverter temperature',
+    kind: 'temp', ink: '--load' },
+];
+
+const SECTIONS = [
+  { key: 'solar', host: 'solarBands' },
+  { key: 'battery', host: 'batteryBands' },
+  { key: 'packs', host: 'packBands' },
+  { key: 'ac', host: 'acBands' },
+];
+
+// Every inverter metric the bands read, asked for in one request. Derived
+// bands name their inputs through values(), so the list is built from what is
+// plotted rather than kept beside it and allowed to drift.
+const WANTED = [
+  'load_power_w', 'eps_power_w',
+  ...BANDS.filter((b) => b.metric).map((b) => b.metric),
+];
+const METRICS = [...new Set(WANTED)].join(',');
+
+// What a pack band holds, in the order the columns are stacked into the data.
+// Both drawn traces are temperatures of the same battery from the same BMS, so
+// they share the band's one hue and are separated by dash and by position: a
+// pack's hottest cell cannot be below its coldest. Colour carries nothing here,
+// which is the point.
+//
+// temperature_c is fetched and read out but never drawn, and what it is
+// depends on the tier — which is the whole reason it is not a trace.
+//
+// On a raw sample it is not a third reading at all. The pack records this
+// collector stores come from pylxpweb's BatteryData.from_modbus_registers, in
+// transports/data.py, which takes one decoded max_cell_temperature out of the
+// register block and assigns it to both `temperature` and
+// `max_cell_temperature` — so a pack's temperature and its hottest cell are
+// one number arriving twice, and a trace for it would be the solid line drawn
+// again under a name implying another sensor.
+//
+// On a rollup they part company, because the registry aggregates them
+// differently: temperature_c takes the bucket's mean while the two cell
+// extremes take its max and min. So the same trace would duplicate another at
+// one resolution and mean something else at the next, which is a worse thing
+// to put on a band than to leave off it. The hover answers for the stored
+// column at every tier instead, which is where both of those can be checked.
+//
+// The names are the bare module metrics /api/battery/history takes. The store
+// keeps them in slot-numbered columns — battery_module1_temperature_c and its
+// siblings — and hands the bare name back against a serial, which is the only
+// mapping this page wants: a slot is a register position and not a battery, and
+// the inverter rotates modules through the four of them.
+const PACK_LINES = [
+  { metric: 'cell_max_temperature_c', label: 'Hottest cell', width: 1.4 },
+  { metric: 'cell_min_temperature_c', label: 'Coldest cell', dash: [5, 3], width: 1 },
+  { metric: 'temperature_c', label: 'Pack temperature', carry: true },
+];
+
+const PACK_METRICS = PACK_LINES.map((l) => l.metric).join(',');
+
+// The pack bands are built from whatever serials the store answers with, so
+// they cannot be listed above. Modules are identified by serial and never by
+// slot, so the label is the serial and nothing else; numbering the bands would
+// reintroduce exactly the identity this project refuses.
+let packBands = [];
+let packKey = '';
+
+// Joined with a character no serial can hold, so ["A B"] and ["A", "B"] cannot
+// compare equal and a pack list that changed cannot look like one that did not.
+const packKeyOf = (serials) => serials.join('\u0000');
+
+// A column of readings minus another, element by element. Absent minus
+// anything is absent.
+const minus = (a, b) => a.map((v, i) => (v === null || b[i] === null ? null : v - b[i]));
+
+const kindOf = (b) => KINDS[b.kind];
+const unitOf = (b) => {
+  const u = kindOf(b).unit;
+  return typeof u === 'function' ? u() : u;
+};
+
+const sectionBands = (key) =>
+  (key === 'packs' ? packBands : BANDS.filter((b) => b.sec === key));
+
+// Only the last band of a section carries time labels. Twenty-odd copies of
+// the same axis is twenty-odd rows of clutter, and the crosshair readout names
+// the instant anywhere the pointer is.
+function isLast(b) {
+  const list = sectionBands(b.sec);
+  return list.length > 0 && list[list.length - 1].id === b.id;
+}
+
+// ---------------------------------------------------------------------------
+// Drawing.
+// ---------------------------------------------------------------------------
+
+const bandHtml = (b) => `<div class="band">
+  <div class="bandlab"><span class="bn">${esc(b.label)}</span>
+    <span class="bs">${esc(b.source || b.metric || '')}</span></div>
+  <div class="chart" id="${esc(b.id)}Wrap" role="img"
+       aria-label="${esc(b.label)} over the selected range"></div>
+</div>`;
+
+function buildSections() {
+  for (const s of SECTIONS) {
+    if (s.key === 'packs') continue;
+    $(s.host).innerHTML = sectionBands(s.key).map(bandHtml).join('');
+  }
+}
+
+// What a band holds, one entry per column. Every band but the pack ones is a
+// single series and does not say so; giving them all an explicit list would be
+// two dozen copies of the same line for the sake of the ones that differ.
+const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
+
+// One band, and one column per trace. The values arrive already in the unit the
+// band is drawn in, and a band with nothing in any of its columns says so
+// rather than drawing an empty plot — a flat line on an axis is a reading of
+// nothing, and nothing recorded is not that.
+function paintBand(b, xs, cols) {
+  const k = kindOf(b);
+  const lines = linesOf(b);
+  if (!anyReading(...cols)) { chartMessage(b.id, 'nothing recorded in this range'); return; }
+  const fmt = b.fmt || k.fmt;
+  // Every trace in the readout, in the order they are stacked, so a pack's
+  // three temperatures are read off one hover rather than three.
+  const plugins = [readout(b.id, lines.map((l, i) => [l.label, i + 1, fmt]))];
+  if (b.signed) plugins.unshift(zeroRule());
+  // Built up rather than written out, because uPlot fills its axis defaults in
+  // with Object.assign: a key present and undefined overwrites the default
+  // with undefined, and the first thing to call axis.splits() then throws. The
+  // series extras below are assembled the same way and for the same reason.
+  const yAxis = { size: 46, gap: 6, values: k.values };
+  if (k.splits) yAxis.splits = k.splits;
+  paint(b.id, {
+    height: BAND_H + (isLast(b) ? AXIS_H : 0),
+    unit: unitOf(b),
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: b.signed ? mirrored : k.range } },
+      // The blank axis keeps the vertical gridlines and the plot's bottom
+      // margin on every band, so the bands stay aligned with the one that does
+      // carry labels and a trace never runs into the edge of its panel.
+      axes: [
+        isLast(b) ? timeAxis() : axis({ size: 10, values: (u, splits) => splits.map(() => '') }),
+        axis(yAxis),
+      ],
+      // A carried line is in the data and in the readout and nowhere on the
+      // canvas, so it also takes no part in ranging the scale.
+      series: [{}, ...lines.map((l) => (l.carry ? carried()
+        : trace(l.label, b.ink, l.width, Object.assign({},
+          b.fill ? { fill: b.fill, fillTo: () => 0 } : null,
+          l.dash ? { dash: l.dash } : null))))],
+      plugins,
+    }),
+  }, [xs, ...cols]);
+}
+
+// A band's own values, converted into the unit it is drawn in. tempOf answers
+// an absent reading with null, so absent survives the conversion.
+function valuesFor(b, f) {
+  const raw = b.values ? b.values(f) : f.of(b.metric);
+  const conv = kindOf(b).conv;
+  return conv ? raw.map(conv) : raw;
+}
+
+function drawInverter(body) {
+  if (!body) return;
+  const f = frame(body.points || []);
+  for (const b of BANDS) paintBand(b, f.xs, [valuesFor(b, f)]);
+}
+
+// Per-pack rows are one stream with the packs interleaved — a row per pack per
+// timestamp, each carrying all three temperatures — so they have to be pivoted
+// onto a shared time axis before they are series at all. frame() cannot do it:
+// it turns one row into one point.
+//
+// A pack that did not report at an instant gets a null there, which draws as a
+// hole in that pack's line and leaves the others alone. So does one reading
+// missing from a row that carries the others: the endpoint returns a row per
+// pack per timestamp with each absent reading as its own null, so filling any
+// of them in would put an invented temperature on the chart.
+function packSeries(points, serials) {
+  const stamps = new Set();
+  for (const p of points) {
+    const t = Date.parse(p && p.timestamp);
+    if (Number.isFinite(t)) stamps.add(t / 1000);
+  }
+  const xs = [...stamps].sort((a, b) => a - b);
+  const at = new Map(xs.map((t, i) => [t, i]));
+  const cols = new Map(serials.map(
+    (s) => [s, PACK_LINES.map(() => new Array(xs.length).fill(null))]));
+  for (const p of points) {
+    const t = Date.parse(p && p.timestamp);
+    const pack = cols.get(p && p.serial);
+    if (!pack || !Number.isFinite(t)) continue;
+    const i = at.get(t / 1000);
+    PACK_LINES.forEach((l, n) => { pack[n][i] = numOrNull(p[l.metric]); });
+  }
+  return { xs, cols };
+}
+
+function forgetPacks() {
+  for (const b of packBands) chartMessage(b.id, '');
+  packBands = [];
+  packKey = '';
+}
+
+// Rebuilt only when the set of serials changes, so a refresh does not tear
+// down four charts and the zoom on them every minute. A pack that has gone is
+// a pack whose band goes with it: leaving it behind would show a serial the
+// bank no longer has.
+function rebuildPacks(serials) {
+  forgetPacks();
+  packBands = serials.map((serial, i) => ({
+    // The id is a DOM handle and nothing more — it is rebuilt from scratch
+    // whenever the set of serials changes, so it never outlives the pack it
+    // was handed to and is not an identity anything reads back.
+    sec: 'packs', id: 'pack' + i, label: 'Pack ' + serial,
+    source: PACK_LINES.map((l) => l.metric).join(', '),
+    kind: 'temp', ink: '--batt', lines: PACK_LINES,
+  }));
+  packKey = packKeyOf(serials);
+  $('packBands').innerHTML = packBands.map(bandHtml).join('');
+}
+
+function drawPacks(body) {
+  if (!body) return;
+  const points = (body.points || []).filter((p) => p && typeof p.serial === 'string' && p.serial);
+  const serials = [...new Set(points.map((p) => p.serial))].sort();
+  if (!serials.length) {
+    forgetPacks();
+    $('packBands').innerHTML = '<div class="empty">no per-pack readings in this range</div>';
+    return;
+  }
+  if (packKeyOf(serials) !== packKey) rebuildPacks(serials);
+  const series = packSeries(points, serials);
+  packBands.forEach((b, i) => {
+    const raw = series.cols.get(serials[i]) || PACK_LINES.map(() => []);
+    // tempOf answers an absent reading with null, so absent survives the
+    // conversion — the same guarantee valuesFor() relies on for the inverter
+    // bands, and the reason a silent pack cannot arrive on the axis at zero.
+    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Loading.
+// ---------------------------------------------------------------------------
+
+let range = RANGES[0];
+
+async function get(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} answered ${r.status}`);
+  return r.json();
+}
+
+const tierPhrase = (body, raw) => (body.tier === 'full' ? raw : `${body.tier} rollup`);
+
+function resolution(body) {
+  if (!body) return;
+  const n = Number(body.count) || 0;
+  $('res').textContent =
+    `${tierPhrase(body, `raw ${tickNum(cadence)} s samples`)} · ${n.toLocaleString()} points`;
+}
+
+// The pack section's own readout. Counted in readings rather than points
+// because a module row is one pack at one instant: four packs answering the
+// same instant are four rows and one point, and calling that four points
+// beside a header that means something else by the word would be worse than
+// saying nothing. Left as the bare legend when the request failed, since the
+// bands then still hold the last successful read and naming a tier for them
+// would name the wrong one.
+function packResolution(body) {
+  const base = 'one band per pack, named by serial';
+  const n = body ? Number(body.count) || 0 : 0;
+  $('packRes').textContent = body
+    ? `${base} · ${tierPhrase(body, 'raw samples')} · ${n.toLocaleString()} readings`
+    : base;
+}
+
+async function load() {
+  const end = new Date();
+  const start = new Date(end.getTime() - range.seconds * 1000);
+  const when = `start=${start.toISOString()}&end=${end.toISOString()}`;
+  // Two asks, because the two endpoints choose from two different lists of
+  // tiers and one width cannot be right for both.
+  const width = widthFor(range.seconds);
+  const packWidth = moduleWidthFor(range.seconds);
+  const problems = [];
+  const [inv, packs] = await Promise.all([
+    get(`/api/history?${when}&metrics=${METRICS}&width=${width}`).catch(() => null),
+    get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
+      .catch(() => null),
+  ]);
+  // A failed poll must not tear the charts down: destroying them takes the
+  // owner's zoom with it over a problem that usually lasts one request, and
+  // what is on screen is still the last thing the inverter actually said.
+  if (!inv) problems.push('history unavailable — showing the last successful read');
+  if (!packs) problems.push('per-pack temperature unavailable');
+  // A rollup is not among them. On the longer spans it is exactly what this
+  // page asked to have chosen for it, and each side names the tier it got
+  // whenever an answer arrives — the inverter's in the header, the packs' in
+  // that section's own legend, since the two endpoints choose separately and
+  // one line could name only one of them. A warning about a rollup would be
+  // noise where it was not simply wrong.
+  note(problems.join(' · '));
+  resolution(inv);
+  packResolution(packs);
+  drawInverter(inv);
+  drawPacks(packs);
+  rangeChanged = false;
+  refreshZoomState();
+}
+
+// All four shared spans. None of them is out of reach: the store keeps a month
+// of raw samples, a year of minutes and every hour it has ever recorded, so
+// each of these has something behind it, and which tier answers is the
+// endpoint's choice rather than this page's business.
+function showRanges() {
+  drawRanges($('ranges'), range, pick);
+}
+
+function pick(r) {
+  if (!r) return;
+  range = r;
+  // Tells the chart factory to drop any zoom on the next paint. Without it the
+  // fetch runs, the button lights up, and nothing on screen changes.
+  rangeChanged = true;
+  showRanges();
+  load();
+}
+
+// The poll interval decides how many raw samples a span holds, and it is
+// configurable, so it is read rather than assumed.
+async function pollInterval() {
+  try {
+    const body = await get('/api/settings');
+    const secs = Number(body && body.values && body.values['collector.poll_interval']);
+    return Number.isFinite(secs) && secs > 0 ? secs : DEFAULT_CADENCE;
+  } catch (err) {
+    return DEFAULT_CADENCE;
+  }
+}
+
+// Boot. Everything above is definitions; nothing runs until here.
+async function boot() {
+  await syncDisplayDefaults();
+  drawNav('graphs');
+  buildSections();
+  $('zoomReset').onclick = resetZoom;
+  setInterval(refreshZoomState, 900);
+  cadence = await pollInterval();
+  showRanges();
+  await load();
+  setInterval(load, REFRESH_MS);
+}
+
+boot();
+</script>
+</body>
+</html>

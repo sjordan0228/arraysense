@@ -18,5 +18,11 @@ inverter_serial = "CE12345678"
 # than the round trip takes gains nothing.
 poll_interval = 11.0
 
+# Which family of inverter to read. Leave this alone unless you know you
+# need something else: it covers the EG4 and LuxPower hybrids reached over
+# the WiFi dongle. A wrong name is reported at startup along with the list
+# of names that work.
+driver = "eg4_luxpower"
+
 # Where the database is written. Prefer an SSD over a Pi's SD card.
 database_path = "/var/lib/arraysense/arraysense.db"

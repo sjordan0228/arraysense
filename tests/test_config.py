@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from arraysense.config import Config, example_toml, load
+from conftest import TEST_DEVICE
 
 GOOD = (
     'dongle_host = "192.168.1.50"\n'
@@ -127,7 +128,7 @@ def test_stored_settings_win_over_the_file(tmp_path: Path) -> None:
     from arraysense.settings import SettingsStore
     from arraysense.store.sqlite_store import SqliteStore
 
-    store = SqliteStore(str(tmp_path / "e.db"))
+    store = SqliteStore(str(tmp_path / "e.db"), device=TEST_DEVICE)
     settings = SettingsStore(store)
     settings.set("collector.poll_interval", 30.0)
     settings.set("connection.dongle_host", "10.0.0.9")
@@ -149,7 +150,7 @@ def test_an_empty_stored_value_does_not_blank_the_file_setting(tmp_path: Path) -
     from arraysense.settings import SettingsStore
     from arraysense.store.sqlite_store import SqliteStore
 
-    store = SqliteStore(str(tmp_path / "e2.db"))
+    store = SqliteStore(str(tmp_path / "e2.db"), device=TEST_DEVICE)
     settings = SettingsStore(store)
     settings.set("connection.dongle_serial", "")
 

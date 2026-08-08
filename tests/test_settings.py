@@ -12,11 +12,12 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 @pytest.fixture
 def settings(tmp_path: Path) -> SettingsStore:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     return SettingsStore(store)
 
 
@@ -33,10 +34,10 @@ def test_a_stored_value_wins_over_the_default(settings: SettingsStore) -> None:
 
 
 def test_a_setting_survives_reopening_the_database(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     SettingsStore(store).set("display.temperature_unit", "C")
     store.close()
-    reopened = SqliteStore(str(tmp_path / "s.db"))
+    reopened = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     assert SettingsStore(reopened).get("display.temperature_unit") == "C"
     reopened.close()
 
@@ -172,3 +173,65 @@ def test_clearing_a_setting_removes_its_override(settings: SettingsStore) -> Non
     settings.set("display.temperature_unit", "C")
     settings.clear("display.temperature_unit")
     assert settings.overrides() == {}
+
+
+# --- findings from an independent review -------------------------------------
+
+
+def test_a_non_finite_number_is_refused(settings: SettingsStore) -> None:
+    # NaN passes every bounds check, because each comparison against it is
+    # false. It was accepted, stored, and then killed the collector when it
+    # reached the event loop — with the HTTP API still up, so the service
+    # looked healthy while collecting nothing.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="finite"):
+            settings.set("collector.poll_interval", bad)
+
+
+def test_an_invisible_character_cannot_override_a_working_value(
+    settings: SettingsStore,
+) -> None:
+    # A zero-width space is not whitespace to str.strip(), so a value made of
+    # one counts as set and would replace a real serial with nothing visible.
+    with pytest.raises(ValueError, match="control or invisible"):
+        settings.set("connection.dongle_serial", "BA​12345678")
+
+
+def test_a_control_character_is_refused(settings: SettingsStore) -> None:
+    # These reach a wire protocol and a socket.
+    with pytest.raises(ValueError, match="control or invisible"):
+        settings.set("connection.dongle_host", "192.168.1.50\r\nEvil")
+
+
+def test_an_absurdly_long_value_is_refused(settings: SettingsStore) -> None:
+    with pytest.raises(ValueError, match="too long"):
+        settings.set("connection.dongle_serial", "x" * 500)
+
+
+def test_an_ordinary_serial_is_still_accepted(settings: SettingsStore) -> None:
+    settings.set("connection.dongle_serial", "BA12345678")
+    assert settings.get("connection.dongle_serial") == "BA12345678"
+
+
+def test_a_table_of_monthly_factors_saves_as_typed(settings: SettingsStore) -> None:
+    # Written a line at a time, the way the supplier publishes them, and read
+    # back unchanged: the registry stores the text and the tariff parses it.
+    typed = "2026-07 | -0.001230 | 0.004560\n2026-08 | 0.002100 | 0.004560"
+    settings.set("tariff.adjustments", typed)
+    assert settings.get("tariff.adjustments") == typed
+
+
+def test_a_malformed_month_of_factors_is_refused_at_the_box_it_was_typed_in(
+    settings: SettingsStore,
+) -> None:
+    # Storing it and letting the Costs page discover it as an absence is how
+    # the tariff field went wrong; the same check runs here for the same reason.
+    with pytest.raises(ValueError, match="2026-07"):
+        settings.set("tariff.adjustments", "2026-07 | -0.001 | 0.004; 2026-07 | -0.002 | 0.004")
+
+
+def test_an_empty_table_of_factors_is_allowed(settings: SettingsStore) -> None:
+    # A supplier that charges no rider is the ordinary case, and it must not
+    # have to type something to say so.
+    settings.set("tariff.adjustments", "")
+    assert settings.get("tariff.adjustments") == ""

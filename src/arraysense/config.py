@@ -30,6 +30,17 @@ DEFAULT_POLL_INTERVAL = 11.0
 # had it, which is why the transport is pluggable.
 DEFAULT_DONGLE_PORT = 8000
 
+# Which family of inverter to read. Defaults to the one every installation of
+# this software has today, so nobody's existing config.toml has to be edited to
+# gain a setting that would only tell it what it was already doing.
+#
+# Not validated here. The list of drivers lives in arraysense.drivers, which
+# imports this module to build a source, so checking a name at load time would
+# be a cycle. The registry raises a ValueError naming the drivers that do exist,
+# and the entry point already reports a ValueError as one line rather than a
+# traceback.
+DEFAULT_DRIVER = "eg4_luxpower"
+
 _REQUIRED = ("dongle_host", "dongle_serial", "inverter_serial", "database_path")
 
 
@@ -54,6 +65,12 @@ class Config:
     refused rather than ignored. Find it on the dongle's label, in the
     router's DHCP list, or broadcast as its WiFi access point name.
     ``poll_interval`` is in seconds.
+
+    ``driver`` names the inverter family, and defaults to the EG4/LuxPower one
+    because that is what every installation of this software reads today. The
+    names are listed by ``arraysense.drivers``; an unknown one is reported
+    there rather than here, so that this module does not have to import the
+    drivers that import it.
     """
 
     dongle_host: str
@@ -62,6 +79,7 @@ class Config:
     database_path: str
     poll_interval: float = DEFAULT_POLL_INTERVAL
     dongle_port: int = DEFAULT_DONGLE_PORT
+    driver: str = DEFAULT_DRIVER
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -79,6 +97,12 @@ class Config:
             raise ValueError(f"poll_interval must be positive, got {self.poll_interval}")
         if not 1 <= self.dongle_port <= 65535:
             raise ValueError(f"dongle_port must be a valid port, got {self.dongle_port}")
+        # Blank rather than absent, because absent means the default. Someone
+        # who wrote ``driver = ""`` meant to name one and did not, and letting
+        # it fall through to the registry would report it as "no such driver:
+        # ''", which reads like a bug in the software rather than in the file.
+        if not self.driver.strip():
+            raise ValueError("driver must be set")
 
 
 def _number(data: dict[str, object], field: str, default: float) -> float:
@@ -137,6 +161,7 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
         database_path=str(data["database_path"]),
         poll_interval=_number(data, "poll_interval", DEFAULT_POLL_INTERVAL),
         dongle_port=round(_number(data, "dongle_port", DEFAULT_DONGLE_PORT)),
+        driver=str(data.get("driver", DEFAULT_DRIVER)),
     )
 
 
@@ -195,6 +220,12 @@ def example_toml() -> str:
         "# Seconds between reads. The dongle answers when it answers, so asking faster\n"
         "# than the round trip takes gains nothing.\n"
         f"poll_interval = {DEFAULT_POLL_INTERVAL}\n"
+        "\n"
+        "# Which family of inverter to read. Leave this alone unless you know you\n"
+        "# need something else: it covers the EG4 and LuxPower hybrids reached over\n"
+        "# the WiFi dongle. A wrong name is reported at startup along with the list\n"
+        "# of names that work.\n"
+        f'driver = "{DEFAULT_DRIVER}"\n'
         "\n"
         "# Where the database is written. Prefer an SSD over a Pi's SD card.\n"
         'database_path = "/var/lib/arraysense/arraysense.db"\n'

@@ -22,11 +22,15 @@ computable without any extra hardware, down to which cell in which module.
 
 ## What it records
 
-147 columns per poll: 63 inverter measurements and 21 for each of four battery
+175 columns per poll: 91 inverter measurements and 21 for each of four battery
 modules. Alongside the obvious power and voltage figures that means per-string
 current, both heatsink temperatures, split-phase backup output leg by leg, the
 charge and discharge limits the BMS is currently imposing, and remaining capacity in
 amp-hours rather than only as a percentage.
+
+Energy comes from the inverter's own kWh counters, daily and lifetime, rather than
+from integrating power. Integration agrees on a clean day and quietly undercounts
+after any gap in collection; the counters keep counting through ours.
 
 Two rules govern all of it. A reading the inverter did not report is stored as NULL
 and rendered as a gap, never as zero — a battery block empty because the CAN link
@@ -101,9 +105,19 @@ from it, so adding a metric is a one-line change there.
 - [docs/api.md](docs/api.md) — HTTP API reference
 - [docs/troubleshooting.md](docs/troubleshooting.md) — dongle connection problems,
   missing battery data, and other things people run into
+- [docs/migrating-from-solar-assistant.md](docs/migrating-from-solar-assistant.md) —
+  bringing your SolarAssistant history across, so switching does not cost you it
 
 ## Licence
 
 [AGPL-3.0-or-later](LICENSE). Chosen deliberately: anyone may run and modify this,
 but a modified version offered as a service must publish its source, which prevents
 this being turned into a closed product.
+
+## Vendored
+
+[uPlot](https://github.com/leeoniya/uPlot) (MIT) is committed under
+`src/arraysense/web/` rather than loaded from a CDN. The service runs on home
+networks that may have no route to the internet, and a chart library that
+silently fails to load leaves a blank panel with no clue why. Its licence ships
+alongside it as `uPlot.LICENSE`.

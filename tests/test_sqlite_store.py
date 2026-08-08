@@ -10,13 +10,14 @@ fixed path.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
 
 
 def _ts() -> datetime:
@@ -31,12 +32,12 @@ def _open_db(path: Path) -> sqlite3.Connection:
 def _metric_columns(conn: sqlite3.Connection) -> tuple[str, ...]:
     """Return the inverter metric column names in table declaration order."""
     cols = [r[1] for r in conn.execute("PRAGMA table_info(inverter_raw)")]
-    return tuple(c for c in cols if c not in ("timestamp", "error"))
+    return tuple(c for c in cols if c not in ("timestamp", "device", "error"))
 
 
 def test_opening_creates_schema(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.close()
     conn = _open_db(path)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -48,11 +49,11 @@ def test_opening_creates_schema(tmp_path: Path) -> None:
 
 def test_opening_existing_database_succeeds_unchanged(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 500.0}))
     store.close()
     # Reopening runs the idempotent DDL again; the existing row must survive.
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.close()
     conn = _open_db(path)
     rows = conn.execute("SELECT pv_total_power_w FROM inverter_raw").fetchall()
@@ -63,7 +64,7 @@ def test_opening_existing_database_succeeds_unchanged(tmp_path: Path) -> None:
 
 def test_wal_journaling_is_enabled(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.close()
     conn = _open_db(path)
     mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -75,7 +76,7 @@ def test_appended_reading_is_stored_scaled(tmp_path: Path) -> None:
     # battery_voltage_v has scale 10 — the resolution the register carries:
     # 51.9 V must land on disk as the integer 519, not as a float.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"battery_voltage_v": 51.9}))
     store.close()
     conn = _open_db(path)
@@ -90,7 +91,7 @@ def test_absent_metric_is_null_and_distinct_from_zero(tmp_path: Path) -> None:
     # pv_total_power_w is a real zero (within bounds); battery_soc_pct is
     # simply absent from the sample. NULL must stay NULL, never become 0.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 0.0}))
     store.close()
     conn = _open_db(path)
@@ -103,7 +104,7 @@ def test_absent_metric_is_null_and_distinct_from_zero(tmp_path: Path) -> None:
 
 def test_failed_poll_stores_reason_and_no_readings(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample.failed(_ts(), "inverter unreachable"))
     store.close()
     conn = _open_db(path)
@@ -111,8 +112,9 @@ def test_failed_poll_stores_reason_and_no_readings(tmp_path: Path) -> None:
     assert row is not None
     # Every metric column is NULL — a failed poll has no readings, not zeroed
     # readings — and the reason rides in the trailing error column.
+    # Columns run timestamp, device, then the registry, then error.
     for i, _ in enumerate(_metric_columns(conn)):
-        assert row[1 + i] is None
+        assert row[2 + i] is None
     assert row[-1] == "inverter unreachable"
     conn.close()
 
@@ -121,7 +123,7 @@ def test_out_of_bounds_reading_is_stored_and_flagged(tmp_path: Path) -> None:
     # 25,583 W of battery power is about double what an 18kPV can deliver. It
     # must be stored (evidence of a decode bug) and flagged in invalid_readings.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"battery_power_w": 25583.0}))
     store.close()
     conn = _open_db(path)
@@ -143,7 +145,7 @@ def test_same_timestamp_twice_leaves_one_row_later_values(tmp_path: Path) -> Non
     # A collector retry after a partial failure rewrites the same timestamp;
     # the later write wins and the row is never duplicated.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     ts = _ts()
     store.append(Sample(timestamp=ts, readings={"pv_total_power_w": 100.0}))
     store.append(Sample(timestamp=ts, readings={"pv_total_power_w": 200.0}))
@@ -157,7 +159,7 @@ def test_same_timestamp_twice_leaves_one_row_later_values(tmp_path: Path) -> Non
 
 def test_unknown_metric_name_raises(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     with pytest.raises(KeyError):
         store.append(Sample(timestamp=_ts(), readings={"no_such_metric": 5.0}))
     store.close()
@@ -171,7 +173,7 @@ def test_unknown_metric_name_raises(tmp_path: Path) -> None:
 def test_repeated_append_does_not_duplicate_failure_flags(tmp_path: Path) -> None:
     # The row upsert is idempotent; the flags must be too, or a collector retry
     # would inflate the failure count for a fault that happened once.
-    store = SqliteStore(str(tmp_path / "t.db"))
+    store = SqliteStore(str(tmp_path / "t.db"), device=TEST_DEVICE)
     ts = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
     sample = Sample(timestamp=ts, readings={"battery_power_w": 25583.0})
     store.append(sample)
@@ -189,7 +191,7 @@ def test_repeated_append_does_not_duplicate_failure_flags(tmp_path: Path) -> Non
 def test_a_reading_becoming_valid_clears_its_stale_flag(tmp_path: Path) -> None:
     # If a retry reports a plausible value, the earlier flag must not linger and
     # imply the reading is still suspect.
-    store = SqliteStore(str(tmp_path / "t.db"))
+    store = SqliteStore(str(tmp_path / "t.db"), device=TEST_DEVICE)
     ts = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
     store.append(Sample(timestamp=ts, readings={"battery_power_w": 25583.0}))
     store.append(Sample(timestamp=ts, readings={"battery_power_w": 5000.0}))
@@ -206,7 +208,7 @@ def test_a_reading_becoming_valid_clears_its_stale_flag(tmp_path: Path) -> None:
 def test_module_reading_is_stored_scaled(tmp_path: Path) -> None:
     # Module temperature_c has scale 10: 23.5 C must land on disk as 235.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(
         Sample(
             timestamp=_ts(),
@@ -226,7 +228,7 @@ def test_serial_is_registered_once(tmp_path: Path) -> None:
     # The same serial appearing in every poll must not create a new id each
     # time; registering must be safe to repeat.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     module = BatteryModuleSample(serial="CE12345678", slot=1, soc_pct=80.0)
     store.append(Sample(timestamp=_ts(), readings={}, battery_modules=(module,)))
     store.append(
@@ -248,7 +250,7 @@ def test_two_serials_in_same_slot_make_distinct_series(tmp_path: Path) -> None:
     # A slot is positional, not identity: two physical batteries rotated through
     # the same slot must land on two module_ids, never merge into one series.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(
         Sample(
             timestamp=_ts(),
@@ -280,7 +282,7 @@ def test_one_serial_across_slots_stays_a_single_series(tmp_path: Path) -> None:
     # The inverse of the rotation case: a module moved to another slot is the
     # same battery and must keep one identity, not fork into a second series.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     for minute, slot, soc in ((0, 1, 80.0), (1, 4, 79.0)):
         store.append(
             Sample(
@@ -304,7 +306,7 @@ def test_absent_module_field_is_null_distinct_from_zero(tmp_path: Path) -> None:
     # soc_pct=0.0 is a real zero (within bounds); soh_pct is simply absent.
     # NULL must stay NULL, never become 0.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(
         Sample(
             timestamp=_ts(),
@@ -325,7 +327,7 @@ def test_same_timestamp_and_module_leaves_one_row_later_values(tmp_path: Path) -
     # A collector retry rewrites the same timestamp and module; the later write
     # wins and the row is never duplicated.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     ts = _ts()
     store.append(
         Sample(
@@ -351,7 +353,7 @@ def test_same_timestamp_and_module_leaves_one_row_later_values(tmp_path: Path) -
 
 def test_four_modules_at_one_timestamp_produce_four_rows(tmp_path: Path) -> None:
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     modules = tuple(
         BatteryModuleSample(serial=f"CE0000000{i}", slot=i, soc_pct=float(i)) for i in range(1, 5)
     )
@@ -368,7 +370,7 @@ def test_out_of_bounds_module_reading_is_stored_and_flagged(tmp_path: Path) -> N
     # flagged against the module's serial, and repeating the write must not
     # duplicate the flag.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     module = BatteryModuleSample(serial="CE12345678", slot=1, soc_pct=120.0)
     sample = Sample(timestamp=_ts(), readings={}, battery_modules=(module,))
     store.append(sample)
@@ -392,7 +394,7 @@ def test_module_reading_becoming_valid_clears_its_stale_flag(tmp_path: Path) -> 
     # If a retry reports a plausible value, the earlier module flag must not
     # linger and imply the reading is still suspect.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     ts = _ts()
     store.append(
         Sample(
@@ -419,7 +421,7 @@ def test_failed_poll_writes_no_module_rows(tmp_path: Path) -> None:
     # A failed poll has no modules (Sample enforces it); it must write no
     # module rows and register no serials.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store.append(Sample.failed(_ts(), "inverter unreachable"))
     store.close()
     conn = _open_db(path)
@@ -434,7 +436,7 @@ def test_a_failing_module_write_rolls_back_the_whole_sample(tmp_path: Path) -> N
     # Both halves of a sample share one transaction, so a crash partway must
     # leave nothing behind rather than an inverter row with no modules.
     path = tmp_path / "store.db"
-    store = SqliteStore(str(path))
+    store = SqliteStore(str(path), device=TEST_DEVICE)
     store._conn.execute(
         "CREATE TRIGGER reject_modules BEFORE INSERT ON module_raw "
         "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
@@ -458,7 +460,7 @@ def test_a_failing_module_write_rolls_back_the_whole_sample(tmp_path: Path) -> N
 
 def test_query_returns_real_world_values(tmp_path: Path) -> None:
     # battery_voltage_v stores scaled by 1000; the caller gets volts back.
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"battery_voltage_v": 51.9}))
     rows = store.query(["battery_voltage_v"], _ts(), _ts())
     store.close()
@@ -468,7 +470,7 @@ def test_query_returns_real_world_values(tmp_path: Path) -> None:
 
 
 def test_query_keeps_absent_distinct_from_zero(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 0.0}))
     rows = store.query(["pv_total_power_w", "battery_soc_pct"], _ts(), _ts())
     store.close()
@@ -477,7 +479,7 @@ def test_query_keeps_absent_distinct_from_zero(tmp_path: Path) -> None:
 
 
 def test_query_respects_the_range_and_orders_by_time(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     for minute, value in ((0, 1.0), (1, 2.0), (5, 3.0)):
         store.append(
             Sample(
@@ -495,7 +497,7 @@ def test_query_respects_the_range_and_orders_by_time(tmp_path: Path) -> None:
 
 
 def test_query_identifies_a_failed_poll(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     store.append(Sample.failed(_ts(), "inverter unreachable"))
     rows = store.query(["pv_total_power_w"], _ts(), _ts())
     store.close()
@@ -504,14 +506,14 @@ def test_query_identifies_a_failed_poll(tmp_path: Path) -> None:
 
 
 def test_unknown_metric_in_query_raises(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     with pytest.raises(KeyError):
         store.query(["no_such_metric"], _ts(), _ts())
     store.close()
 
 
 def test_unknown_tier_raises(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     with pytest.raises(KeyError):
         store.query(["pv_total_power_w"], _ts(), _ts(), tier="nonexistent")
     # Module data has no minute tier.
@@ -523,7 +525,7 @@ def test_unknown_tier_raises(tmp_path: Path) -> None:
 def test_module_query_is_keyed_by_serial(tmp_path: Path) -> None:
     # Two batteries that occupied slot 1 at different times must come back as
     # two series, identified by serial rather than position.
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     for minute, serial, soc in ((0, "AAA", 90.0), (1, "BBB", 20.0)):
         store.append(
             Sample(
@@ -542,7 +544,7 @@ def test_module_query_is_keyed_by_serial(tmp_path: Path) -> None:
 
 
 def test_module_query_can_filter_to_one_serial(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     store.append(
         Sample(
             timestamp=_ts(),
@@ -559,7 +561,7 @@ def test_module_query_can_filter_to_one_serial(tmp_path: Path) -> None:
 
 
 def test_latest_returns_the_most_recent_reading(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     for minute, value in ((0, 1.0), (5, 2.0), (3, 3.0)):
         store.append(
             Sample(
@@ -575,14 +577,14 @@ def test_latest_returns_the_most_recent_reading(tmp_path: Path) -> None:
 
 
 def test_latest_is_none_on_an_empty_store(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     assert store.latest(["pv_total_power_w"]) is None
     assert store.latest_modules(["soc_pct"]) == []
     store.close()
 
 
 def test_latest_modules_gives_each_module_once(tmp_path: Path) -> None:
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     for minute, soc_a, soc_b in ((0, 90.0, 20.0), (1, 88.0, 19.0)):
         store.append(
             Sample(
@@ -605,7 +607,7 @@ def test_latest_uses_an_index_rather_than_scanning(tmp_path: Path) -> None:
     # SQLite reports "SCAN" while walking it in reverse and stopping at the
     # first row. The property that matters is that it does not sort: a temp
     # b-tree would mean reading every row on every refresh.
-    store = SqliteStore(str(tmp_path / "s.db"))
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     plan = store._conn.execute(
         "EXPLAIN QUERY PLAN SELECT timestamp, pv_total_power_w FROM inverter_raw "
         "ORDER BY timestamp DESC LIMIT 1"
@@ -621,7 +623,7 @@ def test_the_store_can_be_used_from_another_thread(tmp_path: Path) -> None:
     # second one, which surfaces only once both halves are running together.
     import threading
 
-    store = SqliteStore(str(tmp_path / "threads.db"))
+    store = SqliteStore(str(tmp_path / "threads.db"), device=TEST_DEVICE)
     store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 1234.0}))
     result: list[object] = []
 
@@ -634,3 +636,118 @@ def test_the_store_can_be_used_from_another_thread(tmp_path: Path) -> None:
     store.close()
     assert result and result[0] is not None
     assert result[0]["pv_total_power_w"] == 1234.0  # type: ignore[index]
+
+
+OTHER_DEVICE = "CE00000001"
+
+
+def test_two_inverters_at_the_same_instant_are_two_rows(tmp_path: Path) -> None:
+    # Parallel units are polled independently and land on the same second often
+    # enough. Before the device was in the key one simply overwrote the other,
+    # and the loser's reading was gone with nothing to say it had existed.
+    store = SqliteStore(str(tmp_path / "two.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 1000.0}))
+    store.append(
+        Sample(timestamp=_ts(), readings={"pv_total_power_w": 2000.0}), device=OTHER_DEVICE
+    )
+    conn = _open_db(tmp_path / "two.db")
+    rows = conn.execute("SELECT device, pv_total_power_w FROM inverter_raw ORDER BY device")
+    assert rows.fetchall() == [(TEST_DEVICE, 1000), (OTHER_DEVICE, 2000)]
+    conn.close()
+    store.close()
+
+
+def test_a_query_returns_one_inverter_and_not_the_other(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "two.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 1000.0}))
+    store.append(
+        Sample(timestamp=_ts(), readings={"pv_total_power_w": 2000.0}), device=OTHER_DEVICE
+    )
+
+    mine = store.query(["pv_total_power_w"], _ts(), _ts())
+    theirs = store.query(["pv_total_power_w"], _ts(), _ts(), device=OTHER_DEVICE)
+    store.close()
+    assert [r["pv_total_power_w"] for r in mine] == [1000.0]
+    assert [r["pv_total_power_w"] for r in theirs] == [2000.0]
+
+
+def test_latest_is_this_inverters_latest_not_the_newest_row(tmp_path: Path) -> None:
+    # The second inverter reporting a second later must not become this one's
+    # live reading, which is what an unfiltered "newest row" would do.
+    store = SqliteStore(str(tmp_path / "two.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 1000.0}))
+    store.append(
+        Sample(timestamp=_ts() + timedelta(seconds=1), readings={"pv_total_power_w": 2000.0}),
+        device=OTHER_DEVICE,
+    )
+
+    row = store.latest(["pv_total_power_w"])
+    store.close()
+    assert row is not None
+    assert row["pv_total_power_w"] == 1000.0
+
+
+def test_a_pack_serial_belongs_to_its_own_inverter(tmp_path: Path) -> None:
+    # Two banks can carry the same serial — a replacement pack, or a vendor that
+    # numbers from one. Each inverter's reading has to stay its own.
+    store = SqliteStore(str(tmp_path / "two.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="P1", slot=1, soc_pct=40.0),),
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="P1", slot=1, soc_pct=90.0),),
+        ),
+        device=OTHER_DEVICE,
+    )
+
+    mine = store.latest_modules(["soc_pct"])
+    theirs = store.latest_modules(["soc_pct"], device=OTHER_DEVICE)
+    store.close()
+    assert [(r["serial"], r["soc_pct"]) for r in mine] == [("P1", 40.0)]
+    assert [(r["serial"], r["soc_pct"]) for r in theirs] == [("P1", 90.0)]
+
+
+def test_a_flagged_reading_is_attributed_to_the_inverter_that_produced_it(
+    tmp_path: Path,
+) -> None:
+    # A decode fault is evidence about one unit. Recording it without saying
+    # which makes it evidence about nothing, and a retry on either inverter
+    # would clear the other's flag.
+    store = SqliteStore(str(tmp_path / "two.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=_ts(), readings={"battery_power_w": 25583.0}))
+    store.append(
+        Sample(timestamp=_ts(), readings={"battery_power_w": 25583.0}), device=OTHER_DEVICE
+    )
+    store.append(Sample(timestamp=_ts(), readings={"battery_power_w": 5000.0}))
+
+    conn = _open_db(tmp_path / "two.db")
+    flags = conn.execute("SELECT device FROM invalid_readings").fetchall()
+    conn.close()
+    store.close()
+    # This inverter's retry cleared its own flag and left the other's standing.
+    assert flags == [(OTHER_DEVICE,)]
+
+
+def test_a_store_refuses_to_open_without_a_device(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="device"):
+        SqliteStore(str(tmp_path / "s.db"), device="   ")
+
+
+def test_a_blank_device_is_refused_rather_than_silently_empty(tmp_path: Path) -> None:
+    # __init__ already rejects a blank device, and the resolver did not — so
+    # ?device= on a query string, which a browser sends readily, resolved to a
+    # device nothing has ever recorded. No rows, no error, and a page that
+    # reads as an inverter which stopped reporting.
+    store = SqliteStore(str(tmp_path / "blank.db"), device=TEST_DEVICE)
+    with pytest.raises(ValueError):
+        store.latest(["pv_total_power_w"], device="")
+    with pytest.raises(ValueError):
+        store.latest(["pv_total_power_w"], device="   ")
+    store.close()
