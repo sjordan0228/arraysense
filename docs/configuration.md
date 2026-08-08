@@ -12,6 +12,7 @@ dongle_host     = "192.168.1.50"
 dongle_serial   = "BA12345678"
 inverter_serial = "CE12345678"
 poll_interval   = 11.0
+driver          = "eg4_luxpower"
 database_path   = "/var/lib/arraysense/arraysense.db"
 ```
 
@@ -43,6 +44,16 @@ card.
 There is little to gain below about ten seconds. The dongle replies at its own
 pace, so a shorter interval mostly produces reads that overlap the previous one
 and get abandoned.
+
+### `driver`
+
+Which family of inverter to read. Defaults to `eg4_luxpower`, which covers the EG4
+and LuxPower hybrids reached over the WiFi dongle — the 18kPV, the 6000XP and the
+12kPV all speak the same register set. There is no reason to set this today; it
+exists so that a second family can be added as a directory rather than as an edit
+to the collector.
+
+An unrecognised name stops the service at startup with the list of names that work.
 
 ### `database_path`
 

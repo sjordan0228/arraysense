@@ -27,9 +27,8 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 
-from arraysense import __version__
+from arraysense import __version__, drivers
 from arraysense.api.app import create_app
-from arraysense.collector.pylxp_source import PylxpSource
 from arraysense.collector.service import CollectorService
 from arraysense.config import DEFAULT_PATH, Config, effective, load
 from arraysense.settings import SettingsStore
@@ -96,17 +95,18 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # the file's values before the merge would print a startup line that
     # disagrees with what the service then does.
     logger.info(
-        "arraysense %s — inverter %s via %s:%d, every %.0fs, database %s",
+        "arraysense %s — inverter %s via %s:%d using the %s driver, every %.0fs, database %s",
         __version__,
         config.inverter_serial,
         config.dongle_host,
         config.dongle_port,
+        config.driver,
         config.poll_interval,
         config.database_path,
     )
 
     service = CollectorService(
-        source=PylxpSource(config),
+        source=drivers.create(config),
         store=store,
         interval=config.poll_interval,
     )
@@ -255,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = load(args.config)
+        # Resolved here rather than where the source is built, so a mistyped
+        # driver name is reported alongside every other thing wrong with the
+        # file — one line naming the drivers that exist, not a traceback out of
+        # the middle of application assembly.
+        drivers.get(config.driver)
     except (FileNotFoundError, ValueError) as exc:
         # A misconfigured service should say what is wrong and stop, not crash
         # with a traceback that buries the one useful line.

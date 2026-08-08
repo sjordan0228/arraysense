@@ -8,9 +8,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from arraysense.settings import lookup_setting
+from arraysense.settings import describe, lookup_setting
 from arraysense.tariff import (
+    EXAMPLE_ADJUSTMENTS,
     EXAMPLE_BANDS,
+    SETTING_ADJUSTMENTS,
     SETTING_BANDS,
     SETTING_CURRENCY,
     SETTING_EXPORT_PER_KWH,
@@ -22,6 +24,7 @@ from arraysense.tariff import (
     counter_delta,
     estimate_bill,
     load_tariff,
+    parse_adjustments,
     parse_bands,
 )
 
@@ -669,3 +672,205 @@ def test_a_completed_month_can_be_priced_on_a_seasonal_tariff() -> None:
     )
     assert result is not None
     assert result.energy_cost == pytest.approx(30 * 0.210321 + 300 * 0.086709, abs=0.02)
+
+
+# --- The monthly adjustment factors -----------------------------------------
+#
+# PCRF (power cost recovery) and SCRF (securitized charges recovery) are riders
+# the supplier sets afresh every month and charges on every kilowatt-hour, on
+# top of the band rate. PCRF is routinely negative. Because they change month to
+# month, the month each pair applied to is part of the value: without it,
+# re-pricing July in September prices July at September's factors and quietly
+# restates a bill the owner has already paid.
+
+
+def adjusted(text: str, **overrides: object) -> Tariff:
+    return tariff(**({SETTING_ADJUSTMENTS: text} | overrides))
+
+
+def test_a_month_of_factors_parses_including_a_negative_pcrf() -> None:
+    (entry,) = parse_adjustments("2026-07 | -0.001230 | 0.004560")
+    assert (entry.year, entry.month) == (2026, 7)
+    assert entry.pcrf_per_kwh == -0.001230
+    assert entry.scrf_per_kwh == 0.004560
+    assert entry.per_kwh == pytest.approx(0.003330)
+
+
+def test_the_example_in_the_adjustments_help_is_one_that_parses() -> None:
+    # The help text is the format's only documentation, so an example the
+    # parser would refuse is worse than no example.
+    assert parse_adjustments(EXAMPLE_ADJUSTMENTS)
+    assert EXAMPLE_ADJUSTMENTS in str(lookup_setting(SETTING_ADJUSTMENTS).help)
+
+
+def test_a_factor_left_blank_is_unrecorded_rather_than_nought() -> None:
+    # The supplier published PCRF and not SCRF. Reading the empty field as zero
+    # would be a measurement nobody took.
+    (entry,) = parse_adjustments("2026-07 | -0.001230 |")
+    assert entry.pcrf_per_kwh == -0.001230
+    assert entry.scrf_per_kwh is None
+    assert entry.per_kwh is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "2026-07 | -0.001 | 0.004; 2026-07 | -0.002 | 0.004",
+        "July 2026 | -0.001 | 0.004",
+        "2026-13 | -0.001 | 0.004",
+        "2026-07 | ever so slightly negative | 0.004",
+        "2026-07 | -0.001",
+    ],
+)
+def test_adjustments_that_cannot_be_read_are_refused(text: str) -> None:
+    with pytest.raises(ValueError):
+        parse_adjustments(text)
+
+
+def test_the_recorded_month_is_charged_on_every_kilowatt_hour() -> None:
+    result = compute_cost(
+        adjusted("2026-01 | -0.002 | 0.005", **{SETTING_FIXED_MONTHLY: 0.0}),
+        january(grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0}),
+    )
+    assert result is not None
+    assert result.adjustment_status == "applied"
+    assert result.pcrf_per_kwh == -0.002
+    assert result.scrf_per_kwh == 0.005
+    assert result.energy_cost == pytest.approx(56.0)
+    # 300 kWh at the combined 0.003 rider.
+    assert result.adjustment == pytest.approx(0.90)
+    assert result.cost == pytest.approx(56.90)
+
+
+def test_a_month_with_no_factors_recorded_cannot_be_priced_and_says_so() -> None:
+    # Not zero. Zero is a measurement meaning "no adjustment this month", and
+    # this project does not assert measurements nobody took.
+    result = compute_cost(
+        adjusted("2026-02 | -0.002 | 0.005", **{SETTING_FIXED_MONTHLY: 0.0}),
+        january(grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0}),
+    )
+    assert result is not None
+    assert result.adjustment_status == "unknown"
+    assert result.adjustment is None
+    assert result.pcrf_per_kwh is None
+    # And the total goes with it. Spending an unknown rider as zero states a
+    # bill the supplier will not send, confidently and with nothing to say a
+    # figure was missing — the same error as rendering a missing reading as 0.
+    assert result.cost is None
+    # What was measured still comes back, so a page can show the energy and say
+    # only the total is unavailable.
+    assert result.energy_cost == pytest.approx(56.0)
+
+
+def test_an_install_whose_supplier_has_no_riders_is_not_nagged_about_them() -> None:
+    # Nothing entered at all is a different fact from a month gone unrecorded,
+    # and a page that cannot tell them apart warns every row forever.
+    result = compute_cost(
+        tariff(**{SETTING_FIXED_MONTHLY: 0.0}),
+        january(grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0}),
+    )
+    assert result is not None
+    assert result.adjustment_status == "none"
+    assert result.adjustment is None
+    assert result.cost == pytest.approx(56.0)
+
+
+def test_recosting_an_old_month_uses_that_months_factors_not_the_newest() -> None:
+    # The whole reason the month is part of the value.
+    loaded = adjusted(
+        "2026-01 | -0.002 | 0.005\n2026-02 | 0.030 | 0.005",
+        **{SETTING_FIXED_MONTHLY: 0.0},
+    )
+    january_result = compute_cost(loaded, january(grid_import_kwh={"Peak": 100.0, "Off-peak": 0.0}))
+    february = compute_cost(
+        loaded,
+        PeriodEnergy(
+            start=datetime(2026, 2, 1, tzinfo=EAST),
+            end=datetime(2026, 2, 16, tzinfo=EAST),
+            grid_import_kwh={"Peak": 100.0, "Off-peak": 0.0},
+        ),
+    )
+    assert january_result is not None and february is not None
+    assert january_result.adjustment == pytest.approx(0.30)
+    assert february.adjustment == pytest.approx(3.50)
+
+
+def test_the_rider_reaches_the_counterfactual_and_so_the_saving() -> None:
+    # Without the system every kilowatt-hour of house load would have been
+    # metered, and the rider is charged on metered kilowatt-hours. Leaving it
+    # out of the counterfactual understates what the array saved.
+    result = compute_cost(
+        adjusted("2026-01 | -0.002 | 0.005", **{SETTING_FIXED_MONTHLY: 0.0}),
+        january(
+            grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0},
+            load_kwh={"Peak": 150.0, "Off-peak": 260.0},
+        ),
+    )
+    assert result is not None
+    # 79.60 of band energy plus 410 kWh at 0.003.
+    assert result.no_solar_cost == pytest.approx(80.83)
+    assert result.savings == pytest.approx(80.83 - 56.90)
+
+
+def test_two_months_with_different_factors_cannot_be_priced_as_one_period() -> None:
+    # A PeriodEnergy carries no split of its kilowatt-hours across months, so
+    # there is no honest way to charge January's rider to January's share.
+    loaded = adjusted("2026-01 | -0.002 | 0.005\n2026-02 | 0.030 | 0.005")
+    across = PeriodEnergy(
+        start=datetime(2026, 1, 20, tzinfo=EAST),
+        end=datetime(2026, 2, 10, tzinfo=EAST),
+        grid_import_kwh={"Peak": 10.0, "Off-peak": 20.0},
+    )
+    result = compute_cost(loaded, across)
+    assert result is not None
+    assert result.adjustment_status == "unknown"
+    assert result.adjustment is None
+
+
+def test_two_months_the_supplier_left_unchanged_are_priced_as_one() -> None:
+    loaded = adjusted("2026-01 | -0.002 | 0.005\n2026-02 | -0.002 | 0.005")
+    across = PeriodEnergy(
+        start=datetime(2026, 1, 20, tzinfo=EAST),
+        end=datetime(2026, 2, 10, tzinfo=EAST),
+        grid_import_kwh={"Peak": 10.0, "Off-peak": 20.0},
+    )
+    result = compute_cost(loaded, across)
+    assert result is not None
+    assert result.adjustment_status == "applied"
+    assert result.adjustment == pytest.approx(30 * 0.003)
+
+
+def test_adjustments_that_will_not_parse_are_unknown_rather_than_absent() -> None:
+    # A stored value that no longer reads is not evidence that the supplier
+    # charges no rider. The tariff still prices energy; the adjustment does not
+    # silently become nothing.
+    loaded = load_tariff(dict(REFERENCE) | {SETTING_ADJUSTMENTS: "kilowatts and rainbows"})
+    assert loaded is not None
+    assert loaded.adjustments_unreadable is True
+    result = compute_cost(loaded, january(grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0}))
+    assert result is not None
+    assert result.adjustment_status == "unknown"
+
+
+def test_the_estimated_bill_projects_the_rider_with_the_energy() -> None:
+    loaded = adjusted("2026-01 | -0.002 | 0.005")
+    bill = estimate_bill(loaded, january(grid_import_kwh={"Peak": 100.0, "Off-peak": 200.0}))
+    assert bill is not None
+    assert bill.adjustment_status == "applied"
+    # 300 kWh at 0.003 over fifteen days, scaled to a thirty-one day month.
+    assert bill.projected_adjustment == pytest.approx(0.90 * 31 / 15, abs=0.01)
+    assert bill.estimated_total == pytest.approx(
+        (bill.projected_energy_cost or 0.0) + 25.0 + (bill.projected_adjustment or 0.0), abs=0.02
+    )
+
+
+def test_the_adjustment_setting_needs_no_change_to_the_settings_page() -> None:
+    # settings.html renders itself from describe(). A per-month table that
+    # needed its own control would be a design that had outgrown the registry.
+    spec = lookup_setting(SETTING_ADJUSTMENTS)
+    assert spec.kind == "str"
+    assert spec.multiline is True
+    assert spec.check is parse_adjustments
+    (entry,) = [row for row in describe() if row["key"] == SETTING_ADJUSTMENTS]
+    assert entry["multiline"] is True
+    assert entry["default"] == ""

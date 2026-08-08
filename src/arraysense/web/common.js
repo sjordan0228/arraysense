@@ -314,19 +314,16 @@ function drawNav(current) {
 // Nothing on any page opts in: the banner finds its own place under the nav
 // this file already draws, and a warning a page has to remember to ask for is a
 // warning the sixth page forgets.
+//
+// The verdict is /api/status's and only the wording is here. It used to be
+// reached in this file, from a threshold copied out of the poll loop and a
+// failure field no success ever clears, and the copy had already drifted from
+// the original: the service calls a dead poll task stopped the instant it dies,
+// while this file was telling the reader to wait twenty minutes for a restart.
+// The service also knows two things a browser cannot — whether the read or the
+// database write is what failed, and how old the newest stored reading is,
+// which is the only clock that survives a restart.
 // ---------------------------------------------------------------------------
-
-// Older than this and the reader is told. About sixty-five missed polls at the
-// reference cadence, so neither a blip nor the fifty-odd seconds a restart
-// costs can reach it.
-const STALE_AFTER_MS = 15 * 60 * 1000;
-
-// STALL_AFTER in collector/service.py, and the two numbers belong to each
-// other. The reader is warned at fifteen minutes and the watchdog restarts a
-// dead loop at twenty, so the normal experience of a crash is a warning that
-// appears and then clears itself — which is the right way round. Whoever
-// changes one changes both.
-const WATCHDOG_AFTER_MS = 20 * 60 * 1000;
 
 // How often the banner asks. Staleness is measured in quarter-hours, so this
 // governs how quickly the warning *clears* far more than how quickly it shows.
@@ -368,103 +365,142 @@ function elapsedWords(ms) {
 const clockWords = (t, age) => age !== null && age < 18 * 3600000
   ? new Date(t).toLocaleTimeString() : new Date(t).toLocaleString();
 
-// What to say, given /api/status and the moment to measure against — or null
-// when there is nothing to say. Separated from the drawing so the cases can be
-// reasoned about as cases, and so each one can be asserted on directly.
-//
-// The distinction that matters most here is the one CollectorService.
-// stalled_for() draws: an inverter that will not answer is *not* a collector
-// that has died. Failing polls are the loop working correctly — it records each
-// gap, backs off and keeps trying — so that case names the inverter and quotes
-// the error, while silence from the loop itself names the service.
-//
-// Each tone carries its own mark, borrowed from the calibration ladder on the
-// dashboard: a dot advises, a triangle alerts, and here a pause bar says the
-// silence was asked for. Three shapes for three tones, so the reader who cannot
-// tell the amber rule from the red one still has the distinction.
-function staleState(status, now) {
-  if (!status || typeof status !== 'object') {
-    return {
-      kind: 'unreachable', tone: 'bad', mark: '⚠',
-      headline: 'The service is not answering',
-      detail: 'Nothing on this page can be trusted as current: /api/status could not be '
-        + 'reached, so there is no way to say how old these readings are.',
-      why: '',
-    };
+// One mark per tone, borrowed from the calibration ladder on the dashboard: a
+// dot advises, a triangle alerts, and a pause bar says the silence was asked
+// for. Three shapes for three tones, so the reader who cannot tell the amber
+// rule from the red one still has the distinction.
+const STALE_MARKS = { note: '⏸', warn: '●', bad: '⚠' };
+
+// How far behind the screen is, in a sentence. The endpoint reports the age of
+// the newest *reading*, so a stretch of recorded gaps leaves no age to quote
+// rather than a reassuring number — and a service that has read nothing at all
+// gets a sentence that says so instead of one about the last reading.
+function staleBehind(s) {
+  const at = msOrNull(s.reading_at);
+  const age = Number(s.age_seconds);
+  if (at !== null && Number.isFinite(age)) {
+    const ms = age * 1000;
+    return `Last reading ${clockWords(at, ms)}, ${elapsedWords(ms)} ago.`;
   }
-  const success = msOrNull(status.last_success);
-  const failure = msOrNull(status.last_failure);
-  // The age of the data, which is what the reader is being warned about, and
-  // not the age of the last attempt. A collector that has never managed a
-  // reading is measured from when it started, because that is how long the
-  // screen has been showing whatever the previous run left behind.
-  const from = success !== null ? success : msOrNull(status.started_at);
-  const age = from === null ? null : Math.max(0, now - from);
-  if (age !== null && age <= STALE_AFTER_MS) return null;
-
-  const words = age === null ? null : elapsedWords(age);
-  const behind = success !== null ? `Last reading ${clockWords(success, age)}, ${words} ago.`
-    : words !== null ? `Nothing has been read for ${words}.`
+  const searched = Number(s.searched_seconds);
+  return Number.isFinite(searched)
+    ? `No reading in the last ${elapsedWords(searched * 1000)}.`
     : 'Nothing has been read at all.';
-  const stopped = (because) => ({
-    kind: 'stopped', tone: 'bad', mark: '⚠',
-    headline: 'The collector has stopped', detail: `${behind} ${because}`, why: '',
-  });
+}
 
+// How long the loop has marked nothing, when that is long enough to be worth a
+// number. A poll task that died a moment ago is stalled by a few seconds, and
+// "silent for 0 minutes" reads as a bug in the page rather than a fault in the
+// service.
+function staleSilence(s) {
+  const seconds = Number(s.stalled_seconds);
+  return Number.isFinite(seconds) && seconds >= 60
+    ? ` and has marked nothing for ${elapsedWords(seconds * 1000)}`
+    : '';
+}
+
+// The wording for each verdict /api/status can reach. Nothing here decides
+// anything: every branch the service used to be second-guessed on — whether the
+// loop is running, whether the inverter or the database is at fault, whether a
+// silence was asked for — arrives already settled, and this turns it into two
+// sentences and a tone.
+const STALE_WORDS = {
   // Silence somebody asked for. The dongle takes one TCP client at a time, so
-  // releasing it for the vendor's app is a deliberate act with an end time on
-  // it, and a warning here would train the reader to wave away the real ones.
-  if (status.yielding) {
+  // releasing it for the vendor's app is deliberate and has an end time on it,
+  // and a warning here would train the reader to wave away the real ones.
+  yielding: (s, status, now) => {
     const until = msOrNull(status.yield_until);
     const resumes = until !== null && until > now
       ? `polling resumes at ${new Date(until).toLocaleTimeString()}`
       : 'polling resumes when the yield ends';
     return {
-      kind: 'yield', tone: 'note', mark: '⏸',
+      tone: 'note',
       headline: 'Paused — the dongle was handed over on purpose',
-      detail: `${behind} It takes one connection at a time and was released so another `
-        + `app could use it, so nothing is wrong here: ${resumes}.`,
-      why: '',
+      detail: `${staleBehind(s)} It takes one connection at a time and was released so `
+        + `another app could use it, so nothing is wrong here: ${resumes}.`,
     };
-  }
-
-  // Consulted here although stalled_for() deliberately ignores it. The watchdog
-  // avoids this flag because a dying loop clears it on its way out — but from
-  // the browser, a service reporting that it is not running is reporting
-  // exactly the thing this banner exists to say, whichever way it got there.
-  if (status.running === false) {
-    return stopped('The service is not polling, so nothing on this page will change '
-      + 'until it starts again.');
-  }
-
-  const marks = [success, failure].filter((t) => t !== null);
-  const idle = marks.length ? now - Math.max(...marks) : null;
-  if (failure !== null && idle !== null && idle <= WATCHDOG_AFTER_MS) {
+  },
+  stopped: (s) => ({
+    tone: 'bad',
+    headline: 'The collector has stopped',
+    detail: `${staleBehind(s)} The poll loop is not running${staleSilence(s)}, so nothing on `
+      + 'this page will change until it comes back.',
+  }),
+  not_running: (s) => ({
+    tone: 'bad',
+    headline: 'The collector is not polling',
+    detail: `${staleBehind(s)} The service reports that it is not collecting at all, so `
+      + 'nothing on this page will change until it starts again.',
+  }),
+  // The loop working, not the loop failing: it records each gap, backs off and
+  // keeps trying, which is why this is amber and not red.
+  inverter: (s, status) => {
     const tries = Number(status.consecutive_failures);
     return {
-      kind: 'inverter', tone: 'warn', mark: '●',
+      tone: 'warn',
       headline: 'The inverter is not responding',
-      detail: `${behind} The collector is still trying and is recording the gap`
+      detail: `${staleBehind(s)} The collector is still trying and is recording the gap`
         + (Number.isFinite(tries) && tries > 0 ? `; ${tries} polls in a row have failed` : '')
         + '.',
-      // Usually names the cause outright — a refused connection, no route to
-      // the dongle, a read that timed out — which is most of the diagnosis.
-      why: status.last_error ? String(status.last_error) : '',
     };
-  }
-  if (idle === null || idle > WATCHDOG_AFTER_MS) {
-    return stopped('Neither a reading nor a failed poll has been recorded since, so the '
-      + 'poll loop is not running.');
-  }
-  // Stale, and it is too early to say why: the loop has marked nothing, but not
-  // for long enough to have been declared stuck. Saying which fault it is would
-  // be a guess, and the watchdog settles it within five minutes either way.
-  return {
-    kind: 'silent', tone: 'warn', mark: '●',
+  },
+  // Told apart by the service rather than guessed at here. The two faults call
+  // for opposite reactions, and this one used to be reported as the inverter —
+  // sending the reader after the dongle, the WiFi and the breaker while the
+  // disk was the problem.
+  storage: (s) => ({
+    tone: 'warn',
+    headline: 'Readings are not being saved',
+    detail: `${staleBehind(s)} The inverter is answering — it is the database that is `
+      + 'refusing the writes, so the disk is the place to look, not the dongle.',
+  }),
+  silent: (s) => ({
+    tone: 'warn',
     headline: 'No new readings',
-    detail: `${behind} Neither a reading nor a failed poll has been recorded since. If the `
-      + 'collector does not recover, the service restarts itself after twenty minutes.',
-    why: '',
+    detail: `${staleBehind(s)} The collector reports no failure either, so it is too early `
+      + 'to say why.',
+  }),
+};
+
+// What to say, given /api/status and the moment to measure against — or null
+// when there is nothing to say. Separated from the drawing so each case can be
+// read as a case, and asserted on directly.
+function staleState(status, now) {
+  const unreachable = (detail) => ({
+    tone: 'bad', mark: STALE_MARKS.bad,
+    headline: 'The service is not answering', detail, why: '',
+  });
+  if (!status || typeof status !== 'object') {
+    return unreachable('Nothing on this page can be trusted as current: /api/status could '
+      + 'not be reached, so there is no way to say how old these readings are.');
+  }
+  const s = status.staleness;
+  if (!s || typeof s !== 'object') {
+    return unreachable('Nothing on this page can be trusted as current: /api/status '
+      + 'answered without saying how old these readings are.');
+  }
+  if (!s.stale) return null;
+  // An unrecognised verdict is a newer service than this page, and the one
+  // thing that must not happen then is silence: the payload has already said
+  // the screen is out of date, so say that much rather than borrow the wording
+  // of a case this might not be.
+  const words = STALE_WORDS[s.verdict];
+  const state = words ? words(s, status, now) : {
+    tone: 'warn',
+    headline: 'No new readings',
+    detail: `${staleBehind(s)} The service names a condition this page is too old to `
+      + 'describe.',
+  };
+  return {
+    tone: state.tone,
+    mark: STALE_MARKS[state.tone],
+    headline: state.headline,
+    detail: state.detail,
+    // Usually names the fault outright — a refused connection, no route to the
+    // dongle, a database held by another writer — which is most of the
+    // diagnosis. Sent only where the verdict names a failure, so an error left
+    // over from an outage that has since cleared is not quoted under a new one.
+    why: s.reason ? String(s.reason) : '',
   };
 }
 
@@ -511,10 +547,10 @@ function showStale(state) {
   const parts = staleElement();
   if (!parts) return;
   if (!state) { parts.box.hidden = true; return; }
-  // Written as text and never as markup. last_error is a string from somewhere
-  // down in the transport stack and has no business being parsed as HTML, and
-  // text also means there is no esc() call here to forget. Only on a change,
-  // so an unchanged line is not re-announced to a screen reader.
+  // Written as text and never as markup. The reason comes from somewhere down
+  // in the transport or the storage stack and has no business being parsed as
+  // HTML, and text also means there is no esc() call here to forget. Only on a
+  // change, so an unchanged line is not re-announced to a screen reader.
   const set = (el, text) => { if (el.textContent !== text) el.textContent = text; };
   parts.box.className = `p stale tone-${state.tone}`;
   set(parts.mark, state.mark);

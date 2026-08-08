@@ -24,6 +24,14 @@ figure. Including it would make the solar look worse the more it saved.
 owner's November has 721 hours in it, not 720, and their March has 743. Elapsed time
 is therefore measured in UTC and month boundaries in local time — and never by
 dividing by 86400, which misprices the fixed charge twice a year by an hour.
+
+On top of the bands sit the monthly adjustment factors, PCRF and SCRF, which the
+supplier re-sets every month and charges on every kilowatt-hour. They are a table
+keyed by billing month rather than a pair of numbers, because a pair would be
+overwritten each month and re-pricing July in September would then charge July at
+September's factors — restating a bill that has already been paid. A month with
+nothing recorded is priced at the base rate and reported as unadjusted, never as
+adjusted by zero: zero is a measurement, and nobody took it.
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +49,12 @@ SETTING_BANDS = "tariff.bands"
 SETTING_FIXED_MONTHLY = "tariff.fixed_monthly"
 SETTING_CURRENCY = "tariff.currency"
 SETTING_EXPORT_PER_KWH = "tariff.export_per_kwh"
+SETTING_ADJUSTMENTS = "tariff.adjustments"
 
 # Shown in the settings help as the format's only documentation, and parsed by a
 # test so the example can never drift into one the parser would refuse.
 EXAMPLE_BANDS = "Peak | 0.34 | 16:00-21:00; Off-peak | 0.11 | 21:00-16:00"
+EXAMPLE_ADJUSTMENTS = "2026-07 | -0.001230 | 0.004560"
 
 # Used when nothing is configured, purely so money has something in front of it.
 # The point of the setting is that the next person's bill is not in dollars.
@@ -94,6 +105,35 @@ def _next_month_start(month_start: datetime) -> datetime:
     if month_start.month == 12:
         return month_start.replace(year=month_start.year + 1, month=1)
     return month_start.replace(month=month_start.month + 1)
+
+
+def _months_spanned(start: datetime, end: datetime) -> list[tuple[int, int]]:
+    """Every calendar month a period touches, oldest first, as (year, month).
+
+    Read off the wall clock in whatever zone the bounds carry, because that is
+    what a season and a billing month are. Stepped a day at a time rather than
+    by arithmetic on month numbers, which keeps a period of a few hours from
+    claiming a month it never entered.
+
+    ``end`` is exclusive, so the final month is taken from the last instant
+    *inside* the period. Adding ``end``'s own month instead made a query for
+    the whole of October claim November as well — which nulled a seasonal
+    tariff's every completed month, and would do the same to a rider recorded
+    for October and not yet for November.
+    """
+    if end <= start:
+        return []
+    seen: list[tuple[int, int]] = []
+    moment = start
+    while moment < end:
+        key = (moment.year, moment.month)
+        if key not in seen:
+            seen.append(key)
+        moment += timedelta(days=1)
+    last = end - timedelta(microseconds=1)
+    if (last.year, last.month) not in seen:
+        seen.append((last.year, last.month))
+    return seen
 
 
 @dataclass(frozen=True)
@@ -172,6 +212,64 @@ class RateBand:
         return any(span.contains(clock) for span in self.hours)
 
 
+AdjustmentStatus = Literal["none", "unknown", "applied"]
+
+
+@dataclass(frozen=True)
+class MonthlyAdjustment:
+    """The per-kilowatt-hour riders one billing month was charged at.
+
+    PCRF is a power cost recovery factor and SCRF a securitized charges
+    recovery factor. Both sit on top of the band rate, both are charged on
+    every metered kilowatt-hour, and both are re-set by the supplier every
+    month — PCRF routinely to a *negative* number, which is a refund of
+    over-recovered fuel cost and not a data error.
+
+    The month is part of the value rather than context around it. Two settings
+    holding this month's pair would be overwritten every month, and re-pricing
+    July in September would then price July at September's factors and restate
+    a bill the owner has already paid.
+
+    Either factor may be None, meaning the supplier has published one and not
+    the other. None is not nought: nought is a measurement saying the rider was
+    zero that month, and ``per_kwh`` refuses to invent one.
+    """
+
+    year: int
+    month: int
+    pcrf_per_kwh: float | None
+    scrf_per_kwh: float | None
+
+    @property
+    def per_kwh(self) -> float | None:
+        """The two riders together, or None if either was never recorded."""
+        if self.pcrf_per_kwh is None or self.scrf_per_kwh is None:
+            return None
+        return self.pcrf_per_kwh + self.scrf_per_kwh
+
+
+@dataclass(frozen=True)
+class AdjustmentRate:
+    """The rider a period is charged at, and whether it is known at all.
+
+    Three states, and conflating any two of them tells the owner something
+    false. ``none`` is a tariff with no riders configured, where there is
+    nothing to say and nothing to add. ``unknown`` is a tariff that has them
+    but not for this period's month, where the base rate is used and the page
+    has to say the adjustment is missing. ``applied`` is the only state that
+    puts money on the bill.
+    """
+
+    status: AdjustmentStatus
+    per_kwh: float | None = None
+    pcrf_per_kwh: float | None = None
+    scrf_per_kwh: float | None = None
+
+
+_NO_ADJUSTMENT = AdjustmentRate(status="none")
+_UNKNOWN_ADJUSTMENT = AdjustmentRate(status="unknown")
+
+
 @dataclass(frozen=True)
 class Tariff:
     """What the owner pays: a fixed monthly charge and the rate bands.
@@ -191,6 +289,49 @@ class Tariff:
     fixed_monthly: float = 0.0
     currency: str = DEFAULT_CURRENCY
     export_per_kwh: float | None = None
+    # The riders, one entry per billing month. Empty means the supplier charges
+    # none — a positive claim, which is why the flag beside it exists: stored
+    # text that no longer parses is not evidence of anything, and reading it as
+    # an empty tuple would assert an adjustment of zero nobody measured.
+    adjustments: tuple[MonthlyAdjustment, ...] = ()
+    adjustments_unreadable: bool = False
+
+    def adjustment_at(self, start: datetime, end: datetime) -> AdjustmentRate:
+        """The rider charged over a period, or why there is none to charge.
+
+        A ``PeriodEnergy`` carries no split of its kilowatt-hours across
+        months, so a period touching two months can only be charged a single
+        rate. Where every month it touches was recorded and they all agree — a
+        supplier that left the factors alone, or the ordinary case of a period
+        inside one month — that rate is known. Where they differ, or where any
+        month has no line, the answer is ``unknown`` and the caller prices at
+        the base rate and says the adjustment is missing.
+
+        Months are read off the wall clock of the bounds handed in, which are
+        expected to be in the owner's zone: a billing month is a local month,
+        and reading it off UTC moves the boundary by the offset.
+        """
+        if self.adjustments_unreadable:
+            return _UNKNOWN_ADJUSTMENT
+        if not self.adjustments:
+            return _NO_ADJUSTMENT
+        by_month = {(entry.year, entry.month): entry for entry in self.adjustments}
+        pairs: set[tuple[float, float]] = set()
+        wanted = _months_spanned(start, end)
+        if not wanted:
+            return _UNKNOWN_ADJUSTMENT
+        for key in wanted:
+            entry = by_month.get(key)
+            if entry is None or entry.pcrf_per_kwh is None or entry.scrf_per_kwh is None:
+                logger.info("no PCRF/SCRF recorded for %04d-%02d; pricing at the base rate", *key)
+                return _UNKNOWN_ADJUSTMENT
+            pairs.add((entry.pcrf_per_kwh, entry.scrf_per_kwh))
+        if len(pairs) != 1:
+            return _UNKNOWN_ADJUSTMENT
+        pcrf, scrf = pairs.pop()
+        return AdjustmentRate(
+            status="applied", per_kwh=pcrf + scrf, pcrf_per_kwh=pcrf, scrf_per_kwh=scrf
+        )
 
     def bands_in_effect(self, start: datetime, end: datetime) -> tuple[RateBand, ...]:
         """The bands that could apply at all between two instants.
@@ -204,19 +345,9 @@ class Tariff:
         Months are compared rather than the clock, since a band's hours can be
         empty on a given day without the band being out of season.
         """
-        if end <= start:
+        months = {month for _, month in _months_spanned(start, end)}
+        if not months:
             return ()
-        months: set[int] = set()
-        moment = start
-        while moment < end:
-            months.add(moment.month)
-            moment += timedelta(days=1)
-        # The last instant *inside* the period, not ``end`` itself. ``end`` is
-        # exclusive, and adding its month unconditionally meant a query for a
-        # whole month — 1 October to 1 November — claimed November's bands too.
-        # On a seasonal tariff that band has no energy, absent propagates, and
-        # every completed month priced as a dash.
-        months.add((end - timedelta(microseconds=1)).month)
         return tuple(band for band in self.bands if band.months is None or band.months & months)
 
     def band_at(self, moment: datetime) -> RateBand | None:
@@ -341,6 +472,20 @@ class CostResult:
     Each field is rounded once, from unrounded inputs, which is why a breakdown
     can be a cent away from adding up to ``cost``. That is the right way round:
     pricing the total is exact and summing rounded parts drifts from it.
+
+    ``adjustment`` is the PCRF and SCRF riders in money, and it is a component
+    of ``cost`` in the same way ``fixed_charge`` is: ``cost`` is
+    ``energy_cost + fixed_charge + adjustment``. It can be negative, since PCRF
+    can be. ``no_solar_cost`` carries the same riders on the whole house load —
+    without the system every one of those kilowatt-hours would have been
+    metered and charged them — so ``savings`` remains ``no_solar_cost`` less
+    the energy and the rider actually paid, and leaving them out of the
+    counterfactual would understate what the array saved.
+
+    ``adjustment_status`` says whether the riders were charged, are not charged
+    at all, or are simply not recorded for this month; see ``AdjustmentRate``.
+    In the last case every figure here is at the base rate and the caller has
+    to say so rather than let it read as a finished bill.
     """
 
     currency: str
@@ -353,6 +498,10 @@ class CostResult:
     export_credit: float | None
     no_solar_cost: float | None
     savings: float | None
+    adjustment_status: AdjustmentStatus = "none"
+    pcrf_per_kwh: float | None = None
+    scrf_per_kwh: float | None = None
+    adjustment: float | None = None
 
 
 @dataclass(frozen=True)
@@ -367,6 +516,13 @@ class BillEstimate:
 
     ``fixed_charge`` is the whole monthly charge, added once, never apportioned:
     the bill being estimated is a whole month's.
+
+    ``projected_adjustment`` is the PCRF and SCRF riders scaled to the whole
+    month exactly as the energy cost is, since they are charged per kilowatt-
+    hour and the kilowatt-hours are what is being projected. Where the month's
+    factors are not recorded it is absent and ``adjustment_status`` says
+    ``unknown``, which is the difference between a bill quoted at the base rate
+    and a bill quoted as final.
     """
 
     currency: str
@@ -380,6 +536,8 @@ class BillEstimate:
     fixed_charge: float
     estimated_total: float | None
     season_changes: bool = False
+    adjustment_status: AdjustmentStatus = "none"
+    projected_adjustment: float | None = None
 
 
 def _parse_clock(token: str, entry: str) -> time:
@@ -550,6 +708,86 @@ def parse_bands(text: str) -> tuple[RateBand, ...]:
     return tuple(bands)
 
 
+def _parse_billing_month(token: str, entry: str) -> tuple[int, int]:
+    """Read the ``YYYY-MM`` a line of factors belongs to."""
+    year_text, sep, month_text = token.strip().partition("-")
+    try:
+        year, month = int(year_text), int(month_text)
+    except ValueError as exc:
+        raise ValueError(f"{entry!r}: {token.strip()!r} is not a month like 2026-07") from exc
+    if not sep or not 1 <= month <= 12 or year < 1:
+        raise ValueError(f"{entry!r}: {token.strip()!r} is not a month like 2026-07")
+    return year, month
+
+
+def _parse_factor(token: str, entry: str, what: str) -> float | None:
+    """Read one rider, or None where the field was left empty.
+
+    Empty means the supplier has not published that factor for the month.
+    Reading it as nought would be a measurement nobody took, and it is the
+    measurement that decides whether the bill is adjusted at all.
+    """
+    text = token.strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise ValueError(f"{entry!r}: {text!r} is not a {what} per kWh") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{entry!r}: a {what} per kWh cannot be {text!r}")
+    return value
+
+
+def parse_adjustments(text: str) -> tuple[MonthlyAdjustment, ...]:
+    """Read the per-month PCRF and SCRF factors a person typed into settings.
+
+    One month per entry, entries separated by a semicolon or a newline, fields
+    separated by a pipe::
+
+        2026-07 | -0.001230 | 0.004560
+        2026-08 |  0.002100 | 0.004560
+
+    The fields are the billing month, the PCRF and the SCRF, in that order.
+    Either factor may be negative — PCRF regularly is — and either may be left
+    empty for a month the supplier has only published one of.
+
+    Refuses rather than guesses, exactly as ``parse_bands`` does: a month that
+    is not a month, a factor that is not a number, or the same month written
+    twice each raise. Entries come back in calendar order however they were
+    typed, so a list appended to over years still reads as one.
+
+    Raises:
+        ValueError: the text is not a table of factors, with the entry quoted.
+    """
+    entries: dict[tuple[int, int], MonthlyAdjustment] = {}
+    for raw in text.replace("\n", ";").split(";"):
+        entry = raw.strip()
+        if not entry:
+            continue
+        parts = [part.strip() for part in entry.split("|")]
+        if len(parts) != 3:
+            raise ValueError(
+                f"{entry!r}: a line is 'YYYY-MM | PCRF | SCRF', separated by |. "
+                "Leave a factor empty if the supplier has not published it."
+            )
+        year, month = _parse_billing_month(parts[0], entry)
+        if (year, month) in entries:
+            raise ValueError(
+                f"{entry!r}: {year:04d}-{month:02d} already has factors; "
+                "one line per billing month, or the bill depends on which is read first"
+            )
+        entries[year, month] = MonthlyAdjustment(
+            year=year,
+            month=month,
+            pcrf_per_kwh=_parse_factor(parts[1], entry, "PCRF"),
+            scrf_per_kwh=_parse_factor(parts[2], entry, "SCRF"),
+        )
+    if not entries:
+        raise ValueError("no monthly adjustments in that text")
+    return tuple(entries[key] for key in sorted(entries))
+
+
 def _as_float(value: object, key: str, fallback: float) -> float:
     """Read a number out of a stored setting, falling back rather than failing.
 
@@ -567,6 +805,32 @@ def _as_float(value: object, key: str, fallback: float) -> float:
     except ValueError:
         logger.warning("setting %s holds %r, which is not a number; using %s", key, value, fallback)
         return fallback
+
+
+def _load_adjustments(
+    values: Mapping[str, object],
+) -> tuple[tuple[MonthlyAdjustment, ...], bool]:
+    """Read the monthly riders, saying whether the stored text was readable.
+
+    Text that will not parse gives no factors *and* the flag, because the two
+    have to stay distinguishable: an empty table means the supplier charges no
+    rider, and quietly returning one for a value that merely failed to read
+    would turn a corrupted setting into a confident claim that a bill needs no
+    adjustment. A bad tariff nulls all money; a bad rider only makes the rider
+    unknown, so this survives rather than refusing.
+    """
+    text = str(values.get(SETTING_ADJUSTMENTS) or "")
+    if not text.strip():
+        return (), False
+    try:
+        return parse_adjustments(text), False
+    except ValueError as exc:
+        logger.error(
+            "monthly adjustments not understood, so no bill will be adjusted "
+            "and none will be reported as unadjusted: %s",
+            exc,
+        )
+        return (), True
 
 
 def load_tariff(values: Mapping[str, object]) -> Tariff | None:
@@ -591,11 +855,14 @@ def load_tariff(values: Mapping[str, object]) -> Tariff | None:
         return None
 
     export = _as_float(values.get(SETTING_EXPORT_PER_KWH), SETTING_EXPORT_PER_KWH, 0.0)
+    adjustments, unreadable = _load_adjustments(values)
     tariff = Tariff(
         bands=bands,
         fixed_monthly=_as_float(values.get(SETTING_FIXED_MONTHLY), SETTING_FIXED_MONTHLY, 0.0),
         currency=str(values.get(SETTING_CURRENCY) or DEFAULT_CURRENCY),
         export_per_kwh=export if export > 0 else None,
+        adjustments=adjustments,
+        adjustments_unreadable=unreadable,
     )
     uncovered = tariff.uncovered_minutes()
     if uncovered:
@@ -689,15 +956,19 @@ def _by_band(
 
 def _price(
     bands: Sequence[RateBand], reported: Mapping[str, float] | None
-) -> tuple[list[BandCost], float | None]:
-    """Price every band, returning the per-band breakdown and the exact total.
+) -> tuple[list[BandCost], float | None, float | None]:
+    """Price every band: the breakdown, the exact total, and the energy behind it.
 
-    The total is None as soon as one band is unknown, and it is unrounded: the
-    caller rounds once, at the end. Returns the breakdown first and the total
-    second — both are needed, and the breakdown is what a person checks.
+    The two totals are None together as soon as one band is unknown, and both
+    are unrounded — the caller rounds once, at the end. The kilowatt-hour total
+    comes back from here rather than being summed again by whoever needs it,
+    because the rule for when it is unknown is the same rule, and a second copy
+    of it would be a second place for a missing band to turn into a small
+    number. It is what the per-kWh riders are charged on.
     """
     breakdown: list[BandCost] = []
     total: float | None = 0.0
+    energy: float | None = 0.0
     for band in bands:
         kwh = None if reported is None else reported.get(band.key)
         cost = None if kwh is None else kwh * band.price_per_kwh
@@ -709,11 +980,12 @@ def _price(
                 cost=None if cost is None else _money(cost),
             )
         )
-        if cost is None or total is None:
-            total = None
+        if cost is None or kwh is None or total is None or energy is None:
+            total, energy = None, None
         else:
             total += cost
-    return breakdown, total
+            energy += kwh
+    return breakdown, total, energy
 
 
 def compute_cost(
@@ -737,6 +1009,11 @@ def compute_cost(
     used means the bank was charged from the grid, and if that happened at the
     peak rate it genuinely cost money — clamping it to zero would hide a tariff
     setting that is losing the owner money every night.
+
+    The PCRF and SCRF riders are charged on every metered kilowatt-hour, so
+    they ride on both sides: on what was imported, and on the whole house load
+    the counterfactual would have imported. A month with no factors recorded is
+    priced at the base rate and labelled, never at a rider of zero.
     """
     if tariff is None:
         return None
@@ -747,10 +1024,25 @@ def compute_cost(
     active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
 
     imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    breakdown, energy_cost = _price(active, imported)
+    breakdown, energy_cost, imported_kwh = _price(active, imported)
 
     consumed = _by_band(energy.load_kwh, active, "house load")
-    _, no_solar = _price(active, consumed)
+    _, no_solar, consumed_kwh = _price(active, consumed)
+
+    rider = tariff.adjustment_at(energy.start, energy.end)
+    unknown_rider = rider.status == "unknown"
+    adjustment = (
+        None if rider.per_kwh is None or imported_kwh is None else imported_kwh * rider.per_kwh
+    )
+    if no_solar is not None and rider.per_kwh is not None and consumed_kwh is not None:
+        no_solar += consumed_kwh * rider.per_kwh
+    # An unknown rider poisons the total rather than counting as nothing. The
+    # two are not unknown together: energy_cost comes from the bands and the
+    # rider from a month's published factors, so a period can price perfectly
+    # while nobody has entered the factors it needs. Treating that as zero
+    # states a bill the supplier will not send, and states it confidently —
+    # which is the one thing a money figure here must never do.
+    billed = None if energy_cost is None or unknown_rider else (energy_cost + (adjustment or 0.0))
 
     # Apportioned by default, because most callers are pricing a bucket: a day
     # inside a month owes a day's share of the connection charge, and charging
@@ -778,10 +1070,14 @@ def compute_cost(
         bands=tuple(breakdown),
         energy_cost=None if energy_cost is None else _money(energy_cost),
         fixed_charge=_money(fixed),
-        cost=None if energy_cost is None else _money(energy_cost + fixed),
+        cost=None if billed is None else _money(billed + fixed),
         export_credit=credit,
         no_solar_cost=None if no_solar is None else _money(no_solar),
-        savings=None if no_solar is None or energy_cost is None else _money(no_solar - energy_cost),
+        savings=None if no_solar is None or billed is None else _money(no_solar - billed),
+        adjustment_status=rider.status,
+        pcrf_per_kwh=rider.pcrf_per_kwh,
+        scrf_per_kwh=rider.scrf_per_kwh,
+        adjustment=None if adjustment is None else _money(adjustment),
     )
 
 
@@ -819,7 +1115,7 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     # never once produce an estimated bill.
     active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
     imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    _, so_far = _price(active, imported)
+    _, so_far, imported_kwh = _price(active, imported)
     whole_month = tariff.bands_in_effect(month_start, month_end) or tariff.bands
 
     # Scaled by the span the counters account for, not by the span requested
@@ -837,13 +1133,26 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     if pays_for_export and energy.grid_export_kwh is not None and scale is not None:
         credit = energy.grid_export_kwh * tariff.export_per_kwh * scale  # type: ignore[operator]
 
+    # The month being estimated, not the part measured: a bill covers the whole
+    # month, so an August estimate wants August's factors even on the first.
+    rider = tariff.adjustment_at(month_start, month_end)
+    unknown_rider = rider.status == "unknown"
+    adjustment = (
+        None
+        if rider.per_kwh is None or imported_kwh is None or scale is None
+        else imported_kwh * rider.per_kwh * scale
+    )
+
     total: float | None = None
     # A tariff that pays for export and an export figure nobody has is not a
     # bill of zero credit — it is a bill that cannot be told. Netting off
     # nothing there would quote a total higher than the one that arrives, and
     # doing it silently is worse than not quoting one.
-    if projected is not None and not (pays_for_export and credit is None):
-        total = _money(projected + tariff.fixed_monthly - (credit or 0.0))
+    # Same rule as the period total: an unknown rider cannot be spent as zero.
+    # The estimate is the figure an owner plans against, so quoting one that
+    # silently omits a rider is worse than quoting none.
+    if projected is not None and not (pays_for_export and credit is None) and not unknown_rider:
+        total = _money(projected + (adjustment or 0.0) + tariff.fixed_monthly - (credit or 0.0))
 
     return BillEstimate(
         currency=tariff.currency,
@@ -857,4 +1166,6 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
         fixed_charge=_money(tariff.fixed_monthly),
         estimated_total=total,
         season_changes={b.key for b in whole_month} != {b.key for b in active},
+        adjustment_status=rider.status,
+        projected_adjustment=None if adjustment is None else _money(adjustment),
     )

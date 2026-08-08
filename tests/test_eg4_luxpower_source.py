@@ -1,4 +1,4 @@
-"""Tests for the misrouted-reply retry in arraysense.collector.pylxp_source.
+"""Tests for the misrouted-reply retry in arraysense.drivers.eg4_luxpower.source.
 
 Every exception message here is copied from pylxpweb 0.9.38's own raise sites,
 not paraphrased. The retry is a string-and-type judgement about somebody else's
@@ -22,8 +22,8 @@ from pylxpweb.transports.exceptions import (
     TransportResponseMismatchError,
 )
 
-from arraysense.collector.pylxp_source import _MISROUTED, PylxpSource
 from arraysense.config import Config
+from arraysense.drivers.eg4_luxpower.source import _MISROUTED, Eg4LuxPowerSource
 
 # The four routing failures pylxpweb 0.9.38 raises, verbatim from
 # transports/dongle.py — three through ``_raise_mismatch`` at line 1037 and one
@@ -107,8 +107,8 @@ class _Crossed:
 def _source(
     transport: object,
     poll_interval: float = 11.0,
-) -> PylxpSource:
-    return PylxpSource(
+) -> Eg4LuxPowerSource:
+    return Eg4LuxPowerSource(
         Config(
             dongle_host="127.0.0.1",
             dongle_serial="BA12345678",
@@ -206,7 +206,7 @@ def test_the_cause_chain_is_what_finds_a_reworded_wrapper() -> None:
         opaque.__cause__ = exc
 
     assert _MISROUTED not in str(opaque), "the wrapper must not give it away on its own"
-    assert PylxpSource._is_misrouted(opaque)
+    assert Eg4LuxPowerSource._is_misrouted(opaque)
 
 
 def test_implicit_context_is_not_followed() -> None:
@@ -220,7 +220,7 @@ def test_implicit_context_is_not_followed() -> None:
             raise OSError("connection reset by peer")
         except OSError as dead:
             assert dead.__context__ is not None, "the mismatch must be in the context"
-            assert PylxpSource._is_misrouted(dead) is False
+            assert Eg4LuxPowerSource._is_misrouted(dead) is False
 
 
 async def test_the_energy_read_is_retried_too() -> None:

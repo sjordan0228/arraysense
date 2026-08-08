@@ -186,6 +186,10 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # the second of those falling over years is the honest measure of ageing —
     # more honest than a state-of-health figure the BMS computes to its own
     # rules.
+    # On the EG4/LuxPower driver this one is derived rather than read —
+    # capacity times state of charge — so it restates battery_soc_pct in
+    # amp-hours and cannot be used to check it. Not a property of the metric,
+    # a property of that library; see the note at its mapping.
     MetricSpec("battery_remaining_capacity_ah", "Ah", 10, 0.0, 5000.0),
     MetricSpec("battery_full_capacity_ah", "Ah", 10, 0.0, 5000.0, "last"),
     # How many modules the bank is answering for. A pack that drops off the CAN
@@ -245,10 +249,20 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # within half a percent of an integration over a day with no gaps, and they
     # keep counting through our downtime, which is the whole point.
     #
-    # Both families aggregate with max. The daily counters reset at midnight
-    # and climb through the day, so the largest value in a rollup window is the
-    # one at the end of it; the lifetime counters only ever climb. An average
-    # of either would be a number that never existed.
+    # Both families are declared max, and neither is averaged: the daily
+    # counters reset at midnight and climb through the day, the lifetime ones
+    # only ever climb, and an average of either would be a number that never
+    # existed.
+    #
+    # What a rollup actually stores for them is the *smallest* reading in the
+    # bucket, not the largest. A bucket's timestamp is the start of the period
+    # it covers, so the row labelled 13:00 has to hold the counter at 13:00,
+    # and a counter that only climbs has its opening value as its minimum.
+    # Under max the row labelled 13:00 held the counter at 14:00 and every
+    # reading sat one bucket later than its label. That decision belongs to
+    # store/rollup.collapse_policy and is made in that one place, because the
+    # SolarAssistant importer fills the same columns and had been using the
+    # opposite convention.
     MetricSpec("pv_energy_today_kwh", "kWh", 10, 0.0, 2000.0, "max"),
     MetricSpec("pv1_energy_today_kwh", "kWh", 10, 0.0, 2000.0, "max"),
     MetricSpec("pv2_energy_today_kwh", "kWh", 10, 0.0, 2000.0, "max"),
@@ -318,6 +332,10 @@ _MODULE_METRIC_SPECS: tuple[MetricSpec, ...] = (
     # Amp-hours, not just percent. Four modules can sit at the same state of
     # charge while holding different energy, and a module whose full capacity
     # has quietly fallen is the one dragging the bank down.
+    #
+    # remaining_capacity_ah is the derived one, on the EG4/LuxPower driver at
+    # least: the library computes it from full capacity and state of charge, so
+    # it is this module's soc_pct in other units and corroborates nothing.
     MetricSpec("remaining_capacity_ah", "Ah", 10, 0.0, 1000.0),
     MetricSpec("full_capacity_ah", "Ah", 10, 0.0, 1000.0, "last"),
     # The limit each module's own BMS is imposing. The bank-level limit is
@@ -328,6 +346,13 @@ _MODULE_METRIC_SPECS: tuple[MetricSpec, ...] = (
     MetricSpec("discharge_current_limit_a", "A", 10, 0.0, 500.0, "min"),
     # Per-module status and alarms. A single pack in protection is invisible at
     # bank level until it has pulled the whole bank's limits down with it.
+    #
+    # fault_code and warning_code are declared but nothing writes them today:
+    # the EG4/LuxPower driver refuses to, because pylxpweb never reads either
+    # from the wire and leaves both at a dataclass default of 0 — and 0 in a
+    # fault column means "no fault", which is health asserted about a pack
+    # nobody asked. They stay here so a driver that does read them has a column
+    # to write, and until one does these store NULL.
     MetricSpec("status_code", "code", 1, 0.0, 65535.0, "last"),
     MetricSpec("fault_code", "code", 1, 0.0, 65535.0, "max"),
     MetricSpec("warning_code", "code", 1, 0.0, 65535.0, "max"),

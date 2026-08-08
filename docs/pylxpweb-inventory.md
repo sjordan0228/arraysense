@@ -44,10 +44,10 @@ rather than inferred:
    `BatteryBankData` constructor and appear on no runtime field at all. The remaining
    fifteen are genuinely read and thrown away.
 2. **Library field to our metric.** The tuple constants in
-   `src/arraysense/collector/pylxp_source.py` — `_RUNTIME_METRICS`,
+   `src/arraysense/drivers/eg4_luxpower/source.py` — `_RUNTIME_METRICS`,
    `_RUNTIME_BATTERY_METRICS`, `_RUNTIME_FLAGS`, `_RUNTIME_SIGNED_PAIRS`,
    `_BANK_METRICS`, `_BANK_FLAGS`, `_ENERGY_METRICS` — plus three paths hand-coded in
-   `sample_from_pylxp` that appear in no tuple: `_house_load()` reading `output_power`
+   `to_sample` that appear in no tuple: `_house_load()` reading `output_power`
    with `eps_power` as fallback, and the two signed battery-power pairs.
 
 The adapter is the only authority on what a library field becomes on our side. Where
@@ -96,7 +96,7 @@ healthy`. Zero is what a silent BMS reports, so the rewrite fires in exactly the
 where nothing is known, and `battery_soh_pct` has no value left that means "no
 reading". Our `_bms_is_answering` gate holds the bank and per-module copies back, but
 it does not cover the third: `_collect(runtime, _RUNTIME_BATTERY_METRICS, ...)` runs
-unconditionally in `sample_from_pylxp`, so whatever register 5 decodes to reaches the
+unconditionally in `to_sample`, so whatever register 5 decodes to reaches the
 store either way. Whether that is a fabricated 100 during a CAN dropout depends on what
 register 5 reads while the BMS is silent, which is **not established** — no capture in
 this repository covers that state.
@@ -491,7 +491,7 @@ library end, and catches fields that no register table mentions.
 
 "Named by the adapter" follows the rule set out under [How the mapping was
 established](#how-the-mapping-was-established): the seven tuple constants *plus* the
-three paths hand-coded in `sample_from_pylxp`. Counting the tuples alone gives 64 for
+three paths hand-coded in `to_sample`. Counting the tuples alone gives 64 for
 `InverterRuntimeData` and 22 for `BatteryBankData`, so the rule has to be stated or the
 rows cannot be reproduced. The totals are raw `dataclasses.fields()` counts, so they
 include bookkeeping fields that are not candidates for anything — but not uniformly,

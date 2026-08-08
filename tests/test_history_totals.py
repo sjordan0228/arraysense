@@ -36,7 +36,10 @@ COSERV_BANDS = (
     "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
 )
 CHICAGO = ZoneInfo("America/Chicago")
+FEBRUARY = datetime(2026, 2, 1, tzinfo=CHICAGO)
+MARCH = datetime(2026, 3, 1, tzinfo=CHICAGO)
 JULY = datetime(2026, 7, 1, tzinfo=CHICAGO)
+MID_JULY = datetime(2026, 7, 16, tzinfo=CHICAGO)
 AUGUST = datetime(2026, 8, 1, tzinfo=CHICAGO)
 FIXED_MONTHLY = 15.0
 
@@ -82,16 +85,20 @@ def _client(tmp_path: Path, build: Any) -> Any:
     return client
 
 
-def _july(client: Any, **extra: Any) -> Any:
+def _span(client: Any, first: datetime, last: datetime, **extra: Any) -> Any:
     return client.get(
         "/api/energy",
         params={
-            "start": JULY.isoformat(),
-            "end": AUGUST.isoformat(),
+            "start": first.isoformat(),
+            "end": last.isoformat(),
             "tz": "America/Chicago",
             **extra,
         },
     ).json()
+
+
+def _july(client: Any, **extra: Any) -> Any:
+    return _span(client, JULY, AUGUST, **extra)
 
 
 def test_the_connection_charge_totals_what_is_billed_not_thirty_one_roundings(
@@ -125,11 +132,14 @@ def test_the_total_of_the_days_is_the_month_priced_once(tmp_path: Path) -> None:
     assert sum(b["cost"] for b in daily["buckets"] if b["cost"] is not None) < month["cost"]
 
 
-def test_a_month_with_an_unpriced_day_totals_the_days_it_could_price(tmp_path: Path) -> None:
-    # The collector was down across the peak window on the 15th, so that day
-    # costs an amount nobody can state. It is left out of the total rather than
-    # counted as nothing — and the day's share of the connection charge goes
-    # with it, because the total is the total of the rows it covers.
+def test_a_month_with_an_unpriced_day_still_owes_the_whole_connection_charge(
+    tmp_path: Path,
+) -> None:
+    # The collector was down across the peak window on the 15th, so that day's
+    # energy costs an amount nobody can state and is left out of the energy
+    # total. The connection charge is not energy. It is owed for being
+    # connected, not for being observed, and the supplier bills the whole
+    # fifteen dollars for a July whether or not anybody watched the 15th.
     def build(store: SqliteStore) -> None:
         _counters(
             store,
@@ -145,9 +155,7 @@ def test_a_month_with_an_unpriced_day_totals_the_days_it_could_price(tmp_path: P
     priced = [b for b in body["buckets"] if b["cost"] is not None]
     assert len(priced) == 30
     totals = body["totals"]
-    # Thirty days of the charge, not thirty-one. A total that quietly filled
-    # the hole would be the missing-day-as-zero bug wearing a currency symbol.
-    assert totals["fixed_charge"] == pytest.approx(FIXED_MONTHLY * 30 / 31, abs=0.005)
+    assert totals["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
     # Each figure is rounded once from unrounded inputs, so the two parts can
     # be a cent away from the whole. That is the right way round — it is the
     # opposite habit, rounding first and adding after, that this fixes.
@@ -156,6 +164,50 @@ def test_a_month_with_an_unpriced_day_totals_the_days_it_could_price(tmp_path: P
     # Still the energy of thirty days, and still above the rounded column it
     # replaces: each row lost a fraction of a cent of connection charge.
     assert totals["cost"] > sum(b["cost"] for b in priced)
+
+
+def test_a_whole_month_of_february_owes_the_same_charge_as_a_whole_july(
+    tmp_path: Path,
+) -> None:
+    # The charge is monthly, so a short month is not a cheap one. Twenty-eight
+    # daily rows carry the same fifteen dollars thirty-one rows do, and the
+    # rounded column beneath them adds to something else again.
+    with _client(tmp_path, lambda s: _counters(s, FEBRUARY - timedelta(hours=2), MARCH)) as c:
+        body = _span(c, FEBRUARY, MARCH, period="day", priced=True)
+    rows = [b for b in body["buckets"] if b["cost"] is not None]
+    assert len(rows) == 28
+    assert body["totals"]["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
+
+
+def test_half_a_month_owes_half_the_connection_charge(tmp_path: Path) -> None:
+    # Calendar coverage is what the charge is shared by. Fifteen days of a
+    # thirty-one-day July is fifteen thirty-firsts of fifteen dollars — the one
+    # case where the total is genuinely less than a whole month's charge.
+    with _client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), MID_JULY)) as c:
+        body = _span(c, JULY, MID_JULY, period="day", priced=True)
+    rows = [b for b in body["buckets"] if b["cost"] is not None]
+    assert len(rows) == 15
+    assert body["totals"]["fixed_charge"] == pytest.approx(FIXED_MONTHLY * 15 / 31, abs=0.005)
+
+
+def test_a_day_nothing_was_recorded_for_at_all_does_not_discount_the_charge(
+    tmp_path: Path,
+) -> None:
+    # The 15th is not merely unpriceable, it is absent from the reply — the
+    # counters said nothing about it, so no row is drawn. The month still ran
+    # for thirty-one days and the supplier still billed for them.
+    def build(store: SqliteStore) -> None:
+        _counters(
+            store,
+            JULY - timedelta(hours=2),
+            AUGUST,
+            skip=lambda w: w.astimezone(CHICAGO).day == 15,
+        )
+
+    with _client(tmp_path, build) as c:
+        body = _july(c, period="day", priced=True)
+    assert not any(b["start"].startswith("2026-07-15") for b in body["buckets"])
+    assert body["totals"]["fixed_charge"] == pytest.approx(FIXED_MONTHLY, abs=0.005)
 
 
 def test_a_period_nothing_could_be_priced_in_has_no_total_rather_than_zero(
@@ -197,3 +249,48 @@ def test_an_install_with_no_tariff_is_told_no_total_at_all(tmp_path: Path) -> No
         body = _july(c, period="day", priced=True)
     assert body["configured"] is False
     assert body["totals"] == {}
+
+
+def test_a_recorded_month_carries_its_riders_onto_every_priced_day(tmp_path: Path) -> None:
+    # PCRF and SCRF are charged per kilowatt-hour on top of the band rate, so
+    # they belong on the day's cost and not only on the month's estimate.
+    with _client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        c.put("/api/settings", json={"tariff.adjustments": "2026-07 | -0.002000 | 0.005000"})
+        body = _july(c, period="day", priced=True)
+    day = body["buckets"][0]
+    assert day["adjustment_status"] == "applied"
+    kwh = day["grid_imported_kwh"]
+    assert day["adjustment"] == pytest.approx(kwh * 0.003, abs=0.005)
+    assert day["cost"] == pytest.approx(
+        day["energy_cost"] + day["fixed_charge"] + day["adjustment"], abs=0.02
+    )
+
+
+def test_a_month_with_no_riders_recorded_cannot_be_priced_and_says_so(
+    tmp_path: Path,
+) -> None:
+    # August's factors are recorded and July's are not. July is not adjusted by
+    # nothing — the owner has said this supplier charges riders and has not said
+    # what July's were, so July's bill cannot be stated. Pricing it at the base
+    # rate would quote a total the supplier will not send, and quote it with no
+    # sign that anything was missing.
+    with _client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        c.put("/api/settings", json={"tariff.adjustments": "2026-08 | -0.002000 | 0.005000"})
+        body = _july(c, period="month", priced=True)
+    month = body["buckets"][0]
+    assert month["adjustment_status"] == "unknown"
+    assert month["adjustment"] is None
+    assert month["cost"] is None, "an unknown rider cannot be spent as zero"
+    # The parts that ARE known still arrive, so the page can show the energy and
+    # the connection charge and say only the total is unavailable.
+    assert month["energy_cost"] is not None
+    assert month["fixed_charge"] is not None
+
+
+def test_an_install_with_no_riders_configured_says_none_rather_than_unknown(
+    tmp_path: Path,
+) -> None:
+    with _client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        body = _july(c, period="month", priced=True)
+    assert body["buckets"][0]["adjustment_status"] == "none"
+    assert body["buckets"][0]["adjustment"] is None

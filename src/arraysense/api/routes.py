@@ -26,7 +26,7 @@ import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -51,6 +51,12 @@ from arraysense.tariff import (
     estimate_bill,
     load_tariff,
 )
+
+if TYPE_CHECKING:
+    # For the annotation only. Nothing here calls into the collector: the
+    # service arrives on the app's state, already built and already polling,
+    # and the one thing asked of it is the verdict it has already reached.
+    from arraysense.collector.service import CollectorService
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +97,30 @@ COUNTER_LEAD = timedelta(hours=2)
 # tariff, the display defaults — is read afresh on each request that needs it,
 # and takes effect as soon as it is saved.
 RESTART_PREFIXES = ("connection.", "collector.")
+
+# How old the newest stored reading may be before the reader is warned that the
+# screen is behind. About eighty missed polls at the reference cadence, so
+# neither a dropped read nor the minute a restart costs can reach it.
+#
+# Deliberately not the collector's stall threshold, and not derived from it.
+# That one answers "is the poll loop running", which this endpoint asks the
+# service directly; this one answers "is what you are looking at current",
+# which is a question about the store and stays here.
+STALE_AFTER = timedelta(minutes=15)
+
+# How far back to look for a reading when the newest stored row is a recorded
+# gap. Long enough to name the hour an outage began, short enough that the scan
+# stays about two thousand raw rows — a status poll runs every thirty seconds on
+# every open page and may not walk a month of history. Measured at 1.5 ms on a
+# week-long raw table whose whole window was gaps, which is the worst this can
+# do because the search then reads all of it and finds nothing, against 0.2 ms
+# for the ordinary case where the newest row is a reading and nothing is
+# scanned at all.
+#
+# Past the window the honest answer is that there is no reading in it. That is
+# not a shrug: an outage of six hours and one of six days call for the same
+# reaction, and inventing a number for the second would be the more precise lie.
+READING_SEARCH = timedelta(hours=6)
 
 
 class YieldRequest(BaseModel):
@@ -137,6 +167,104 @@ def _check_range(start: datetime, end: datetime) -> None:
         raise HTTPException(status_code=400, detail="end must be after start")
 
 
+def _row_time(row: Mapping[str, Any] | None) -> datetime | None:
+    """The timestamp of a stored row, or None if there is no row."""
+    if row is None:
+        return None
+    stamp = row.get("timestamp")
+    return stamp if isinstance(stamp, datetime) else None
+
+
+def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None, bool]:
+    """When the newest stored reading was taken, and whether the store holds anything.
+
+    The store's clock, deliberately, and not the collector's. ``last_success``
+    lives in the process and comes back None the moment it restarts, so a
+    collector crash-looping faster than the staleness threshold read as
+    perfectly current every time — which is the one case the warning exists
+    for. Rows outlive the process that wrote them.
+
+    A recorded gap is not a reading. It carries a reason and no values, so a
+    page drawing it shows dashes, and counting one as data reports a screen
+    full of nothing as up to date. No metric columns are asked for: only the
+    timestamp and the gap marker decide this.
+
+    Returns no timestamp when every row inside the search window is a gap,
+    which is a longer outage rather than a fresh install — the second half of
+    the answer tells those apart, and a caller that flattened them would either
+    warn about an install that has simply not polled yet or stay quiet through
+    an outage that has run all day.
+    """
+    newest = store.latest([])
+    if newest is None:
+        return None, False
+    if not newest.get("error"):
+        return _row_time(newest), True
+    for row in reversed(store.query([], now - READING_SEARCH, now)):
+        if not row.get("error"):
+            return _row_time(row), True
+    return None, True
+
+
+def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> dict[str, Any]:
+    """Whether the screen is out of date and what is behind it, for the page to print.
+
+    The banner used to work this out in the browser, from a copy of the poll
+    loop's stall threshold and a copy of most of ``stalled_for``. The copies had
+    already drifted: the service treats a dead poll task as stopped the instant
+    it dies, while the page was still telling the reader to wait twenty minutes
+    for a restart. So the verdict is reached once, here, and ``stalled_for`` is
+    asked rather than reimplemented — with the same ``now`` it is measured
+    against, so the two cannot disagree about a borderline second.
+
+    Naming the fault is the other half. The page cannot tell an unreachable
+    inverter from a database refusing writes, because the service records both
+    in ``last_error``, and it guessed the inverter — sending whoever read it
+    after the dongle, the WiFi and the breaker while the disk was the problem.
+    Here the two are separable: ``connected`` is set from the read, before the
+    write is attempted, so a poll that failed with the connection up failed at
+    the store. ``consecutive_failures`` gates the whole question, because it is
+    cleared by a success and ``last_failure`` never is — reading that field
+    alone is what let the banner fire over a poll that had just worked.
+    """
+    s = service.status
+    stalled: timedelta | None = service.stalled_for(now)
+    reading_at, any_rows = _newest_reading(store, now)
+    age = (now - reading_at).total_seconds() if reading_at is not None else None
+    stale = (
+        stalled is not None
+        or (age is None and any_rows)
+        or (age is not None and age > STALE_AFTER.total_seconds())
+    )
+
+    if s.yielding:
+        verdict = "yielding"
+    elif stalled is not None:
+        verdict = "stopped"
+    elif not s.running:
+        verdict = "not_running"
+    elif s.consecutive_failures:
+        verdict = "storage" if s.connected else "inverter"
+    elif stale:
+        verdict = "silent"
+    else:
+        verdict = "fresh"
+
+    return {
+        "stale": stale,
+        "verdict": verdict,
+        "reading_at": reading_at.isoformat() if reading_at else None,
+        "age_seconds": age,
+        "any_rows": any_rows,
+        "searched_seconds": READING_SEARCH.total_seconds(),
+        "stalled_seconds": stalled.total_seconds() if stalled is not None else None,
+        # Only where the verdict names a failure. The field is left set by the
+        # service long after the fault it describes has cleared, so quoting it
+        # beside any other verdict attaches an old cause to a new condition.
+        "reason": s.last_error if verdict in {"inverter", "storage"} else None,
+    }
+
+
 @router.get("/status")
 async def status(request: Request) -> dict[str, Any]:
     """Whether the collector is alive, connected, and holding the dongle."""
@@ -166,6 +294,10 @@ async def status(request: Request) -> dict[str, Any]:
         # measurement meaning none happened, and claiming it from something that
         # never looked is the same error as rendering a missing reading as 0.
         "misroutes": getattr(service.source, "misroutes", None),
+        # The verdict the stale banner prints. Reached here because it is a
+        # judgement, and one made in the browser is one that can disagree with
+        # the watchdog about whether the collector is running.
+        "staleness": _staleness(service, request.app.state.store, datetime.now(tz=UTC)),
     }
 
 
@@ -613,6 +745,10 @@ async def energy(
     # would then slide onto that bucket's neighbour.
     money: dict[datetime, CostResult | None] = {}
     splits: dict[datetime, PeriodEnergy] = {}
+    # Every calendar bucket the table spans, including the ones nothing was
+    # recorded for. The connection charge is drawn from these rather than from
+    # the buckets that could be priced; see _period_total.
+    spanned: list[PeriodEnergy] = []
     if tariff is not None:
         # ``end`` goes with it so the bucket in progress is priced over the
         # part of itself that has happened. A calendar month runs to the first
@@ -625,6 +761,11 @@ async def energy(
             money[read.edges[index]] = price_period(
                 tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
             )
+        if read.buckets:
+            first, last = read.buckets[0].start, read.buckets[-1].start
+            spanned = [
+                splits[edge] for edge in read.edges if first <= edge <= last and edge in splits
+            ]
 
     payload: dict[str, Any] = {
         "period": period,
@@ -652,12 +793,13 @@ async def energy(
             # table totals the rows of that same table and nothing else.
             "totals": _period_total(
                 tariff,
-                period,
                 [
                     (splits[bucket.start], money.get(bucket.start))
                     for bucket in read.buckets
                     if bucket.start in splits
                 ],
+                spanned,
+                period,
             ),
         }
     return payload
@@ -702,7 +844,7 @@ def _merge_bands(
 
 
 def _price_together(
-    tariff: Tariff, period: Period, spans: Sequence[PeriodEnergy]
+    tariff: Tariff, spans: Sequence[PeriodEnergy], fixed_charge: float
 ) -> CostResult | None:
     """Price a run of buckets as one period rather than adding up their costs.
 
@@ -712,10 +854,9 @@ def _price_together(
     is the trap every other duration in this project goes out of its way to
     avoid.
 
-    The connection charge is summed from the buckets rather than apportioned
-    across the span, because the span may have holes in it. A month missing its
-    fifteenth owes thirty days of the charge, not thirty-one, and apportioning
-    over the whole month would quietly charge for the day nobody could price.
+    The connection charge is handed in rather than derived from ``spans``,
+    because ``spans`` is only the part of the period that could be priced and
+    the charge does not depend on that. See ``_period_total``.
     """
     if not spans:
         return None
@@ -729,14 +870,15 @@ def _price_together(
             battery_discharge_kwh=_merge_bands(span.battery_discharge_kwh for span in spans)
             or None,
         ),
-        fixed_charge=sum(_bucket_fixed(tariff, period, span) for span in spans),
+        fixed_charge=fixed_charge,
     )
 
 
 def _period_total(
     tariff: Tariff | None,
-    period: Period,
     buckets: Sequence[tuple[PeriodEnergy, CostResult | None]],
+    spanned: Sequence[PeriodEnergy],
+    period: Period,
 ) -> dict[str, Any]:
     """What the whole span cost, priced once rather than added up from the rows.
 
@@ -751,11 +893,21 @@ def _period_total(
     unrounded and priced in a single pass, exactly as the monthly row is, and
     the page draws what comes back instead of deriving money a second time.
 
-    Only the buckets the service could price are in it. A month with a day
-    nobody measured does not cost the sum of the days that were, and this says
-    so by covering fewer rows rather than by treating the hole as free; a span
-    where nothing could be priced has no total at all, which is a dash and
-    never a zero.
+    Only the buckets the service could price contribute *energy*. A month with
+    a day nobody measured did not use the energy of the days that were, and
+    this says so by covering fewer rows rather than by treating the hole as
+    free; a span where nothing could be priced has no total at all, which is a
+    dash and never a zero.
+
+    The connection charge is the exception, and it is drawn from ``spanned`` —
+    every calendar bucket between the first row and the last, whether anything
+    was recorded for it or not. It is owed for being connected, not for being
+    observed, so losing a day of telemetry does not reduce it: a July with a
+    hole on the fifteenth still owes the whole $15.00, where summing the thirty
+    buckets that could be priced owed $14.52 and quietly credited the owner for
+    the outage. Calendar coverage is still what shares it out, so a query
+    covering half of July owes half — the charge is reduced by asking about
+    less of the month, never by failing to watch it.
 
     Cost and savings are totalled over their own rows, because they can be
     knowable for different ones. A counter reset takes one column backwards and
@@ -765,14 +917,21 @@ def _period_total(
     """
     if tariff is None:
         return {}
+    fixed = sum(_bucket_fixed(tariff, period, span) for span in spanned)
     costed = [energy for energy, result in buckets if result and result.cost is not None]
     saving = [energy for energy, result in buckets if result and result.savings is not None]
-    whole = _price_together(tariff, period, costed)
-    against = _price_together(tariff, period, saving)
+    whole = _price_together(tariff, costed, fixed)
+    against = _price_together(tariff, saving, fixed)
     return {
         "cost": whole.cost if whole else None,
         "energy_cost": whole.energy_cost if whole else None,
         "fixed_charge": whole.fixed_charge if whole else None,
+        "adjustment": whole.adjustment if whole else None,
+        # Over a run of buckets this is usually "unknown" the moment the run
+        # crosses a month the supplier changed the factors in, which is the
+        # honest answer: the kilowatt-hours are not split by month, so no
+        # single rider can be charged on them.
+        "adjustment_status": whole.adjustment_status if whole else None,
         "saved": against.savings if against else None,
         "no_solar_cost": against.no_solar_cost if against else None,
     }
@@ -798,6 +957,12 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
     array would make the system look worse the more it saved. It is null rather
     than zero whenever either side of that subtraction is unknown, because a
     saving computed from a half-measured day is a number nobody can check.
+
+    ``adjustment`` is the PCRF and SCRF riders, already inside ``cost``, and
+    ``adjustment_status`` says whether it was charged at all. A null adjustment
+    with a status of "unknown" is a bucket priced at the base rate because its
+    month has no factors recorded — the page has to say so, since a bill
+    quoted without a rider is not the bill that arrives.
     """
     if tariff is None:
         return {}
@@ -806,6 +971,8 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
             "cost": None,
             "energy_cost": None,
             "fixed_charge": None,
+            "adjustment": None,
+            "adjustment_status": None,
             "saved": None,
             "no_solar_cost": None,
         }
@@ -813,6 +980,8 @@ def _bucket_money(tariff: Tariff | None, result: CostResult | None) -> dict[str,
         "cost": result.cost,
         "energy_cost": result.energy_cost,
         "fixed_charge": result.fixed_charge,
+        "adjustment": result.adjustment,
+        "adjustment_status": result.adjustment_status,
         "saved": result.savings,
         "no_solar_cost": result.no_solar_cost,
     }

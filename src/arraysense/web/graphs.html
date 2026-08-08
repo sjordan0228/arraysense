@@ -69,8 +69,13 @@
   </section>
 
   <section class="p">
+    <!-- This section states its own resolution rather than borrowing the one
+         in the header. The two endpoints choose a tier independently and out
+         of different lists, and the answers genuinely differ: a week arrives
+         as a minute rollup on the inverter side, and these bands have no
+         minute tier to land on at all. -->
     <div class="chead"><h2>Battery pack temperature</h2>
-      <span class="legend muted">one band per pack, named by serial</span>
+      <span class="legend muted" id="packRes">one band per pack, named by serial</span>
     </div>
     <div id="packBands"><div class="empty">waiting for per-pack readings</div></div>
     <!-- Two same-coloured traces, and a third column deliberately not drawn,
@@ -80,15 +85,18 @@
     <p class="why">Two traces to a pack, in one colour because they are one
       quantity from one battery: its hottest cell solid, its coldest dashed. The
       hottest cannot sit below the coldest, so position separates the pair and
-      the dash only confirms it. There is no third trace for the pack's own
-      <code>temperature_c</code>, because pylxpweb fills a module's temperature
-      from its hottest cell — it would be the solid line drawn twice. It is read
-      out on hover beside the other two instead, which is where that can be
-      checked. Over a range long enough to be served from a rollup the pair
-      spreads apart, since the extremes then aggregate as a maximum and a
-      minimum across each bucket rather than each sample; the header says which
-      tier arrived. The bank band above is a different register again — the
-      hottest cell anywhere in the bank, not in any one pack.</p>
+      the dash only confirms it. The pack's own <code>temperature_c</code> is
+      read out on hover rather than drawn, because it is not one thing: on a raw
+      sample it is the same number as the hottest cell, the inverter library
+      filling both from a single register, and on a rollup it is the bucket's
+      mean while the drawn pair are the bucket's maximum and minimum. That is
+      also where the pair spreads apart, and why the legend on this section
+      names the tier these bands came from rather than leaving the header to
+      speak for them — per-module readings are kept at full cadence and hourly
+      with nothing between, so the two halves of this page can be drawn from
+      different tiers of the same range. The bank band above is a different
+      register again: the hottest cell anywhere in the bank, not in any one
+      pack, which is exactly what a pack-by-pack chart is here to open up.</p>
   </section>
 
   <section class="p">
@@ -131,18 +139,52 @@
 // readout in the header says which one did.
 const MAX_POINTS = 4000;
 
+// The per-pack side needs a cap of its own, because it is choosing between a
+// different pair of tiers. Per-module readings have no minute rollup — the
+// store keeps them at full cadence and hourly and nothing between — so a
+// middling width that would put the inverter side on its minute tier scores
+// full cadence here, there being nothing in the middle to score.
+//
+// Both endpoints score a tier by log distance from the requested width, so the
+// tie between two of them sits at the geometric mean of the point counts they
+// would return — for the module tiers, the span over sqrt(cadence × 3600). At
+// eleven seconds that boundary is a width of 434 for a day and 3,039 for a
+// week, and the cap has to fall between them: above the first so a day still
+// comes back at full cadence, below the second so a week does not.
+//
+// A point there is one instant, and this endpoint answers an instant with a
+// row per pack, so what arrives is four times that count on this bank. Worth
+// saying twice, because quoting a span's instant count as its row count is
+// exactly how the figures that used to stand here came out at a quarter of
+// what they should have been.
+//
+// Measured as response bytes against a rebuilt month at this cadence, the four
+// spans cost 1.14, 4.56, 0.11 and 0.47 MB — 7,856 and 31,420 rows at full
+// cadence, then 672 and 2,880 off the hourly tier. The week is what the cap is
+// for: uncapped it comes back at full cadence instead, 219,928 rows and 32 MB.
+//
+// The day is the heavier load, though, and neither cap changes what it costs —
+// both sides answer from full cadence with the caps on or off. Its 4.56 MB of
+// packs arrives beside 4.55 MB of inverter bands in the same pair of requests,
+// so one click on 24h pulls a little over nine megabytes: the two sides cost
+// the same despite the packs carrying three metric columns against the
+// inverter's twenty-three, because four rows to the instant is what that buys.
+const MODULE_MAX_POINTS = 1200;
+
 // Only reached when /api/settings cannot be read. The interval is configurable
-// and the width below is computed from it, so guessing wrong here would ask
+// and the widths below are computed from it, so guessing wrong here would ask
 // for a width that lands on the wrong tier.
 const DEFAULT_CADENCE = 11;
 let cadence = DEFAULT_CADENCE;
 
 // The span's own raw sample count while that is under the cap, the cap once it
-// is not. The cap sits well clear of where raw stops winning: at this cadence
-// a width of four thousand against a day still scores the full tier ahead of
-// the minute rollup, so a day comes back raw despite asking for half as many
-// points as it holds.
-const widthFor = (seconds) => Math.max(1, Math.round(Math.min(seconds / cadence, MAX_POINTS)));
+// is not. The inverter cap sits well clear of where raw stops winning: at this
+// cadence a width of four thousand against a day still scores the full tier
+// ahead of the minute rollup, so a day comes back raw despite asking for half
+// as many points as it holds.
+const askFor = (seconds, cap) => Math.max(1, Math.round(Math.min(seconds / cadence, cap)));
+const widthFor = (seconds) => askFor(seconds, MAX_POINTS);
+const moduleWidthFor = (seconds) => askFor(seconds, MODULE_MAX_POINTS);
 
 // Short enough that twenty-odd of them fit on a screen, tall enough that a
 // swing is a shape rather than a smudge. The last band in each section carries
@@ -349,14 +391,23 @@ const METRICS = [...new Set(WANTED)].join(',');
 // pack's hottest cell cannot be below its coldest. Colour carries nothing here,
 // which is the point.
 //
-// temperature_c is fetched and read out but never drawn, because it is not a
-// third reading. pylxpweb fills a module's temperature from its hottest cell —
-// transports/data.py, BatteryModuleData.from_registers, where `temperature` and
-// `max_cell_temperature` are both assigned the same max_cell_temp; the RS485
-// master protocol sets all three from its one register. A trace for it would be
-// the solid line drawn a second time under a name implying another sensor.
-// Carried rather than dropped so the hover still answers for the column the
-// store actually keeps, and so the duplication is something a reader can see.
+// temperature_c is fetched and read out but never drawn, and what it is
+// depends on the tier — which is the whole reason it is not a trace.
+//
+// On a raw sample it is not a third reading at all. The pack records this
+// collector stores come from pylxpweb's BatteryData.from_modbus_registers, in
+// transports/data.py, which takes one decoded max_cell_temperature out of the
+// register block and assigns it to both `temperature` and
+// `max_cell_temperature` — so a pack's temperature and its hottest cell are
+// one number arriving twice, and a trace for it would be the solid line drawn
+// again under a name implying another sensor.
+//
+// On a rollup they part company, because the registry aggregates them
+// differently: temperature_c takes the bucket's mean while the two cell
+// extremes take its max and min. So the same trace would duplicate another at
+// one resolution and mean something else at the next, which is a worse thing
+// to put on a band than to leave off it. The hover answers for the stored
+// column at every tier instead, which is where both of those can be checked.
 //
 // The names are the bare module metrics /api/battery/history takes. The store
 // keeps them in slot-numbered columns — battery_module1_temperature_c and its
@@ -568,23 +619,43 @@ async function get(url) {
   return r.json();
 }
 
+const tierPhrase = (body, raw) => (body.tier === 'full' ? raw : `${body.tier} rollup`);
+
 function resolution(body) {
   if (!body) return;
   const n = Number(body.count) || 0;
-  $('res').textContent = body.tier === 'full'
-    ? `raw ${tickNum(cadence)} s samples · ${n.toLocaleString()} points`
-    : `${body.tier} rollup · ${n.toLocaleString()} points`;
+  $('res').textContent =
+    `${tierPhrase(body, `raw ${tickNum(cadence)} s samples`)} · ${n.toLocaleString()} points`;
+}
+
+// The pack section's own readout. Counted in readings rather than points
+// because a module row is one pack at one instant: four packs answering the
+// same instant are four rows and one point, and calling that four points
+// beside a header that means something else by the word would be worse than
+// saying nothing. Left as the bare legend when the request failed, since the
+// bands then still hold the last successful read and naming a tier for them
+// would name the wrong one.
+function packResolution(body) {
+  const base = 'one band per pack, named by serial';
+  const n = body ? Number(body.count) || 0 : 0;
+  $('packRes').textContent = body
+    ? `${base} · ${tierPhrase(body, 'raw samples')} · ${n.toLocaleString()} readings`
+    : base;
 }
 
 async function load() {
   const end = new Date();
   const start = new Date(end.getTime() - range.seconds * 1000);
   const when = `start=${start.toISOString()}&end=${end.toISOString()}`;
+  // Two asks, because the two endpoints choose from two different lists of
+  // tiers and one width cannot be right for both.
   const width = widthFor(range.seconds);
+  const packWidth = moduleWidthFor(range.seconds);
   const problems = [];
   const [inv, packs] = await Promise.all([
     get(`/api/history?${when}&metrics=${METRICS}&width=${width}`).catch(() => null),
-    get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${width}`).catch(() => null),
+    get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
+      .catch(() => null),
   ]);
   // A failed poll must not tear the charts down: destroying them takes the
   // owner's zoom with it over a problem that usually lasts one request, and
@@ -592,11 +663,14 @@ async function load() {
   if (!inv) problems.push('history unavailable — showing the last successful read');
   if (!packs) problems.push('per-pack temperature unavailable');
   // A rollup is not among them. On the longer spans it is exactly what this
-  // page asked to have chosen for it, and the header states which tier arrived
-  // on every load, so a warning about one would be noise where it was not
-  // simply wrong.
+  // page asked to have chosen for it, and each side names the tier it got
+  // whenever an answer arrives — the inverter's in the header, the packs' in
+  // that section's own legend, since the two endpoints choose separately and
+  // one line could name only one of them. A warning about a rollup would be
+  // noise where it was not simply wrong.
   note(problems.join(' · '));
   resolution(inv);
+  packResolution(packs);
   drawInverter(inv);
   drawPacks(packs);
   rangeChanged = false;

@@ -17,14 +17,16 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from arraysense.energy import energy_totals
-from arraysense.metrics import lookup
+from arraysense.metrics import INVERTER_METRICS, lookup
 from arraysense.models import Sample
-from arraysense.store.schema import INVERTER_TIERS
+from arraysense.store.rollup import collapse_policy, rebuild_inverter_hourly
+from arraysense.store.schema import FOREIGN_KEYS_PRAGMA, INVERTER_TIERS, schema_ddl
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 from import_solar_assistant import (
     HOURLY_ENERGY,
     SOURCES,
+    Accumulator,
     Buckets,
     _encode,
     _fahrenheit,
@@ -32,6 +34,7 @@ from import_solar_assistant import (
     read_anchor,
     scan,
     synthesise_counters,
+    tier_policy,
     write_tier,
 )
 
@@ -166,6 +169,73 @@ def test_the_counter_at_an_hour_is_its_start_not_its_end() -> None:
     assert series[10] == pytest.approx(90.0)
     # And the difference across the whole span is what was actually measured.
     assert series[12] - series[10] == pytest.approx(5.0)
+
+
+def test_the_importer_and_the_rollup_agree_on_what_an_hour_holds() -> None:
+    # The two write the same column of the same table, so a row's meaning must
+    # not depend on which of them produced it. The importer deliberately puts
+    # the counter as it stood at the start of the hour; this checks the rollup
+    # puts the same number on the same hour given the same energy history.
+    #
+    # One kWh in hour 10, two in hour 11, four in hour 12, with the counter
+    # standing at 90.0 kWh when hour 10 begins.
+    conn = sqlite3.connect(":memory:")
+    conn.execute(FOREIGN_KEYS_PRAGMA)
+    conn.executescript(schema_ddl())
+    readings = {
+        10: (900, 910),
+        11: (910, 930),
+        12: (930, 970),
+    }
+    for hour, (opening, closing) in readings.items():
+        for offset, stored in ((1, opening), (3599, closing)):
+            conn.execute(
+                f"INSERT INTO inverter_raw (timestamp, device, pv_energy_total_kwh) "
+                f"VALUES (?, '{TEST_DEVICE}', ?)",
+                (hour * HOUR + offset, stored),
+            )
+    rebuild_inverter_hourly(conn, 10 * HOUR, 13 * HOUR)
+    rolled = {
+        int(at) // HOUR: lookup("pv_energy_total_kwh").decode(value)
+        for at, value in conn.execute(
+            "SELECT timestamp, pv_energy_total_kwh FROM inverter_hourly ORDER BY timestamp"
+        )
+    }
+    conn.close()
+
+    counters = synthesise_counters(
+        _buckets({10: 1.0, 11: 2.0, 12: 4.0}, "pv_energy_total_kwh"),
+        {"pv_energy_total_kwh": 97.0},
+        12,
+    )
+    imported = counters["pv_energy_total_kwh"]
+
+    assert rolled == {10: 90.0, 11: 91.0, 12: 93.0}
+    for hour in (10, 11, 12):
+        assert imported[hour] == pytest.approx(rolled[hour]), hour
+
+
+def test_the_importer_reads_its_collapse_policy_from_the_rollup() -> None:
+    # A second copy of the policy disagrees with the first the moment either
+    # moves, and the disagreement is invisible until a chart is wrong.
+    policy = tier_policy()
+    assert policy == {spec.name: collapse_policy(spec) for spec in INVERTER_METRICS}
+
+
+def test_an_unknown_collapse_policy_is_an_error_not_a_silent_latest() -> None:
+    # It used to fall through to the latest value, so a policy the rollup
+    # rejects outright would have been imported as something plausible.
+    acc = Accumulator(1)
+    acc.add(0, 5.0, 100)
+    with pytest.raises(AssertionError, match="median"):
+        acc.value(0, "median")
+
+
+def test_an_empty_bucket_has_no_value_under_any_policy() -> None:
+    # Absent is not zero, and min is as capable of inventing a zero as max is.
+    acc = Accumulator(1)
+    for how in ("mean", "max", "min", "last"):
+        assert acc.value(0, how) is None
 
 
 def test_an_implausible_reading_stores_as_absent_rather_than_clamped() -> None:

@@ -92,6 +92,202 @@ def test_status_reports_the_collector(client: Any) -> None:
     assert body["version"]
 
 
+# --- the staleness verdict -------------------------------------------------
+#
+# The banner used to reach these conclusions in the browser, from a copy of the
+# poll loop's stall threshold and a field no success ever clears. Each of these
+# asserts on the verdict the endpoint now hands it, because a page that decides
+# is a page that can decide differently from the service.
+
+
+def _polling(client: Any, now: datetime) -> Any:
+    """Put the client's collector into the state of one that has just polled well."""
+    service = client.app.state.service
+    service.status.running = True
+    service.status.connected = True
+    service.status.last_success = now
+    return service
+
+
+def _staleness(client: Any) -> Any:
+    return client.get("/api/status").json()["staleness"]
+
+
+def test_status_ages_the_reading_and_not_the_process(empty_client: Any) -> None:
+    # A restart clears last_success, so a collector crash-looping faster than
+    # the threshold never looked stale at all — the one case the warning is
+    # for. The rows it already wrote do not move when the process does.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=40), readings={"pv_total_power_w": 1000.0})
+    )
+    service = empty_client.app.state.service
+    service.status.running = True
+    service.status.started_at = now
+    service.status.last_success = None
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["age_seconds"] == pytest.approx(2400, abs=30)
+    assert body["reading_at"] == (now - timedelta(minutes=40)).replace(microsecond=0).isoformat()
+
+
+def test_status_is_not_stale_while_the_readings_are_current(empty_client: Any) -> None:
+    # last_failure is never cleared by a later success, so a banner reading it
+    # fires after a poll that worked. consecutive_failures is cleared.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now, readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now)
+    service.status.last_failure = now - timedelta(hours=2)
+    service.status.last_error = "ConnectionRefusedError: [Errno 111] refused"
+
+    body = _staleness(empty_client)
+    assert body["stale"] is False
+    assert body["verdict"] == "fresh"
+    assert body["reason"] is None
+
+
+def test_status_blames_the_database_when_the_write_is_what_failed(empty_client: Any) -> None:
+    # A busy database is recorded in the same field as an unreachable inverter.
+    # Reported as the inverter, it sends the reader after the dongle, the WiFi
+    # and the breaker while the fault is the disk. The read having succeeded is
+    # what tells them apart: connected is set from the read, before the write.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=20), readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=20))
+    service.status.last_failure = now
+    service.status.last_error = "OperationalError: database is locked"
+    service.status.consecutive_failures = 3
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["verdict"] == "storage"
+    assert body["reason"] == "OperationalError: database is locked"
+
+
+def test_status_blames_the_inverter_when_the_read_is_what_failed(empty_client: Any) -> None:
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=20), readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=20))
+    service.status.connected = False
+    service.status.last_failure = now
+    service.status.last_error = "TimeoutError: read timed out"
+    service.status.consecutive_failures = 3
+
+    body = _staleness(empty_client)
+    assert body["verdict"] == "inverter"
+    assert body["reason"] == "TimeoutError: read timed out"
+
+
+def test_status_reports_the_stall_the_service_itself_detects(empty_client: Any) -> None:
+    # One opinion, not two: whatever stalled_for() says is what goes over the
+    # wire, so the page cannot disagree with the watchdog about a dead loop.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=30), readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=30))
+
+    stalled = service.stalled_for()
+    assert stalled is not None, "a loop silent for half an hour is stalled"
+    body = _staleness(empty_client)
+    assert body["verdict"] == "stopped"
+    assert body["stalled_seconds"] == pytest.approx(stalled.total_seconds(), abs=5)
+
+
+def test_status_does_not_count_a_recorded_gap_as_a_reading(empty_client: Any) -> None:
+    # A gap carries a reason and no values, so a page drawing it shows dashes.
+    # Counted as data it would report a screen full of nothing as current.
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(Sample(timestamp=now - timedelta(minutes=40), readings={"pv_total_power_w": 1.0}))
+    store.append(Sample.failed(now - timedelta(seconds=10), "TimeoutError: read timed out"))
+    service = _polling(empty_client, now - timedelta(minutes=40))
+    service.status.connected = False
+    service.status.last_failure = now
+    service.status.last_error = "TimeoutError: read timed out"
+    service.status.consecutive_failures = 200
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["age_seconds"] == pytest.approx(2400, abs=30)
+    assert body["verdict"] == "inverter"
+
+
+def test_status_says_no_reading_rather_than_guessing_at_an_age(empty_client: Any) -> None:
+    # The search behind a gap is bounded — a status poll every thirty seconds
+    # may not scan a month of raw rows — so an outage longer than the window
+    # has no age to report. None, never a number and never zero.
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(Sample(timestamp=now - timedelta(hours=9), readings={"pv_total_power_w": 1.0}))
+    store.append(Sample.failed(now - timedelta(seconds=10), "TimeoutError: read timed out"))
+    service = _polling(empty_client, now - timedelta(hours=9))
+    service.status.connected = False
+    service.status.last_failure = now
+    service.status.last_error = "TimeoutError: read timed out"
+    service.status.consecutive_failures = 200
+
+    body = _staleness(empty_client)
+    assert body["reading_at"] is None
+    assert body["age_seconds"] is None
+    assert body["any_rows"] is True
+    assert body["stale"] is True
+    assert body["searched_seconds"] > 0
+
+
+def test_status_does_not_call_a_fresh_install_stale(empty_client: Any) -> None:
+    # Nothing recorded and nothing wrong: a service that started a moment ago
+    # has an empty store, and a banner over it would be the first thing a new
+    # owner ever saw.
+    service = _polling(empty_client, datetime.now(tz=UTC))
+    service.status.started_at = datetime.now(tz=UTC)
+
+    body = _staleness(empty_client)
+    assert body["any_rows"] is False
+    assert body["reading_at"] is None
+    assert body["stale"] is False
+    assert body["verdict"] == "fresh"
+
+
+def test_status_reports_an_empty_store_behind_a_stalled_loop(empty_client: Any) -> None:
+    # An install that never worked: the loop is running and has marked nothing,
+    # which stalled_for() calls stalled whether or not a row was ever written.
+    now = datetime.now(tz=UTC)
+    service = empty_client.app.state.service
+    service.status.running = True
+    service.status.started_at = now - timedelta(minutes=30)
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["verdict"] == "stopped"
+    assert body["any_rows"] is False
+    assert body["reading_at"] is None
+
+
+def test_status_treats_a_deliberate_yield_as_its_own_case(empty_client: Any) -> None:
+    # The dongle takes one client at a time, so handing it over is a deliberate
+    # act with an end time on it and not a fault to be warned about.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=40), readings={"pv_total_power_w": 1.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=40))
+    service.status.yielding = True
+    service.status.yield_until = now + timedelta(minutes=5)
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["verdict"] == "yielding"
+    assert body["stalled_seconds"] is None
+
+
 def test_live_returns_the_latest_inverter_and_every_module(client: Any) -> None:
     body = client.get("/api/live").json()
     assert body["inverter"]["pv_total_power_w"] == 3000.0

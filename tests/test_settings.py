@@ -211,3 +211,27 @@ def test_an_absurdly_long_value_is_refused(settings: SettingsStore) -> None:
 def test_an_ordinary_serial_is_still_accepted(settings: SettingsStore) -> None:
     settings.set("connection.dongle_serial", "BA12345678")
     assert settings.get("connection.dongle_serial") == "BA12345678"
+
+
+def test_a_table_of_monthly_factors_saves_as_typed(settings: SettingsStore) -> None:
+    # Written a line at a time, the way the supplier publishes them, and read
+    # back unchanged: the registry stores the text and the tariff parses it.
+    typed = "2026-07 | -0.001230 | 0.004560\n2026-08 | 0.002100 | 0.004560"
+    settings.set("tariff.adjustments", typed)
+    assert settings.get("tariff.adjustments") == typed
+
+
+def test_a_malformed_month_of_factors_is_refused_at_the_box_it_was_typed_in(
+    settings: SettingsStore,
+) -> None:
+    # Storing it and letting the Costs page discover it as an absence is how
+    # the tariff field went wrong; the same check runs here for the same reason.
+    with pytest.raises(ValueError, match="2026-07"):
+        settings.set("tariff.adjustments", "2026-07 | -0.001 | 0.004; 2026-07 | -0.002 | 0.004")
+
+
+def test_an_empty_table_of_factors_is_allowed(settings: SettingsStore) -> None:
+    # A supplier that charges no rider is the ordinary case, and it must not
+    # have to type something to say so.
+    settings.set("tariff.adjustments", "")
+    assert settings.get("tariff.adjustments") == ""

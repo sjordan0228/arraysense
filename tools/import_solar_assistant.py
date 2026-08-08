@@ -42,7 +42,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
-from arraysense.metrics import INVERTER_METRICS, lookup
+from arraysense.metrics import INVERTER_METRICS, Aggregation, lookup
+from arraysense.store.rollup import collapse_policy
 from arraysense.store.schema import INVERTER_TIERS
 
 logger = logging.getLogger("import_sa")
@@ -218,7 +219,21 @@ class Accumulator:
             self.latest[index] = value
 
     def value(self, index: int, how: str) -> float | None:
-        """The bucket's value under its metric's own aggregation policy."""
+        """The bucket's value under the collapse policy ``tier_policy`` assigned it.
+
+        An empty bucket is None and never zero: the import lands beside live
+        readings in the same tables, and an hour SolarAssistant never recorded
+        must not read as an hour in which nothing happened.
+
+        The four policies are the rollup's four, and an unrecognised one is an
+        error rather than a fallback. Falling through to the latest value is
+        what let this quietly disagree with ``store.rollup``, which raises on
+        exactly the same input.
+
+        Raises:
+            AssertionError: ``how`` is not one of the registry's four policies,
+                which is a programming error, not a data condition.
+        """
         if self.count[index] == 0:
             return None
         if how == "mean":
@@ -227,7 +242,9 @@ class Accumulator:
             return float(self.peak[index])
         if how == "min":
             return float(self.trough[index])
-        return float(self.latest[index])
+        if how == "last":
+            return float(self.latest[index])
+        raise AssertionError(f"unhandled aggregation policy: {how!r}")
 
 
 def parse(path: Path) -> Iterator[tuple[str, str, float, int]]:
@@ -420,6 +437,19 @@ def synthesise_counters(
     return out
 
 
+def tier_policy() -> dict[str, Aggregation]:
+    """How every inverter metric collapses into a tier bucket.
+
+    Deferred to ``store.rollup.collapse_policy`` rather than read off the
+    registry here. The collector's rollup and this importer both write
+    ``inverter_hourly`` and ``inverter_minute``, and while each decided for
+    itself the same column carried two meanings depending on which had
+    produced the row — the rollup put a counter's closing value on a bucket
+    stamped with its opening instant, and the import put its opening one.
+    """
+    return {spec.name: collapse_policy(spec) for spec in INVERTER_METRICS}
+
+
 def _encode(metric: str, value: float | None) -> int | None:
     """Scale a reading to the integer the column stores, or None if absent."""
     if value is None:
@@ -451,7 +481,7 @@ def write_tier(
     run twice replaces its own rows, and never another inverter's readings for
     the same instant.
     """
-    policy = {m.name: m.aggregation for m in INVERTER_METRICS}
+    policy = tier_policy()
     metrics = sorted(accumulators)
     energy_metrics = sorted(counters)
     columns = ["timestamp", "device", *metrics, *energy_metrics, "sample_count"]
@@ -469,7 +499,7 @@ def write_tier(
         samples = 0
         for metric in metrics:
             acc = accumulators[metric]
-            raw = acc.value(slot, policy.get(metric, "mean"))
+            raw = acc.value(slot, policy[metric])
             samples = max(samples, acc.count[slot])
             values.append(_encode(metric, raw))
         hour = at // counter_step

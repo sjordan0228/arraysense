@@ -1,10 +1,17 @@
-"""pylxp_source.py — adapter from pylxpweb's data classes to the wire-independent Sample.
+"""source.py — the EG4/LuxPower driver: pylxpweb's data classes to a Sample.
 
-This is the only module that knows what the inverter library calls things.
-Everything downstream sees the metric names registered in arraysense.metrics,
-so a change of library, transport or inverter family stops here.
+This is the only module in the project that knows what the inverter library
+calls things. Everything downstream sees the metric names registered in
+arraysense.metrics, so a change of library, transport or inverter family stops
+here — which is the whole reason it sits in a driver package rather than in the
+collector, where it began.
 
-Three properties of the library shape the whole mapping.
+One package per protocol family, not per model. LuxPower's 141-register surface
+is shared by the 18kPV, the 6000XP and the 12kPV, so all three read through this
+same mapping; a device that answers differently gets its own package rather than
+a branch in this one.
+
+Four properties of the library shape the whole mapping.
 
 Its runtime object declares a field for every register any supported inverter
 might expose, and a real read populates a handful of them: the reference 18kPV
@@ -13,7 +20,17 @@ rest None. So the mapping asks for attributes rather than reading them, and
 emits only the ones that came back as numbers. A metric the inverter did not
 report is absent from the sample, never a zero.
 
-Its per-module battery records, by contrast, default to zero rather than None,
+That only covers a register the inverter left out of its reply. A register that
+is in the reply and reads 0 decodes to 0.0, which is a measurement as far as
+anything downstream can tell — and the BMS block is exactly where that happens,
+because the inverter answers for those registers whether or not the CAN link
+behind them is up. Absence there has to be inferred rather than read, which is
+what ``_bms_is_answering`` is for: a cell voltage of 0.000 V is not a cell, so
+the whole block it stands for is dropped. The readings the inverter takes at its
+own terminals are not gated with it, because a silent BMS does not stop the
+inverter measuring its own busbar.
+
+Its per-module battery records go further and default to zero rather than None,
 so an unpopulated slot arrives looking like a healthy module sitting at 0% SOC.
 The distinguishing mark is the serial number, which is empty for a slot that
 holds nothing — and identity is the serial anyway, so a module without one is
@@ -40,9 +57,20 @@ from pylxpweb.transports.exceptions import TransportError, TransportResponseMism
 from pylxpweb.transports.factory import create_dongle_transport
 
 from arraysense.config import Config
+from arraysense.drivers.base import (
+    Capabilities,
+    DeviceIdentity,
+    EnergyReporting,
+    expand_module_metrics,
+)
 from arraysense.models import BatteryModuleSample, Sample
 
 logger = logging.getLogger(__name__)
+
+# The name this driver is registered and configured under. Kept here beside the
+# mapping so the identity a source reports and the key the registry answers to
+# are one string rather than two that have to agree.
+NAME = "eg4_luxpower"
 
 # The word pylxpweb puts on every reply that answers a question nobody asked.
 # The dongle serves its vendor's cloud on the same socket and the replies cross,
@@ -116,16 +144,28 @@ _RUNTIME_METRICS: tuple[tuple[str, str], ...] = (
     ("inverter_run_time_s", "inverter_on_time"),
 )
 
-# Battery readings as the *inverter* measures them, at its own terminals, and
-# the BMS figures it relays. They arrive on the runtime read, which does not
-# depend on the bank object existing at all — a poll that comes back with no
-# bank still carries them, which is why they are mapped; the bank's own figures
-# below overwrite them whenever the BMS answered.
+# Battery readings the inverter takes at its own DC terminals, with its own
+# sensors. They arrive on the runtime read and are written whatever the BMS
+# did, because nothing about a silent BMS stops the inverter measuring the
+# voltage on its own busbar. Register 4 is the only one that is a plain reading;
+# battery power is the signed pair of registers 10 and 11, below.
 #
-# What they hold while the BMS is silent is *not* established. The library
-# decodes registers rather than reporting absence, and no capture in this
-# repository covers a CAN dropout, so treat "these survive a dropout" as
-# unproven rather than as a reason to trust them during one.
+# The split from the table beneath is the library's classification, not a
+# judgement made here. Every register definition carries a category, and
+# ``battery_voltage`` (reg 4), ``charge_power`` (10) and ``discharge_power``
+# (11) are tagged ``runtime`` while everything in _RUNTIME_BMS_METRICS is tagged
+# ``bms``. test_eg4_luxpower_mapping pins that, so a library that reclassifies
+# one fails rather than moving a reading silently to the wrong side.
+_RUNTIME_TERMINAL_METRICS: tuple[tuple[str, str], ...] = (("battery_voltage_v", "battery_voltage"),)
+
+# The figures the inverter relays from the BMS rather than measuring: cell
+# extremes, state of charge, capacities and the BMS's own current and voltage
+# limits. Written only when ``_bms_is_answering`` says the BMS answered — see
+# _RUNTIME_WITNESSES for why the gate is needed and what it cannot cover.
+#
+# They are mapped at all because the runtime read does not depend on the bank
+# object existing: a poll that comes back with no bank still carries them. The
+# bank's own copies overwrite them whenever it answered too.
 #
 # battery_temperature_c comes from the hottest cell, not from the library's
 # ``battery_temperature`` field. That field returned 11880 against real
@@ -133,8 +173,7 @@ _RUNTIME_METRICS: tuple[tuple[str, str], ...] = (
 # beside it read a correct 39 and 38 °C.
 #
 # State of health is deliberately not here; see ``_measured_soh``.
-_RUNTIME_BATTERY_METRICS: tuple[tuple[str, str], ...] = (
-    ("battery_voltage_v", "battery_voltage"),
+_RUNTIME_BMS_METRICS: tuple[tuple[str, str], ...] = (
     ("battery_current_a", "battery_current"),
     ("battery_soc_pct", "battery_soc"),
     ("battery_temperature_c", "bms_max_cell_temperature"),
@@ -164,11 +203,14 @@ _BANK_METRICS: tuple[tuple[str, str], ...] = (
     ("battery_max_cell_voltage_v", "max_cell_voltage"),
     ("battery_min_cell_voltage_v", "min_cell_voltage"),
     ("battery_cycle_count", "cycle_count"),
-    # Not a register. The library computes it as
+    # DERIVED, NOT MEASURED. The library computes it as
     # ``round(max_capacity * battery_soc / 100)`` (0.9.38, data.py:1670-1672),
-    # so it is battery_soc_pct restated in amp-hours and cannot disagree with
-    # the column above it. Useful as a size, useless as corroboration — never
-    # read it as a second opinion on state of charge.
+    # so it is battery_soc_pct restated in amp-hours. It cannot disagree with
+    # the column above it, which means it cannot corroborate it either: two
+    # numbers that are the same number cross-check nothing. calibration.py is
+    # where that matters — its whole job is noticing a reported state of charge
+    # drifting from reality, and this is the reported state of charge again.
+    # Kept because the amp-hours are a useful size. Never a second opinion.
     ("battery_remaining_capacity_ah", "current_capacity"),
     ("battery_full_capacity_ah", "max_capacity"),
     ("battery_module_count", "battery_count"),
@@ -188,6 +230,12 @@ _BANK_METRICS: tuple[tuple[str, str], ...] = (
 # the tables above because the reader used for measurements rejects booleans on
 # purpose: True quietly becoming 1.0 in a column of watts would be a bug, while
 # here it is the whole intent.
+#
+# All three come from register 95, which the library decodes as a permission
+# bitmap. A register that reads 0 decodes to three Falses, so these are gated
+# with the BMS table rather than collected unconditionally: "the BMS refuses to
+# charge or discharge" is a serious claim to make about a pack that said
+# nothing.
 _RUNTIME_FLAGS: tuple[tuple[str, str], ...] = (
     ("bms_allow_charge", "bms_allow_charge"),
     ("bms_allow_discharge", "bms_allow_discharge"),
@@ -202,7 +250,7 @@ _BANK_FLAGS: tuple[tuple[str, str], ...] = (
 
 # The inverter's own energy counters, as (metric name, library attribute).
 # Read separately from the runtime block and on their own cadence — see
-# PylxpSource. The library reports None for counters this hardware has no
+# Eg4LuxPowerSource. The library reports None for counters this hardware has no
 # source for: strings four to six on a three-MPPT unit, and the generator when
 # none is fitted. Those stay absent rather than becoming zero, which would say
 # the generator ran and produced nothing.
@@ -253,6 +301,97 @@ _RUNTIME_SIGNED_PAIRS: tuple[tuple[str, str, str], ...] = (
     # figure, which reads as a balanced house when it is the opposite.
     ("grid_power_l1_w", "grid_import_power_l1", "grid_export_power_l1"),
     ("grid_power_l2_w", "grid_import_power_l2", "grid_export_power_l2"),
+)
+
+# The three readings assembled rather than copied, so they appear in no table
+# above and would otherwise be missing from what this driver claims to produce.
+# House load is picked between two registers by ``_house_load``, battery power
+# is a signed pair taken from whichever of the runtime object and the bank
+# answered, and state of health is filtered by ``_measured_soh``.
+_ASSEMBLED_METRICS: tuple[str, ...] = (
+    "load_power_w",
+    "battery_power_w",
+    "battery_soh_pct",
+)
+
+# The per-module metric templates ``_module_sample`` fills, named as
+# arraysense.metrics names them before the registry expands each across the four
+# register slots. fault_code and warning_code are absent on purpose: pylxpweb
+# declares both as ``int = 0`` and none of its 21 battery registers carries
+# either, so every poll would assert "no fault" about a pack nobody asked.
+#
+# This list can only drift from ``_module_sample`` by someone editing one and
+# not the other, which is what test_drivers pins by mapping a fully populated
+# record and comparing what came through.
+_MODULE_TEMPLATES: tuple[str, ...] = (
+    "soc_pct",
+    "soh_pct",
+    "voltage_v",
+    "current_a",
+    "temperature_c",
+    "cycle_count",
+    "remaining_capacity_ah",
+    "full_capacity_ah",
+    "charge_current_limit_a",
+    "discharge_current_limit_a",
+    "status_code",
+    "cell_max_voltage_v",
+    "cell_min_voltage_v",
+    "cell_max_temperature_c",
+    "cell_min_temperature_c",
+    "cell_max_voltage_num",
+    "cell_min_voltage_num",
+    "cell_max_temperature_num",
+    "cell_min_temperature_num",
+)
+
+
+def _declared_metrics() -> frozenset[str]:
+    """Every metric name this driver can produce, read off the mapping tables.
+
+    Derived rather than listed. The tables are already the statement of what
+    this driver emits, and a second list beside them would be a copy that goes
+    stale the first time a mapping changes — the failure mode is a column the
+    schema never creates and a reading silently dropped on the way to the store.
+
+    The per-module names are read out of the registry rather than composed from
+    a slot count kept here. How many slots the inverter exposes is the
+    registry's business — it is the thing that expands each template — and a
+    count copied into this module would be one more number to keep in step.
+    """
+    names: set[str] = set(_ASSEMBLED_METRICS)
+    for table in (
+        _RUNTIME_METRICS,
+        _RUNTIME_TERMINAL_METRICS,
+        _RUNTIME_BMS_METRICS,
+        _RUNTIME_FLAGS,
+        _BANK_METRICS,
+        _BANK_FLAGS,
+        _ENERGY_METRICS,
+    ):
+        names.update(metric for metric, _ in table)
+    names.update(metric for metric, _, _ in _RUNTIME_SIGNED_PAIRS)
+    names.update(expand_module_metrics(_MODULE_TEMPLATES))
+    return frozenset(names)
+
+
+# What a LuxPower-protocol inverter can do, as this driver reads it.
+#
+# Three PV strings, a backup panel, split-phase service and a generator input
+# describe the 18kPV and equally the 6000XP and 12kPV, which share its register
+# surface. Energy is COUNTED and that is the important line: these units keep 31
+# kWh counters of their own, which is what the whole energy model reads. A
+# family without them — the 3000 EHV — would declare ESTIMATED and everything
+# above would know not to present its totals as meter readings.
+CAPABILITIES = Capabilities(
+    pv_strings=3,
+    energy=EnergyReporting.COUNTED,
+    metrics=_declared_metrics(),
+    backup_output=True,
+    generator_input=True,
+    split_phase=True,
+    parallel_capable=True,
+    per_module_battery=True,
 )
 
 
@@ -434,23 +573,58 @@ def _collect_signed(
             into[metric] = value
 
 
-def _bms_is_answering(source: object) -> bool:
-    """Whether the BMS block holds real readings or a CAN-down block of zeroes.
+# The fields consulted to decide whether a BMS answered at all, spelled once
+# per object because the bank and the runtime block name the same registers
+# differently. Both lists are cell voltages plus a capacity: a lithium cell that
+# is connected and measurable is never 0.000 V, and a BMS that is talking always
+# publishes a capacity.
+#
+# The runtime list has no ``current_capacity`` equivalent because the runtime
+# block carries no such register — the library computes that figure on the bank
+# only.
+_BANK_WITNESSES: tuple[str, ...] = (
+    "max_cell_voltage",
+    "min_cell_voltage",
+    "max_capacity",
+    "current_capacity",
+)
+_RUNTIME_WITNESSES: tuple[str, ...] = (
+    "bms_max_cell_voltage",
+    "bms_min_cell_voltage",
+    "battery_capacity_ah",
+)
+
+
+def _bms_is_answering(source: object, witnesses: tuple[str, ...]) -> bool:
+    """Whether a block of BMS readings holds measurements or a CAN-down block of zeroes.
 
     This is the guard the project's central rule depends on. The library's data
     classes default to None, but the decoder does not: it reads registers, and
-    a BMS whose CAN link is down leaves those registers zero-filled, so a bank
+    a BMS whose CAN link is down leaves those registers zero-filled, so a block
     arrives with ``soc=0``, ``soh=100``, zero capacities and zero cell voltages
     — a full set of numbers, all of them false. Emitted as-is that renders a
     healthy bank at 0% state of charge, which is precisely the failure this
     project was built to avoid.
 
-    Cell voltage is the discriminator. A lithium cell that is connected and
-    measurable is never 0.000 V; the bank's own reported capacity is the same
-    kind of witness. If neither says anything, nothing in the block is a
-    measurement and all of it is dropped rather than any of it being trusted.
+    ``witnesses`` names the fields that decide it, because the readings
+    themselves cannot: 0.0 A is what an idle bank draws and 0 cycles is what a
+    new pack has done, so neither can be refused on its own without throwing
+    away the real reading of the same shape. A cell voltage can, and it stands
+    for the whole block — if nothing in the block is a measurement, none of it
+    is trusted.
+
+    Two things it does not do. It is all-or-nothing per block, so a BMS that
+    answers some of its registers and zero-fills the rest still writes those
+    zeros — the witness passes and every field goes through. And it cannot
+    separate a silent BMS from one genuinely reporting zero on a witness field,
+    which is why the witnesses are quantities that have no true zero.
+
+    No capture in this repository covers a CAN dropout on this hardware, so the
+    premise that these registers read 0 during one is inherited from what the
+    library's decoder does with an unanswered register rather than measured on
+    the wire.
     """
-    for attribute in ("max_cell_voltage", "min_cell_voltage", "max_capacity", "current_capacity"):
+    for attribute in witnesses:
         value = _reading(source, attribute)
         if value is not None and value > 0:
             return True
@@ -480,7 +654,7 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     # A slot can carry a serial from a previous read and still hold nothing but
     # zeroes once its CAN link drops. A pack reading 0.000 V per cell is not a
     # flat pack, it is a pack that is not answering.
-    if not _bms_is_answering(module):
+    if not _bms_is_answering(module, _BANK_WITNESSES):
         logger.debug("module %s reports no cell data; treating the block as absent", serial)
         return None
 
@@ -523,7 +697,7 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     )
 
 
-def sample_from_pylxp(
+def to_sample(
     runtime: object,
     bank: object | None,
     timestamp: datetime | None = None,
@@ -542,7 +716,9 @@ def sample_from_pylxp(
 
     A bank whose CAN link is down arrives as None, and that is an absence
     rather than a failed poll. The sample then carries whatever the inverter's
-    own runtime read returned, with no battery state invented to fill the hole.
+    own runtime read returned, with no battery state invented to fill the hole
+    — which includes holding back the BMS figures the runtime read relays,
+    since those come back as a block of zeroes rather than as nothing.
 
     Raises:
         ValueError: a battery record claims a slot outside 1-4, or an explicit
@@ -550,17 +726,26 @@ def sample_from_pylxp(
     """
     readings: dict[str, float] = {}
     _collect(runtime, _RUNTIME_METRICS, readings)
-    _collect(runtime, _RUNTIME_BATTERY_METRICS, readings)
-    _collect_flags(runtime, _RUNTIME_FLAGS, readings)
+    _collect(runtime, _RUNTIME_TERMINAL_METRICS, readings)
     _collect_signed(runtime, _RUNTIME_SIGNED_PAIRS, readings)
+
+    # Everything the inverter relays from the BMS waits on the BMS having
+    # answered. Those registers are in the reply whether or not the CAN link
+    # behind them is up, and read 0 when it is not, so collecting them
+    # unconditionally wrote thirteen measurements and three permission flags —
+    # state of charge and the cell extremes among them — about a bank that had
+    # reported nothing.
+    soh: float | None = None
+    if _bms_is_answering(runtime, _RUNTIME_WITNESSES):
+        _collect(runtime, _RUNTIME_BMS_METRICS, readings)
+        _collect_flags(runtime, _RUNTIME_FLAGS, readings)
+        # State of health is filtered rather than mapped, on both objects, so
+        # it sits outside the tables above. See ``_measured_soh``.
+        soh = _measured_soh(runtime, "battery_soh")
 
     load = _house_load(runtime)
     if load is not None:
         readings["load_power_w"] = load
-
-    # State of health is filtered rather than mapped, on both objects, so it
-    # sits outside the tables above. See ``_measured_soh``.
-    soh = _measured_soh(runtime, "battery_soh")
 
     battery_power = _signed_pair(runtime, "battery_charge_power", "battery_discharge_power")
     modules: tuple[BatteryModuleSample, ...] = ()
@@ -569,7 +754,7 @@ def sample_from_pylxp(
         # The bank block and the per-module blocks fail independently: the CAN
         # link can drop the summary while the modules still answer, or the
         # reverse. Each is judged on its own rather than one vetoing the other.
-        if _bms_is_answering(bank):
+        if _bms_is_answering(bank, _BANK_WITNESSES):
             _collect(bank, _BANK_METRICS, readings)
             _collect_flags(bank, _BANK_FLAGS, readings)
             bank_power = _signed_pair(bank, "charge_power", "discharge_power")
@@ -625,12 +810,12 @@ class _Transport(Protocol):
         ...
 
 
-class PylxpSource:
+class Eg4LuxPowerSource:
     """An InverterSource backed by pylxpweb's WiFi dongle transport.
 
     Holds the dongle's single TCP client slot for as long as it is connected,
     so exactly one of these may exist per inverter. All the interesting work is
-    in ``sample_from_pylxp``; this class exists to own the socket and to
+    in ``to_sample``; this class exists to own the socket and to
     translate the library's failures into the ConnectionError the polling
     service expects.
     """
@@ -682,6 +867,31 @@ class PylxpSource:
         another unit's identity.
         """
         return self._config.inverter_serial
+
+    @property
+    def identity(self) -> DeviceIdentity:
+        """Which unit this is, for anything describing the device rather than polling it.
+
+        The serial is ``device`` rather than a second reading of the same
+        setting: the store files rows under one of them, and two spellings of
+        one inverter would be two inverters as far as it is concerned.
+
+        The model is left absent. pylxpweb detects the family from the
+        device-type holding register and this driver reads no holding registers,
+        so naming the 18kPV here would be the model we develop against dressed
+        up as something the inverter said.
+        """
+        return DeviceIdentity(driver=NAME, serial=self.device)
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """What this family can do — the module-level declaration, not a copy.
+
+        The same object the registry entry carries, so a caller reading it off
+        a built source and one reading it off the entry cannot be told two
+        different things.
+        """
+        return CAPABILITIES
 
     async def connect(self) -> None:
         """Claim the inverter's single client slot.
@@ -805,7 +1015,7 @@ class PylxpSource:
             bank = await self._retrying(self._transport.read_battery)
         except (TransportError, OSError) as exc:
             raise ConnectionError(f"reading from inverter failed: {exc}") from exc
-        sample = sample_from_pylxp(runtime, bank)
+        sample = to_sample(runtime, bank)
         energy = await self._read_energy(sample.timestamp)
         if not energy:
             return sample

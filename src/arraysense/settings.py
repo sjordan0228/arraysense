@@ -25,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from arraysense.tariff import parse_bands
+from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
 if TYPE_CHECKING:
     from arraysense.store.sqlite_store import SqliteStore
@@ -239,6 +239,30 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help=(
             "What the supplier pays for a kWh sent back. Leave it at zero if "
             "yours pays nothing, and no credit is shown rather than a zero one."
+        ),
+    ),
+    SettingSpec(
+        key="tariff.adjustments",
+        # One line per billing month, at roughly thirty characters a line. A
+        # supplier publishes twelve a year and the old lines are what let an
+        # old month be re-priced, so this has to hold years of them.
+        max_length=4000,
+        multiline=True,
+        # Checked with the real parser, for the same reason the bands are: a
+        # month that stored but would not read is a bill silently unadjusted.
+        check=parse_adjustments,
+        kind="str",
+        default="",
+        label="Monthly adjustment factors",
+        help=(
+            "PCRF and SCRF, the per-kWh factors the supplier re-sets every "
+            "month and charges on top of the band rate. One line per billing "
+            "month: the month as YYYY-MM, then PCRF, then SCRF, separated by "
+            "pipes. PCRF is often negative. For example: "
+            f"{EXAMPLE_ADJUSTMENTS} — leave a factor empty if it has not been "
+            "published, and leave the whole box empty if your supplier charges "
+            "neither. A month with nothing recorded is priced at the base rate "
+            "and shown as unadjusted rather than as adjusted by nothing."
         ),
     ),
     SettingSpec(

@@ -3,11 +3,17 @@
 The full-cadence tier is kept for 30 days and the coarse tiers far longer —
 hourly indefinitely — so a rollup mistake is permanent in a way a mistake in
 the raw tier is not. These functions rebuild a destination tier from the raw
-tier over a time range, reading each metric's collapse policy
-(``MetricSpec.aggregation``) from the registry rather than inferring it from a
-name: most measurements average, a cycle counter takes its maximum, an extreme
-stays an extreme, and a cell *number* field takes the latest value because the
-average of two cell numbers is a cell that does not exist.
+tier over a time range, reading each metric's collapse policy from
+``collapse_policy`` rather than inferring it from a name: most measurements
+average, a bitfield takes its maximum, an extreme stays an extreme, and a cell
+*number* field takes the latest value because the average of two cell numbers
+is a cell that does not exist. ``collapse_policy`` is also what the
+SolarAssistant importer asks, so the two writers of these tables cannot end up
+putting different things in the same column — with one gap, recorded here
+rather than left to be discovered: the importer holds no per-reading timestamp
+to rank by, so where these rebuilds give an energy counter's bucket its
+earliest reading the importer gives it the smallest. The two agree unless a
+counter goes backwards inside a bucket.
 
 Every tier derives from raw; no tier derives from another. Recombining minute
 buckets into hourly would need each bucket weighted by how many readings it
@@ -30,7 +36,11 @@ Two rules keep a rebuild correct and repeatable.
   boundary without coordinating. SQLite's ``/`` truncates toward zero, so the
   floor is computed arithmetically; a negative epoch floors downward. An
   hourly row therefore falls exactly on an hour boundary (UTC), never on a
-  rounded local time.
+  rounded local time. The timestamp is a claim about the row's contents as
+  well as its position: a row stamped 13:00 describes 13:00, which is why the
+  energy counters collapse to their opening value rather than their closing
+  one — see ``collapse_policy`` for the rule and ``_first_expr`` for how the
+  opening reading is found cheaply.
 - A rebuild deletes the destination range and reinserts it within one
   transaction. That is what makes it idempotent — running it twice over the
   same range leaves the same rows — and what stops a bucket that has lost its
@@ -50,7 +60,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from arraysense.metrics import INVERTER_METRICS, lookup
+from arraysense.metrics import INVERTER_METRICS, Aggregation, MetricSpec, lookup
 from arraysense.store.schema import module_metric_columns
 
 # A failed poll is stored with its reason and no readings (see models.Sample).
@@ -75,6 +85,65 @@ def _bucket_bounds(bucket_seconds: int, start: int, end: int) -> tuple[int, int]
     )
 
 
+def is_energy_counter(spec: MetricSpec) -> bool:
+    """Whether this metric is a counter, whose bucket carries its opening reading.
+
+    ``kWh`` is the test because it is a declared registry field and it selects
+    exactly the energy counters: all twenty-four kWh metrics are counters and no
+    energy counter is anything else.
+
+    The other ``max`` metrics are deliberately not swept along. For the fault
+    bitfields and the force-charge flag the extreme is the whole point, since a
+    fault raised for ten seconds has to survive into the coarse tiers. Cycle
+    count and run time climb the way the counters do, but nothing differences
+    them across a bucket edge; both are drawn as a level, so the reading a
+    bucket ends on is the useful one.
+    """
+    return spec.unit == "kWh" and spec.aggregation == "max"
+
+
+def pack_scale(spec: MetricSpec) -> int:
+    """Return the multiplier that lifts a row's position clear of its reading.
+
+    A bucket's opening reading is found by ranking one packed integer per row —
+    the row's offset into its bucket above, the reading below — so the
+    multiplier has to exceed every reading the metric can hold. The registry's
+    own upper bound answers that, rounded up to the next power of two, which is
+    an exact way to clear it without picking a number by eye: a lifetime counter
+    tops out at 10,000,000 stored tenths against a multiplier of 16,777,216, and
+    a daily one at 20,000 against 32,768. Deriving it rather than fixing it is
+    what makes a widened bound a one-line change in the registry instead of a
+    quietly truncated column here.
+    """
+    return 1 << spec.encode(spec.upper).bit_length()
+
+
+def collapse_policy(spec: MetricSpec) -> Aggregation:
+    """Return how one metric collapses into a bucket, for every writer of a tier.
+
+    The registry says what a metric *is*; this says what a bucket of them
+    means, and it is deliberately the only place that second question is
+    answered. The importer fills the same tiers from a different source, and
+    while it carried its own copy the two put different numbers in the same
+    column of the same table depending on which had written the row.
+
+    Every energy counter collapses to its opening reading rather than to the
+    largest, which is what its registry entry declares. A bucket's timestamp is
+    the start of the period it covers, so the row labelled 13:00 has to describe
+    the counter at 13:00; taking the maximum puts the value from 14:00 there and
+    shifts every reading one bucket later than its label.
+
+    ``Aggregation`` has no name for "the value at the bucket's start", so this
+    returns ``min``, which is what a source holding no per-reading timestamps
+    can offer: a counter that only climbs opens on its smallest reading. Where
+    the timestamps *are* present — every rollup here — ``_first_expr`` finds the
+    opening reading properly, by position rather than by size, because the two
+    part company exactly when a counter goes backwards. A fifth policy in the
+    registry would be the tidier home for both.
+    """
+    return "min" if is_energy_counter(spec) else spec.aggregation
+
+
 def _floor_div(column: str, divisor: int) -> str:
     """Return a SQL expression that floor-divides ``column`` by ``divisor``.
 
@@ -96,13 +165,16 @@ def _floor_div(column: str, divisor: int) -> str:
 def _agg_expr(column: str, aggregation: str, last_rn: str) -> str:
     """Return the SQL aggregate producing one metric's rolled-up value.
 
-    The policy is read from the registry and dispatched here, never inferred
-    from the column name, so a metric that collapses unusually cannot be given
-    the wrong aggregate by being named like an ordinary measurement.
+    The policy comes from ``collapse_policy`` and is dispatched here, never
+    inferred from the column name, so a metric that collapses unusually cannot
+    be given the wrong aggregate by being named like an ordinary measurement.
 
     ``mean`` rounds to the nearest integer — the STRICT tables reject a real.
     SQLite's ``AVG`` returns a real even from integer inputs, so no integer
-    division truncates before rounding. ``max`` and ``min`` keep the extreme.
+    division truncates before rounding. ``max`` and ``min`` keep the extreme,
+    and nothing else is folded into them: the energy counters do not come
+    through here at all, since the reading their bucket wants is the earliest
+    rather than the smallest and ``_first_expr`` is what finds it.
 
     ``last`` takes the value from the latest source row that *reported* the
     metric, which is not the same as the bucket's last row: ``last_rn`` names a
@@ -129,6 +201,91 @@ def _agg_expr(column: str, aggregation: str, last_rn: str) -> str:
     raise AssertionError(f"unhandled aggregation policy: {aggregation!r}")
 
 
+def _first_expr(column: str, spec: MetricSpec, bucket_seconds: int) -> str:
+    """Return the SQL producing the bucket's earliest reported value of ``column``.
+
+    This is what an energy counter collapses to, and it is deliberately not
+    ``MIN``. The two agree while a counter climbs and part company the moment it
+    does not: a lifetime total that opens at 1000.0 kWh, misdecodes to 900.0
+    mid-hour and recovers to 1000.5 has an opening reading of 1000.0 and a
+    smallest reading of 900.0, and the hourly tier is kept for ever, so the
+    glitch would sit there as a hole in that hour and a spike in the next for
+    the life of the database. ``MAX`` was immune to a low glitch and exposed to
+    a high one; ranking by position is immune to both.
+
+    A counter that genuinely restarts is a third case, and it is handled by the
+    same rule rather than by a special case for it. The daily counters restart
+    at the owner's midnight, which lands inside an hourly bucket in any zone
+    offset by a half hour, and a lifetime counter restarts on a firmware update
+    or a replaced BMS. Either way the row is stamped at the start of its bucket,
+    so it holds what the counter read then, which is the pre-reset value; the
+    restart then appears in the step to the next bucket, where it happened, and
+    anything differencing the counter sees it as the reset it was rather than a
+    bucket early. Reading the smallest value instead moves it a bucket back and
+    charges the interval twice.
+
+    The rank is found without a window function, because ranking each counter
+    with one is what made the first attempt at this correction six times slower
+    than the pass it replaced. Instead each row is packed into a single integer
+    — its offset into its own bucket multiplied by ``pack_scale``, plus the
+    reading — so an ordinary ``MIN`` orders by time first and returns the
+    reading in its low bits, which ``%`` recovers. That costs a few per cent
+    over the bare ``MIN`` it replaces rather than the five-fold the ranked
+    version does.
+
+    The ``FILTER`` is what makes that arithmetic safe rather than assumed. An
+    implausible reading is *stored* and flagged in ``invalid_readings`` rather
+    than rejected, so a misdecoded register really can put a negative or an
+    enormous number in a counter column, and either one packs into a value that
+    unpacks as something else entirely — a decode error in one row would come
+    back as a fabricated reading in the tier that is kept for ever. Restricting
+    the candidates to values the encoding can carry means such a row cannot be
+    the bucket's opening reading; if it is the only reading there, the bucket
+    rolls up NULL, which is the truthful answer and the one ``invalid_readings``
+    already has the evidence for. The bound here protects the arithmetic and
+    says nothing about plausibility, which is ``validate``'s question.
+
+    The offset comes from ``bucket``, the floored division the grouping already
+    computed, so it lies in ``[0, bucket_seconds)`` below zero as well as above
+    it and needs no second opinion about where a boundary is. A NULL reading
+    packs to NULL and ``MIN`` skips it, so the bucket opens on the earliest row
+    that *reported* the counter rather than on the earliest row — the same
+    distinction the ``last`` policy rests on, at the other end of the bucket.
+    """
+    scale = pack_scale(spec)
+    offset = f"(timestamp - bucket * {bucket_seconds})"
+    carries = f"FILTER (WHERE {column} BETWEEN 0 AND {scale - 1})"
+    return f"MIN({offset} * {scale} + {column}) {carries} % {scale}"
+
+
+def _bucket_expr(column: str, spec: MetricSpec, bucket_seconds: int) -> str:
+    """Return the SQL collapsing one metric into its bucket, whatever its policy.
+
+    One door for both tiers, so an energy counter cannot be routed through the
+    plain aggregates by one rebuild and through the opening-value expression by
+    the other. Everything but a counter is dispatched on ``collapse_policy``.
+    """
+    if is_energy_counter(spec):
+        return _first_expr(column, spec, bucket_seconds)
+    return _agg_expr(column, collapse_policy(spec), f"last_{column}")
+
+
+def _module_spec(column: str) -> MetricSpec:
+    """Return the registry entry answering for a bare per-module column name.
+
+    The normalised module tables hold one set of columns rather than one per
+    slot, so the bare names they carry are not registry names. Every slot
+    shares a template, which makes slot 1's entry the one that answers for all
+    of them.
+    """
+    return lookup(f"battery_module1_{column}")
+
+
+def _module_policy(column: str) -> Aggregation:
+    """Return the collapse policy for a bare per-module column name."""
+    return collapse_policy(_module_spec(column))
+
+
 def _last_rn_expr(column: str, bucket_seconds: int, module: bool) -> str:
     """Return a SQL row number marking the latest row that reported ``column``.
 
@@ -144,7 +301,9 @@ def _last_rn_expr(column: str, bucket_seconds: int, module: bool) -> str:
     ``module_id`` too; without it one pack's reading would decide another
     pack's rolled-up value. The expression comes back unaliased because the
     alias has to match the one handed to ``_agg_expr``, and only the caller
-    knows it.
+    knows it. Only the ``last`` policy needs this; the energy counters find
+    their opening reading with a plain aggregate instead, which is what keeps
+    the pass one scan (see ``_first_expr``).
     """
     part = f"{_floor_div('timestamp', bucket_seconds)}, device"
     partition = f"{part}, module_id" if module else part
@@ -167,8 +326,8 @@ def _rebuild_inverter(
 
     ``columns`` carries full registry names, unlike the bare ones its
     per-module counterpart takes below. Each is passed straight to ``lookup``
-    for its aggregation policy, so a bare module metric handed to this function
-    raises rather than rolling up under the wrong policy.
+    on the way to ``_bucket_expr``, so a bare module metric handed to this
+    function raises rather than rolling up under the wrong policy.
 
     Deletes the destination buckets and reinserts them within one transaction,
     so a rebuild is idempotent and a bucket whose source rows have gone is
@@ -195,11 +354,10 @@ def _rebuild_inverter(
     last_aliases = ", ".join(
         f"{_last_rn_expr(column, bucket_seconds, False)} AS last_{column}"
         for column in columns
-        if lookup(column).aggregation == "last"
+        if collapse_policy(lookup(column)) == "last"
     )
     agg = ", ".join(
-        f"{_agg_expr(column, lookup(column).aggregation, f'last_{column}')} AS {column}"
-        for column in columns
+        f"{_bucket_expr(column, lookup(column), bucket_seconds)} AS {column}" for column in columns
     )
     inner = f"SELECT {part} AS bucket, *"
     if last_aliases:
@@ -246,9 +404,8 @@ def _rebuild_module(
     rebuild idempotent and what drops buckets whose source rows have gone.
 
     ``columns`` carries bare metric names with no slot prefix, because the
-    normalised table has one set of columns rather than one per slot. Every
-    slot shares a template, so slot 1's registry entry supplies the aggregation
-    policy for each bare name.
+    normalised table has one set of columns rather than one per slot;
+    ``_module_policy`` is what turns one back into a registry name.
 
     ``sample_count`` records how many source rows the bucket covers, as a
     record of coverage only; every tier is built from raw, so nothing weights
@@ -256,16 +413,13 @@ def _rebuild_module(
     """
     aligned_start, aligned_end = _bucket_bounds(bucket_seconds, start, end)
     part = _floor_div("timestamp", bucket_seconds)
-    # Every slot shares the same template, so slot 1's spec carries the
-    # aggregation for each bare column name.
     last_aliases = ", ".join(
         f"{_last_rn_expr(column, bucket_seconds, True)} AS last_{column}"
         for column in columns
-        if lookup(f"battery_module1_{column}").aggregation == "last"
+        if _module_policy(column) == "last"
     )
     agg = ", ".join(
-        f"{_agg_expr(column, lookup(f'battery_module1_{column}').aggregation, f'last_{column}')} "
-        f"AS {column}"
+        f"{_bucket_expr(column, _module_spec(column), bucket_seconds)} AS {column}"
         for column in columns
     )
     inner = f"SELECT {part} AS bucket, *"
