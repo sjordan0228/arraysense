@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
@@ -33,6 +35,54 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 Kind = Literal["str", "int", "float", "bool", "choice"]
+
+# Where the installation is. Named here rather than spelled as literals at each
+# call site, for the same reason the tariff keys are named in tariff.py: a key
+# typed by hand in one place and mistyped in another reads as an unset setting
+# rather than as an error.
+SETTING_TIMEZONE = "site.timezone"
+SETTING_LATITUDE = "site.latitude"
+SETTING_LONGITUDE = "site.longitude"
+SETTING_CONTACT_EMAIL = "site.contact_email"
+
+
+def check_timezone(name: str) -> ZoneInfo:
+    """Resolve an IANA zone name, raising ValueError if the tz database has no such zone.
+
+    Refused where it is typed rather than discovered later by an endpoint that
+    then has to decide what to do about it. Every daily and monthly total in
+    this project is cut at a midnight, and which midnight is exactly what this
+    value chooses; an unusable one stored here would surface as a page that
+    cannot answer at all, far from the box it was typed in.
+    """
+    try:
+        return ZoneInfo(name.strip())
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(
+            f"{name.strip()!r} is not a zone in the tz database — "
+            "use a name like America/New_York, or leave it empty to follow the machine"
+        ) from exc
+
+
+# Deliberately loose. The full grammar of an address admits quoted local parts
+# and bracketed literals that no owner is going to type, and every stricter
+# pattern than this one refuses real addresses — plus-addressing and the long
+# TLDs are the usual casualties. What it catches is the mistake worth catching:
+# something with no @ at all, no domain, or whitespace through the middle.
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s.]+$")
+
+
+def check_email(value: str) -> str:
+    """Refuse something that is plainly not an email address.
+
+    This is a note to the owner rather than a credential, so the check exists
+    to catch a typo at the box rather than to enforce RFC 5322 — a pattern
+    strict enough to do the latter refuses addresses people actually have.
+    """
+    address = value.strip()
+    if not _EMAIL.match(address):
+        raise ValueError(f"{address!r} does not look like an email address")
+    return address
 
 
 @dataclass(frozen=True)
@@ -56,6 +106,30 @@ class SettingSpec:
     label: str
     help: str
     choices: tuple[str, ...] = ()
+    # What the number means, rendered beside the control. A bare box asking for
+    # a poll interval is a box that gets minutes typed into it. Empty where
+    # there is nothing to say — a page appending "units" to a temperature unit
+    # would be writing nonsense of its own.
+    #
+    # The money settings say "currency per month" and "currency per kWh" rather
+    # than "kWh": they hold a rate, and a unit reading as a quantity of energy
+    # invites the value to be typed as one.
+    unit: str = ""
+    # Offered, never enforced — a datalist rather than a choice list. The
+    # difference is the whole point for the currency (#6): an owner whose
+    # supplier bills in something not on any list must still be able to type
+    # it, and one who has already typed their own must not find it replaced.
+    # Use ``choices`` for a value the server genuinely refuses anything else
+    # for, and this for one where a list is a convenience.
+    suggestions: tuple[str, ...] = ()
+    # Whether "not set" is a value this setting can hold, distinct from any
+    # number it could hold. Latitude is the reason: 0.0 is the Gulf of Guinea,
+    # a real place, so a zero standing in for "nobody has said" would put the
+    # installation there — the same shape of mistake as a battery block with no
+    # answer rendering as 0% state of charge. An optional setting defaults to
+    # None, stores as an empty cell, decodes back to None, and travels the wire
+    # as JSON null, so the two are distinguishable at every step.
+    optional: bool = False
     lower: float | None = None
     upper: float | None = None
     secret: bool = False
@@ -85,10 +159,18 @@ class SettingSpec:
         "soon" is a mistake, and quietly turning it into a number would hide the
         mistake somewhere far from where it was made.
 
+        An ``optional`` setting accepts nothing at all — None, or the empty
+        string a page posts from a box someone cleared — and returns None for
+        it. That is what keeps an unset latitude out of the Gulf of Guinea: the
+        emptiness travels as emptiness instead of being coerced to a number
+        that means somewhere.
+
         Raises:
             ValueError: the value is the wrong type, outside the bounds, or not
                 one of the allowed choices.
         """
+        if self.optional and _unset(value):
+            return None
         if self.kind == "choice":
             if value not in self.choices:
                 raise ValueError(f"{self.key} must be one of {list(self.choices)}, got {value!r}")
@@ -141,7 +223,15 @@ class SettingSpec:
         return number
 
     def decode(self, stored: str) -> object:
-        """Turn the stored text back into the type this setting is declared as."""
+        """Turn the stored text back into the type this setting is declared as.
+
+        An optional setting stores "not set" as an empty cell, and that is the
+        one reading which must not become a number: ``float("")`` raises, and
+        the caller's fallback to the default would be right by accident today
+        and wrong the moment an optional setting has a non-None default.
+        """
+        if self.optional and not stored.strip():
+            return None
         if self.kind == "int":
             return int(float(stored))
         if self.kind == "float":
@@ -151,7 +241,109 @@ class SettingSpec:
         return stored
 
 
+def _unset(value: object) -> bool:
+    """Whether a posted value is somebody saying nothing rather than saying a number.
+
+    A cleared box arrives as the empty string over JSON and as None from a
+    caller in Python, and both mean the same thing. Whitespace counts as empty
+    for the same reason it does everywhere else here: a value made of spaces is
+    not a decision.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+# Common currencies, offered rather than imposed. Symbols first because that is
+# what most bills show, then the ISO codes for the ones whose symbol is
+# ambiguous or absent from a keyboard. The list is deliberately short — it is a
+# convenience for the usual case, and every unusual one is still typable.
+CURRENCY_SUGGESTIONS: tuple[str, ...] = (
+    "$",
+    "£",
+    "€",
+    "¥",
+    "₹",
+    "R$",
+    "USD",
+    "EUR",
+    "GBP",
+    "CAD",
+    "AUD",
+    "NZD",
+    "JPY",
+    "INR",
+    "ZAR",
+)
+
 SETTINGS: tuple[SettingSpec, ...] = (
+    # --- Site ---------------------------------------------------------------
+    # Where the installation is, as against who is looking at it. The inverter
+    # is in one place; a phone that has travelled is not, and every one of
+    # these was being answered by the browser or by the machine's own settings
+    # before they existed here.
+    SettingSpec(
+        key=SETTING_TIMEZONE,
+        kind="str",
+        default="",
+        label="Timezone",
+        help=(
+            "The zone the installation lives in, as an IANA name like "
+            "America/New_York. It decides where midnight falls and which hours "
+            "a rate band covers, so it belongs to the site rather than to "
+            "whoever is looking. Leave it empty to follow the machine's own "
+            "zone, which is what happens today."
+        ),
+        # Resolved against the tz database at save time. An unparseable zone
+        # stored here would surface as a history page that cannot answer, a
+        # long way from the box it was typed in.
+        check=check_timezone,
+        max_length=64,
+    ),
+    SettingSpec(
+        key=SETTING_LATITUDE,
+        kind="float",
+        # Not 0.0. That is a real latitude, and an install that has said
+        # nothing has not said it is on the equator.
+        default=None,
+        optional=True,
+        lower=-90.0,
+        upper=90.0,
+        unit="decimal degrees",
+        label="Latitude",
+        help=(
+            "Decimal degrees, negative south of the equator. Leave it empty if "
+            "you would rather not record it — empty means not recorded, and is "
+            "kept distinct from zero, which is a place in the Gulf of Guinea."
+        ),
+    ),
+    SettingSpec(
+        key=SETTING_LONGITUDE,
+        kind="float",
+        default=None,
+        optional=True,
+        lower=-180.0,
+        upper=180.0,
+        unit="decimal degrees",
+        label="Longitude",
+        help=(
+            "Decimal degrees, negative west of Greenwich. Leave it empty if "
+            "you would rather not record it."
+        ),
+    ),
+    SettingSpec(
+        key=SETTING_CONTACT_EMAIL,
+        kind="str",
+        default="",
+        label="Contact email",
+        help=(
+            "Who to reach about this installation. Nothing is sent to it yet; "
+            "it is recorded so a future alert has somewhere to go."
+        ),
+        # Masked on read like the serials, and for the same reason: the page in
+        # front of it has no authentication, so an address typed here would
+        # otherwise be readable by anything that can reach the port.
+        secret=True,
+        check=check_email,
+    ),
     # --- Display ------------------------------------------------------------
     SettingSpec(
         key="display.temperature_unit",
@@ -167,6 +359,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         default=5,
         lower=1,
         upper=300,
+        unit="seconds",
         label="Dashboard refresh",
         help=(
             "How often the page asks for new readings. It does not affect how "
@@ -181,6 +374,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         default=11.0,
         lower=1.0,
         upper=3600.0,
+        unit="seconds",
         label="Poll interval",
         help=(
             "Seconds between reads of the inverter. The dongle answers at its "
@@ -221,6 +415,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         default=0.0,
         lower=0.0,
         upper=100000.0,
+        # Money for a month, not a count of months. Named as the rate it is so
+        # the box cannot be read as asking how many.
+        unit="currency per month",
         label="Fixed monthly charge",
         help=(
             "The connection or supply charge, payable whatever the usage. It "
@@ -235,6 +432,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
         default=0.0,
         lower=0.0,
         upper=1000.0,
+        # The value is money for each kWh exported, not an amount of energy.
+        # "kWh" alone beside the box reads as the second, which is how a rate
+        # ends up typed as a quantity.
+        unit="currency per kWh",
         label="Export credit",
         help=(
             "What the supplier pays for a kWh sent back. Leave it at zero if "
@@ -269,6 +470,13 @@ SETTINGS: tuple[SettingSpec, ...] = (
         key="tariff.currency",
         kind="str",
         default="$",
+        # Suggested, never restricted. A closed list would make an unusual
+        # currency unrepresentable, and the page renders these as a datalist so
+        # a value already typed is offered alongside rather than replaced.
+        # Both a symbol and a code have to keep working: the page spaces them
+        # differently, "$12.30" against "USD 12.30", so neither may be
+        # normalised into the other.
+        suggestions=CURRENCY_SUGGESTIONS,
         label="Currency",
         help=(
             "Written in front of every money figure. A symbol or a code — whatever your bill uses."
@@ -381,7 +589,14 @@ class SettingsStore:
         """
         spec = lookup_setting(key)
         checked = spec.validate(value)
-        stored = "1" if checked is True else "0" if checked is False else str(checked)
+        # An optional setting that holds nothing stores an empty cell, which is
+        # what ``decode`` reads back as None. str(None) would write the four
+        # characters "None", and a latitude of "None" decodes to nothing
+        # useful — or worse, to a number, if a later reader is generous.
+        if checked is None:
+            stored = ""
+        else:
+            stored = "1" if checked is True else "0" if checked is False else str(checked)
         with self._conn:
             self._conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
@@ -476,7 +691,10 @@ class SettingsStore:
         out: dict[str, object] = {}
         for spec in SETTINGS:
             value = self.get(spec.key)
-            out[spec.key] = _mask(str(value)) if spec.secret else value
+            # Masked only when there is text to mask. ``str(None)`` would send
+            # the word "None" through the masker and back out as "N••e", which
+            # a page would render as a configured value.
+            out[spec.key] = _mask(value) if spec.secret and isinstance(value, str) else value
         return out
 
 
@@ -517,6 +735,20 @@ def describe() -> list[dict[str, object]]:
             # which field is a line and which is a paragraph.
             "max_length": spec.max_length,
             "multiline": spec.multiline,
+            # What the number means, and what a value might reasonably be.
+            # Emitted on every field, empty where there is nothing to say, so
+            # a page reads them unconditionally rather than branching on
+            # whether the server happened to mention them.
+            "unit": spec.unit,
+            # Not ``choices``. A page must offer these without refusing
+            # anything else, or the currency becomes a closed list and an
+            # unusual one becomes unrepresentable.
+            "suggestions": list(spec.suggestions),
+            # Whether an empty control means "not set" rather than zero. A page
+            # that renders an optional number has to send the empty string back
+            # for an emptied box and show a blank for null, instead of drawing
+            # a 0 that would claim the site is on the equator.
+            "optional": spec.optional,
         }
         for spec in SETTINGS
     ]

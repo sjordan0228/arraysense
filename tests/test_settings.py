@@ -7,8 +7,13 @@ from pathlib import Path
 import pytest
 
 from arraysense.settings import (
+    SETTING_CONTACT_EMAIL,
+    SETTING_LATITUDE,
+    SETTING_LONGITUDE,
+    SETTING_TIMEZONE,
     SETTINGS,
     SettingsStore,
+    describe,
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
@@ -235,3 +240,198 @@ def test_an_empty_table_of_factors_is_allowed(settings: SettingsStore) -> None:
     # have to type something to say so.
     settings.set("tariff.adjustments", "")
     assert settings.get("tariff.adjustments") == ""
+
+
+# --- units and suggestions ----------------------------------------------------
+
+
+def test_every_described_field_carries_a_unit_and_suggestions() -> None:
+    # The page renders itself from describe(). A field that omits either key
+    # makes the page branch on whether the key exists, which is exactly the
+    # hard-coding the registry is meant to remove.
+    for field in describe():
+        assert "unit" in field, field["key"]
+        assert "suggestions" in field, field["key"]
+        assert isinstance(field["unit"], str)
+        assert isinstance(field["suggestions"], list)
+
+
+def test_a_setting_with_nothing_to_say_about_units_says_nothing() -> None:
+    # Empty rather than a placeholder: a page appending "units" beside a
+    # temperature unit control would be writing nonsense of its own.
+    assert lookup_setting("display.temperature_unit").unit == ""
+
+
+def test_the_intervals_are_labelled_in_seconds() -> None:
+    assert lookup_setting("collector.poll_interval").unit == "seconds"
+    assert lookup_setting("display.refresh_seconds").unit == "seconds"
+
+
+def test_the_export_credit_is_labelled_as_a_rate_and_not_as_energy() -> None:
+    # The value is money per kWh. A unit reading "kWh" would present a rate as
+    # a quantity of energy, which is the one reading it must not have.
+    unit = lookup_setting("tariff.export_per_kwh").unit
+    assert "kWh" in unit
+    assert unit.startswith("currency per")
+    assert lookup_setting("tariff.fixed_monthly").unit == "currency per month"
+
+
+def test_the_currency_suggests_without_restricting(settings: SettingsStore) -> None:
+    # #6 is explicit that a closed list makes an unusual currency
+    # unrepresentable. Suggestions are a datalist, not a choice list.
+    spec = lookup_setting("tariff.currency")
+    assert spec.kind == "str"
+    assert spec.choices == ()
+    assert "$" in spec.suggestions
+    assert "USD" in spec.suggestions
+    # Both forms have to keep working: money() spaces a symbol and a code
+    # differently, so neither may be normalised into the other.
+    for typed in ("$", "USD", "kr", "₹", "R$"):
+        settings.set("tariff.currency", typed)
+        assert settings.get("tariff.currency") == typed
+
+
+def test_an_existing_typed_currency_is_never_replaced(settings: SettingsStore) -> None:
+    # The issue warns about this directly: someone who has already typed their
+    # own currency must not find it swapped for a suggested one.
+    settings.set("tariff.currency", "Kč")
+    assert settings.public()["tariff.currency"] == "Kč"
+
+
+# --- site: where the installation is ------------------------------------------
+
+
+def test_a_fresh_install_follows_the_host_zone(settings: SettingsStore) -> None:
+    # Empty is the default and means "whatever the machine keeps". Anything
+    # else would move an existing install's midnight on upgrade, and every
+    # money figure is cut at a midnight.
+    assert settings.get(SETTING_TIMEZONE) == ""
+
+
+def test_a_real_zone_is_accepted(settings: SettingsStore) -> None:
+    settings.set(SETTING_TIMEZONE, "America/New_York")
+    assert settings.get(SETTING_TIMEZONE) == "America/New_York"
+
+
+def test_an_unparseable_zone_is_refused_where_it_is_typed(settings: SettingsStore) -> None:
+    # Not discovered later by an endpoint that then has to decide what to do
+    # about it. The check resolves the name against the tz database.
+    with pytest.raises(ValueError, match="Mars/Olympus_Mons"):
+        settings.set(SETTING_TIMEZONE, "Mars/Olympus_Mons")
+    with pytest.raises(ValueError, match=SETTING_TIMEZONE):
+        settings.set(SETTING_TIMEZONE, "EST5EDT-nope")
+
+
+def test_clearing_the_zone_back_to_empty_is_allowed(settings: SettingsStore) -> None:
+    settings.set(SETTING_TIMEZONE, "Asia/Tokyo")
+    settings.set(SETTING_TIMEZONE, "")
+    assert settings.get(SETTING_TIMEZONE) == ""
+
+
+def test_an_unset_coordinate_reads_as_none_not_as_zero(settings: SettingsStore) -> None:
+    # 0.0 is a real place in the Gulf of Guinea. An unset latitude that read as
+    # zero would put the installation there, and this project exists because
+    # absent data rendered as a number.
+    assert settings.get(SETTING_LATITUDE) is None
+    assert settings.get(SETTING_LONGITUDE) is None
+    assert lookup_setting(SETTING_LATITUDE).optional
+
+
+def test_the_equator_is_storable_and_distinguishable_from_unset(
+    settings: SettingsStore,
+) -> None:
+    settings.set(SETTING_LATITUDE, 0.0)
+    assert settings.get(SETTING_LATITUDE) == 0.0
+    assert settings.get(SETTING_LATITUDE) is not None
+    # And on the wire, where a page has to tell the two apart as well.
+    assert settings.public()[SETTING_LATITUDE] == 0.0
+    assert settings.public()[SETTING_LONGITUDE] is None
+
+
+def test_a_coordinate_survives_reopening_as_zero_rather_than_as_unset(
+    tmp_path: Path,
+) -> None:
+    # The distinction has to survive the round trip through TEXT storage: an
+    # empty cell is unset and "0.0" is the equator, and decoding must not
+    # collapse them.
+    store = SqliteStore(str(tmp_path / "c.db"), device=TEST_DEVICE)
+    SettingsStore(store).set(SETTING_LATITUDE, 0.0)
+    store.close()
+    reopened = SqliteStore(str(tmp_path / "c.db"), device=TEST_DEVICE)
+    assert SettingsStore(reopened).get(SETTING_LATITUDE) == 0.0
+    reopened.close()
+
+
+def test_a_coordinate_can_be_emptied_back_to_unset(settings: SettingsStore) -> None:
+    # The page posts an empty box as empty text. That is "I have not said",
+    # and it must not be read as the equator.
+    settings.set(SETTING_LATITUDE, 51.5)
+    settings.set(SETTING_LATITUDE, "")
+    assert settings.get(SETTING_LATITUDE) is None
+    settings.set(SETTING_LONGITUDE, -0.12)
+    settings.set(SETTING_LONGITUDE, None)
+    assert settings.get(SETTING_LONGITUDE) is None
+
+
+def test_an_impossible_coordinate_is_refused(settings: SettingsStore) -> None:
+    with pytest.raises(ValueError, match="latitude"):
+        settings.set(SETTING_LATITUDE, 91.0)
+    with pytest.raises(ValueError, match="latitude"):
+        settings.set(SETTING_LATITUDE, -90.5)
+    with pytest.raises(ValueError, match="longitude"):
+        settings.set(SETTING_LONGITUDE, 180.5)
+    with pytest.raises(ValueError, match="longitude"):
+        settings.set(SETTING_LONGITUDE, "north")
+
+
+def test_the_poles_and_the_antimeridian_are_still_valid(settings: SettingsStore) -> None:
+    for lat in (-90.0, 90.0):
+        settings.set(SETTING_LATITUDE, lat)
+        assert settings.get(SETTING_LATITUDE) == lat
+    for lon in (-180.0, 180.0):
+        settings.set(SETTING_LONGITUDE, lon)
+        assert settings.get(SETTING_LONGITUDE) == lon
+
+
+def test_an_optional_setting_that_was_never_set_is_not_an_override(
+    settings: SettingsStore,
+) -> None:
+    # A default is not a decision, and neither is an unset coordinate.
+    assert SETTING_LATITUDE not in settings.overrides()
+    settings.set(SETTING_LATITUDE, 0.0)
+    assert settings.overrides()[SETTING_LATITUDE] == 0.0
+
+
+def test_the_contact_email_is_masked_like_the_serials(settings: SettingsStore) -> None:
+    # The settings page has no authentication in front of it, so an address
+    # typed here would otherwise be readable by anything on the network.
+    assert lookup_setting(SETTING_CONTACT_EMAIL).secret
+    settings.set(SETTING_CONTACT_EMAIL, "owner@example.com")
+    masked = settings.public()[SETTING_CONTACT_EMAIL]
+    assert isinstance(masked, str)
+    assert "owner@example.com" not in masked
+    assert masked.startswith("ow") and masked.endswith("om")
+    assert settings.get(SETTING_CONTACT_EMAIL) == "owner@example.com"
+
+
+def test_something_that_is_plainly_not_an_address_is_refused(settings: SettingsStore) -> None:
+    for bad in ("owner", "owner@", "@example.com", "owner@example", "a b@example.com"):
+        with pytest.raises(ValueError, match="contact_email"):
+            settings.set(SETTING_CONTACT_EMAIL, bad)
+
+
+def test_an_ordinary_address_with_a_plus_or_a_long_tld_is_accepted(
+    settings: SettingsStore,
+) -> None:
+    # The check refuses what is obviously wrong rather than enforcing RFC 5322.
+    # An over-strict pattern rejects real addresses, and this is a note to the
+    # owner rather than a credential.
+    for good in ("owner+solar@example.com", "o@example.photography", "a.b-c@sub.example.co.uk"):
+        settings.set(SETTING_CONTACT_EMAIL, good)
+        assert settings.get(SETTING_CONTACT_EMAIL) == good
+
+
+def test_an_empty_contact_email_is_allowed(settings: SettingsStore) -> None:
+    settings.set(SETTING_CONTACT_EMAIL, "")
+    assert settings.get(SETTING_CONTACT_EMAIL) == ""
+    assert settings.public()[SETTING_CONTACT_EMAIL] == ""

@@ -242,14 +242,43 @@ def _zone_from_localtime(localtime: Path) -> str:
     return resolved[marker + len(_ZONEINFO_DIR) :] if marker >= 0 else ""
 
 
-def resolve_zone(name: str | None) -> ZoneInfo:
-    """Return the zone a caller asked for, falling back to the machine's own.
+def resolve_zone(name: str | None, configured: str | None = None) -> ZoneInfo:
+    """Return the zone this answer is cut on: the installation's, the caller's, the host's.
+
+    ``configured`` is the installation's own zone from the settings registry,
+    and it wins because the inverter is in one place while the person looking
+    at it may not be (#7). A phone that has travelled reports a different zone
+    and would otherwise get a different answer for the same day — and the
+    answer it gets is confidently wrong rather than obviously wrong, because a
+    bill drawn against the wrong midnight looks entirely normal.
+
+    ``name`` is what the browser asked for, and it still answers when the
+    installation has stated no zone: that is every install today, and the empty
+    setting is the default precisely so none of them moves. Where a zone *is*
+    configured, ``name`` is not consulted at all — not even to reject it — so a
+    stale or malformed zone from a client cannot refuse a request whose answer
+    is already fully determined.
+
+    A configured zone that does not resolve is warned about and stepped past
+    rather than raised on. It is refused at the point it is typed, so this is a
+    value stored before that check existed or written straight into the
+    database; failing every request over it would take down a page that has a
+    perfectly good answer available.
 
     Raises:
-        KeyError: ``name`` is not a zone in the tz database. A typo has to be
-            refused rather than quietly answered in some other zone, since
-            every total in the reply depends on which midnight it was cut at.
+        KeyError: ``name`` is not a zone in the tz database, and no zone is
+            configured to override it. A typo has to be refused rather than
+            quietly answered in some other zone, since every total in the reply
+            depends on which midnight it was cut at.
     """
+    if configured is not None and configured.strip():
+        try:
+            return ZoneInfo(configured.strip())
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "configured timezone %r is not a known zone; falling back to the request's",
+                configured,
+            )
     if name is None or not name.strip():
         return host_zone()
     try:
@@ -647,6 +676,12 @@ def read_energy(
 
     The range is widened outward to whole buckets in ``zone``, defaulting to
     the machine's own, and the counters are read across them.
+
+    The installation's configured zone is not consulted here. The caller
+    resolves it once with ``resolve_zone`` and passes the answer, because the
+    same zone has to cut the buckets and price the bands in a single request —
+    two lookups is two chances to disagree, and money is the wrong thing to
+    decide twice.
     """
     zone = zone or host_zone()
     start, end = with_zone(start, zone), with_zone(end, zone)

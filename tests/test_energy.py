@@ -33,8 +33,10 @@ from arraysense.energy import (
     resolve_zone,
 )
 from arraysense.models import Sample
+from arraysense.settings import SETTING_TIMEZONE, SettingsStore
 from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
+from arraysense.tariff import SETTING_BANDS
 from conftest import TEST_DEVICE
 
 NY = ZoneInfo("America/New_York")
@@ -738,6 +740,36 @@ def test_resolve_zone_falls_back_to_the_host_when_asked_for_nothing() -> None:
     assert isinstance(resolve_zone(None), ZoneInfo)
 
 
+def test_an_install_with_no_configured_zone_resolves_exactly_as_before() -> None:
+    # The precedence change must be invisible to every install that has not
+    # set the setting. Both ways of saying "nothing configured" have to give
+    # the same answer the one-argument call always gave: the caller's zone,
+    # then the host's.
+    for asked in (None, "", "  ", "UTC", "America/New_York", "Pacific/Auckland"):
+        expected = ZoneInfo(asked.strip()) if asked and asked.strip() else host_zone()
+        assert resolve_zone(asked) == expected
+        assert resolve_zone(asked, "") == expected
+        assert resolve_zone(asked, None) == expected
+        assert resolve_zone(asked, "   ") == expected
+
+
+def test_the_configured_zone_wins_over_the_browsers() -> None:
+    # The inverter is in one place. A phone that has travelled must not get a
+    # different day, because a bill drawn against the wrong midnight looks
+    # entirely normal.
+    assert resolve_zone("Asia/Tokyo", "America/New_York") == ZoneInfo("America/New_York")
+    assert resolve_zone(None, "America/New_York") == ZoneInfo("America/New_York")
+
+
+def test_a_stale_unresolvable_configured_zone_falls_back_rather_than_failing() -> None:
+    # The setting is checked where it is typed, so this is a value stored
+    # before that check or by a hand-edited database. Refusing every request
+    # over it would take the whole site down; the caller's zone and then the
+    # host still answer, and the warning says why.
+    assert resolve_zone("Asia/Tokyo", "Mars/Olympus_Mons") == ZoneInfo("Asia/Tokyo")
+    assert isinstance(resolve_zone(None, "Mars/Olympus_Mons"), ZoneInfo)
+
+
 # --- the endpoint --------------------------------------------------------------
 
 
@@ -794,6 +826,59 @@ def test_energy_endpoint_reads_naive_timestamps_in_the_requested_zone(client: An
 
     assert body["buckets"][0]["start"] == "2026-07-01T00:00:00-04:00"
     assert body["buckets"][0]["load_kwh"] == 24.0
+
+
+def test_energy_endpoint_prefers_the_configured_zone_over_the_browsers(client: Any) -> None:
+    # The browser says Tokyo; the installation says New York. New York decides
+    # where the day is cut, and the reply says so rather than answering in a
+    # zone the owner never chose.
+    SettingsStore(client.app.state.store).set(SETTING_TIMEZONE, "America/New_York")
+    body = client.get(
+        "/api/energy",
+        params={
+            "start": "2026-07-01T00:00:00",
+            "end": "2026-07-02T00:00:00",
+            "tz": "Asia/Tokyo",
+        },
+    ).json()
+
+    assert body["timezone"] == "America/New_York"
+    assert body["buckets"][0]["start"] == "2026-07-01T00:00:00-04:00"
+    assert body["buckets"][0]["load_kwh"] == 24.0
+
+
+def test_energy_endpoint_still_follows_the_browser_when_nothing_is_configured(
+    client: Any,
+) -> None:
+    # The setting empty is the default, and an install that has not set it must
+    # answer exactly as it did before the setting existed.
+    SettingsStore(client.app.state.store).set(SETTING_TIMEZONE, "")
+    body = client.get(
+        "/api/energy",
+        params={
+            "start": "2026-07-01T00:00:00",
+            "end": "2026-07-02T00:00:00",
+            "tz": "Asia/Tokyo",
+        },
+    ).json()
+    assert body["timezone"] == "Asia/Tokyo"
+
+
+def test_costs_endpoint_prefers_the_configured_zone_over_the_browsers(client: Any) -> None:
+    # Rate bands are wall-clock hours in the owner's zone. This is the endpoint
+    # where getting it wrong costs money rather than a chart.
+    settings = SettingsStore(client.app.state.store)
+    settings.set(SETTING_BANDS, "Peak | 0.34 | 16:00-21:00; Off-peak | 0.11 | 21:00-16:00")
+    settings.set(SETTING_TIMEZONE, "America/New_York")
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-01T00:00:00",
+            "end": "2026-07-02T00:00:00",
+            "tz": "Asia/Tokyo",
+        },
+    ).json()
+    assert body["timezone"] == "America/New_York"
 
 
 def test_energy_endpoint_rejects_an_unknown_timezone(client: Any) -> None:
