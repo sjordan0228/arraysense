@@ -7,6 +7,33 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.8 — 8 August 2026
+
+### Added
+
+- **The Power flow chart shows which hours were expensive**
+  ([#46](https://github.com/sjordan0228/arraysense/issues/46)). Peak hours are
+  shaded brighter behind the lines, so a spike of grid import can be read against
+  what it cost rather than only how large it was. The legend names the bands and
+  says which way round the shading goes.
+
+  The shading varies **brightness, not colour**. A tariff has as many bands as it
+  likes and two colours could never say that, and every colour on these charts has
+  to be checked against every other for a reader who cannot tell some of them
+  apart — so a band with a colour of its own would be one nobody had checked.
+  Brightness needs no such check and works for everybody.
+
+  With no tariff configured nothing is shaded, and a stretch of time no band
+  covers is left plain rather than shaded as though it had a middling price.
+
+### Changed
+
+- **Solar is drawn as a line rather than a filled area.** Two filled areas left no
+  room to read the shading behind them, and on a sunny day the solar one covers
+  most of the chart. Grid keeps its fill: when the house runs on the grid, import
+  equals house load to the watt, so a grid line lies exactly under the home line
+  and disappears beneath it.
+
 ## 0.5.7 — 8 August 2026
 
 ### Added

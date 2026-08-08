@@ -318,6 +318,10 @@
              a fourth line on this chart would need a second axis, and a
              temperature plotted against kilowatts shares no scale with them. -->
         <span class="muted" id="invTemp"></span>
+        <!-- Filled in only when there is shading to explain. Left standing with
+             no tariff configured, it would describe a feature that is not on
+             the chart and send the reader looking for it. -->
+        <span class="muted" id="bandNote"></span>
       </div>
       <div class="rng" id="ranges"></div>
     </div>
@@ -1181,6 +1185,13 @@ function powerTable(rows) {
     <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
 }
 
+// The windows the shading paints, held here rather than passed in. ``paint``
+// builds each chart once and afterwards only calls ``setData``, so a plugin
+// rebuilt on a later draw is thrown away — the chart keeps the one it was
+// constructed with. The long-lived plugin reads this on every frame instead, so
+// changing range repaints the bands that range actually has.
+let powerBands = null;
+
 function drawPower(points) {
   const f = frame(points);
   const pv = f.of('pv_total_power_w');
@@ -1196,10 +1207,10 @@ function drawPower(points) {
       axes: [timeAxis(), kwAxis()],
       // Three series at equal weight is three things competing, and where they
       // cross you lose which is which. So identity is carried by form as well
-      // as by hue — solar a filled area because it is volume the array
-      // harvested, home the heaviest line because it is the one the owner
-      // acts on, grid a thin dashed trace because it is usually zero and only
-      // matters when it is not. The chart still reads when the colours do not.
+      // as by hue — solar a line, home the heaviest line because it is the one
+      // the owner acts on, grid a filled area because when the house runs on
+      // the grid, import equals load to the watt and a line would vanish under
+      // it. The chart still reads when the colours do not.
       //
       // Grid is an area, not a line, and that is the second time this series
       // has been re-drawn. When the house runs on the grid, import *is* the
@@ -1211,16 +1222,15 @@ function drawPower(points) {
       // reader this palette exists for.
       //
       // An area cannot hide that way. Its body shows below the coincident line
-      // whatever the top edge is doing, and it says the same thing solar's fill
-      // says — volume, not rate. So the order returns to fills underneath and
-      // home over them, and home is again the line that is never obscured.
+      // whatever the top edge is doing. So grid keeps the fill, underneath, and
+      // home stays over it as the line that is never obscured.
       series: [
         {},
-        trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
+        trace('Solar', '--pv', 1.6),
         trace('Grid', '--grid', 1.4, { fill: gridFill, fillTo: () => 0 }),
         trace('Home', '--load', 2.1),
       ],
-      plugins: [zeroRule(), readout('power', [
+      plugins: [bandShade(() => powerBands), zeroRule(), readout('power', [
         ['Solar', 1, kw], ['Home', 3, kw], ['Grid', 2, kw],
       ])],
     }),
@@ -1412,6 +1422,45 @@ async function loadHistory() {
     note('history unavailable — showing the last successful read');
     return;
   }
+
+  // Fetch tariff bands for shading. A 400 (unknown zone or range too long) or
+  // no tariff configured means no shading, not a broken page.
+  let bands = null;
+  try {
+    // zoneQuery() is built to be appended to a bare path — it leads with '?'.
+    // Appended after a query string it lands mid-URL, the zone becomes part of
+    // the end timestamp, and the request comes back 422. The failure is silent
+    // from here: the catch below draws the chart unshaded, which looks exactly
+    // like a tariff nobody configured.
+    const zone = zoneQuery().replace(/^\?/, '&');
+    const bandUrl = `/api/bands?start=${start.toISOString()}&end=${end.toISOString()}${zone}`;
+    const resp = await fetch(bandUrl);
+    if (resp.ok) {
+      const b = await resp.json();
+      if (b.configured && b.windows && b.windows.length) {
+        bands = b.windows;
+      }
+    }
+  } catch (e) {
+    // Bands unavailable — draw without shading.
+    bands = null;
+  }
+
+  // Name the encoding rather than only announcing that it exists: "shading =
+  // tariff band" tells a reader a shade means something without telling them
+  // which way round it goes. Cleared when nothing is shaded.
+  powerBands = bands;
+  const bandNote = document.getElementById('bandNote');
+  if (bandNote) {
+    const priced = bands ? new Set(bands.filter((w) => w.band).map((w) => w.band)) : new Set();
+    // "brighter", not "darker". The wash is white on a dark panel, so more
+    // opacity reads lighter — the dearer the band, the more it stands out.
+    // Saying darker would send the reader looking at exactly the wrong hours.
+    bandNote.textContent = priced.size
+      ? `shading: ${[...priced].join(' · ')} — brighter is dearer`
+      : '';
+  }
+
   try {
     drawPower(body.points || []);
     drawBattery(body.points || []);
