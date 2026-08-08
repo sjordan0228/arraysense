@@ -186,9 +186,31 @@ How far the per-pack state-of-charge estimates have drifted from reality.
 
 Each pack estimates its charge by counting amp-hours and cannot correct itself until
 it charges fully, so the useful question is not what the packs say but how long it has
-been since anything forced them to agree with reality. A full charge is only credited
-when the bank held at its own BMS charge reference **and** every pack reported full
-during that window; either piece of evidence alone gives a wrong answer.
+been since anything forced them to agree with reality.
+
+A full charge needs evidence from the inverter's terminals **and** from the packs'
+counters, because either alone gives a wrong answer: absorb voltage without the packs
+agreeing is a charge that was cut short, and a pack reading 100% with no absorb behind
+it is a counter that has drifted high, which is the very condition being detected.
+What the two halves trade off is *duration*. A bank that holds at its BMS charge
+reference for twenty minutes needs only every pack to have peaked full within that
+window. A bank that finishes faster — the reference installation crosses absorb and
+tapers to zero in about three minutes — has to show the packs *arriving* at full
+together, which means a transition per pack: **every** pack the bank is known to hold
+measured below 99% in the quarter hour before the absorb, and every one of them at or
+above 99% at a single instant during it, with the current settled.
+
+Both halves are per pack because a charge resets every counter. Asking only that some
+pack had been below full is not enough: three counters drifted high and pegged at 100%
+beside a fourth that genuinely charged would satisfy it, and three quarters of the
+percentages on screen would then be stale ones drawn as measurements. Counters cannot
+independently drift across the bar inside a couple of minutes, a bank whose counters
+have all been pegged at 100% for weeks shows no transition at all, and the lookback
+stops at the previous absorb so one charge cannot vouch for the next.
+
+Neither door reports the reset itself, which nothing observes. The long door gives the
+end of the absorb and the short one the instant the whole bank was first seen to have
+arrived; both are late rather than early.
 
 | `severity` | Meaning |
 | --- | --- |

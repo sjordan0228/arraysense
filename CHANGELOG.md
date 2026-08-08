@@ -7,6 +7,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.3 — 8 August 2026
+
+### Fixed
+
+- **A real full charge went unnoticed**
+  ([#36](https://github.com/sjordan0228/arraysense/issues/36)). The bank was
+  charged to full overnight on 8 August, all four packs recalibrated, and the
+  spread between their counters fell from 24 points to 3 — and the dashboard
+  still said "State of charge maybe drifting", still marked every pack
+  percentage as an estimate, and still advised charging to 100%. A full charge
+  was only credited to a bank that held at its charge reference for twenty
+  minutes, which this hardware never does: it crosses absorb, finishes and
+  tapers to zero in about three minutes, so the sixty-day search came back
+  empty with the charge sitting in the history. A charge that short is now
+  credited on the packs' own evidence instead: every pack the bank is known to
+  hold measured below full in the quarter hour before the absorb and at or above
+  99% together during it, with the bank at its reference and the current settled.
+  A transition per pack, because a charge resets every counter. What is *not*
+  credited is one counter drifting to 100% on its own, a bank whose counters have
+  all been pegged at 100% for weeks with no charge behind them, or three stale
+  counters sitting at 100% beside a fourth that really did charge — all three are
+  the drift being detected, and all three stay reported.
+
 ## 0.5.2 — 8 August 2026
 
 ### Added

@@ -34,7 +34,13 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense import mode as operating_mode
-from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
+from arraysense.calibration import (
+    CORROBORATING_ABSORB,
+    PACK_RESET_LAG,
+    assess,
+    charge_completed_at,
+    full_charge_windows,
+)
 from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
@@ -85,7 +91,11 @@ _CALIBRATION_TIER = "minute"
 
 # Absorb windows examined, newest first. A bank charges fully at most about
 # once a day, so this covers well over a month of candidates while bounding the
-# per-window module reads that follow.
+# per-window module reads that follow. Counted against the short candidates
+# rather than the sustained ones: the reference installation's sixty days hold
+# 27 of the former against 11 of the latter, so the budget still spans the
+# search, and the slice keeps the newest — which is the one that decides the
+# answer.
 _MAX_WINDOWS_EXAMINED = 40
 
 # How far before a costed period to start reading its counters. The first
@@ -449,7 +459,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:
-    """Read every module's state of charge across one absorb window.
+    """Read every module's state of charge across one absorb window and its margins.
 
     Tries the full-cadence tier first and falls back to hourly. Raw module data
     is kept for thirty days and the search reaches back sixty, so the older
@@ -459,10 +469,18 @@ def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[di
     the right direction: the cost of missing one is a warning shown a few days
     early, and the cost of inventing one is silence for a month.
 
+    The range is the window widened by ``PACK_RESET_LAG`` at both ends, and the
+    two margins are read for opposite reasons: the later one catches a pack that
+    snapped its counter after the bank left absorb, the earlier one is the
+    evidence that the packs were not already reading full before it started.
+    ``charge_completed_at`` slices the window itself back out.
+
     Both bounds are timezone-aware, and the result is empty when no pack
     reported at all during the window — which is a different thing from every
     pack reporting and none of them being full.
     """
+    start -= PACK_RESET_LAG
+    end += PACK_RESET_LAG
     rows: list[dict[str, Any]] = store.query_modules(["soc_pct"], start, end, tier="full")
     if not rows:
         rows = store.query_modules(["soc_pct"], start, end, tier="hourly")
@@ -503,11 +521,31 @@ async def calibration(request: Request) -> dict[str, Any]:
     # on behalf of a pack that never recalibrated.
     known = [str(row["serial"]) for row in latest if row.get("serial")]
 
+    # A one-minute hold rather than twenty. What separates a charge from a
+    # voltage excursion here is the packs, not the clock: the reference
+    # installation crosses absorb and tapers to zero in three minutes, so a
+    # twenty-minute candidate list contains none of its charges at all. Every
+    # window on this list still has to end settled below the taper, and
+    # ``charge_completed_at`` is what decides which of them a bank has passed.
+    candidates = full_charge_windows(history, min_absorb=CORROBORATING_ABSORB)[
+        -_MAX_WINDOWS_EXAMINED:
+    ]
     last_full: datetime | None = None
-    for window_start, window_end in reversed(full_charge_windows(history)[-_MAX_WINDOWS_EXAMINED:]):
-        during = _packs_during(store, window_start, window_end)
-        if packs_recalibrated(during, expected=known or None):
-            last_full = window_end
+    for index in reversed(range(len(candidates))):
+        window_start, window_end = candidates[index]
+        packs = _packs_during(store, window_start, window_end)
+        # The previous candidate's end caps how far back the below-full evidence
+        # may be read. Two touches closer together than PACK_RESET_LAG would
+        # otherwise let the later one borrow the earlier charge's transition.
+        reset = charge_completed_at(
+            window_start,
+            window_end,
+            packs,
+            expected=known or None,
+            after=candidates[index - 1][1] if index else None,
+        )
+        if reset is not None:
+            last_full = reset
             break
 
     status = assess(
