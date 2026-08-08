@@ -2054,3 +2054,118 @@ def test_bands_are_absent_rather_than_everything_when_no_tariff_is_set(client: A
     )
     assert body["configured"] is False
     assert body["windows"] == []
+
+
+# --- how fast the bank is filling or emptying (#44) -----------------------------
+#
+# A power figure says how hard the bank is working; it does not say what that
+# means for the bank. +7 kW into 57 kWh is a different afternoon from +7 kW into
+# 14 kWh, and the owner reads the card to know how long they have. The rate is
+# derived here rather than in the page, because the capacity it divides by is a
+# reading, and a browser doing its own arithmetic on readings is how the Costs
+# page came to disagree with the service about money.
+
+
+def _with_battery(client: Any, **readings: float | None) -> Any:
+    """Store one inverter reading carrying the given battery fields."""
+    store = client.app.state.store
+    store.append(
+        Sample(
+            timestamp=T0 + timedelta(minutes=30),
+            readings={k: v for k, v in readings.items() if v is not None},
+        )
+    )
+    return client.get("/api/live").json()
+
+
+def test_the_rate_follows_the_power_and_the_banks_own_capacity(client: Any) -> None:
+    # 1120 Ah at 51.1 V is 57.2 kWh, which is the reference bank. Charging at
+    # 7.41 kW fills 12.95% of it in an hour.
+    body = _with_battery(
+        client,
+        battery_power_w=7410.0,
+        battery_full_capacity_ah=1120.0,
+        battery_voltage_v=51.1,
+    )
+    assert body["battery"]["capacity_kwh"] == pytest.approx(57.2, abs=0.1)
+    assert body["battery"]["rate_pct_per_hour"] == pytest.approx(12.95, abs=0.05)
+
+
+def test_a_discharging_bank_reports_a_negative_rate(client: Any) -> None:
+    body = _with_battery(
+        client,
+        battery_power_w=-5720.0,
+        battery_full_capacity_ah=1120.0,
+        battery_voltage_v=51.1,
+    )
+    assert body["battery"]["rate_pct_per_hour"] == pytest.approx(-10.0, abs=0.05)
+
+
+def test_an_idle_bank_reports_zero_and_not_nothing(client: Any) -> None:
+    # Zero is a real reading here and a different state from unknown: the bank
+    # is neither filling nor emptying, which is worth saying.
+    body = _with_battery(
+        client,
+        battery_power_w=0.0,
+        battery_full_capacity_ah=1120.0,
+        battery_voltage_v=51.1,
+    )
+    assert body["battery"]["rate_pct_per_hour"] == 0.0
+
+
+def test_the_rate_is_absent_when_the_capacity_is_unknown(client: Any) -> None:
+    # Absent, never zero. A bank whose capacity nobody reported is not a bank
+    # filling at 0% an hour, and a card showing that would be inventing a fact.
+    body = _with_battery(client, battery_power_w=7410.0, battery_voltage_v=51.1)
+    assert body["battery"]["capacity_kwh"] is None
+    assert body["battery"]["rate_pct_per_hour"] is None
+
+
+def test_the_rate_is_absent_when_the_power_is_unknown(client: Any) -> None:
+    body = _with_battery(client, battery_full_capacity_ah=1120.0, battery_voltage_v=51.1)
+    assert body["battery"]["rate_pct_per_hour"] is None
+
+
+def test_a_bank_that_holds_nothing_reports_no_rate_rather_than_crashing(client: Any) -> None:
+    # Zero is inside battery_full_capacity_ah's own plausible range, so it
+    # arrives as an ordinary reading. Dividing by it took down /api/live, which
+    # is the endpoint the whole dashboard polls — every card on the page goes
+    # blank over one implausible-but-legal number. A bank holding nothing also
+    # has no rate to report, so the answer is absent rather than any figure.
+    store = client.app.state.store
+    store.append(
+        Sample(
+            timestamp=T0 + timedelta(minutes=45),
+            readings={
+                "battery_power_w": 7410.0,
+                "battery_full_capacity_ah": 0.0,
+                "battery_voltage_v": 51.1,
+            },
+        )
+    )
+    r = client.get("/api/live")
+    assert r.status_code == 200
+    assert r.json()["battery"]["rate_pct_per_hour"] is None
+
+
+def test_the_rate_is_derived_from_the_unrounded_capacity(client: Any) -> None:
+    # capacity_kwh is rounded for display. Dividing by the rounded figure would
+    # compute the rate from what the card shows rather than from what the bank
+    # reported, which is a small error today and a habit that gets larger.
+    body = _with_battery(
+        client,
+        battery_power_w=7410.0,
+        battery_full_capacity_ah=1120.0,
+        battery_voltage_v=51.1,
+    )
+    assert body["battery"]["capacity_kwh"] == pytest.approx(57.2, abs=0.05)
+    # 7410 / 57.232 / 10 = 12.95; from the rounded 57.2 it would be 12.96.
+    assert body["battery"]["rate_pct_per_hour"] == pytest.approx(12.95, abs=0.005)
+
+
+def test_the_battery_block_is_present_even_with_nothing_to_report(empty_client: Any) -> None:
+    # A field that appears only sometimes is one every caller has to branch on —
+    # the same reason the settings and staleness payloads carry every key.
+    body = empty_client.get("/api/live").json()
+    assert "battery" in body
+    assert body["battery"]["rate_pct_per_hour"] is None
