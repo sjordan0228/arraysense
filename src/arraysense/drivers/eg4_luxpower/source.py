@@ -643,9 +643,11 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     its history to.
 
     Raises:
-        ValueError: the record claims a slot outside the four the inverter
-            exposes. Loud is right here: silently dropping a real module would
-            lose its history for good.
+        ValueError: the record claims a slot below one, which means the 0-based
+            index the library reports was not adjusted. Loud is right here:
+            silently dropping a real module would lose its history for good.
+            There is no upper bound any more — a bank may hold more packs than
+            the registry names columns for, and storage is keyed on the serial.
     """
     serial = getattr(module, "serial_number", None)
     index = _int_reading(module, "battery_index")
@@ -721,8 +723,10 @@ def to_sample(
     since those come back as a block of zeroes rather than as nothing.
 
     Raises:
-        ValueError: a battery record claims a slot outside 1-4, or an explicit
-            ``timestamp`` is naive.
+        ValueError: a battery record claims a slot below one, which means the
+            library's 0-based index was not adjusted, or an explicit
+            ``timestamp`` is naive. There is no upper bound: a bank may hold more
+            packs than the registry names columns for.
     """
     readings: dict[str, float] = {}
     _collect(runtime, _RUNTIME_METRICS, readings)

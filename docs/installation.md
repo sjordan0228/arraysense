@@ -141,7 +141,10 @@ Two layers, because they catch different failures and neither catches both.
 
 **systemd restarts a process that exits.** `Restart=always` with `RestartSec=10`
 is in the shipped unit and covers a crash, an out-of-memory kill, or a
-deliberate stop.
+deliberate stop. It is `always` and not `on-failure` for a specific reason: the
+watchdog below restarts a stalled loop by sending SIGTERM, and systemd treats a
+SIGTERM as a clean exit by default — `on-failure` would never restart after
+exactly the restart the watchdog exists to trigger.
 
 **The service restarts itself if it stops collecting.** This is the failure
 systemd cannot see: the process alive and serving pages perfectly while the poll
