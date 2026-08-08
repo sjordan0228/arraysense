@@ -37,7 +37,11 @@ migration says so at the top of its entry.
   and bands nobody touched are saved back exactly as they were written. A band
   whose hours are entirely claimed by a band above it is now pointed out —
   bands are first-match-wins, so one that prices nothing is almost always a
-  mistake, and until now nothing anywhere said so.
+  mistake, and until now nothing anywhere said so. A band name cannot hold a
+  pipe, a semicolon or a line break: those separate one band and one field from
+  the next, so a name containing them would store a different set of bands than
+  the one on screen. They are dropped when the name is saved, and the editor
+  says so beside it.
 - **Where the installation is**, as latitude and longitude, with a control that
   fills them from the device you are holding. Groundwork for weather
   ([#5](https://github.com/sjordan0228/arraysense/issues/5)). Empty means not
