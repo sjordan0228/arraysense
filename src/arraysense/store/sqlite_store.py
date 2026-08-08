@@ -357,7 +357,7 @@ class SqliteStore:
         """Read one inverter's per-module battery readings over a range, oldest first.
 
         Rows are identified by ``serial``, never by slot: the inverter rotates
-        modules through four register slots, so a caller plotting one battery asks
+        modules through its register slots, so a caller plotting one battery asks
         for its serial and the rotation neither splits that battery's series in two
         nor averages two batteries into one. Naming a serial narrows the read to
         that module; None returns them all, ascending by time then serial.
@@ -593,16 +593,27 @@ class SqliteStore:
         """Write one normalised row per battery module to module_raw.
 
         A module's identity is its serial, never its slot. The inverter rotates
-        modules through four register slots when a bank holds more than four, so a
-        slot is positional metadata; keying rows by it would hand one battery's
+        modules through a fixed set of register slots, which a bank may outnumber,
+        so a slot is positional metadata; keying rows by it would hand one battery's
         history to another every time the rotation moved. Each serial resolves to a
         stable integer id and the row is keyed by (timestamp, module_id).
 
-        The slot still decides the scale, though, not the identity: values encode
-        through the per-slot registry spec, ``lookup`` with a ``battery_module{slot}_``
-        prefix. An unreported field stores as NULL never zero, and an out-of-bounds
-        value is stored anyway and flagged in ``invalid_readings`` against the
-        serial, so a suspect reading stays attributable to the pack that produced it.
+        The scale does not depend on which slot the pack sat in. The registry
+        expands one template across slots and every slot's spec comes from that
+        same template, so the first slot's spec answers for all of them — exactly
+        as the read path already resolves a module column — and a fifth pack
+        encodes by the same scale as the first, keeping one unit per column. A
+        bank larger than four needs no new column because a pack is a row, not a
+        column.
+
+        The slot does still name the reading in ``invalid_readings``, which is a
+        label rather than a lookup and so is not bound to the slots the registry
+        expands. ``validate.py`` reports the same reading the same way; the two
+        resolve bounds from one template and name the pack from its slot, and
+        would otherwise give one database two names for one condition. An
+        unreported field stores as NULL never zero, and an out-of-bounds value is
+        stored anyway and flagged against the serial, so a suspect reading stays
+        attributable to the pack that produced it.
 
         A failed poll carries no modules, so nothing is written for one.
 
@@ -634,7 +645,7 @@ class SqliteStore:
                 if value is None:
                     values.append(None)
                     continue
-                spec = lookup(f"battery_module{module.slot}_{name}")
+                spec = lookup(f"battery_module1_{name}")
                 if not spec.within_bounds(value):
                     cur.execute(
                         "INSERT INTO invalid_readings (timestamp, device, metric, value, serial) "

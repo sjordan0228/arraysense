@@ -34,7 +34,13 @@ from pydantic import BaseModel, Field
 
 from arraysense import __version__
 from arraysense import mode as operating_mode
-from arraysense.calibration import assess, full_charge_windows, packs_recalibrated
+from arraysense.calibration import (
+    CORROBORATING_ABSORB,
+    PACK_RESET_LAG,
+    assess,
+    charge_completed_at,
+    full_charge_windows,
+)
 from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
@@ -85,7 +91,11 @@ _CALIBRATION_TIER = "minute"
 
 # Absorb windows examined, newest first. A bank charges fully at most about
 # once a day, so this covers well over a month of candidates while bounding the
-# per-window module reads that follow.
+# per-window module reads that follow. Counted against the short candidates
+# rather than the sustained ones: the reference installation's sixty days hold
+# 27 of the former against 11 of the latter, so the budget still spans the
+# search, and the slice keeps the newest — which is the one that decides the
+# answer.
 _MAX_WINDOWS_EXAMINED = 40
 
 # How far before a costed period to start reading its counters. The first
@@ -137,6 +147,19 @@ STALE_AFTER = timedelta(minutes=15)
 # not a shrug: an outage of six hours and one of six days call for the same
 # reaction, and inventing a number for the second would be the more precise lie.
 READING_SEARCH = timedelta(hours=6)
+
+# Which layer the service says failed, and what the page calls it. A reply the
+# driver could not turn into a sample is neither an outage nor a disk fault: the
+# inverter answered and our own decoding refused it, so naming it after either
+# of the other two sends the reader somewhere there is nothing to find.
+_FAULT_VERDICT = {"transport": "inverter", "store": "storage", "build": "driver"}
+
+# The verdicts that name a fault, and so the ones allowed to quote the recorded
+# reason. Derived from the mapping above rather than listed again, because the
+# two drifted apart the moment a third fault was added: the new verdict rendered
+# with its cause suppressed, which for a decode failure is the only thing on the
+# page that says what was refused.
+_NAMED_FAULTS = frozenset(_FAULT_VERDICT.values())
 
 
 class YieldRequest(BaseModel):
@@ -237,11 +260,15 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
     inverter from a database refusing writes, because the service records both
     in ``last_error``, and it guessed the inverter — sending whoever read it
     after the dongle, the WiFi and the breaker while the disk was the problem.
-    Here the two are separable: ``connected`` is set from the read, before the
-    write is attempted, so a poll that failed with the connection up failed at
-    the store. ``consecutive_failures`` gates the whole question, because it is
-    cleared by a success and ``last_failure`` never is — reading that field
-    alone is what let the banner fire over a poll that had just worked.
+    The service now says which layer failed, so the answer is read rather than
+    inferred. That mattered once there were three answers instead of two: a
+    reply the driver could not turn into a sample arrives with the connection
+    up, so deriving the fault from ``connected`` alone blamed the store, and
+    marking the connection down to avoid that blamed the inverter while it was
+    answering every poll. ``consecutive_failures`` gates the whole question,
+    because it is cleared by a success and ``last_failure`` never is — reading
+    that field alone is what let the banner fire over a poll that had just
+    worked.
     """
     s = service.status
     stalled: timedelta | None = service.stalled_for(now)
@@ -260,7 +287,9 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
     elif not s.running:
         verdict = "not_running"
     elif s.consecutive_failures:
-        verdict = "storage" if s.connected else "inverter"
+        verdict = _FAULT_VERDICT.get(
+            s.last_failure_kind or "", "storage" if s.connected else "inverter"
+        )
     elif stale:
         verdict = "silent"
     else:
@@ -277,7 +306,7 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
         # Only where the verdict names a failure. The field is left set by the
         # service long after the fault it describes has cleared, so quoting it
         # beside any other verdict attaches an old cause to a new condition.
-        "reason": s.last_error if verdict in {"inverter", "storage"} else None,
+        "reason": s.last_error if verdict in _NAMED_FAULTS else None,
     }
 
 
@@ -449,7 +478,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:
-    """Read every module's state of charge across one absorb window.
+    """Read every module's state of charge across one absorb window and its margins.
 
     Tries the full-cadence tier first and falls back to hourly. Raw module data
     is kept for thirty days and the search reaches back sixty, so the older
@@ -459,10 +488,18 @@ def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[di
     the right direction: the cost of missing one is a warning shown a few days
     early, and the cost of inventing one is silence for a month.
 
+    The range is the window widened by ``PACK_RESET_LAG`` at both ends, and the
+    two margins are read for opposite reasons: the later one catches a pack that
+    snapped its counter after the bank left absorb, the earlier one is the
+    evidence that the packs were not already reading full before it started.
+    ``charge_completed_at`` slices the window itself back out.
+
     Both bounds are timezone-aware, and the result is empty when no pack
     reported at all during the window — which is a different thing from every
     pack reporting and none of them being full.
     """
+    start -= PACK_RESET_LAG
+    end += PACK_RESET_LAG
     rows: list[dict[str, Any]] = store.query_modules(["soc_pct"], start, end, tier="full")
     if not rows:
         rows = store.query_modules(["soc_pct"], start, end, tier="hourly")
@@ -503,11 +540,31 @@ async def calibration(request: Request) -> dict[str, Any]:
     # on behalf of a pack that never recalibrated.
     known = [str(row["serial"]) for row in latest if row.get("serial")]
 
+    # A one-minute hold rather than twenty. What separates a charge from a
+    # voltage excursion here is the packs, not the clock: the reference
+    # installation crosses absorb and tapers to zero in three minutes, so a
+    # twenty-minute candidate list contains none of its charges at all. Every
+    # window on this list still has to end settled below the taper, and
+    # ``charge_completed_at`` is what decides which of them a bank has passed.
+    candidates = full_charge_windows(history, min_absorb=CORROBORATING_ABSORB)[
+        -_MAX_WINDOWS_EXAMINED:
+    ]
     last_full: datetime | None = None
-    for window_start, window_end in reversed(full_charge_windows(history)[-_MAX_WINDOWS_EXAMINED:]):
-        during = _packs_during(store, window_start, window_end)
-        if packs_recalibrated(during, expected=known or None):
-            last_full = window_end
+    for index in reversed(range(len(candidates))):
+        window_start, window_end = candidates[index]
+        packs = _packs_during(store, window_start, window_end)
+        # The previous candidate's end caps how far back the below-full evidence
+        # may be read. Two touches closer together than PACK_RESET_LAG would
+        # otherwise let the later one borrow the earlier charge's transition.
+        reset = charge_completed_at(
+            window_start,
+            window_end,
+            packs,
+            expected=known or None,
+            after=candidates[index - 1][1] if index else None,
+        )
+        if reset is not None:
+            last_full = reset
             break
 
     status = assess(
@@ -797,7 +854,7 @@ async def battery_history(
     """One inverter's per-module battery readings over a range, keyed by serial.
 
     Modules are identified by serial rather than slot, so a bank that rotates
-    modules through the inverter's four register slots neither splits one
+    modules through the inverter's register slots neither splits one
     battery into two series nor merges two into one. ``device`` picks the
     inverter whose bank is being asked about and defaults to the configured
     one; a serial is unique within a device, not across them.

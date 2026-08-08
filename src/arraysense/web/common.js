@@ -588,6 +588,22 @@ const STALE_WORDS = {
     detail: `${staleBehind(s)} The inverter is answering — it is the database that is `
       + 'refusing the writes, so the disk is the place to look, not the dongle.',
   }),
+  // Neither of the other two: the inverter answered and this build could not
+  // turn the reply into a reading. Red rather than amber because the fault is in
+  // our own decoding — an outage and a busy disk both clear on their own, and
+  // this one may not. It is not claimed to be permanent: one malformed reply
+  // followed by a good one clears it, so the count is what says how bad it is.
+  driver: (s, status) => {
+    const tries = Number(status.consecutive_failures);
+    return {
+      tone: 'bad',
+      headline: 'Readings cannot be decoded',
+      detail: `${staleBehind(s)} The inverter is answering, but this build could not turn its `
+        + 'reply into a reading'
+        + (Number.isFinite(tries) && tries > 0 ? `; ${tries} polls in a row have failed` : '')
+        + '. The recorded reason names what was refused.',
+    };
+  },
   silent: (s) => ({
     tone: 'warn',
     headline: 'No new readings',

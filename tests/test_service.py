@@ -13,6 +13,7 @@ import pytest
 
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
+from arraysense.models import Sample
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -414,3 +415,106 @@ async def test_a_recorded_gap_names_the_inverter_that_went_quiet(tmp_path: Path)
     rows = store._conn.execute("SELECT device, error FROM inverter_raw").fetchall()
     store.close()
     assert rows == [("CE00000001", "ConnectionError: gone")]
+
+
+# --- a sample that cannot be built (#29) ---------------------------------------
+#
+# A malformed sample is deterministic: it will fail identically on every poll, so
+# retrying is pointless — but stopping the loop is worse. The ValueError a sample
+# raises when it refuses what the driver assembled escapes poll_once today, kills
+# the asyncio task while uvicorn keeps serving, and nothing restarts it: the
+# watchdog only fires on a stalled loop and systemd sees no process exit. Not one
+# gap row is written either, so the outage leaves no trace at all.
+
+
+class _MalformedSource(FakeSource):
+    """A source whose read raises the way a driver does on a sample it cannot build.
+
+    The example is an empty serial rather than an out-of-range slot: a slot past
+    four is legal now, so a refused slot would be a failure the model no longer
+    has, and a fixture that simulates an impossible error tests nothing real.
+    """
+
+    async def read(self) -> Sample:
+        raise ValueError("serial must not be empty; it is the module identity")
+
+
+class _CrashingSource(FakeSource):
+    """A source whose read raises what nothing catches, so the loop really dies.
+
+    ``_MalformedSource`` cannot stand in for this: its ValueError is caught and
+    recorded as a gap, so the loop survives and ``stop()`` only ever cancels a
+    live task — which is how the release-the-dongle test below passed while
+    proving nothing. Demonstrating that a *dead* loop still releases the socket
+    needs a failure that escapes ``poll_once`` altogether, which is what a bug in
+    our own code is: neither a transport fault nor a sample that would not build.
+    """
+
+    async def read(self) -> Sample:
+        raise RuntimeError("a bug in our own code, not a transport fault")
+
+
+async def test_a_sample_that_cannot_be_built_is_recorded_as_a_gap(tmp_path: Path) -> None:
+    svc, store = _service(tmp_path, source=_MalformedSource())
+    sample = await svc.poll_once()
+    assert sample is not None and sample.is_failed
+    assert "serial" in (sample.error or "")
+    rows = store.query(["pv_total_power_w"], sample.timestamp, sample.timestamp)
+    store.close()
+    # The outage has to be visible in the history, exactly as an unreachable
+    # inverter is. A silent hole is the one thing worse than a recorded one.
+    assert rows[0]["error"] is not None
+    assert rows[0]["pv_total_power_w"] is None
+
+
+async def test_a_sample_that_cannot_be_built_leaves_the_loop_running(tmp_path: Path) -> None:
+    svc, store = _service(tmp_path, source=_MalformedSource())
+    for _ in range(3):
+        await svc.poll_once()
+    store.close()
+    assert svc.status.total_failures == 3
+    assert svc.status.consecutive_failures == 3
+
+
+async def test_a_sample_that_cannot_be_built_does_not_blame_the_inverter(tmp_path: Path) -> None:
+    svc, store = _service(tmp_path, source=_MalformedSource())
+    await svc.poll_once()
+    store.close()
+    # The inverter answered: connect() returned and the registers arrived, and
+    # only turning the reply into a sample failed. Reporting the connection as
+    # down sends whoever reads it after the dongle, the WiFi and the breaker over
+    # a fault that is in this build's own decoding.
+    assert svc.status.connected is True
+    assert svc.status.last_failure_kind == "build"
+
+
+async def test_a_transport_failure_still_marks_the_connection_down(tmp_path: Path) -> None:
+    # The other side of the same distinction: an unreachable inverter must still
+    # report the connection down, or the page calls a real outage a disk fault.
+    svc, store = _service(tmp_path, source=FakeSource(fail_on_read=ConnectionError("no route")))
+    await svc.poll_once()
+    store.close()
+    assert svc.status.connected is False
+    assert svc.status.last_failure_kind == "transport"
+
+
+async def test_the_dongle_is_released_even_when_the_loop_died(tmp_path: Path) -> None:
+    # The dongle accepts exactly one TCP client, so a loop that dies without
+    # disconnecting holds the slot until the dongle times it out — blocking both
+    # the restart and the owner's own vendor app. stop() re-raises the dead
+    # task's exception before it reaches disconnect, so the socket leaks.
+    source = _CrashingSource()
+    svc, store = _service(tmp_path, source=source)
+    await svc.start()
+    # Wait for the loop to actually die, and prove that it did. Without this the
+    # test is vacuous: with a source whose failure poll_once *catches*, the loop
+    # survives, stop() only ever cancels a live task, and the whole release path
+    # this test exists for can be deleted with the suite still green.
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if not svc.status.running:
+            break
+    assert not svc.status.running, "the loop never died, so this test proves nothing"
+    await svc.stop()
+    store.close()
+    assert source.connected is False

@@ -192,6 +192,28 @@ def test_status_blames_the_database_when_the_write_is_what_failed(empty_client: 
     assert body["reason"] == "OperationalError: database is locked"
 
 
+def test_status_names_the_driver_when_the_reply_could_not_be_decoded(empty_client: Any) -> None:
+    # The third fault, and the one with nowhere honest to go until it was named.
+    # The inverter answered and the driver refused the reply: called an outage it
+    # sends the reader after the dongle, called a storage fault it sends them to
+    # a disk that is fine. Deriving it from `connected` alone could only ever
+    # produce one of those two wrong answers.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=20), readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=20))
+    service.status.last_failure = now
+    service.status.last_error = "ValueError: serial must not be empty; it is the module identity"
+    service.status.last_failure_kind = "build"
+    service.status.consecutive_failures = 3
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["verdict"] == "driver"
+    assert body["reason"] == "ValueError: serial must not be empty; it is the module identity"
+
+
 def test_status_blames_the_inverter_when_the_read_is_what_failed(empty_client: Any) -> None:
     now = datetime.now(tz=UTC)
     empty_client.app.state.store.append(
@@ -482,12 +504,26 @@ def test_resume_takes_the_dongle_back(client: Any) -> None:
 # --- state-of-charge calibration --------------------------------------------
 
 
-def _bank(store: SqliteStore, when: datetime, volts: float, socs: dict[str, float]) -> None:
-    """Record one poll of the bank at a given voltage with the given pack states."""
+def _bank(
+    store: SqliteStore,
+    when: datetime,
+    volts: float,
+    socs: dict[str, float],
+    amps: float | None = None,
+) -> None:
+    """Record one poll of the bank at a given voltage with the given pack states.
+
+    ``amps`` is the bank current, and omitting it leaves the column NULL — which
+    is a real state the inverter produces and one the taper check deliberately
+    does not judge. A test about the taper has to say a number.
+    """
+    readings: dict[str, float] = {"battery_voltage_v": volts, "bms_charge_voltage_ref_v": 56.0}
+    if amps is not None:
+        readings["battery_current_a"] = amps
     store.append(
         Sample(
             timestamp=when,
-            readings={"battery_voltage_v": volts, "bms_charge_voltage_ref_v": 56.0},
+            readings=readings,
             battery_modules=tuple(
                 BatteryModuleSample(serial=s, slot=i + 1, soc_pct=soc, voltage_v=volts)
                 for i, (s, soc) in enumerate(socs.items())
@@ -613,6 +649,167 @@ def test_calibration_answers_on_an_empty_database(tmp_path: Path) -> None:
     body = response.json()
     assert body["last_full_charge"] is None
     assert body["soc_spread_pct"] is None
+
+
+# The reference installation's charge of 8 August 2026, as the minute tier
+# recorded it: 55.6, 55.7, 55.7 and 55.5 V at 111.2, 63.9, 12.2 and -1.6 A —
+# three minutes of absorb against a twenty-minute rule. Three packs snapped to
+# 100% two minutes in, the fourth five minutes later, three minutes after the
+# bank's own voltage had fallen back below the reference. The climb before the
+# absorb is shortened; everything else is as recorded.
+#
+# _DRIFTED is what the four read through the quarter hour before the absorb:
+# 70-75, 77-80, 72-76 and 96-99. The fourth pack's dip below 99 is what proves
+# its counter reset too, and its last such reading was 2 min 19 s before the
+# absorb opened — so the lookback has to be minutes rather than seconds.
+_ABSORB = ((55.6, 111.2), (55.7, 63.9), (55.7, 12.2), (55.5, -1.6))
+_DRIFTED = {"A": 75.0, "B": 80.0, "C": 76.0, "D": 96.0}
+_THREE_OF_FOUR = {"A": 100.0, "B": 100.0, "C": 77.0, "D": 100.0}
+_RESET = {"A": 100.0, "B": 100.0, "C": 100.0, "D": 100.0}
+
+
+def _short_charge(
+    store: SqliteStore,
+    charged: datetime,
+    *,
+    before: dict[str, float],
+    during: dict[str, float],
+    after: dict[str, float],
+) -> None:
+    """Replay that charge through the store, with the pack states each stage reports."""
+    for minute in range(15):
+        _bank(store, charged + timedelta(minutes=minute), 54.0, before, amps=175.0)
+    for minute, (volts, amps) in enumerate(_ABSORB):
+        socs = during if minute >= 2 else before
+        _bank(store, charged + timedelta(minutes=15 + minute), volts, socs, amps=amps)
+    for minute in range(19, 31):
+        socs = after if minute >= 22 else during
+        _bank(store, charged + timedelta(minutes=minute), 54.9, socs, amps=0.0)
+
+
+def test_calibration_credits_a_charge_that_only_absorbed_for_three_minutes(
+    tmp_path: Path,
+) -> None:
+    # The defect. This hardware crosses absorb, finishes and tapers to zero in
+    # about three minutes, so the twenty-minute hold never happens and sixty
+    # days of nightly full charges came back as "no full charge found" — telling
+    # the owner to do the thing they had just finished doing.
+    now = datetime.now(tz=UTC)
+    charged = now - timedelta(hours=6)
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(store, charged, before=_DRIFTED, during=_THREE_OF_FOUR, after=_RESET)
+        _bank(store, now, 53.0, {"A": 92.0, "B": 93.0, "C": 92.0, "D": 94.0}, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    assert body["severity"] == "none"
+    assert body["drift_severity"] == "none"
+    assert body["soc_is_estimate"] is False
+    assert body["headline"] == "State of charge is calibrated"
+    # The instant the last counter reset, three minutes after the bank left
+    # absorb — not the end of the voltage window, which was earlier.
+    reset_at = (charged + timedelta(minutes=22)).replace(microsecond=0)
+    assert body["last_full_charge"] == reset_at.isoformat()
+    assert 0.2 < body["days_since"] < 0.3
+
+
+def test_calibration_still_ignores_one_pack_drifting_to_full(tmp_path: Path) -> None:
+    # The hole that must stay shut. One counter at 100% while the rest sit at 70
+    # is drift, which is the condition being detected — and the inverter side of
+    # this database is the real charge, byte for byte, so only the packs differ.
+    now = datetime.now(tz=UTC)
+    lagging = {"A": 70.0, "B": 70.0, "C": 70.0, "D": 70.0}
+    drifted_high = {**lagging, "D": 100.0}
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(
+            store,
+            now - timedelta(hours=6),
+            before=lagging,
+            during=drifted_high,
+            after=drifted_high,
+        )
+        _bank(store, now, 53.0, drifted_high, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    assert body["last_full_charge"] is None
+    assert body["days_since"] is None
+    assert body["severity"] == "elevated"
+    assert body["soc_is_estimate"] is True
+
+
+def test_calibration_ignores_a_bank_whose_counters_are_all_pegged(tmp_path: Path) -> None:
+    # The other shape of the same hole. Uncounted standby draw makes every
+    # counter read high, so a bank left alone long enough has all four pegged at
+    # 100% while it sits at half charge. A standing unanimity is not a reset, and
+    # crediting it would silence the warning on the bank that most needs it.
+    now = datetime.now(tz=UTC)
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(store, now - timedelta(hours=6), before=_RESET, during=_RESET, after=_RESET)
+        _bank(store, now, 53.0, _RESET, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    assert body["last_full_charge"] is None
+    assert body["severity"] == "elevated"
+
+
+def test_calibration_ignores_three_pegged_counters_beside_one_that_charged(
+    tmp_path: Path,
+) -> None:
+    # Found by review and reproduced against the reference database through this
+    # endpoint. Three counters drifted high and pegged at 100%, the fourth
+    # genuinely charges across 99: every pack reads full at the end and one of
+    # them was previously below, which was enough for an earlier version of the
+    # rule. Three quarters of these percentages are stale, and the endpoint was
+    # reporting the bank calibrated with soc_is_estimate false — so the
+    # dashboard would have drawn all four as measurements.
+    now = datetime.now(tz=UTC)
+    pegged = {"A": 100.0, "B": 100.0, "C": 100.0}
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(
+            store,
+            now - timedelta(hours=6),
+            before={**pegged, "D": 96.0},
+            during={**pegged, "D": 100.0},
+            after={**pegged, "D": 100.0},
+        )
+        _bank(store, now, 53.0, {**pegged, "D": 100.0}, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    assert body["last_full_charge"] is None
+    assert body["severity"] == "elevated"
+    assert body["soc_is_estimate"] is True
+
+
+def test_calibration_does_not_let_a_second_absorb_borrow_the_first_transition(
+    tmp_path: Path,
+) -> None:
+    # Two absorb touches ten minutes apart, packs at 100 throughout the second.
+    # The second's lookback reaches back past the first and finds the below-full
+    # rows belonging to that charge, so the later window was being credited on
+    # evidence that was never about it. The answer is the first charge's reset.
+    now = datetime.now(tz=UTC)
+    charged = now - timedelta(hours=6)
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(store, charged, before=_DRIFTED, during=_RESET, after=_RESET)
+        for minute, (volts, amps) in enumerate(_ABSORB):
+            _bank(store, charged + timedelta(minutes=28 + minute), volts, _RESET, amps=amps)
+        for minute in range(32, 40):
+            _bank(store, charged + timedelta(minutes=minute), 54.9, _RESET, amps=0.0)
+        _bank(store, now, 53.0, {"A": 92.0, "B": 93.0, "C": 92.0, "D": 94.0}, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    reset_at = (charged + timedelta(minutes=17)).replace(microsecond=0)
+    assert body["last_full_charge"] == reset_at.isoformat()
+    assert body["severity"] == "none"
 
 
 # --- settings ----------------------------------------------------------------

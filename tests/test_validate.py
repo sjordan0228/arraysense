@@ -113,6 +113,36 @@ def test_same_module_flagged_by_serial_after_rotating_slots() -> None:
     assert first.serial == second.serial == "BA12345673"
 
 
+def test_a_fifth_pack_validates_instead_of_raising() -> None:
+    # The registry names columns for four slots, so resolving a spec by slot
+    # number raised KeyError on the fifth pack the model now accepts (#29).
+    # Bounds come from the template instead — every slot's spec is identical to
+    # it — and the slot survives as the label, which is not a registry lookup.
+    sample = Sample(
+        timestamp=_ts(),
+        readings={},
+        battery_modules=(BatteryModuleSample(serial="BA12345675", slot=5, soc_pct=137.0),),
+    )
+
+    failure = validate_sample(sample).failures[0]
+
+    assert failure.metric == "battery_module5_soc_pct"
+    assert failure.serial == "BA12345675"
+    assert failure.value == 137.0
+
+
+def test_a_fifth_pack_is_still_actually_checked() -> None:
+    # Guards the fix against the lazy version of itself: if resolving by template
+    # had quietly stopped applying bounds, the test above would still pass on the
+    # failure it expects while every plausible reading also came back flagged.
+    plausible = Sample(
+        timestamp=_ts(),
+        readings={},
+        battery_modules=(BatteryModuleSample(serial="BA12345675", slot=5, soc_pct=64.0),),
+    )
+    assert validate_sample(plausible).failures == ()
+
+
 def test_failed_poll_validates_trivially() -> None:
     # A failed poll is a recorded gap carrying no readings: there is nothing to
     # check, and the gap itself is not a plausibility failure.

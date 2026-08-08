@@ -67,17 +67,23 @@ class BatteryModuleSample:
         """Validate identity and slot.
 
         ``slot`` is 1-based to match the registry's ``battery_module1..4``
-        column names. The inverter library reports a 0-based ``battery_index``,
-        so an adapter must add one; validating here turns that off-by-one into
-        an immediate error rather than a column name that silently does not
-        exist. Anything outside 1 to 4 is refused, as is an empty serial — the
-        serial is the module's only stable identity, and a blank one would put
-        readings from a real pack under a key nothing can match again.
+        column names, and it describes where the inverter placed the pack — not
+        which pack it is. The inverter library reports a 0-based
+        ``battery_index``, so an adapter must add one; validating here turns
+        that off-by-one into an immediate error rather than a column name that
+        silently does not exist. It is checked to be a positive integer but not
+        capped, because a bank may hold more than four packs: the store resolves
+        a reading's scale by template, so the slot number no longer bounds what
+        can be stored. The old 1..4 cap existed when the registry expanded
+        per-slot column names over exactly four slots and the write path looked
+        a spec up by slot number — a slot outside that range located no column.
+        The serial is the module's only stable identity, and a blank one would
+        put readings from a real pack under a key nothing can match again.
         """
         if not self.serial:
             raise ValueError("serial must not be empty; it is the module identity")
-        if not 1 <= self.slot <= 4:
-            raise ValueError(f"slot must be 1-4 (1-based), got {self.slot}")
+        if self.slot < 1:
+            raise ValueError(f"slot must be a positive integer (1-based), got {self.slot}")
 
     @property
     def cell_delta_v(self) -> float | None:
@@ -131,7 +137,12 @@ class Sample:
 
     @property
     def is_failed(self) -> bool:
-        """Report whether this poll failed to reach the inverter.
+        """Report whether this poll produced no reading.
+
+        Not only an unreachable inverter: a reply the driver could not turn into
+        a sample is recorded the same way, and there the inverter answered. Both
+        are holes in the history, which is what this field is asked about — the
+        reason says which one it was.
 
         The test is the error reason, never the absence of readings: an
         inverter can legitimately report no battery modules, and treating that
@@ -141,7 +152,11 @@ class Sample:
 
     @classmethod
     def failed(cls, timestamp: datetime, reason: str) -> Sample:
-        """Build a sample representing a poll that could not reach the inverter.
+        """Build a sample representing a poll that produced no reading.
+
+        Usually an inverter that could not be reached, but also a reply that
+        could not be turned into a sample — the reason distinguishes them, and
+        the collector records both as gaps because both are holes in the history.
 
         The absence is data: it is stored and rendered as a break in the chart
         rather than smoothed over, so an outage stays visible instead of being

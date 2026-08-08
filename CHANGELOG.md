@@ -7,6 +7,73 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.4 — 8 August 2026
+
+### Fixed
+
+- **A bank of more than four battery modules stopped collecting entirely**
+  ([#29](https://github.com/sjordan0228/arraysense/issues/29)). A fifth pack
+  raised an error the poll loop did not catch, which killed the collector while
+  the web server carried on serving pages — so the dashboard looked alive, the
+  history simply stopped, and not even a gap row was written to show where. It
+  was not only a five-pack problem: the inverter library hands out a *virtual*
+  slot per battery and keeps the number reserved when a serial goes unread, so a
+  four-pack bank that had one poll with an unreadable serial could produce a
+  fifth slot and hit the same wall. Storage never needed the limit — a pack is a
+  row keyed on its serial, not a column — so no migration is required and
+  existing databases are untouched.
+
+- **Any reading the driver could not decode killed the poll loop.** The loop
+  died, nothing restarted it, and the outage left no trace — not even a gap row
+  to show where the history stopped. Such a reading is now recorded as a gap
+  carrying its reason and backed off from, exactly as an unreachable inverter is,
+  and the status page names it as a condition of its own instead of borrowing the
+  name of an unreachable inverter or a failing disk. One limitation is worth
+  knowing: the reading is recognised by the `ValueError` a sample raises when it
+  refuses what the driver assembled, which is broader than it ought to be, so a
+  `ValueError` from an unrelated mistake in our own code is recorded the same way
+  rather than surfacing. A dedicated decode error is the next step.
+
+- **The dongle was not released when the poll loop died.** Stopping the service
+  re-raised the dead loop's error before it reached the disconnect, so the
+  dongle's single TCP slot stayed held until it timed out — blocking both the
+  restart and the EG4 app.
+
+- **The shipped service file could never restart a stalled collector.** It set
+  `Restart=on-failure`, and the watchdog restarts a stalled loop by sending
+  SIGTERM, which systemd treats as a clean exit — so the one restart the
+  watchdog exists to trigger was the one that never happened. Anyone who
+  installed from this repository had a watchdog that could stall silently. Now
+  `Restart=always`, and the installation docs say why.
+
+- **Plausibility checking raised an error on a fifth pack** rather than checking
+  it. `validate.py` resolved a reading's bounds through its slot number, which
+  only exists for four of them; it now resolves through the shared template, the
+  same way storage does, so the two cannot disagree about what is plausible.
+
+## 0.5.3 — 8 August 2026
+
+### Fixed
+
+- **A real full charge went unnoticed**
+  ([#36](https://github.com/sjordan0228/arraysense/issues/36)). The bank was
+  charged to full overnight on 8 August, all four packs recalibrated, and the
+  spread between their counters fell from 24 points to 3 — and the dashboard
+  still said "State of charge maybe drifting", still marked every pack
+  percentage as an estimate, and still advised charging to 100%. A full charge
+  was only credited to a bank that held at its charge reference for twenty
+  minutes, which this hardware never does: it crosses absorb, finishes and
+  tapers to zero in about three minutes, so the sixty-day search came back
+  empty with the charge sitting in the history. A charge that short is now
+  credited on the packs' own evidence instead: every pack the bank is known to
+  hold measured below full in the quarter hour before the absorb and at or above
+  99% together during it, with the bank at its reference and the current settled.
+  A transition per pack, because a charge resets every counter. What is *not*
+  credited is one counter drifting to 100% on its own, a bank whose counters have
+  all been pegged at 100% for weeks with no charge behind them, or three stale
+  counters sitting at 100% beside a fourth that really did charge — all three are
+  the drift being detected, and all three stay reported.
+
 ## 0.5.2 — 8 August 2026
 
 ### Added
