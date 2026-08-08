@@ -269,6 +269,140 @@ const tempDeltaStr = (dc) => dc === null ? DASH
   : `${(settings.tempUnit === 'F' ? dc * 9/5 : dc).toFixed(1)} °${settings.tempUnit}`;
 
 // ---------------------------------------------------------------------------
+// The calendar the service answers on.
+//
+// A day and a month are wall-clock questions, and which wall clock is not the
+// browser's to decide: the installation's own zone beats it, because the
+// inverter is in one place and the person looking at it may not be. So a page
+// that builds "this month" or "the last thirty days" out of its own getMonth()
+// is asking about a calendar the reply was not cut on. Both pages did, and both
+// were wrong in a way that reads as normal: the Costs page asked from the
+// browser's midnight on the first, which is not the site's, so the connection
+// charge that falls due whole was apportioned instead — $3.44 of $15.00 on an
+// install five hours west of the reader — and the History page keyed the
+// server's buckets by a date it had built for itself, so a real day's bucket
+// fell outside the row set while its energy stayed in the footer's total.
+//
+// One copy of the question, here, for the same reason there is one tariff
+// parser: the two pages asking it separately is two answers waiting to differ.
+// ---------------------------------------------------------------------------
+
+// What this browser's clock is set to, or '' when it will not say. Still sent
+// with every request, because where the installation has stated no zone — the
+// default, and every install that has not been told otherwise — this is the
+// zone the service answers on.
+function browserZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// What this browser asks the service to consider, as a query string. Sent on
+// every status poll as well, so the answer below is the answer this browser
+// would actually get.
+const zoneQuery = () => {
+  const mine = browserZone();
+  return mine ? `?tz=${encodeURIComponent(mine)}` : '';
+};
+
+// The zone /api/energy and /api/costs will cut this browser's requests in.
+// Asked of the service rather than worked out here from the setting: which of
+// the setting, this browser and the machine wins is the service's rule, and a
+// copy of it in the browser is a copy that can drift.
+//
+// Held once resolved, and refreshed by the stale watch's own poll rather than
+// by a request of its own — see checkStale. A wall tablet left open for a week
+// would otherwise keep building calendars in the zone the setting held when it
+// was opened, while the service answered in the new one, which is this defect
+// all over again with a longer fuse.
+let zonePromise = null;
+function siteZone() {
+  if (zonePromise === null) zonePromise = askSiteZone();
+  return zonePromise;
+}
+
+// What a status reply says the calendar is. Ignored when it says nothing: a
+// service too old to carry the field must leave the browser's own zone in
+// place rather than blank it.
+function noteZone(status) {
+  const zone = status && status.timezone;
+  if (typeof zone === 'string' && zone) zonePromise = Promise.resolve(zone);
+}
+
+async function askSiteZone() {
+  const mine = browserZone();
+  try {
+    const response = await fetch('/api/status' + zoneQuery());
+    if (response.ok) {
+      const zone = (await response.json()).timezone;
+      if (typeof zone === 'string' && zone) return zone;
+    }
+  } catch (err) {
+    // Falls through to this browser's own zone, below.
+  }
+  // A service that will not answer. The browser's zone is what every page drew
+  // on before this existed and is still what the service falls back to, so the
+  // page shows a calendar rather than nothing at all.
+  return mine;
+}
+
+// Today's date and time on a named zone's calendar, as plain numbers. Intl is
+// the only thing in a browser that knows another zone's clock; everything past
+// this point works in whole calendar fields, which is what a bucket boundary
+// is. An empty or unusable zone name means this browser's own calendar, which
+// is the answer when the service has stated none either.
+function civilNow(zone) {
+  const now = new Date();
+  const own = () => ({
+    year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate(),
+    hour: now.getHours(), minute: now.getMinutes(), second: now.getSeconds(),
+  });
+  if (!zone) return own();
+  const parts = {};
+  try {
+    const fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: zone, hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    for (const p of fmt.formatToParts(now)) parts[p.type] = Number(p.value);
+  } catch (err) {
+    return own();
+  }
+  return {
+    year: parts.year, month: parts.month, day: parts.day,
+    // Some engines render midnight as hour 24 rather than 0 under hour12:false,
+    // and a day that begins at hour 24 is a day whose fraction elapsed is 100%.
+    hour: parts.hour % 24, minute: parts.minute, second: parts.second,
+  };
+}
+
+// A Date standing for one date on the site's calendar. It is a position and a
+// label, never an instant: pages draw rows and chart columns against it and
+// tell the API the date in words. Built at this browser's own midnight so that
+// toLocaleDateString names the date it stands for — the true instant of the
+// site's midnight would be labelled with the browser's date for it, which for a
+// site five hours west is the day before. Month and day are allowed to run off
+// the end of their ranges, which is how the Date constructor is asked what the
+// calendar does next.
+const civilDay = (year, month, day) => new Date(year, month - 1, day);
+
+const pad2 = (n) => String(n).padStart(2, '0');
+
+// One date in the words the API reads it in. A naive timestamp is read by the
+// service as local time in whichever zone it resolved (see energy.with_zone),
+// so this asks about the site's own midnight without the page ever having to
+// work out which instant that is.
+const naiveStamp = (d) =>
+  `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T00:00:00`;
+
+// A zone name as prose. The tz database writes them with underscores and a
+// reader does not.
+const zoneWords = (zone) => String(zone || '').replace(/_/g, ' ');
+
+// ---------------------------------------------------------------------------
 // Navigation. One list in one place: a page that names its own siblings is a
 // page that goes stale the moment a sixth view is added, and a nav that
 // disagrees between pages reads as a broken site rather than a stale constant.
@@ -582,11 +716,15 @@ async function checkStale() {
   let status = null;
   let now = Date.now();
   try {
-    const response = await fetch('/api/status');
+    const response = await fetch('/api/status' + zoneQuery());
     if (response.ok) {
       const served = Date.parse(response.headers.get('date') || '');
       if (Number.isFinite(served)) now = served;
       status = await response.json();
+      // This poll runs every thirty seconds on every open page, so the zone
+      // the pages build their calendars in follows a setting changed elsewhere
+      // within one poll — without a request of its own.
+      noteZone(status);
     }
   } catch (err) {
     // A status endpoint that cannot be reached is itself one of the cases, and

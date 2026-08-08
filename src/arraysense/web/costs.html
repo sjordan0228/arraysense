@@ -261,27 +261,49 @@ async function getJSON(url) {
   return response.json();
 }
 
-const localZone = () => {
-  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; }
-};
-
-// The owner's month, in the owner's zone: local midnight on the first, to local
-// midnight on the first of the next. Never now minus thirty days, and never an
-// epoch divided by 86400 — one month a year is 23 hours short of that and one
-// is an hour long, and both look like a data bug.
-function monthWindow(now) {
-  const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  const end = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-  // A page opened in the first second of the month still has to ask for a
-  // range the API will accept.
-  const cursor = new Date(Math.max(now.getTime(), start.getTime() + 1000));
-  return { start, end, now: cursor };
+// The owner's month, on the calendar the service answers on: local midnight on
+// the first, to local midnight on the first of the next. Never now minus thirty
+// days, and never an epoch divided by 86400 — one month a year is 23 hours short
+// of that and one is an hour long, and both look like a data bug.
+//
+// ``today`` is the date in the *installation's* zone, from
+// civilNow(siteZone()), and not this browser's. Built from the browser's the
+// page asked about an instant that is not the site's midnight on the first, and
+// the whole month turned on it: the connection charge falls due whole and was
+// apportioned instead ($3.44 of $15.00 on an install five hours west of the
+// reader), the month-to-date cost was short by the hours either side, and the
+// estimated bill came back for the previous calendar month, complete, in the
+// first week of this one.
+function monthWindow(today) {
+  const start = civilDay(today.year, today.month, 1);
+  const end = civilDay(today.year, today.month + 1, 1);
+  // How far into the month the site's own clock is, in its own days. Calendar
+  // fields rather than an interval, so it needs no instant to measure from; it
+  // is a day out of thirty-one at worst and only stands in until the service's
+  // own fraction_elapsed arrives with the pricing.
+  const done = today.day - 1
+    + (today.hour * 3600 + today.minute * 60 + today.second) / 86400;
+  return {
+    start,
+    end,
+    days: Math.round(elapsed(start, end) / 86400000),
+    done,
+    // A bare wall-clock date, read by the service as midnight in the zone it
+    // resolved — which is what makes this the site's first of the month rather
+    // than the reader's.
+    startParam: naiveStamp(start),
+    // A true instant, needing no zone at all, and it has to stay one: it is
+    // also what tells the service how much of the month has actually happened.
+    // A page opened in the first second of the month still has to ask for a
+    // range the API will accept, hence the nudge.
+    endParam: new Date(Date.now() + (done === 0 ? 1000 : 0)).toISOString(),
+  };
 }
 
 async function monthEnergy(win) {
-  const zone = localZone();
-  const url = `/api/energy?start=${encodeURIComponent(win.start.toISOString())}`
-    + `&end=${encodeURIComponent(win.now.toISOString())}&period=month`
+  const zone = browserZone();
+  const url = `/api/energy?start=${encodeURIComponent(win.startParam)}`
+    + `&end=${encodeURIComponent(win.endParam)}&period=month`
     + (zone ? `&tz=${encodeURIComponent(zone)}` : '');
   const body = await getJSON(url);
   const buckets = Array.isArray(body.buckets) ? body.buckets : [];
@@ -295,8 +317,8 @@ const tierWord = (tier) =>
   tier === 'hourly' ? 'hourly' : tier === 'minute' ? 'minute' : 'raw';
 
 // Real elapsed time, never a difference of calendar fields. One month a year
-// is 721 hours long and one is 743, and apportioning a connection charge by
-// the wrong one is out by an hour twice a year.
+// is 721 hours long and one is 743, and counting the days in one by subtracting
+// its month numbers is out by an hour twice a year.
 const elapsed = (a, b) => b.getTime() - a.getTime();
 
 // ---------------------------------------------------------------------------
@@ -358,8 +380,8 @@ function shortNote(entry, what) {
 
 function renderMonth(win, priced) {
   $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
-  const days = Math.round(elapsed(win.start, win.end) / 86400000);
-  const done = elapsed(win.start, win.now) / 86400000;
+  const days = win.days;
+  const done = win.done;
   const fraction = priced ? priced.fractionElapsed : Math.min(1, done / days);
   // Within the last three-quarters of an hour of a month, calling it a part
   // month is pedantry rather than honesty; before that, saying so is the whole
@@ -816,9 +838,11 @@ function renderAssumptions(p, hasTariff, unreadable) {
     bits.push('Energy comes from the inverter’s own lifetime kWh counters, differenced '
       + 'across each rate band. Integrating stored power instead would agree on a clean day and '
       + 'quietly undercount after any gap in collection.');
-    bits.push('A band is a wall-clock range in this device’s timezone, and a month runs '
-      + 'from local midnight on the first. Daylight saving makes one day 23 hours long and '
-      + 'another 25, and both are counted as they fall.');
+    bits.push('A band is a wall-clock range on the installation’s own clock'
+      + (p && p.zone ? ` — ${esc(zoneWords(p.zone))} — ` : ', ')
+      + 'and a month runs from midnight there on the first, not from midnight wherever this '
+      + 'page is being read. Daylight saving makes one day 23 hours long and another 25, and '
+      + 'both are counted as they fall.');
     bits.push('The saving is what the same house load would have cost at the same tariff, less '
       + 'what the grid actually cost. It excludes the connection charge, which is payable '
       + 'whatever the roof does.');
@@ -859,9 +883,9 @@ function renderAssumptions(p, hasTariff, unreadable) {
 // rejected the seasonal band format the service accepts, and in the form it did
 // accept it applied the summer peak window to a January evening.
 async function monthCost(win) {
-  const zone = localZone();
-  return getJSON(`/api/costs?start=${encodeURIComponent(win.start.toISOString())}`
-    + `&end=${encodeURIComponent(win.now.toISOString())}`
+  const zone = browserZone();
+  return getJSON(`/api/costs?start=${encodeURIComponent(win.startParam)}`
+    + `&end=${encodeURIComponent(win.endParam)}`
     + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
 }
 
@@ -891,6 +915,10 @@ function fromQuote(quote) {
   const elapsedMin = numOrNull(quote.elapsed_minutes);
   return {
     currency: quote.currency || '$',
+    // Which calendar this month was cut on. Reported rather than assumed: the
+    // page asked in one zone's words and the service answers in the zone it
+    // resolved, and on a page of money the difference is worth naming.
+    zone: typeof quote.timezone === 'string' ? quote.timezone : null,
     rows,
     energyCost: numOrNull(cost.energy_cost),
     noSolarCost: numOrNull(cost.no_solar_cost),
@@ -945,7 +973,10 @@ function monthNames(list) {
 }
 
 async function refresh() {
-  const win = monthWindow(new Date());
+  // The month the *installation* is in, which is not always the month the
+  // browser is in, and is never the browser's month measured from the browser's
+  // midnight. Everything below hangs off this.
+  const win = monthWindow(civilNow(await siteZone()));
   // Collected rather than set as they happen: two reads can fail in one pass,
   // and a second failure overwriting the first would leave the page explaining
   // only half of what went wrong.

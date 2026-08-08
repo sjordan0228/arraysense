@@ -7,6 +7,62 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.2 — 8 August 2026
+
+### Added
+
+- **The installation has its own timezone**
+  ([#7](https://github.com/sjordan0228/arraysense/issues/7)). Every page used to
+  send the *browser's* zone, so a phone that had travelled got a different
+  answer for the same day — and a bill drawn against the wrong midnight looks
+  entirely normal rather than obviously wrong. Rate bands are wall-clock hours
+  in the owner's zone, so this is the one setting a tariff cannot be read
+  without. The zone now decides, then the request, then the machine; an
+  unresolvable name is refused where it is typed rather than discovered later
+  by an endpoint that has to guess what to do about it. The pages ask the
+  service which calendar to build rather than assuming their own — half a fix
+  here is worse than none, because a page still cutting months on the
+  browser's clock while the service prices on the installation's loses the
+  connection charge and can show one month's bill under another month's
+  heading. Leaving it empty follows the host exactly as before, so nothing
+  moves on upgrade.
+- **A friendly editor for the rate bands.** They were a box of pipe-delimited
+  text — a rate, a clock range and a season per line — which is a reasonable
+  thing to ask of somebody who wrote it and an unreasonable one for anybody
+  else. Each band now has a rate box, month toggles and time selectors. What
+  is *stored* is the same text as before and the service is still the only
+  thing that judges it: a browser with its own opinion about tariff grammar is
+  how a January evening once got priced at a summer peak rate. A band the
+  editor cannot represent keeps its own text box rather than being dropped,
+  and bands nobody touched are saved back exactly as they were written. A band
+  whose hours are entirely claimed by a band above it is now pointed out —
+  bands are first-match-wins, so one that prices nothing is almost always a
+  mistake, and until now nothing anywhere said so. A band name cannot hold a
+  pipe, a semicolon or a line break: those separate one band and one field from
+  the next, so a name containing them would store a different set of bands than
+  the one on screen. They are dropped when the name is saved, and the editor
+  says so beside it.
+- **Where the installation is**, as latitude and longitude, with a control that
+  fills them from the device you are holding. Groundwork for weather
+  ([#5](https://github.com/sjordan0228/arraysense/issues/5)). Empty means not
+  recorded and is kept distinct from zero, which is a real place in the Gulf of
+  Guinea.
+- **A contact address**, recorded for alerts that do not exist yet, and masked
+  on read like the serials. Nothing is sent to it. Sending needs a mail server
+  and a password, and there is nowhere honest to put a password until
+  [#34](https://github.com/sjordan0228/arraysense/issues/34) settles
+  authentication.
+- **Common currencies are suggested** rather than typed blind
+  ([#6](https://github.com/sjordan0228/arraysense/issues/6)) — offered, never
+  enforced, so an unusual currency stays possible and one already configured is
+  never replaced.
+- **An About panel** naming the running version and what the connected driver
+  declares it can measure.
+- **Numbers say what they are measured in.** Seconds, currency per month,
+  currency per kWh, decimal degrees. The export credit is money for each
+  exported kWh rather than an amount of energy, and now says so — a box marked
+  only "kWh" invites a rate to be typed as a quantity.
+
 ## 0.5.1 — 8 August 2026
 
 Closes every open item in 0.5.0's known issues except the rollup migration,

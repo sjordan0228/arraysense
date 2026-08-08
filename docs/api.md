@@ -27,13 +27,22 @@ Whether the collector is running, connected, and keeping up.
   "consecutive_failures": 0,
   "total_samples": 7854,
   "total_failures": 3,
-  "started_at": "2026-08-06T00:00:00+00:00"
+  "started_at": "2026-08-06T00:00:00+00:00",
+  "timezone": "America/Chicago"
 }
 ```
 
 `consecutive_failures` is the field to alert on. A single failure is ordinary — the
 dongle drops connections — but a climbing count means the retry backoff is not
 recovering.
+
+`timezone` is the zone this service would cut a calendar answer on, by the
+precedence below: the setting, then the optional `tz` query parameter, then the
+machine's own zone. It is here so a caller can ask *before* asking anything else —
+"which calendar are you going to answer on" has to be settled before a request for
+"this month" can be written, and a caller that decides for itself has made a second
+copy of the precedence rule. An unresolvable `tz` is stepped past here rather than
+refused, so this endpoint always answers.
 
 ## `GET /api/live`
 
@@ -216,7 +225,9 @@ configuration file.
       "help": "Applies to every temperature on the page, on every device.",
       "choices": ["F", "C"],
       "lower": null, "upper": null,
-      "secret": false, "default": "F"
+      "secret": false, "default": "F",
+      "max_length": 128, "multiline": false,
+      "unit": "", "suggestions": [], "optional": false
     }
   ],
   "values": { "display.temperature_unit": "F", "connection.dongle_serial": "BA••••••60" }
@@ -227,6 +238,49 @@ The field descriptions travel with the values so a page renders its controls fro
 this rather than hard-coding labels, bounds and choices. Hard-coded copies drift
 from the validation the moment either changes, and the drift surfaces as a control
 offering a value the server then refuses.
+
+Every field carries every key, empty where there is nothing to say, so a page reads
+them unconditionally rather than branching on whether the server mentioned them.
+
+- `unit` is what the number means — `"seconds"`, `"currency per kWh"` — rendered
+  beside the control. The money settings name themselves as rates, because a box
+  labelled `kWh` invites a rate to be typed as a quantity of energy.
+- `suggestions` are offered and never enforced: a datalist, not a choice list. The
+  currency has them because a closed list would make an unusual currency
+  unrepresentable, and a value already typed must never be replaced by a suggested
+  one. Use `choices` for what the server genuinely refuses anything else for.
+- `optional` says the setting can hold *nothing*, distinct from any number it could
+  hold. `site.latitude` is the case that forces it: `0.0` is a real place in the
+  Gulf of Guinea, so an unset coordinate cannot be represented as zero. An optional
+  setting reads back as `null`, and is cleared by sending `null` or `""`. Sending
+  `0` sets it to the equator, which is a different statement.
+
+## Where the installation is
+
+`site.timezone` is an IANA name and decides where midnight falls and which
+wall-clock hours a rate band covers. It is resolved against the tz database when it
+is saved, so an unparseable zone is a `400` at the box it was typed in rather than
+a history page that later cannot answer.
+
+Zone precedence for `/api/energy` and `/api/costs` is **the setting, then the
+request's `tz`, then the machine's own zone**. The installation is in one place
+while the person looking at it may not be, and a bill drawn against a travelling
+phone's midnight looks entirely normal while being wrong. Empty is the default, so
+an install that has set nothing keeps following the browser exactly as before. Both
+endpoints return the zone they actually used as `timezone` — on every path,
+including the one where there is no tariff to price anything with — and so does
+`/api/status`, which is where a caller asks the question first. Nothing is cached
+anywhere, so a change takes effect on the next request.
+
+That precedence is why the calendar bound of a range should be sent **naive**:
+`start=2026-08-01T00:00:00` is read as midnight in whichever zone the service
+resolved, which is the midnight the answer is cut at. An instant computed by the
+caller — `2026-08-01T05:00:00Z`, midnight where the caller happens to be — is not
+that midnight once the two zones differ, and asking about "this month" from the
+wrong one loses the whole monthly connection charge, which falls due on the first
+and is never apportioned. An instant is still the right thing for the *end* of a
+range: it carries no calendar question and it is what says how much of the period
+in progress has actually happened.
 
 `PUT` takes a flat object of key to value and returns what changed:
 

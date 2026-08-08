@@ -92,6 +92,29 @@ def test_status_reports_the_collector(client: Any) -> None:
     assert body["version"]
 
 
+def test_status_names_the_calendar_it_would_answer_on(client: Any) -> None:
+    # A page cannot write a request for "this month" until it knows which zone
+    # the reply will be cut in, and working that out in the browser would be a
+    # second copy of the precedence rule — the copy that drifts. This is the
+    # one copy: the setting, then the caller's tz, then the machine's.
+    assert client.get("/api/status", params={"tz": "Asia/Tokyo"}).json()["timezone"] == "Asia/Tokyo"
+    client.put("/api/settings", json={"site.timezone": "Pacific/Honolulu"})
+    assert (
+        client.get("/api/status", params={"tz": "Asia/Tokyo"}).json()["timezone"]
+        == "Pacific/Honolulu"
+    )
+
+
+def test_status_answers_even_when_the_caller_names_a_zone_it_does_not_know(client: Any) -> None:
+    # /api/energy refuses an unknown zone with a 400 and the page's answer is
+    # to ask again without it. Refusing here too would take down the banner
+    # over a stale browser zone, and the fallback is the same zone that retry
+    # lands on — so the calendar the page builds still matches the reply.
+    r = client.get("/api/status", params={"tz": "Mars/Olympus_Mons"})
+    assert r.status_code == 200
+    assert r.json()["timezone"] == client.get("/api/status").json()["timezone"]
+
+
 # --- the staleness verdict -------------------------------------------------
 #
 # The banner used to reach these conclusions in the browser, from a copy of the
@@ -648,6 +671,53 @@ def test_changing_a_connection_setting_asks_for_a_restart(client: Any) -> None:
     assert r.json()["restart_required"] is True
 
 
+def test_posting_a_masked_email_back_does_not_overwrite_the_real_one(client: Any) -> None:
+    # Same trap as the serials: the page renders the mask, and a form saved
+    # without touching the field would write the bullets over the address.
+    client.put("/api/settings", json={"site.contact_email": "owner@example.com"})
+    masked = client.get("/api/settings").json()["values"]["site.contact_email"]
+    assert "owner@example.com" not in masked
+    r = client.put("/api/settings", json={"site.contact_email": masked})
+    assert r.status_code == 200
+    assert r.json()["changed"] == []
+    assert client.get("/api/settings").json()["values"]["site.contact_email"] == masked
+
+
+def test_the_described_fields_carry_a_unit_and_suggestions(client: Any) -> None:
+    # What agent B's page renders from. Both keys are present on every field,
+    # so the page never has to branch on whether the server mentioned them.
+    fields = client.get("/api/settings").json()["fields"]
+    assert all("unit" in f and "suggestions" in f for f in fields)
+    poll = next(f for f in fields if f["key"] == "collector.poll_interval")
+    assert poll["unit"] == "seconds"
+    currency = next(f for f in fields if f["key"] == "tariff.currency")
+    assert "$" in currency["suggestions"]
+    assert currency["choices"] == []
+
+
+def test_an_unset_coordinate_arrives_as_null_and_the_equator_as_zero(client: Any) -> None:
+    # 0.0 is a real place. The wire has to keep "not set" and "on the equator"
+    # apart, or the page cannot tell them apart either.
+    body = client.get("/api/settings").json()
+    assert body["values"]["site.latitude"] is None
+    latitude = next(f for f in body["fields"] if f["key"] == "site.latitude")
+    assert latitude["optional"] is True
+    assert latitude["default"] is None
+
+    assert client.put("/api/settings", json={"site.latitude": 0.0}).status_code == 200
+    assert client.get("/api/settings").json()["values"]["site.latitude"] == 0.0
+    # And an emptied box clears it rather than moving the site to the equator.
+    assert client.put("/api/settings", json={"site.latitude": ""}).status_code == 200
+    assert client.get("/api/settings").json()["values"]["site.latitude"] is None
+
+
+def test_an_unparseable_timezone_is_a_400_at_the_settings_endpoint(client: Any) -> None:
+    r = client.put("/api/settings", json={"site.timezone": "Mars/Olympus_Mons"})
+    assert r.status_code == 400
+    assert "site.timezone" in r.json()["detail"]
+    assert client.get("/api/settings").json()["values"]["site.timezone"] == ""
+
+
 # --- the pages ----------------------------------------------------------------
 
 
@@ -796,6 +866,22 @@ def test_costs_shows_no_money_at_all_without_a_tariff(client: Any) -> None:
     assert body["cost"] is None
     assert body["bill"] is None
     assert body["currency"] is None
+
+
+def test_costs_names_its_calendar_even_with_no_tariff(client: Any) -> None:
+    # A page has to be able to say which calendar it is showing whether or not
+    # there is money on it, and a field that appears only sometimes is one every
+    # caller has to branch on. The docs promise it on both endpoints.
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-15T00:00:00",
+            "end": "2026-07-16T00:00:00",
+            "tz": "Asia/Tokyo",
+        },
+    ).json()
+    assert body["configured"] is False
+    assert body["timezone"] == "Asia/Tokyo"
 
 
 def test_costs_prices_the_seasonal_tariff_the_page_could_not_read(client: Any) -> None:
@@ -1019,6 +1105,33 @@ def _energy_client(tmp_path: Path, build: Any, bands: str | None = COSERV_BANDS)
     if bands is not None:
         client.put("/api/settings", json={"tariff.bands": bands, "tariff.fixed_monthly": 15.0})
     return client
+
+
+def test_a_date_in_words_buckets_on_the_installations_calendar(tmp_path: Path) -> None:
+    # What the History page depends on. It builds one row per day on the site's
+    # calendar and keys the reply's buckets by their own date, so the two have
+    # to be cut at the same midnights. Asking with the reader's midnight begins
+    # the run a day early where the inverter is — that first bucket then has no
+    # row to land in and is dropped from the table, the chart and the row count,
+    # while its energy stays inside the footer's total.
+    with _energy_client(tmp_path, lambda s: _counters(s, JULY - timedelta(hours=2), AUGUST)) as c:
+        c.put("/api/settings", json={"site.timezone": "Pacific/Honolulu"})
+        asked = {"period": "day", "tz": "America/Chicago"}
+        in_words = c.get(
+            "/api/energy",
+            params={"start": "2026-07-10T00:00:00", "end": "2026-07-13T00:00:00", **asked},
+        ).json()
+        readers = c.get(
+            "/api/energy",
+            params={"start": "2026-07-10T05:00:00Z", "end": "2026-07-13T05:00:00Z", **asked},
+        ).json()
+    assert in_words["timezone"] == readers["timezone"] == "Pacific/Honolulu"
+    assert [b["start"][:10] for b in in_words["buckets"]] == [
+        "2026-07-10",
+        "2026-07-11",
+        "2026-07-12",
+    ]
+    assert readers["buckets"][0]["start"][:10] == "2026-07-09"
 
 
 def _july(client: Any, **extra: Any) -> Any:
@@ -1392,6 +1505,32 @@ def test_the_month_charge_is_judged_in_the_owners_zone(client: Any) -> None:
         },
     ).json()
     assert (body.get("cost") or {}).get("fixed_charge") == pytest.approx(15.0, abs=0.01)
+
+
+def test_the_month_charge_survives_a_reader_in_another_zone(client: Any) -> None:
+    # The defect the pages carried once the setting could outrank the browser.
+    # A page that computes midnight on the first where the *reader* is sends an
+    # instant that, five hours west, is the previous month's evening — so the
+    # connection charge that falls due whole was apportioned to a fifth of
+    # itself, and the month-to-date cost was short by the hours either side.
+    #
+    # The fix is to send the date in words and let the service read it in the
+    # zone it resolved, which is the whole point of a naive bound.
+    client.put(
+        "/api/settings",
+        json={
+            "tariff.bands": "Flat | 0.12 | 00:00-24:00",
+            "tariff.fixed_monthly": 15.0,
+            "site.timezone": "Pacific/Honolulu",
+        },
+    )
+    rest = {"end": "2026-07-20T00:00:00", "tz": "America/Chicago"}
+    readers = client.get("/api/costs", params={"start": "2026-07-01T05:00:00Z", **rest}).json()
+    assert (readers.get("cost") or {}).get("fixed_charge") != pytest.approx(15.0, abs=0.01)
+
+    in_words = client.get("/api/costs", params={"start": "2026-07-01T00:00:00", **rest}).json()
+    assert in_words["timezone"] == "Pacific/Honolulu"
+    assert (in_words.get("cost") or {}).get("fixed_charge") == pytest.approx(15.0, abs=0.01)
 
 
 def test_status_reports_recovered_crossed_replies(client: Any) -> None:
