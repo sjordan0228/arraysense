@@ -7,6 +7,27 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.7 — 8 August 2026
+
+### Added
+
+- **An endpoint that says which tariff band a stretch of time fell in**
+  ([#46](https://github.com/sjordan0228/arraysense/issues/46)). `GET /api/bands`
+  returns the ordered windows covering a range, each with its band, its price and
+  its exact bounds. This is the groundwork for shading the Power flow chart by
+  band, so grid import can be read against what it cost rather than only how much
+  there was. The chart itself comes next; nothing on any page changes yet.
+
+  The windows are worked out here rather than in the browser for the same reason
+  the pricing is. When the page had its own copy of the tariff rules the two
+  disagreed within a day: it rejected the seasonal format the parser accepts, so a
+  real tariff priced nothing at all, and in the older format it had no notion of a
+  season and charged a January evening at the summer peak rate.
+
+  With no tariff configured the answer is no windows, rather than one window
+  implying the whole day was cheap. A range longer than can be walked is refused
+  with a clear message instead of a server error.
+
 ## 0.5.6 — 8 August 2026
 
 ### Changed

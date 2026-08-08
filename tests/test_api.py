@@ -9,6 +9,7 @@ always agrees.
 
 from __future__ import annotations
 
+import itertools
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1917,3 +1918,139 @@ def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> 
     assert device["per_module_battery"] is None
     assert device["metrics"] is None
     assert device["battery_module_metrics"] is None
+
+
+# --- which tariff band a moment fell in (#46) -----------------------------------
+#
+# The Power flow chart shades its background by band so grid import can be read
+# against what it cost. The windows are resolved here rather than in the page for
+# the same reason the pricing is: the browser once had its own tariff parser and
+# the two disagreed within a day, charging a January evening at the summer peak
+# rate. A page that draws bands it worked out itself is that bug with a chart
+# instead of a number.
+
+_SEASONAL = (
+    "On-peak | 0.210321 | 15:00-20:00 | May-Oct; "
+    "Off-peak | 0.086709 | 00:00-24:00 | May-Oct; "
+    "Winter | 0.123030 | 00:00-24:00 | Nov-Apr"
+)
+
+
+def _bands(client: Any, **params: Any) -> Any:
+    return client.get("/api/bands", params=params).json()
+
+
+def test_bands_returns_one_window_for_a_range_inside_a_single_band(client: Any) -> None:
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    body = _bands(
+        client,
+        start="2026-07-15T21:00:00Z",  # 16:00 Chicago, inside the 15:00-20:00 peak
+        end="2026-07-15T22:00:00Z",
+        tz="America/Chicago",
+    )
+    assert [w["band"] for w in body["windows"]] == ["On-peak"]
+    assert body["windows"][0]["price_per_kwh"] == pytest.approx(0.210321)
+
+
+def test_bands_splits_exactly_at_a_boundary_with_no_gap_and_no_overlap(client: Any) -> None:
+    # A gap would leave a stripe of chart unshaded that really was in a band; an
+    # overlap would paint one instant twice. The boundary is the whole point.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    body = _bands(
+        client,
+        start="2026-07-15T23:00:00Z",  # 18:00 Chicago, peak
+        end="2026-07-16T02:00:00Z",  # 21:00 Chicago, off-peak
+        tz="America/Chicago",
+    )
+    windows = body["windows"]
+    assert [w["band"] for w in windows] == ["On-peak", "Off-peak"]
+    assert windows[0]["end"] == windows[1]["start"]
+
+
+def test_bands_changes_season_partway_through_a_range(client: Any) -> None:
+    # A thirty-day view can cross a seasonal boundary, so returning one daily
+    # pattern for the whole range prices half of it wrong.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    body = _bands(
+        client,
+        start="2026-10-30T12:00:00Z",
+        end="2026-11-02T12:00:00Z",
+        tz="America/Chicago",
+    )
+    names = {w["band"] for w in body["windows"]}
+    assert "Winter" in names, "the November side of the range is still priced as summer"
+    assert names & {"On-peak", "Off-peak"}, "the October side lost its summer bands"
+
+
+def test_bands_are_wall_clock_in_the_owners_zone_not_utc(client: Any) -> None:
+    # The trap that mispriced every hour of every day: an aware bound must be
+    # converted to the owner's zone, not merely have one attached. Read against
+    # the UTC clock a 15:00-20:00 peak lands at 10:00-15:00 local.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    body = _bands(
+        client,
+        start="2026-07-15T17:00:00Z",  # 12:00 Chicago — off-peak
+        end="2026-07-15T18:00:00Z",  # 13:00 Chicago — still off-peak
+        tz="America/Chicago",
+    )
+    assert [w["band"] for w in body["windows"]] == ["Off-peak"], (
+        "midday local was priced as peak, so the bands matched the UTC clock"
+    )
+
+
+def test_bands_survive_a_daylight_saving_change(client: Any) -> None:
+    # A day is not always 24 hours. The window crossing the change is the one
+    # that goes wrong, and it goes wrong silently.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    body = _bands(
+        client,
+        start="2026-11-01T04:00:00Z",  # spans 2026-11-01, when US DST ends
+        end="2026-11-01T12:00:00Z",
+        tz="America/Chicago",
+    )
+    windows = body["windows"]
+    assert windows, "the DST day produced no windows at all"
+    for earlier, later in itertools.pairwise(windows):
+        assert earlier["end"] == later["start"], "a DST-day window left a gap"
+
+
+def test_bands_refuses_a_zone_the_tz_database_does_not_know(client: Any) -> None:
+    # Refused rather than quietly fallen back on, the way /api/energy refuses it.
+    # A band window is a claim about which hours were expensive; one cut on a zone
+    # the caller did not ask for is wrong in a way nothing on the page reveals.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    r = client.get(
+        "/api/bands",
+        params={
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-07-16T00:00:00Z",
+            "tz": "Mars/Olympus_Mons",
+        },
+    )
+    assert r.status_code == 400
+    assert "Mars/Olympus_Mons" in r.json()["detail"]
+
+
+def test_bands_refuses_a_range_longer_than_it_can_walk(client: Any) -> None:
+    # A caller asking for five years gets told so, not a 500 implying the service
+    # is broken. band_intervals raises ValueError; the endpoint converts it.
+    client.put("/api/settings", json={"tariff.bands": _SEASONAL})
+    r = client.get(
+        "/api/bands",
+        params={"start": "2021-01-01T00:00:00Z", "end": "2026-01-01T00:00:00Z"},
+    )
+    assert r.status_code == 400
+    assert "may not exceed" in r.json()["detail"]
+
+
+def test_bands_are_absent_rather_than_everything_when_no_tariff_is_set(client: Any) -> None:
+    # Absent data is not zero. With no tariff the chart must draw no shading at
+    # all, rather than one window implying the whole day was cheap.
+    body = _bands(
+        client,
+        start="2026-07-15T00:00:00Z",
+        end="2026-07-16T00:00:00Z",
+        tz="America/Chicago",
+    )
+    assert body["configured"] is False
+    assert body["windows"] == []

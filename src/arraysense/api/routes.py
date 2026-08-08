@@ -41,7 +41,13 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
-from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
+from arraysense.costs import (
+    band_intervals,
+    bucket_energy,
+    period_energy,
+    price_period,
+    unpriced_minutes,
+)
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
@@ -1257,6 +1263,76 @@ def _bucket_money(
         "cost_short": result.cost_is_short,
         "saved_short": result.savings_is_short,
         "shortfall": _shortfall_payload(split.shortfall if split else None),
+    }
+
+
+@router.get("/bands")
+async def bands(
+    request: Request,
+    start: datetime,
+    end: datetime,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """Return the ordered tariff-band windows covering a time range.
+
+    The chart shades its background by band so grid import can be read against
+    what it cost. The windows are resolved here rather than in the page for the
+    same reason the pricing is: the browser once had its own tariff parser and
+    the two disagreed within a day, charging a January evening at the summer
+    peak rate. A page that draws bands it worked out itself is that bug with a
+    chart instead of a number.
+
+    Absent data is not zero: with no tariff configured the windows are absent,
+    not one window covering everything.
+    """
+    store = request.app.state.store
+    settings = SettingsStore(store)
+    tariff = load_tariff(settings.all())
+    # A zone this tz database does not know is refused, as ``/api/energy``
+    # refuses it, rather than quietly falling back the way ``/api/status`` does.
+    # The difference is what the answer is for: a status banner cut on the wrong
+    # calendar is cosmetic, but a band window is a claim about which hours were
+    # expensive, and one cut on a zone the caller did not ask for is wrong in a
+    # way nothing on the page could reveal.
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if tariff is None:
+        return {
+            "configured": False,
+            "timezone": str(zone),
+            "windows": [],
+        }
+
+    start, end = with_zone(start, zone), with_zone(end, zone)
+    _check_range(start, end)
+
+    # A range longer than the tariff walk will scan is the caller's mistake, not
+    # the server's. ``band_intervals`` says so with a ValueError, which would
+    # otherwise leave FastAPI to answer 500 — telling somebody who asked for five
+    # years that the service is broken. ``/api/costs`` converts the same error
+    # for the same reason.
+    try:
+        intervals = band_intervals(tariff, start, end, zone)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    windows = [
+        {
+            "start": interval.start.isoformat(),
+            "end": interval.end.isoformat(),
+            "band": interval.band,
+            "price_per_kwh": interval.price_per_kwh,
+        }
+        for interval in intervals
+    ]
+
+    return {
+        "configured": True,
+        "timezone": str(zone),
+        "windows": windows,
     }
 
 

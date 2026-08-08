@@ -44,7 +44,6 @@ from arraysense.tariff import (
     CostResult,
     EnergyShortfall,
     PeriodEnergy,
-    RateBand,
     Tariff,
     compute_cost,
 )
@@ -99,6 +98,7 @@ class BandInterval:
     band: str | None
     start: datetime
     end: datetime
+    price_per_kwh: float | None = None
 
 
 def _clock_marks(tariff: Tariff) -> tuple[time, ...]:
@@ -214,13 +214,37 @@ def band_intervals(
     local_end = _local(end, zone)
     out: list[BandInterval] = []
     edge = local_start
-    current = _band_name(tariff, local_start)
+    current_band = tariff.band_at(local_start)
     for moment in _candidates(tariff, local_start, local_end, zone):
-        name = _band_name(tariff, moment)
-        if name != current:
-            out.append(BandInterval(current, edge, moment))
-            edge, current = moment, name
-    out.append(BandInterval(current, edge, local_end))
+        next_band = tariff.band_at(moment)
+        # Bands are compared as objects rather than by name so the price can be
+        # carried out with each interval. That is only equivalent to comparing
+        # names because two bands cannot share one: ``parse_bands`` refuses a
+        # duplicate, saying energy is reported per band by name so the names have
+        # to differ. Were that ever relaxed, two same-named bands in different
+        # seasons would split here where they used to join — which changes where
+        # energy is attributed, and therefore what it costs.
+        if next_band != current_band:
+            price = current_band.price_per_kwh if current_band else None
+            out.append(
+                BandInterval(
+                    current_band.name if current_band else None,
+                    edge,
+                    moment,
+                    price,
+                )
+            )
+            edge = moment
+            current_band = next_band
+    price = current_band.price_per_kwh if current_band else None
+    out.append(
+        BandInterval(
+            current_band.name if current_band else None,
+            edge,
+            local_end,
+            price,
+        )
+    )
     return out
 
 
@@ -236,11 +260,6 @@ def unpriced_minutes(tariff: Tariff, start: datetime, end: datetime, zone: ZoneI
         for i in band_intervals(tariff, start, end, zone)
         if i.band is None
     )
-
-
-def _band_name(tariff: Tariff, moment: datetime) -> str | None:
-    band: RateBand | None = tariff.band_at(moment)
-    return band.name if band is not None else None
 
 
 def _aligned(
