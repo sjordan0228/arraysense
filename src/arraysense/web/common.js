@@ -37,16 +37,66 @@ const BASE_CSS = `
     --grid-line:rgba(255,255,255,.08);
     --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
     --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+    /* Canvas cannot read a stylesheet, so anything drawn to one has to be told
+       its colour. These three exist for that: the chart code reads them at draw
+       time the same way it reads a series hue, and they are the only thing that
+       has to change for a canvas to follow the theme.
+       --wash-rgb is a bare triplet rather than a colour because the band shading
+       composes it with a different opacity per band. --theme is read as a word,
+       so nothing has to infer the theme by inspecting a colour. */
+    --theme:dark;
+    --zero-rule:rgba(255,255,255,.28);
+    --wash-rgb:255,255,255;
+    /* Tints laid over a panel — track backgrounds, input fills, pressed states.
+       They are the surface's own colour at low opacity, so on a light panel a
+       white one is invisible and they have to invert with the theme. */
+    --tint:rgba(255,255,255,.07); --tint-2:rgba(255,255,255,.12);
+    --tint-3:rgba(255,255,255,.19);
+    /* The page itself. Left as a literal, a light theme put light panels and
+       dark text on a dark page: the headings sat on their own background and
+       vanished. The panels are translucent over this, so it is the one colour
+       everything else is read against. */
+    --page:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
+    --glow:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      /* Light theme tokens. The chart hues separate identically on light or dark
+         — a pair's distance does not depend on the background — but their contrast
+         against the surface changes. These values are the dark theme's until
+         measured against a light panel like #f7f8fb. */
+      --ink:#1a1a1a; --ink2:#333333; --ink3:#555555;
+      --grid-line:rgba(0,0,0,.12);
+      --panel:rgba(255,255,255,.85); --panel-b:rgba(0,0,0,.15);
+      /* Light-theme chart hues need measuring against the light surface. For now,
+         reuse the dark values — the relationships between them are already validated. */
+      --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
+      --batt-dis:#d1495b;
+      --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+      /* The three canvas tokens, inverted. A white wash on a light panel is
+         invisible, and a white zero rule with it — these are the whole reason
+         the canvas needs telling rather than inheriting. */
+      --theme:light;
+      --zero-rule:rgba(0,0,0,.34);
+      --wash-rgb:0,0,0;
+      --tint:rgba(0,0,0,.05); --tint-2:rgba(0,0,0,.10);
+      --tint-3:rgba(0,0,0,.16);
+      /* The same walk through the same hues, lightened: dawn rather than dusk.
+         Keeping the shape means the page still reads as this installation's
+         rather than as a generic light theme. */
+      --page:linear-gradient(168deg,#eef1f8 0%,#e7ebf5 34%,#efe8f3 62%,#f8ece3 85%,#fdf4e7 100%);
+      --glow:radial-gradient(circle,rgba(255,186,96,.20),transparent 66%);
+    }
   }
   * { box-sizing:border-box; }
   body {
     margin:0; min-height:100vh; color:var(--ink);
     font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
-    background:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
+    background:var(--page);
     background-attachment:fixed;
   }
   .sunglow{position:fixed;width:420px;height:420px;border-radius:50%;right:-140px;top:-160px;
-    background:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);filter:blur(16px);pointer-events:none}
+    background:var(--glow);filter:blur(16px);pointer-events:none}
   main{position:relative;max-width:1180px;margin:0 auto;padding:22px 20px 40px}
   header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
   h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
@@ -822,9 +872,16 @@ const SYNC_KEY = 'arraysense';
 // OKLCH space against a protan, deutan and tritan checker, and a second copy
 // of them is a copy that drifts away from the one that was validated. The map
 // below is only reached when there is no computed style to read at all.
+//
+// The fallback values are dark-theme defaults. When the stylesheet is not
+// available, the canvas falls back to these; when it is, the computed style
+// wins and respects prefers-color-scheme.
 const INK_FALLBACK = {
   '--pv':'#cf7b26', '--load':'#4678cc', '--batt':'#2aa198', '--grid':'#b0486e',
   '--batt-dis':'#d1495b', '--ink2':'#c8cbd9', '--ink3':'#8d92a8', '--grid-line':'rgba(255,255,255,.08)',
+  // Reached only when there is no computed style at all, which is the dark
+  // theme's case by definition — with a stylesheet the media query answers.
+  '--theme':'dark', '--zero-rule':'rgba(255,255,255,.28)', '--wash-rgb':'255,255,255',
 };
 const inkCache = {};
 function ink(name) {
@@ -835,6 +892,13 @@ function ink(name) {
     inkCache[name] = value || INK_FALLBACK[name];
   }
   return inkCache[name];
+}
+// Whether the light theme is in force, read as a word the stylesheet declares
+// rather than inferred from a colour. Inferring it meant parsing --panel's rgba
+// and summing the channels against a threshold, which is a rule nobody would
+// know they had broken by restyling a panel.
+function isLightTheme() {
+  return ink('--theme') === 'light';
 }
 
 // Fills are the series colour at lower opacity and never a colour of their
@@ -919,7 +983,7 @@ const zeroRule = () => ({
       if (y < top || y > top + height) return;
       const ctx = u.ctx;
       ctx.save();
-      ctx.strokeStyle = 'rgba(255,255,255,.28)';
+      ctx.strokeStyle = ink('--zero-rule');
       ctx.lineWidth = uPlot.pxRatio || 1;
       ctx.beginPath();
       ctx.moveTo(left, y);
@@ -937,10 +1001,11 @@ const zeroRule = () => ({
 // could never say. Luminance carries it instead, and luminance is the one
 // distinction that survives every form of colour vision deficiency.
 //
-// The wash is white on a dark panel, so more opacity reads *brighter*. The more
+// On a dark panel the wash is white, so more opacity reads *brighter*. The more
 // expensive the band, the more it stands out, which puts the eye on the costly
-// hours. The legend says "brighter = higher rate" for that reason, and the two
-// must not drift apart.
+// hours. On a light panel the wash is dark, so more opacity reads *darker* —
+// the expensive hours are still the ones that stand out, just in the opposite
+// direction. The legend text must reverse accordingly.
 //
 // ``getWindows`` is a function, not an array, and that is load-bearing. ``paint``
 // builds a chart once and afterwards only calls ``setData`` on it, so a plugin
@@ -984,6 +1049,12 @@ function bandShade(getWindows) {
         ctx.beginPath();
         ctx.rect(left, top, width, height);
         ctx.clip();
+        // ``ink`` caches, as it does for every token, so switching the system
+        // theme with the page open keeps the old wash until a reload. That is
+        // the same for every colour on every chart and not worth a cache
+        // invalidation of its own; it is written down so nobody reads this as
+        // live and is surprised.
+        const wash = ink('--wash-rgb');
 
         for (const w of windows) {
           // A stretch no band covers comes back with a null band and no price —
@@ -998,7 +1069,7 @@ function bandShade(getWindows) {
           const x1 = Math.min(left + width, u.valToPos(new Date(w.end).getTime() / 1000, 'x', true));
           if (x1 <= x0) continue;
 
-          ctx.fillStyle = `rgba(255,255,255,${opacity})`;
+          ctx.fillStyle = `rgba(${wash},${opacity})`;
           ctx.fillRect(x0, top, x1 - x0, height);
         }
 

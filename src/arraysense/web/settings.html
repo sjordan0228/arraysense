@@ -21,7 +21,7 @@
   .fields .wide{grid-column:1/-1}
   .f{display:flex;flex-direction:column;gap:5px;min-width:0}
   .f .lbl{display:block}
-  .f input,.f select,.f textarea{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
+  .f input,.f select,.f textarea{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;width:100%;
     font-variant-numeric:tabular-nums}
   .f textarea{resize:vertical;min-height:74px;line-height:1.55;
@@ -66,7 +66,7 @@
      parse_bands on the service does, as it did before. */
   .bands{display:flex;flex-direction:column;gap:10px}
   .band{border:1px solid var(--panel-b);border-radius:10px;padding:11px 12px;
-    background:rgba(255,255,255,.03);display:flex;flex-direction:column;gap:10px}
+    background:var(--tint);display:flex;flex-direction:column;gap:10px}
   .band .top{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
   .band .top .who{flex:1 1 200px;min-width:0}
   .band .top .rate{flex:0 1 210px;min-width:0}
@@ -80,9 +80,9 @@
   .span .hint{font-size:11px;color:var(--ink3)}
   .span .hint.warn{color:var(--warn)}
   .mons{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
-  .mons button{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);color:var(--ink3);
+  .mons button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
     border-radius:7px;padding:3px 8px;font:inherit;font-size:11.5px;cursor:pointer;line-height:1.4}
-  .mons button[aria-pressed="true"]{background:rgba(255,255,255,.19);color:var(--ink)}
+  .mons button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
   .mons .season{font-size:11px;color:var(--ink3);margin-left:4px}
   .bandacts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .bandacts .iconbtn{font-size:11.5px;padding:3px 9px}
