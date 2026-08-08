@@ -196,11 +196,21 @@ What the two halves trade off is *duration*. A bank that holds at its BMS charge
 reference for twenty minutes needs only every pack to have peaked full within that
 window. A bank that finishes faster — the reference installation crosses absorb and
 tapers to zero in about three minutes — has to show the packs *arriving* at full
-together: every pack the bank is known to hold at or above 99% within a couple of
-minutes of one another, at least one of them measured below full beforehand, and the
-current settled. Four counters cannot independently drift to full inside two minutes,
-and a bank whose counters have all been pegged at 100% for weeks shows no arrival at
-all, so neither is credited.
+together, which means a transition per pack: **every** pack the bank is known to hold
+measured below 99% in the quarter hour before the absorb, and every one of them at or
+above 99% at a single instant during it, with the current settled.
+
+Both halves are per pack because a charge resets every counter. Asking only that some
+pack had been below full is not enough: three counters drifted high and pegged at 100%
+beside a fourth that genuinely charged would satisfy it, and three quarters of the
+percentages on screen would then be stale ones drawn as measurements. Counters cannot
+independently drift across the bar inside a couple of minutes, a bank whose counters
+have all been pegged at 100% for weeks shows no transition at all, and the lookback
+stops at the previous absorb so one charge cannot vouch for the next.
+
+Neither door reports the reset itself, which nothing observes. The long door gives the
+end of the absorb and the short one the instant the whole bank was first seen to have
+arrived; both are late rather than early.
 
 | `severity` | Meaning |
 | --- | --- |

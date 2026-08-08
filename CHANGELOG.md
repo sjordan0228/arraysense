@@ -21,13 +21,14 @@ migration says so at the top of its entry.
   minutes, which this hardware never does: it crosses absorb, finishes and
   tapers to zero in about three minutes, so the sixty-day search came back
   empty with the charge sitting in the history. A charge that short is now
-  credited on the packs' own
-  evidence instead — every pack the bank is known to hold arriving at full
-  within a couple of minutes of one another, with the bank at its reference and
-  the current settled. What is *not* credited is a single counter drifting to
-  100% on its own, or a bank whose four counters have all been pegged at 100%
-  for weeks with no charge behind them; both are the drift being detected, and
-  both stay reported.
+  credited on the packs' own evidence instead: every pack the bank is known to
+  hold measured below full in the quarter hour before the absorb and at or above
+  99% together during it, with the bank at its reference and the current settled.
+  A transition per pack, because a charge resets every counter. What is *not*
+  credited is one counter drifting to 100% on its own, a bank whose counters have
+  all been pegged at 100% for weeks with no charge behind them, or three stale
+  counters sitting at 100% beside a fourth that really did charge — all three are
+  the drift being detected, and all three stay reported.
 
 ## 0.5.2 — 8 August 2026
 

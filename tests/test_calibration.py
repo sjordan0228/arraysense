@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from arraysense.calibration import (
+    CORROBORATING_ABSORB,
     ESTIMATE_AFTER_DAYS,
     INFO_AFTER_DAYS,
     PACK_RESET_LAG,
@@ -407,9 +408,15 @@ def test_a_wiring_alert_on_a_freshly_charged_bank_says_nothing_about_drift() -> 
 # minutes after the bank's own voltage had fallen back below the reference. The
 # spread across the four fell from 24 points to nothing. The climb before the
 # absorb is shortened; everything else is as recorded.
+#
+# ``DRIFTED`` is what the four read through the quarter hour before the absorb,
+# measured: 70-75, 77-80, 72-76 and 96-99. The fourth pack's dip below 99 is
+# load-bearing rather than incidental — it is what proves that pack's counter
+# also reset, and a version of these tests that pinned it at a flat 99 was
+# passing a bank three quarters of whose counters were stale.
 
 BANK = ("P1", "P2", "P3", "P4")
-DRIFTED = {"P1": 75.0, "P2": 80.0, "P3": 76.0, "P4": 99.0}
+DRIFTED = {"P1": 75.0, "P2": 80.0, "P3": 76.0, "P4": 96.0}
 THREE_OF_FOUR = {"P1": 100.0, "P2": 100.0, "P3": 77.0, "P4": 100.0}
 RESET = dict.fromkeys(BANK, 100.0)
 
@@ -540,3 +547,84 @@ def test_a_pack_silent_through_a_short_charge_blocks_the_reset() -> None:
     ]
     assert bank_recalibrated_at(packs, NOW + timedelta(minutes=15)) is not None
     assert bank_recalibrated_at(packs, NOW + timedelta(minutes=15), expected=BANK) is None
+
+
+# --- what a transition has to be a transition of -----------------------------
+
+
+def test_three_counters_pegged_and_one_charging_is_not_a_bank_reset() -> None:
+    # Reproduced against the reference database through the endpoint before this
+    # test existed. Three counters drifted high and pegged at 100% while the
+    # fourth genuinely charged: every pack reads at or above 99 by the end, and
+    # one of them was previously below, so a rule asking only for *some* pack to
+    # have transitioned called the bank calibrated. Three quarters of those
+    # percentages were stale and the dashboard would have drawn all four as
+    # measurements. A charge resets every counter, so every counter has to show
+    # the transition.
+    pegged = {"P1": 100.0, "P2": 100.0, "P3": 100.0}
+    packs = [
+        *_packs_over(NOW, 15, {**pegged, "P4": 96.0}),
+        *_packs_over(NOW + timedelta(minutes=15), 16, {**pegged, "P4": 100.0}),
+    ]
+    assert last_full_charge(_short_charge(), packs) is None
+
+
+def test_a_pack_that_never_dipped_below_full_blocks_the_reset() -> None:
+    # The same defect one pack at a time, and the reason DRIFTED reads 96 rather
+    # than 99 for the fourth pack. A counter sitting at exactly 99 through the
+    # quarter hour before the absorb has not been seen to reset, so the bank has
+    # not been seen to reset.
+    stuck = {**DRIFTED, "P4": 99.0}
+    packs = [
+        *_packs_over(NOW, 17, stuck),
+        *_packs_over(NOW + timedelta(minutes=17), 14, RESET),
+    ]
+    assert last_full_charge(_short_charge(), packs) is None
+
+
+def test_a_second_absorb_cannot_borrow_the_first_charge_transition() -> None:
+    # Two absorb touches ten minutes apart. The packs transition during the
+    # first and read 100 throughout the second, so the second's lookback reaches
+    # back past the first and finds a below-full row belonging to that charge.
+    # The answer must be the first charge's reset, not a later window credited
+    # on evidence that was never about it.
+    volts = [RESTING_V] * 15 + [55.6, 55.7, 55.7, 55.5] + [54.9] * 9
+    volts += [55.6, 55.7, 55.7, 55.5] + [54.9] * 14
+    rows = _inverter(NOW, volts)
+    for offset in (15, 28):
+        for row, current in zip(rows[offset : offset + 4], (111.2, 63.9, 12.2, -1.6), strict=True):
+            row["battery_current_a"] = current
+    assert len(full_charge_windows(rows, CORROBORATING_ABSORB)) == 2
+    packs = [
+        *_packs_over(NOW, 17, DRIFTED),
+        *_packs_over(NOW + timedelta(minutes=17), 25, RESET),
+    ]
+    assert last_full_charge(rows, packs) == NOW + timedelta(minutes=17)
+
+
+def test_a_pack_full_before_the_window_opened_has_not_been_seen_to_arrive() -> None:
+    # A pack's qualifying reading has to fall inside the charge, not in the
+    # minutes before it. Otherwise the whole transition can happen before the
+    # bank ever reaches its charge reference, and the absorb becomes decoration
+    # rather than corroboration.
+    packs = [
+        *_packs_over(NOW, 14, DRIFTED),
+        *_packs_over(NOW + timedelta(minutes=14), 1, RESET),
+        *_modules(NOW + timedelta(minutes=16), {"P1": 100.0}),
+    ]
+    assert last_full_charge(_short_charge(), packs) is None
+
+
+def test_a_reading_whose_clock_cannot_be_compared_is_dropped_not_raised() -> None:
+    # This is reached from an endpoint, so a TypeError here is a 500. Every store
+    # read hands back aware timestamps, but a caller assembling rows by hand can
+    # mix them, and a row that cannot be placed in time is unusable rather than
+    # fatal — the same treatment a row with no state of charge already gets.
+    naive = {"timestamp": datetime(2026, 8, 6, 12, 5), "serial": "P1", "soc_pct": 100.0}
+    packs = [
+        *_packs_over(NOW, 17, DRIFTED),
+        naive,
+        *_packs_over(NOW + timedelta(minutes=17), 14, RESET),
+    ]
+    assert last_full_charge(_short_charge(), packs) == NOW + timedelta(minutes=17)
+    assert bank_recalibrated_at([naive], NOW) is None

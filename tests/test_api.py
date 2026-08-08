@@ -635,8 +635,13 @@ def test_calibration_answers_on_an_empty_database(tmp_path: Path) -> None:
 # 100% two minutes in, the fourth five minutes later, three minutes after the
 # bank's own voltage had fallen back below the reference. The climb before the
 # absorb is shortened; everything else is as recorded.
+#
+# _DRIFTED is what the four read through the quarter hour before the absorb:
+# 70-75, 77-80, 72-76 and 96-99. The fourth pack's dip below 99 is what proves
+# its counter reset too, and its last such reading was 2 min 19 s before the
+# absorb opened — so the lookback has to be minutes rather than seconds.
 _ABSORB = ((55.6, 111.2), (55.7, 63.9), (55.7, 12.2), (55.5, -1.6))
-_DRIFTED = {"A": 75.0, "B": 80.0, "C": 76.0, "D": 99.0}
+_DRIFTED = {"A": 75.0, "B": 80.0, "C": 76.0, "D": 96.0}
 _THREE_OF_FOUR = {"A": 100.0, "B": 100.0, "C": 77.0, "D": 100.0}
 _RESET = {"A": 100.0, "B": 100.0, "C": 100.0, "D": 100.0}
 
@@ -728,6 +733,61 @@ def test_calibration_ignores_a_bank_whose_counters_are_all_pegged(tmp_path: Path
         body = c.get("/api/calibration").json()
     assert body["last_full_charge"] is None
     assert body["severity"] == "elevated"
+
+
+def test_calibration_ignores_three_pegged_counters_beside_one_that_charged(
+    tmp_path: Path,
+) -> None:
+    # Found by review and reproduced against the reference database through this
+    # endpoint. Three counters drifted high and pegged at 100%, the fourth
+    # genuinely charges across 99: every pack reads full at the end and one of
+    # them was previously below, which was enough for an earlier version of the
+    # rule. Three quarters of these percentages are stale, and the endpoint was
+    # reporting the bank calibrated with soc_is_estimate false — so the
+    # dashboard would have drawn all four as measurements.
+    now = datetime.now(tz=UTC)
+    pegged = {"A": 100.0, "B": 100.0, "C": 100.0}
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(
+            store,
+            now - timedelta(hours=6),
+            before={**pegged, "D": 96.0},
+            during={**pegged, "D": 100.0},
+            after={**pegged, "D": 100.0},
+        )
+        _bank(store, now, 53.0, {**pegged, "D": 100.0}, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    assert body["last_full_charge"] is None
+    assert body["severity"] == "elevated"
+    assert body["soc_is_estimate"] is True
+
+
+def test_calibration_does_not_let_a_second_absorb_borrow_the_first_transition(
+    tmp_path: Path,
+) -> None:
+    # Two absorb touches ten minutes apart, packs at 100 throughout the second.
+    # The second's lookback reaches back past the first and finds the below-full
+    # rows belonging to that charge, so the later window was being credited on
+    # evidence that was never about it. The answer is the first charge's reset.
+    now = datetime.now(tz=UTC)
+    charged = now - timedelta(hours=6)
+
+    def build(store: SqliteStore) -> None:
+        _short_charge(store, charged, before=_DRIFTED, during=_RESET, after=_RESET)
+        for minute, (volts, amps) in enumerate(_ABSORB):
+            _bank(store, charged + timedelta(minutes=28 + minute), volts, _RESET, amps=amps)
+        for minute in range(32, 40):
+            _bank(store, charged + timedelta(minutes=minute), 54.9, _RESET, amps=0.0)
+        _bank(store, now, 53.0, {"A": 92.0, "B": 93.0, "C": 92.0, "D": 94.0}, amps=-80.0)
+
+    with _calibration_client(tmp_path, build) as c:
+        body = c.get("/api/calibration").json()
+    reset_at = (charged + timedelta(minutes=17)).replace(microsecond=0)
+    assert body["last_full_charge"] == reset_at.isoformat()
+    assert body["severity"] == "none"
 
 
 # --- settings ----------------------------------------------------------------

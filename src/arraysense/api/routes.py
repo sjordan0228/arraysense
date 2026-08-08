@@ -527,11 +527,23 @@ async def calibration(request: Request) -> dict[str, Any]:
     # twenty-minute candidate list contains none of its charges at all. Every
     # window on this list still has to end settled below the taper, and
     # ``charge_completed_at`` is what decides which of them a bank has passed.
-    candidates = full_charge_windows(history, min_absorb=CORROBORATING_ABSORB)
+    candidates = full_charge_windows(history, min_absorb=CORROBORATING_ABSORB)[
+        -_MAX_WINDOWS_EXAMINED:
+    ]
     last_full: datetime | None = None
-    for window_start, window_end in reversed(candidates[-_MAX_WINDOWS_EXAMINED:]):
+    for index in reversed(range(len(candidates))):
+        window_start, window_end = candidates[index]
         packs = _packs_during(store, window_start, window_end)
-        reset = charge_completed_at(window_start, window_end, packs, expected=known or None)
+        # The previous candidate's end caps how far back the below-full evidence
+        # may be read. Two touches closer together than PACK_RESET_LAG would
+        # otherwise let the later one borrow the earlier charge's transition.
+        reset = charge_completed_at(
+            window_start,
+            window_end,
+            packs,
+            expected=known or None,
+            after=candidates[index - 1][1] if index else None,
+        )
         if reset is not None:
             last_full = reset
             break
