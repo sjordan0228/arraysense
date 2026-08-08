@@ -201,24 +201,25 @@ let shown = [];
 // for.
 // ---------------------------------------------------------------------------
 
-const pad2 = (n) => String(n).padStart(2, '0');
-
 // One more boundary than there are buckets: bucket i runs from starts[i] to
-// starts[i + 1]. The arithmetic is on local calendar fields, so the Date
-// constructor resolves the daylight saving days for us — a 23-hour day is 23
-// hours and the boundary after it is still midnight, which is exactly what
-// stepping by 86400 seconds gets wrong.
-function calendarStarts(span) {
-  const now = new Date();
+// starts[i + 1]. The arithmetic is on calendar fields, so the Date constructor
+// resolves the daylight saving days for us — a 23-hour day is 23 hours and the
+// boundary after it is still midnight, which is exactly what stepping by 86400
+// seconds gets wrong.
+//
+// ``today`` is the date on the *site's* calendar, from civilNow(siteZone()),
+// and not this browser's. Reading it off the browser is how the last row came
+// to be a day the site has not reached — drawn blank while the bucket for the
+// day before the first row was dropped on the floor, its energy still inside
+// the footer's total.
+function calendarStarts(span, today) {
   const out = [];
   if (span.period === 'month') {
-    const first = now.getMonth() - (span.count - 1);
-    for (let i = 0; i <= span.count; i++) out.push(new Date(now.getFullYear(), first + i, 1));
+    const first = today.month - (span.count - 1);
+    for (let i = 0; i <= span.count; i++) out.push(civilDay(today.year, first + i, 1));
   } else {
-    const first = now.getDate() - (span.count - 1);
-    for (let i = 0; i <= span.count; i++) {
-      out.push(new Date(now.getFullYear(), now.getMonth(), first + i, 0, 0, 0, 0));
-    }
+    const first = today.day - (span.count - 1);
+    for (let i = 0; i <= span.count; i++) out.push(civilDay(today.year, today.month, first + i));
   }
   return out;
 }
@@ -242,8 +243,7 @@ const labelOf = (d, period) => (period === 'month'
 // project exists to prevent: reported and whole, reported but partial, and
 // absent. A partial bucket holds a real number that is not the whole period,
 // and an absent one holds no number at all — neither is a low total.
-function buildRows(span, buckets) {
-  const starts = calendarStarts(span);
+function buildRows(span, buckets, starts) {
   const cut = keyLength(span.period);
   const byKey = new Map();
   for (const b of (buckets || [])) {
@@ -683,19 +683,6 @@ function exportFill(u) {
 // Loading.
 // ---------------------------------------------------------------------------
 
-// The server cuts buckets in its own zone unless told otherwise, and this page
-// builds the calendar it renders with the browser's. Sending the browser's zone
-// is what keeps them the same calendar: an hour of disagreement between the two
-// shows up as the first and last rows of the table reading as days nobody
-// collected.
-function timeZone() {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-  } catch (err) {
-    return '';
-  }
-}
-
 // A browser zone the server's tz database does not know is answered with a 400.
 // The owner's own calendar cut a little differently beats an empty page, so the
 // request goes again without it and the reply says which zone it used instead.
@@ -713,23 +700,32 @@ async function fetchEnergy(base, zone) {
 function stamp(body) {
   const zone = body && typeof body.timezone === 'string' ? body.timezone : '';
   const parts = [];
-  if (zone) parts.push(`${current.unitName} as reckoned in ${zone.replace(/_/g, ' ')}`);
+  if (zone) parts.push(`${current.unitName} as reckoned in ${zoneWords(zone)}`);
   parts.push(`read ${new Date().toLocaleTimeString()}`);
   $('conn').textContent = parts.join(' · ');
 }
 
 async function load() {
   const span = current;
-  const starts = calendarStarts(span);
+  // The calendar the service will answer on, so the rows below are the same
+  // days its buckets are cut into. Both halves matter: which dates the rows are
+  // for, and — through the naive start below — which midnights the service
+  // measures between.
+  const starts = calendarStarts(span, civilNow(await siteZone()));
   // priced=1 asks the service to price each bucket as well as total it. The
   // money rides on the bucket it belongs to rather than arriving from a second
   // request, so there are never two lists of buckets here to line up by date —
   // and each reply omits the buckets it had nothing to report for, so lining
   // two of them up by position is exactly how energy ends up in the wrong row.
-  const base = `/api/energy?start=${encodeURIComponent(starts[0].toISOString())}`
+  //
+  // The start is sent as a bare wall-clock date, which the service reads in the
+  // zone it resolved; the end is a true instant, which needs no zone and must
+  // stay one, since it is also what says how much of the bucket in progress has
+  // actually happened.
+  const base = `/api/energy?start=${encodeURIComponent(naiveStamp(starts[0]))}`
     + `&end=${encodeURIComponent(new Date().toISOString())}&period=${span.period}&priced=1`;
   try {
-    const body = await fetchEnergy(base, timeZone());
+    const body = await fetchEnergy(base, browserZone());
     // The owner can switch span while this is in flight, and painting the reply
     // for the span they left would put thirteen months of buckets in a table
     // headed Day.
@@ -742,7 +738,7 @@ async function load() {
     // The note below the table depends on whether there is a cost column, and
     // that is not known until the first reply arrives.
     applyTitles();
-    const rows = buildRows(span, body.buckets);
+    const rows = buildRows(span, body.buckets, starts);
     drawChart(rows);
     drawTable(span, rows);
     stamp(body);

@@ -38,7 +38,7 @@ from arraysense.calibration import assess, full_charge_windows, packs_recalibrat
 from arraysense.costs import bucket_energy, period_energy, price_period, unpriced_minutes
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
-from arraysense.settings import SettingsStore, describe, lookup_setting
+from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -99,6 +99,20 @@ COUNTER_LEAD = timedelta(hours=2)
 # tariff, the display defaults — is read afresh on each request that needs it,
 # and takes effect as soon as it is saved.
 RESTART_PREFIXES = ("connection.", "collector.")
+
+
+def _request_zone(store: SqliteStore, tz: str | None) -> ZoneInfo:
+    """Return the zone this request's answer is cut on.
+
+    The installation's own zone first, then whatever the browser asked for,
+    then the machine's — see ``resolve_zone``. Read from the settings on every
+    request rather than held anywhere: nothing in this service memoises a
+    figure, so a zone changed on the settings page takes effect on the next
+    request with no cache to invalidate and no stale money to reconcile.
+    """
+    configured = SettingsStore(store).get(SETTING_TIMEZONE)
+    return resolve_zone(tz, configured if isinstance(configured, str) else None)
+
 
 # How old the newest stored reading may be before the reader is warned that the
 # screen is behind. About eighty missed polls at the reference cadence, so
@@ -268,12 +282,37 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
 
 
 @router.get("/status")
-async def status(request: Request) -> dict[str, Any]:
-    """Whether the collector is alive, connected, and holding the dongle."""
+async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
+    """Whether the collector is alive, connected, and holding the dongle.
+
+    It also answers the one question a page has to settle before it can ask
+    anything else: which calendar the service will cut its answers on.
+    ``timezone`` is what ``resolve_zone`` makes of the installation's setting,
+    the ``tz`` a caller passes, and the machine's own zone, in that order — so a
+    page builds "this month" and "the last thirty days" in the zone the reply
+    will come back in rather than in the browser's. It used to build them in the
+    browser's, and on an install five hours west of the reader that lost the
+    whole monthly connection charge and dropped a real day out of the history
+    table while leaving it in the footer's total.
+
+    Answered here because the precedence is the service's rule. A page working
+    it out from ``site.timezone`` would be a second implementation of it, which
+    is the shape of every disagreement this codebase has had.
+    """
+    store = request.app.state.store
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError:
+        # A zone this tz database does not know is exactly what /api/energy
+        # refuses, and a page told the truth here asks with one that works
+        # instead of collecting a 400 first. Stepping past the name lands on
+        # the same zone that request would have fallen back to.
+        zone = _request_zone(store, None)
     service = request.app.state.service
     s = service.status
     return {
         "version": __version__,
+        "timezone": str(zone),
         "running": s.running,
         "connected": s.connected,
         "yielding": s.yielding,
@@ -566,7 +605,10 @@ async def costs(
     store = request.app.state.store
     settings = SettingsStore(store)
     tariff = load_tariff(settings.all())
-    zone = resolve_zone(tz)
+    # The installation's zone decides which wall-clock hours a band covers, and
+    # ``tz`` only speaks for the browser. This is the endpoint where getting it
+    # wrong is a mispriced day rather than a shifted chart.
+    zone = _request_zone(store, tz)
 
     if tariff is None:
         # Two different situations, and conflating them tells somebody staring
@@ -577,6 +619,11 @@ async def costs(
         return {
             "currency": None,
             "configured": False,
+            # On this path as on the priced one. A page has to be able to say
+            # which calendar it is showing whether or not there is money on it,
+            # and a field that appears only sometimes is one every caller has to
+            # branch on — the same reason the settings fields carry every key.
+            "timezone": str(zone),
             "unreadable": bool(stored),
             "cost": None,
             "bill": None,
@@ -783,11 +830,17 @@ async def energy(
     it, and a bucket that reads low for that reason must not be presented as a
     quiet day.
 
-    ``tz`` is an IANA zone name and decides where midnight falls, defaulting to
-    the machine's own zone. Naive timestamps in ``start`` and ``end`` are read
-    in that same zone rather than the server's, since otherwise the answer
-    depends on where the service happens to be installed. A bucket nothing was
-    recorded for is left out of the reply rather than returned as zero.
+    ``tz`` is an IANA zone name and decides where midnight falls, but only
+    where the installation has not stated its own: ``site.timezone`` wins over
+    it, and the machine's zone answers when neither is set. Naive timestamps in
+    ``start`` and ``end`` are read in whichever zone that resolves to rather
+    than the server's, since otherwise the answer depends on where the service
+    happens to be installed. The zone actually used comes back as ``timezone``,
+    so a page never has to assume the one it asked for is the one it got — and
+    a page that means the owner's own midnight should send ``start`` naive and
+    let this read it, rather than working out an instant from a clock that may
+    be nowhere near the inverter. A bucket nothing was recorded for is left out
+    of the reply rather than returned as zero.
 
     ``priced`` asks for what each bucket cost as well as what it used. The
     money rides on the bucket it belongs to rather than arriving from a second
@@ -807,14 +860,14 @@ async def energy(
     cost on any bucket, no totals, and ``configured`` false. Not zero — an
     install that has never entered a tariff shows its energy and says so.
     """
+    store = request.app.state.store
     try:
-        zone = resolve_zone(tz)
+        zone = _request_zone(store, tz)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     start, end = with_zone(start, zone), with_zone(end, zone)
     _check_range(start, end)
 
-    store = request.app.state.store
     read = read_energy(store, start, end, period=period, zone=zone)
 
     tariff, stored = (None, "")
