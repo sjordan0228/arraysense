@@ -7,6 +7,25 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.1 — 8 August 2026
+
+### Added
+
+- **Light mode, following the system setting**
+  ([#33](https://github.com/sjordan0228/arraysense/issues/33)). A machine set to a
+  light appearance gets light pages. Nothing changes for anyone who has not
+  asked for it — the dark theme is unchanged down to the pixel.
+
+  The chart colours are the same in both. A pair of colours sits the same
+  distance apart whatever is behind them, so the ones already validated stay
+  validated; what changes is the page under them. Two things had to be reversed
+  rather than restyled, because they are painted onto the chart itself rather
+  than set in the stylesheet: the tariff band shading, which is a pale wash on a
+  dark page and a dark one on a light page, and the zero line on the battery
+  chart. The shading legend reverses with it — "brighter = higher rate" on dark,
+  "darker = higher rate" on light — because naming it the wrong way round would
+  point the reader at exactly the wrong hours.
+
 ## 0.6.0 — 8 August 2026
 
 ### Added

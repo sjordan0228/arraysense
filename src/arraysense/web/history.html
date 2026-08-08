@@ -43,7 +43,7 @@
      dashboard's estimate badge so the two pages mark a qualified reading the
      same way. */
   .tag{margin-left:8px;font-size:9px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
-    color:var(--ink);background:rgba(255,255,255,.15);border-radius:5px;padding:2px 6px;
+    color:var(--ink);background:var(--tint-3);border-radius:5px;padding:2px 6px;
     vertical-align:1px;white-space:nowrap;cursor:help}
   .tag.none{color:var(--ink3);background:transparent;box-shadow:inset 0 0 0 1px var(--panel-b)}
   .chead .legend .swatch{display:inline-block;width:15px;height:0;margin-right:6px;vertical-align:4px;
@@ -553,7 +553,9 @@ function partialBands() {
         ctx.beginPath();
         ctx.rect(left, top, width, height);
         ctx.clip();
-        ctx.fillStyle = 'rgba(255,255,255,.055)';
+        // The same wash the tariff shading uses, and inverted for the same
+        // reason: white over a light panel is nothing at all.
+        ctx.fillStyle = `rgba(${ink('--wash-rgb')},.055)`;
         for (const r of shown) {
           if (!r.reported || !r.partial) continue;
           const x0 = Math.max(left, u.valToPos(r.xs, 'x', true));

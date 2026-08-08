@@ -18,13 +18,13 @@
   .monthbar{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap}
   .monthbar h2{margin:2px 0 0;font-size:22px;font-weight:300;letter-spacing:-.025em}
   .mstat{font-size:11.5px;color:var(--ink3);text-align:right;line-height:1.6}
-  .mprog{height:4px;border-radius:3px;background:rgba(255,255,255,.12);margin-top:12px;overflow:hidden}
+  .mprog{height:4px;border-radius:3px;background:var(--tint-2);margin-top:12px;overflow:hidden}
   .mprog i{display:block;height:100%;width:0;border-radius:3px;
     background:linear-gradient(90deg,rgba(207,123,38,.85),rgba(207,123,38,.35))}
   /* An unmeasurable elapsed fraction gets the hatch the rest of the site uses
      for an unknown, never an empty bar that would read as "nothing yet". */
-  .mprog.none{background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
-    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+  .mprog.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px var(--tint-2)}
   .pn{margin-bottom:12px;font-size:12px;color:var(--warn);border-left:3px solid var(--warn)}
   .pn[hidden]{display:none}
   /* No tariff. This is not an error state and must not look like one: nothing
@@ -61,14 +61,14 @@
   .split{margin:2px 0 14px}
   .splitrow{display:flex;align-items:center;gap:9px;margin-top:7px}
   .splitrow .sl{flex:0 0 74px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3)}
-  .splitbar{flex:1;display:flex;height:19px;border-radius:5px;overflow:hidden;background:rgba(255,255,255,.07)}
+  .splitbar{flex:1;display:flex;height:19px;border-radius:5px;overflow:hidden;background:var(--tint)}
   .splitbar span{display:flex;align-items:center;justify-content:center;min-width:0;overflow:hidden;
-    font-size:10px;color:rgba(255,255,255,.95);white-space:nowrap;font-variant-numeric:tabular-nums}
-  .splitbar.none{background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
-    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+    font-size:10px;color:rgba(255,255,255,.95) /* on a filled bar, not the panel */;white-space:nowrap;font-variant-numeric:tabular-nums}
+  .splitbar.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px var(--tint-2)}
   .tw{overflow-x:auto}
   .hours{font-size:9.5px;color:var(--ink3);letter-spacing:.03em;margin-top:2px}
-  .bandbar{height:4px;border-radius:2px;background:rgba(255,255,255,.09);margin-top:5px;overflow:hidden}
+  .bandbar{height:4px;border-radius:2px;background:var(--tint);margin-top:5px;overflow:hidden}
   .bandbar i{display:block;height:100%;width:0;border-radius:2px;background:var(--grid)}
   td.part{position:relative}
   td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}

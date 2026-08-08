@@ -137,3 +137,42 @@ def test_band_shading_adds_no_colour_to_the_palette() -> None:
     assert not [k for k in declared if k.startswith("--band")], (
         "a per-band colour was added; shading must vary opacity, not hue"
     )
+
+
+def test_nothing_drawn_to_canvas_hardcodes_white() -> None:
+    # Light mode inverts the surface, and a white gridline, zero rule or band
+    # wash simply disappears on it. CSS can answer to a theme; a string handed
+    # to ctx.fillStyle cannot, so these have to read a token that changes with
+    # the theme rather than a literal that does not.
+    web = Path(__file__).resolve().parents[1] / "src" / "arraysense" / "web"
+    offenders = []
+    for path in sorted(web.glob("*.html")) + sorted(web.glob("common.js")):
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            if ("fillStyle" in line or "strokeStyle" in line) and "rgba(255,255,255" in line:
+                offenders.append(f"{path.name}:{number}")
+    assert not offenders, (
+        "canvas drawing hardcodes white and will vanish in light mode: " + ", ".join(offenders)
+    )
+
+
+def test_the_band_shading_legend_does_not_hardcode_a_direction() -> None:
+    # On a dark panel the wash is white, so more opacity reads brighter. On a
+    # light one it must be dark, and "brighter" becomes exactly wrong — the
+    # reader is sent to the cheap hours. Whatever the page says about direction
+    # has to be decided with the theme, not written into the string.
+    page = _web("index.html")
+    assert "brighter = higher rate" not in page, (
+        "the legend states a fixed direction; it reverses in light mode"
+    )
+
+
+def test_both_themes_declare_the_chart_palette() -> None:
+    # The hues themselves separate identically whatever the surface — a pair's
+    # distance does not depend on the background. What changes is contrast
+    # against it, so a light theme has to declare its own values rather than
+    # inherit ones chosen against #131a2e.
+    common = _web("common.js")
+    assert "prefers-color-scheme" in common, "no light theme is declared at all"
+    light = common.split("prefers-color-scheme", 1)[-1]
+    for token in ("--ink", "--panel", "--grid-line"):
+        assert token in light, f"the light theme does not redeclare {token}"
