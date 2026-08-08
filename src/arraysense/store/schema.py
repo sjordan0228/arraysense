@@ -5,6 +5,25 @@ column comes from arraysense.metrics, so adding a metric there stays a
 one-line change and this module follows. Hardcoding a column name here would
 defeat that.
 
+The registry says what a metric *is*; it does not say this device produces it.
+Every generator here therefore takes an optional ``declared`` set — the metric
+names the installed driver's ``Capabilities`` carries — and narrows the columns
+to it, so a one-string inverter does not get a column for a third string it
+does not have. That column would otherwise hold a NULL meaning two different
+things at once: there is no third string, and the third string reported
+nothing. With no declared set the whole registry is generated, which is what
+the device migration needs to rebuild a database from before drivers declared
+anything.
+
+What a declared set governs is tables that do not exist yet, and columns a
+declared metric is missing. It never shrinks anything: ``CREATE TABLE IF NOT
+EXISTS`` leaves an existing table exactly as it is, and ``migration_ddl`` only
+ever ADDs. An installation whose tables carry the full registry — every one
+from before this narrowing existed — keeps every column and every reading it
+has; the undeclared columns simply stop being written. Dropping them would
+destroy history to save bytes, and the store reads what is there rather than
+what is declared for exactly that reason.
+
 Two shapes are deliberate. Inverter metrics use a wide row — one row per
 timestamp, one column per metric — because the main chart asks for solar,
 load, battery and grid together, and a wide row costs the same as asking for
@@ -59,9 +78,10 @@ integers in storage.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 
-from arraysense.metrics import BATTERY_MODULE_METRICS, INVERTER_METRICS
+from arraysense.metrics import column_names
 
 
 @dataclass(frozen=True)
@@ -124,7 +144,46 @@ _TABLE_OPTIONS = "STRICT, WITHOUT ROWID"
 FOREIGN_KEYS_PRAGMA = "PRAGMA foreign_keys = ON"
 
 
-def module_metric_columns() -> tuple[str, ...]:
+def _declared_names(declared: Iterable[str]) -> frozenset[str]:
+    """Normalise a driver's declared metric set, refusing names the registry lacks.
+
+    ``Capabilities`` already checks a declaration at construction, so a
+    stranger arriving here is a caller composing sets by hand — a test, or a
+    future second entry point — and the failure has to be loud where the schema
+    is generated. Passed through silently, an unknown name is simply a column
+    that never appears, and the reading meant for it is dropped on the way to
+    the store without a trace.
+    """
+    wanted = frozenset(declared)
+    unknown = sorted(wanted - set(column_names()))
+    if unknown:
+        raise KeyError(f"no such metric(s) in the registry: {', '.join(unknown)}")
+    return wanted
+
+
+def inverter_metric_columns(declared: Iterable[str] | None = None) -> tuple[str, ...]:
+    """Return the inverter metric column names in registry order.
+
+    These are the wide-row columns of every inverter tier. A ``declared`` set
+    narrows them to what the installed driver produces; None means the whole
+    registry. Order always follows the registry, never the declaration, so two
+    databases created for the same driver lay their columns down identically.
+
+    Read off ``column_names()`` at call time rather than bound at import, so
+    the schema always reflects the registry as it stands — which is what lets
+    a test extend the registry and watch the column arrive with nothing else
+    edited. The per-slot pattern is what separates the two halves of the
+    registry: ``battery_module_count`` starts with the same words as a module
+    expansion and is an inverter metric, so a bare prefix test misfiles it.
+    """
+    names = tuple(name for name in column_names() if not _MODULE_PREFIX.match(name))
+    if declared is None:
+        return names
+    wanted = _declared_names(declared)
+    return tuple(name for name in names if name in wanted)
+
+
+def module_metric_columns(declared: Iterable[str] | None = None) -> tuple[str, ...]:
     """Return the module metric column names, without slot numbers.
 
     The registry expands one template across the four battery slots
@@ -134,15 +193,25 @@ def module_metric_columns() -> tuple[str, ...]:
     prefix has to come back off somewhere, and doing it here keeps the registry
     the only place the metric is named. Order follows first occurrence, which
     is template order.
+
+    A ``declared`` set narrows the templates: one is kept when any slot's
+    expansion of it is declared, because the normalised tables hold one column
+    per template however many slots the registry expands it across. None means
+    every template.
     """
-    seen: set[str] = set()
-    cols: list[str] = []
-    for spec in BATTERY_MODULE_METRICS:
-        bare = _MODULE_PREFIX.sub("", spec.name)
-        if bare not in seen:
-            seen.add(bare)
-            cols.append(bare)
-    return tuple(cols)
+    wanted = None if declared is None else _declared_names(declared)
+    templates: list[str] = []
+    kept: set[str] = set()
+    for name in column_names():
+        match = _MODULE_PREFIX.match(name)
+        if not match:
+            continue
+        bare = name[match.end() :]
+        if bare not in templates:
+            templates.append(bare)
+        if wanted is None or name in wanted:
+            kept.add(bare)
+    return tuple(bare for bare in templates if bare in kept)
 
 
 def _serials_ddl(as_name: str) -> str:
@@ -250,17 +319,23 @@ def _index_ddl(table: str, columns: str) -> str:
     return f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
 
 
-def ddl_for(table: str, as_name: str | None = None) -> str:
+def ddl_for(table: str, as_name: str | None = None, declared: Iterable[str] | None = None) -> str:
     """Return the CREATE TABLE for one table of the schema, under any name.
 
     Every table's shape is defined once and asked for by name here, so the
     startup DDL and the device migration in ``arraysense.store.migrate`` build
     the same table rather than two that drift. ``as_name`` is what the
     migration needs: it creates the new shape beside the old one under a
-    temporary name, copies, and renames.
+    temporary name, copies, and renames — and it leaves ``declared`` unset,
+    because a database old enough to need that migration was written when
+    every registry metric got a column, and rebuilding it must keep them all.
+
+    ``declared`` narrows the metric columns to what the installed driver
+    produces; see the module docstring for what that does and does not govern.
 
     Raises:
-        KeyError: ``table`` is not part of the schema.
+        KeyError: ``table`` is not part of the schema, or ``declared`` names a
+            metric the registry does not hold.
     """
     name = table if as_name is None else as_name
     if table == SERIALS_TABLE:
@@ -269,10 +344,10 @@ def ddl_for(table: str, as_name: str | None = None) -> str:
         return _invalid_readings_ddl(name)
     for tier in INVERTER_TIERS:
         if tier.table == table:
-            return _inverter_tier_ddl(tier, tuple(spec.name for spec in INVERTER_METRICS), name)
+            return _inverter_tier_ddl(tier, inverter_metric_columns(declared), name)
     for tier in MODULE_TIERS:
         if tier.table == table:
-            return _module_tier_ddl(tier, module_metric_columns(), name)
+            return _module_tier_ddl(tier, module_metric_columns(declared), name)
     raise KeyError(f"unknown table: {table!r}")
 
 
@@ -312,7 +387,7 @@ DEVICED_TABLES: tuple[str, ...] = (
 )
 
 
-def expected_columns() -> dict[str, tuple[str, ...]]:
+def expected_columns(declared: Iterable[str] | None = None) -> dict[str, tuple[str, ...]]:
     """Return the metric columns each tier table should have, keyed by table name.
 
     This is what a live database gets measured against, so one created before a
@@ -321,13 +396,18 @@ def expected_columns() -> dict[str, tuple[str, ...]]:
     and then failing on the first write. Metric columns come out in registry
     order, with ``SAMPLE_COUNT`` appended for every tier but ``full``.
 
+    ``declared`` narrows the expectation to the installed driver's metrics.
+    "Should have" then means "must at least have": a table carrying more —
+    the full registry, from before drivers declared subsets — satisfies any
+    declaration, because ``migration_ddl`` only asks what is missing.
+
     Only the columns ``migration_ddl`` can add with an ALTER are here.
     ``device`` is not among them: SQLite cannot ALTER a primary key, so giving
     a database its device identity means recreating every table, which is
     ``arraysense.store.migrate`` and not something to do behind an open.
     """
-    inverter = tuple(spec.name for spec in INVERTER_METRICS)
-    module = module_metric_columns()
+    inverter = inverter_metric_columns(declared)
+    module = module_metric_columns(declared)
     tables: dict[str, tuple[str, ...]] = {}
     for tier in INVERTER_TIERS:
         cols = inverter
@@ -342,7 +422,9 @@ def expected_columns() -> dict[str, tuple[str, ...]]:
     return tables
 
 
-def migration_ddl(existing: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
+def migration_ddl(
+    existing: dict[str, tuple[str, ...]], declared: Iterable[str] | None = None
+) -> tuple[str, ...]:
     """Return ALTER statements adding registry columns an old database lacks.
 
     ``CREATE TABLE IF NOT EXISTS`` is idempotent only while the schema is
@@ -351,18 +433,22 @@ def migration_ddl(existing: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     a metric to the registry is meant to be a one-line change, the gap has to be
     closed on open; a database already current yields nothing to run.
 
-    Only additions are handled. A removed or retyped metric needs a considered
-    migration, not an automatic one, so those are left alone. ``SAMPLE_COUNT``
-    is NOT NULL in the DDL, and SQLite rejects a NOT NULL column added to a
-    non-empty table unless it carries a default; existing rows take 0, which a
-    later rollup overwrites.
+    Only additions are handled, and under a ``declared`` set only declared
+    additions: what the driver does not produce is not worth a column, and a
+    column the table already has — declared or not — is left exactly as it is.
+    A removed or retyped metric needs a considered migration, not an automatic
+    one, so those are left alone too. ``SAMPLE_COUNT`` is NOT NULL in the DDL,
+    and SQLite rejects a NOT NULL column added to a non-empty table unless it
+    carries a default; existing rows take 0, which a later rollup overwrites.
 
     Args:
         existing: table name to the columns that table currently has, as read
             from the live database.
+        declared: the metric names the installed driver produces, or None for
+            the whole registry.
     """
     statements: list[str] = []
-    for table, wanted in expected_columns().items():
+    for table, wanted in expected_columns(declared).items():
         have = set(existing.get(table, ()))
         for name in wanted:
             if name in have:
@@ -376,23 +462,27 @@ def migration_ddl(existing: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     return tuple(statements)
 
 
-def schema_ddl() -> str:
+def schema_ddl(declared: Iterable[str] | None = None) -> str:
     """Return the complete storage schema as executable SQL text.
 
     Builds every table from the metric registry and the tier definitions, so a
     change in either flows through here untouched — which is the point, since
     the alternative is a hand-written schema that drifts away from the registry
-    silently. The text is idempotent, every statement being
-    CREATE ... IF NOT EXISTS, so it can be run on every startup rather than
-    guarded by a "have we set up yet" flag that can be wrong.
+    silently. ``declared`` narrows the metric columns to what the installed
+    driver produces, and governs only tables that do not exist yet; the module
+    docstring says why an existing table keeps whatever it has. The text is
+    idempotent, every statement being CREATE ... IF NOT EXISTS, so it can be
+    run on every startup rather than guarded by a "have we set up yet" flag
+    that can be wrong.
 
     Note what idempotent does not cover: a table that already exists with a
-    different key is left exactly as it is, silently. That is why the device
-    column arrived as an explicit migration rather than as an edit here.
+    different key — or with more columns than the declaration asks for — is
+    left exactly as it is, silently. That is why the device column arrived as
+    an explicit migration rather than as an edit here.
     """
     statements: list[str] = []
     for table in DEVICED_TABLES:
-        statements.append(ddl_for(table))
+        statements.append(ddl_for(table, declared=declared))
         statements.extend(indexes_for(table))
     # Each statement ends on its own line; a trailing semicolon per statement
     # makes the whole text executable as a single script.

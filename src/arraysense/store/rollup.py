@@ -60,12 +60,32 @@ from __future__ import annotations
 
 import sqlite3
 
-from arraysense.metrics import INVERTER_METRICS, Aggregation, MetricSpec, lookup
-from arraysense.store.schema import module_metric_columns
+from arraysense.metrics import Aggregation, MetricSpec, lookup
+from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 
 # A failed poll is stored with its reason and no readings (see models.Sample).
 # Excluding it from the aggregate stops it being counted as a reading of zero.
 _ERROR_FILTER = "error IS NULL"
+
+
+def _columns_present(
+    conn: sqlite3.Connection, source: str, dest: str, candidates: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Return the candidate metric columns present in both source and destination.
+
+    The registry says which columns *could* exist; the tables say which ones
+    this installation's driver declared when they were created. A database laid
+    down for a driver that declares a subset has columns for that subset alone,
+    so a rebuild naming the whole registry would die on its first pass there —
+    while an older database carries every registry column and must keep rolling
+    all of them up. Reading the columns off the tables serves both without
+    either being configured, and the intersection guards the one mismatch a
+    half-run migration could leave: a column that exists to read but not to
+    write is skipped rather than fatal.
+    """
+    src = {row[1] for row in conn.execute(f"PRAGMA table_info({source})")}
+    dst = {row[1] for row in conn.execute(f"PRAGMA table_info({dest})")}
+    return tuple(name for name in candidates if name in src and name in dst)
 
 
 def _bucket_bounds(bucket_seconds: int, start: int, end: int) -> tuple[int, int]:
@@ -348,7 +368,15 @@ def _rebuild_inverter(
     ``sample_count`` records how many successful source rows the bucket
     covers, and is a record of coverage only — every tier is built from raw, so
     nothing downstream ever weights by it.
+
+    An empty ``columns`` skips the rebuild entirely: a device that declares no
+    metric at this level has nothing to roll up, and the SQL for zero metric
+    columns is not SQL at all — the empty select list left ``sample_count,
+    FROM``, a syntax error that every sixty-second maintenance pass re-raised
+    for the life of the service.
     """
+    if not columns:
+        return
     aligned_start, aligned_end = _bucket_bounds(bucket_seconds, start, end)
     part = _floor_div("timestamp", bucket_seconds)
     last_aliases = ", ".join(
@@ -410,7 +438,14 @@ def _rebuild_module(
     ``sample_count`` records how many source rows the bucket covers, as a
     record of coverage only; every tier is built from raw, so nothing weights
     by it.
+
+    An empty ``columns`` skips the rebuild entirely, exactly as the inverter
+    rebuild does: a device reporting only a bank-level summary declares no
+    per-module template, has nothing to roll up here, and the SQL for zero
+    metric columns is a syntax error rather than a no-op.
     """
+    if not columns:
+        return
     aligned_start, aligned_end = _bucket_bounds(bucket_seconds, start, end)
     part = _floor_div("timestamp", bucket_seconds)
     last_aliases = ", ".join(
@@ -460,7 +495,7 @@ def rebuild_inverter_minute(conn: sqlite3.Connection, start: int, end: int) -> N
         60,
         start,
         end,
-        tuple(spec.name for spec in INVERTER_METRICS),
+        _columns_present(conn, "inverter_raw", "inverter_minute", inverter_metric_columns()),
     )
 
 
@@ -487,7 +522,7 @@ def rebuild_inverter_hourly(conn: sqlite3.Connection, start: int, end: int) -> N
         3600,
         start,
         end,
-        tuple(spec.name for spec in INVERTER_METRICS),
+        _columns_present(conn, "inverter_raw", "inverter_hourly", inverter_metric_columns()),
     )
 
 
@@ -509,5 +544,5 @@ def rebuild_module_hourly(conn: sqlite3.Connection, start: int, end: int) -> Non
         3600,
         start,
         end,
-        module_metric_columns(),
+        _columns_present(conn, "module_raw", "module_hourly", module_metric_columns()),
     )

@@ -386,6 +386,36 @@ class Tariff:
 
 
 @dataclass(frozen=True)
+class EnergyShortfall:
+    """How much of one counter's energy the band split could not account for.
+
+    ``attributed_kwh`` is the sum of the band mapping's known values, written
+    once where the split happens so nobody sums the mapping a second time.
+    ``unattributed_kwh`` is energy the meter counted that no band interval
+    could take — a counter is monotonic, so this is always genuinely missing
+    from the figures and a label may say so. ``unknowable`` marks loss whose
+    size cannot be stated: a reset, a stretch reaching past the counter's
+    readings, a span straddling the period's own edge. It is deliberately
+    direction-neutral — a backstep inflates the next delta and an edge
+    straddle carries foreign energy *in* — so anything rendered from it says
+    the figure may not be exact, never that an amount is missing.
+
+    This is what both reverted attempts at #23 lacked: attempt one had no way
+    to show a figure at all, and attempt two derived its labels from minutes
+    watched, which read 100% while a counter sat silent.
+    """
+
+    attributed_kwh: float
+    unattributed_kwh: float
+    unknowable: bool
+
+    @property
+    def short(self) -> bool:
+        """Whether a figure built on this counter must not be read as whole."""
+        return self.unattributed_kwh > 0 or self.unknowable
+
+
+@dataclass(frozen=True)
 class PeriodEnergy:
     """The energy a period used, already split into the tariff's bands.
 
@@ -396,12 +426,14 @@ class PeriodEnergy:
     power does not.
 
     Both mappings are keyed by band name and their values are kilowatt-hours. A
-    band that is missing, or present with None, is *unknown* rather than zero,
-    and unknown propagates: a cost that cannot be told is reported as absent
-    rather than as a total that quietly leaves a band out. ``load_kwh`` is the
-    whole house, which is what the counterfactual bill is priced from;
-    ``grid_export_kwh`` needs no band split until a tariff pays differently for
-    export by hour.
+    band that is missing, or present with None, is *unknown* rather than zero.
+    Unknown propagates — a cost that cannot be told is reported as absent
+    rather than as a total that quietly leaves a band out — unless the
+    counter's ``shortfall`` entry accounts for what the total would be
+    missing, in which case the measured part prices and is flagged (#23).
+    ``load_kwh`` is the whole house, which is what the counterfactual bill is
+    priced from; ``grid_export_kwh`` needs no band split until a tariff pays
+    differently for export by hour.
 
     Nobody meters the bank, so ``battery_discharge_kwh`` is priced by nothing —
     but it is what the system carried through the expensive hours, and valuing
@@ -428,6 +460,13 @@ class PeriodEnergy:
     measured_minutes: float | None = None
     elapsed_minutes: float | None = None
     counted_minutes: float | None = None
+    # Per-counter accounting of what the split could not place, keyed
+    # "grid_import", "load", "grid_export", "battery_discharge". None means
+    # nobody accounted for it, and None keeps the old rule: an unknown band
+    # poisons its total, because a partial figure whose shortfall nobody
+    # computed cannot say what it covers. Whoever fills the bands from real
+    # readings fills this beside them; see costs.period_energy.
+    shortfall: Mapping[str, EnergyShortfall] | None = None
 
     def __post_init__(self) -> None:
         """Reject naive bounds and a period that runs backwards.
@@ -466,8 +505,11 @@ class CostResult:
     house load priced at the same tariff — and is the figure the savings ribbon
     of the energy-flow diagram is drawn from.
 
-    Every money field is None rather than zero when its inputs were not all
-    reported, so a caption with a hole in it does not appear at all.
+    A money field whose inputs were not all reported is None rather than zero
+    when nothing accounts for the difference, so a caption with a hole in it
+    does not appear at all. Under shortfall accounting it is instead the
+    measured part with its ``*_is_short`` flag raised — the labelled partial
+    the owner chose over a dash in #23.
 
     Each field is rounded once, from unrounded inputs, which is why a breakdown
     can be a cent away from adding up to ``cost``. That is the right way round:
@@ -486,6 +528,14 @@ class CostResult:
     at all, or are simply not recorded for this month; see ``AdjustmentRate``.
     In the last case every figure here is at the base rate and the caller has
     to say so rather than let it read as a finished bill.
+
+    The ``*_is_short`` flags say which figures must not be read as whole,
+    decided here from the period's shortfall accounting because which counter
+    feeds which figure is pricing knowledge: ``cost`` rides on grid import,
+    ``no_solar_cost`` on house load, ``savings`` on both, ``export_credit``
+    on export. A page draws its qualification from these and its wording from
+    the shortfall itself — a known number of missing kilowatt-hours reads
+    differently from a measurement that may not be exact.
     """
 
     currency: str
@@ -502,6 +552,10 @@ class CostResult:
     pcrf_per_kwh: float | None = None
     scrf_per_kwh: float | None = None
     adjustment: float | None = None
+    cost_is_short: bool = False
+    no_solar_is_short: bool = False
+    savings_is_short: bool = False
+    export_is_short: bool = False
 
 
 @dataclass(frozen=True)
@@ -523,6 +577,16 @@ class BillEstimate:
     factors are not recorded it is absent and ``adjustment_status`` says
     ``unknown``, which is the difference between a bill quoted at the base rate
     and a bill quoted as final.
+
+    ``is_short`` says the projection's inputs were not whole — energy the
+    meter counted never reached a band, or a loss whose size nobody can
+    state. ``assumed_kwh`` is the import energy the projection restored at the
+    blended rate of the energy it did price; None when there was nothing to
+    restore or no observed blend to restore it at, in which case the flag
+    alone carries the warning. The bill is the figure most sensitive to
+    coverage and was the only money figure without a coverage statement; its
+    projection was also the figure the second reverted attempt understated by
+    $23.54 through a minutes-based denominator, which is finding 1 of #23.
     """
 
     currency: str
@@ -538,6 +602,8 @@ class BillEstimate:
     season_changes: bool = False
     adjustment_status: AdjustmentStatus = "none"
     projected_adjustment: float | None = None
+    is_short: bool = False
+    assumed_kwh: float | None = None
 
 
 def _parse_clock(token: str, entry: str) -> time:
@@ -929,6 +995,36 @@ def counter_delta(first: float | None, last: float | None) -> float | None:
     return last - first
 
 
+def merge_shortfalls(spans: Sequence[PeriodEnergy]) -> Mapping[str, EnergyShortfall] | None:
+    """Combine a run of buckets' accounting into one period's.
+
+    Kilowatt-hours add and unknowability spreads: a counter unknowable in one
+    bucket is unknowable over any run containing it. The answer is None the
+    moment any span carries no accounting at all — a total over buckets one
+    of which nobody accounted for cannot claim to know what it is missing,
+    and None is what makes the pricing below fall back to poisoning rather
+    than showing that total as a labelled partial.
+
+    This exists for the History footer, which prices thirty-one days as one
+    period; without the merge the footer would revert to dashing under a
+    column of flagged numbers, and no clean-data test would ever notice.
+    """
+    collected = [span.shortfall for span in spans]
+    if not collected or any(mapping is None for mapping in collected):
+        return None
+    present: list[Mapping[str, EnergyShortfall]] = [m for m in collected if m is not None]
+    out: dict[str, EnergyShortfall] = {}
+    for key in {name for mapping in present for name in mapping}:
+        entries = [mapping.get(key) for mapping in present]
+        out[key] = EnergyShortfall(
+            attributed_kwh=sum(e.attributed_kwh for e in entries if e is not None),
+            unattributed_kwh=sum(e.unattributed_kwh for e in entries if e is not None),
+            # A counter one bucket never accounted for is not a clean merge.
+            unknowable=any(e is None or e.unknowable for e in entries),
+        )
+    return out
+
+
 def _by_band(
     values: Mapping[str, float | None] | None, bands: Sequence[RateBand], what: str
 ) -> dict[str, float] | None:
@@ -955,20 +1051,28 @@ def _by_band(
 
 
 def _price(
-    bands: Sequence[RateBand], reported: Mapping[str, float] | None
+    bands: Sequence[RateBand], reported: Mapping[str, float] | None, partial: bool = False
 ) -> tuple[list[BandCost], float | None, float | None]:
     """Price every band: the breakdown, the exact total, and the energy behind it.
 
-    The two totals are None together as soon as one band is unknown, and both
-    are unrounded — the caller rounds once, at the end. The kilowatt-hour total
-    comes back from here rather than being summed again by whoever needs it,
-    because the rule for when it is unknown is the same rule, and a second copy
-    of it would be a second place for a missing band to turn into a small
-    number. It is what the per-kWh riders are charged on.
+    Without ``partial``, the two totals are None together as soon as one band
+    is unknown — a total that quietly leaves a band out is a missing reading
+    rendered as a smaller number. With it, the totals sum the bands that
+    reported and are None only when none did: the caller has shortfall
+    accounting saying exactly what the sum is missing, so the figure can be
+    shown with a label instead of withheld (#23). The breakdown carries None
+    for an unknown band either way.
+
+    Both totals are unrounded — the caller rounds once, at the end. The
+    kilowatt-hour total comes back from here rather than being summed again by
+    whoever needs it, because the rule for when it is unknown is the same
+    rule, and a second copy of it would be a second place for a missing band
+    to turn into a small number. It is what the per-kWh riders are charged on.
     """
     breakdown: list[BandCost] = []
     total: float | None = 0.0
     energy: float | None = 0.0
+    known = 0
     for band in bands:
         kwh = None if reported is None else reported.get(band.key)
         cost = None if kwh is None else kwh * band.price_per_kwh
@@ -980,11 +1084,15 @@ def _price(
                 cost=None if cost is None else _money(cost),
             )
         )
-        if cost is None or kwh is None or total is None or energy is None:
-            total, energy = None, None
-        else:
+        if cost is None or kwh is None:
+            if not partial:
+                total, energy = None, None
+        elif total is not None and energy is not None:
             total += cost
             energy += kwh
+            known += 1
+    if partial and known == 0:
+        return breakdown, None, None
     return breakdown, total, energy
 
 
@@ -1023,11 +1131,21 @@ def compute_cost(
     # failing to measure it.
     active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
 
+    # Partial pricing is authorised per counter, never by the mapping merely
+    # existing: an accounted import must not license a partial house figure
+    # whose own shortfall nobody computed.
+    entries = energy.shortfall or {}
+    import_entry = entries.get("grid_import")
+    load_entry = entries.get("load")
+    export_entry = entries.get("grid_export")
+
     imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    breakdown, energy_cost, imported_kwh = _price(active, imported)
+    breakdown, energy_cost, imported_kwh = _price(
+        active, imported, partial=import_entry is not None
+    )
 
     consumed = _by_band(energy.load_kwh, active, "house load")
-    _, no_solar, consumed_kwh = _price(active, consumed)
+    _, no_solar, consumed_kwh = _price(active, consumed, partial=load_entry is not None)
 
     rider = tariff.adjustment_at(energy.start, energy.end)
     unknown_rider = rider.status == "unknown"
@@ -1063,6 +1181,8 @@ def compute_cost(
     if tariff.export_per_kwh is not None and energy.grid_export_kwh is not None:
         credit = _money(energy.grid_export_kwh * tariff.export_per_kwh)
 
+    cost_is_short = import_entry is not None and import_entry.short
+    no_solar_is_short = load_entry is not None and load_entry.short
     return CostResult(
         currency=tariff.currency,
         start=energy.start,
@@ -1078,6 +1198,10 @@ def compute_cost(
         pcrf_per_kwh=rider.pcrf_per_kwh,
         scrf_per_kwh=rider.scrf_per_kwh,
         adjustment=None if adjustment is None else _money(adjustment),
+        cost_is_short=cost_is_short,
+        no_solar_is_short=no_solar_is_short,
+        savings_is_short=cost_is_short or no_solar_is_short,
+        export_is_short=export_entry is not None and export_entry.short,
     )
 
 
@@ -1114,8 +1238,11 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     # on the reference installation's own seasonal tariff this endpoint could
     # never once produce an estimated bill.
     active = tariff.bands_in_effect(energy.start, energy.end) or tariff.bands
+    entries = energy.shortfall or {}
+    import_entry = entries.get("grid_import")
+    export_entry = entries.get("grid_export")
     imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    _, so_far, imported_kwh = _price(active, imported)
+    _, so_far, imported_kwh = _price(active, imported, partial=import_entry is not None)
     whole_month = tariff.bands_in_effect(month_start, month_end) or tariff.bands
 
     # Scaled by the span the counters account for, not by the span requested
@@ -1126,21 +1253,51 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     # counter kept counting through every gap between those minutes.
     accounted = covered if energy.counted_minutes is None else energy.counted_minutes * 60
     scale = max(month_seconds / accounted, 1.0) if accounted > 0 else None
-    projected = None if so_far is None or scale is None else so_far * scale
+
+    # Then by the energy the bands account for, which is a different question
+    # from the time: a counter can sit silent for a day while polls keep
+    # arriving, and the time scale reads that day as covered while its energy
+    # is in no band. The known-missing kilowatt-hours are restored at the
+    # blended rate of the energy that was priced — the projection's own
+    # premise, one step further — and only when there is a blend to use:
+    # priced energy of zero has nothing to price the missing share at, and
+    # dividing by it is how a solar fortnight becomes an error page.
+    correction = 1.0
+    assumed: float | None = None
+    if (
+        import_entry is not None
+        and import_entry.unattributed_kwh > 0
+        and imported_kwh is not None
+        and imported_kwh > 0
+    ):
+        correction = (imported_kwh + import_entry.unattributed_kwh) / imported_kwh
+        assumed = import_entry.unattributed_kwh
+
+    projected = None if so_far is None or scale is None else so_far * scale * correction
 
     pays_for_export = tariff.export_per_kwh is not None
+    # The credit and the riders are flat per-kilowatt-hour, so their missing
+    # energy needs no blend at all — the kilowatt-hours are known and every
+    # one of them will be metered. Restoring them is arithmetic, not
+    # assumption, which is why neither shares the correction's guard.
+    export_kwh = energy.grid_export_kwh
+    if export_entry is not None and export_entry.unattributed_kwh > 0:
+        export_kwh = (export_kwh or 0.0) + export_entry.unattributed_kwh
     credit: float | None = None
-    if pays_for_export and energy.grid_export_kwh is not None and scale is not None:
-        credit = energy.grid_export_kwh * tariff.export_per_kwh * scale  # type: ignore[operator]
+    if pays_for_export and export_kwh is not None and scale is not None:
+        credit = export_kwh * tariff.export_per_kwh * scale  # type: ignore[operator]
 
     # The month being estimated, not the part measured: a bill covers the whole
     # month, so an August estimate wants August's factors even on the first.
     rider = tariff.adjustment_at(month_start, month_end)
     unknown_rider = rider.status == "unknown"
+    rider_kwh = imported_kwh
+    if import_entry is not None and import_entry.unattributed_kwh > 0:
+        rider_kwh = (rider_kwh or 0.0) + import_entry.unattributed_kwh
     adjustment = (
         None
-        if rider.per_kwh is None or imported_kwh is None or scale is None
-        else imported_kwh * rider.per_kwh * scale
+        if rider.per_kwh is None or rider_kwh is None or scale is None
+        else rider_kwh * rider.per_kwh * scale
     )
 
     total: float | None = None
@@ -1168,4 +1325,7 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
         season_changes={b.key for b in whole_month} != {b.key for b in active},
         adjustment_status=rider.status,
         projected_adjustment=None if adjustment is None else _money(adjustment),
+        is_short=(import_entry is not None and import_entry.short)
+        or (pays_for_export and export_entry is not None and export_entry.short),
+        assumed_kwh=assumed,
     )

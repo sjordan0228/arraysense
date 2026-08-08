@@ -18,7 +18,9 @@ from arraysense.store.schema import (
     INVERTER_TIERS,
     MODULE_TIERS,
     expected_columns,
+    inverter_metric_columns,
     migration_ddl,
+    module_metric_columns,
     schema_ddl,
 )
 
@@ -301,3 +303,118 @@ def test_rollup_rows_require_sample_count() -> None:
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute("INSERT INTO inverter_minute (timestamp, pv_total_power_w) VALUES (60, 5)")
     conn.close()
+
+
+# --- schemas narrowed to what a driver declares ------------------------------
+#
+# The registry says what a metric *is*; a driver says which of them its device
+# produces. A schema generated from the whole registry gives a one-string
+# inverter a column for a third string it does not have, and a NULL there means
+# two different things at once. These tests pin the narrowing — and pin that an
+# existing database, whose tables may carry the full column set, is left alone.
+
+
+def test_declared_set_narrows_new_inverter_tables() -> None:
+    declared = frozenset({"pv_total_power_w", "battery_soc_pct"})
+    ddl = schema_ddl(declared)
+    for table in _inverter_table_names():
+        cols = _table_columns(ddl, table)
+        assert "pv_total_power_w" in cols
+        assert "battery_soc_pct" in cols
+        assert "pv1_power_w" not in cols
+
+
+def test_declared_set_narrows_module_tables() -> None:
+    # Any slot's expansion declares the template: the module tables hold one
+    # bare column per template, never one per slot.
+    declared = frozenset({"battery_module2_soc_pct"})
+    ddl = schema_ddl(declared)
+    for table in _module_table_names():
+        cols = _table_columns(ddl, table)
+        assert "soc_pct" in cols
+        assert "voltage_v" not in cols
+
+
+def test_battery_module_count_is_an_inverter_metric_not_a_template() -> None:
+    # The one registry name that starts with "battery_module" without being a
+    # per-slot expansion. A prefix test wrongly files it with the module
+    # templates; only the slot-number pattern splits correctly.
+    declared = frozenset({"battery_module_count"})
+    assert inverter_metric_columns(declared) == ("battery_module_count",)
+    assert module_metric_columns(declared) == ()
+
+
+def test_no_declared_set_means_the_whole_registry() -> None:
+    # The default is every metric, which is what every caller before drivers
+    # declared subsets relied on — and what keeps the device migration
+    # rebuilding pre-declaration databases in their original full shape.
+    assert inverter_metric_columns() == tuple(spec.name for spec in INVERTER_METRICS)
+    all_names = frozenset(spec.name for spec in INVERTER_METRICS + BATTERY_MODULE_METRICS)
+    assert schema_ddl() == schema_ddl(all_names)
+
+
+def test_two_drivers_declaring_different_subsets_produce_two_schemas() -> None:
+    from arraysense.drivers import eg4_luxpower, fake
+
+    a = schema_ddl(eg4_luxpower.CAPABILITIES.metrics)
+    b = schema_ddl(fake.CAPABILITIES.metrics)
+    assert a != b
+    # Concretely: the fake reports no per-string readings, the real driver does.
+    assert "pv1_power_w" in _table_columns(a, "inverter_raw")
+    assert "pv1_power_w" not in _table_columns(b, "inverter_raw")
+    # Neither driver declares the per-module fault codes: pylxpweb's
+    # inverter-register path — the one the eg4 driver reads — never fills
+    # them (its direct-BMS transports do, but nothing here speaks those), so
+    # neither schema carries a column that could only ever hold an asserted
+    # "no fault" about a pack nobody asked.
+    assert "fault_code" not in _table_columns(a, "module_raw")
+    assert "fault_code" not in _table_columns(b, "module_raw")
+    assert "status_code" in _table_columns(a, "module_raw")
+    assert "status_code" not in _table_columns(b, "module_raw")
+
+
+def test_a_declared_name_outside_the_registry_fails_loudly() -> None:
+    with pytest.raises(KeyError, match="pv9_flux_capacitance"):
+        schema_ddl(frozenset({"pv_total_power_w", "pv9_flux_capacitance"}))
+
+
+def test_narrowed_ddl_leaves_an_existing_full_table_alone() -> None:
+    # CREATE IF NOT EXISTS is the whole upgrade contract: a database created
+    # before drivers declared subsets has every registry column, and a narrower
+    # declaration must not drop, rebuild or otherwise touch what exists.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    before = {r[1] for r in conn.execute("PRAGMA table_info(inverter_raw)")}
+    conn.executescript(schema_ddl(frozenset({"pv_total_power_w"})))
+    after = {r[1] for r in conn.execute("PRAGMA table_info(inverter_raw)")}
+    conn.close()
+    assert after == before
+
+
+def test_migration_over_a_full_database_under_a_narrow_set_adds_nothing() -> None:
+    # The declared set governs what must exist, never what must not: a full
+    # column set already covers any subset, so there is nothing to run.
+    existing = expected_columns()
+    declared = frozenset({"pv_total_power_w", "battery_module1_soc_pct"})
+    assert migration_ddl(existing, declared) == ()
+
+
+def test_migration_adds_only_declared_missing_columns() -> None:
+    declared = frozenset(
+        {
+            "pv_total_power_w",
+            "battery_soc_pct",
+            "battery_module1_soc_pct",
+            "battery_module1_voltage_v",
+        }
+    )
+    existing: dict[str, tuple[str, ...]] = {
+        table: ("timestamp", "device", "pv_total_power_w", "soc_pct", "error")
+        for table in expected_columns(declared)
+    }
+    statements = migration_ddl(existing, declared)
+    added = {s.split(" ADD COLUMN ")[1].split()[0] for s in statements}
+    # battery_soc_pct and voltage_v are declared and missing; sample_count is
+    # structural on the rollup tiers. Nothing undeclared is added.
+    assert added == {"battery_soc_pct", "voltage_v", "sample_count"}
+    assert not any("pv1_power_w" in s for s in statements)
