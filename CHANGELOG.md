@@ -7,6 +7,38 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.5 — 8 August 2026
+
+### Fixed
+
+- **A battery pack the inverter did not read was recorded as though it had
+  been** ([#40](https://github.com/sjordan0228/arraysense/issues/40)). The
+  inverter library serves every pack it has ever seen on every read, and a pack
+  the firmware did not surface on a given cycle comes back with its registers
+  frozen at their last real values. Nothing checked for that, so held readings
+  were stored stamped with the current time — a pack last actually measured
+  fifteen minutes or nine hours ago looked as fresh as one measured a second ago.
+
+  The consequences were not cosmetic. Every safeguard downstream decides what to
+  trust by looking at that timestamp, so none of them could fire: the checks that
+  drop a reading too old to compare, and the ones that require packs to have been
+  read at the same moment, both saw a bank where every pack was current. A held
+  voltage compared against a live one could raise a **wiring fault that was not
+  there**, and the charge- and voltage-spread graphs could draw a spread that was
+  partly the gap between a fresh reading and a stale one.
+
+  A held pack is now left out of the reading rather than recorded, the same way a
+  pack whose BMS has gone quiet already was. **Expect the spread graphs to look
+  sparser as a result**: moments where a pack was not actually read now show a
+  break instead of a line drawn from old values. That is the honest picture
+  replacing a misleading one, not a regression.
+
+  Two cases deliberately keep the pack rather than dropping it, because being
+  wrong in the direction of keeping data can be recovered from and being wrong in
+  the direction of discarding it cannot: a library build that does not stamp the
+  reading time at all, and one that stamps it without a timezone. The second logs
+  a warning every poll, because it would mean the library changed underneath us.
+
 ## 0.5.4 — 8 August 2026
 
 ### Fixed
