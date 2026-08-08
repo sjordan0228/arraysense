@@ -937,10 +937,10 @@ const zeroRule = () => ({
 // could never say. Luminance carries it instead, and luminance is the one
 // distinction that survives every form of colour vision deficiency.
 //
-// The wash is white on a dark panel, so more opacity reads *brighter*. The
-// dearer the band, the more it stands out, which puts the eye on the costly
-// hours. The legend says "brighter is dearer" for that reason and the two must
-// not drift apart.
+// The wash is white on a dark panel, so more opacity reads *brighter*. The more
+// expensive the band, the more it stands out, which puts the eye on the costly
+// hours. The legend says "brighter = higher rate" for that reason, and the two
+// must not drift apart.
 //
 // ``getWindows`` is a function, not an array, and that is load-bearing. ``paint``
 // builds a chart once and afterwards only calls ``setData`` on it, so a plugin

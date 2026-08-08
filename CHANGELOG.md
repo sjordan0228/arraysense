@@ -7,6 +7,14 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.9 — 8 August 2026
+
+### Changed
+
+- **The band shading legend says what it means in plain words.** It read
+  "brighter is dearer", which is compressed and not how most people say it. It now
+  reads "brighter = higher rate".
+
 ## 0.5.8 — 8 August 2026
 
 ### Added
