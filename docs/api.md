@@ -62,6 +62,58 @@ one table either way. A metric the inverter did not report is `null`, never `0`.
 inverter. Such a row is a recorded gap and should be drawn as a break in a chart, not
 smoothed over.
 
+## `GET /api/capabilities`
+
+What each device is and which metrics it produces, from the driver's own
+declaration. Nothing is read from the inverter to answer this.
+
+```json
+{
+  "devices": [
+    {
+      "device": "CE12345678",
+      "driver": "eg4_luxpower",
+      "model": null,
+      "pv_strings": 3,
+      "energy": "counted",
+      "backup_output": true,
+      "generator_input": true,
+      "split_phase": true,
+      "three_phase": false,
+      "parallel_capable": true,
+      "per_module_battery": true,
+      "metrics": ["pv_total_power_w", "pv1_power_w", "..."],
+      "battery_module_metrics": ["soc_pct", "voltage_v", "..."]
+    }
+  ]
+}
+```
+
+`metrics` names what this device can report at inverter level, and
+`battery_module_metrics` the bare per-module names it produces, both in the
+registry's order. `/api/battery/history` takes names in this bare form — it accepts
+any registry template, but only the ones listed here can ever hold data for this
+device. A metric absent from these lists is one the hardware cannot produce —
+different from a metric listed here that reads `null` on `/api/live`, which the
+device can produce and did not report. Render from these lists rather than
+hard-coding names, and a one-string inverter stops showing empty charts for strings
+it does not have.
+
+`energy` is `counted` when every kWh figure is a counter the inverter keeps itself,
+and `estimated` when it could only be integrated from power samples. An estimate
+misses whatever happened during a collection gap; the two must not be presented with
+the same authority.
+
+`model` is `null` when it has not been established — nothing reads the model register
+today — rather than filled with an assumption.
+
+The reply has three states, because an unknown declaration is not an absent device.
+A driver that describes itself gets the full entry above. A source that names its
+device but declares nothing gets an entry with its serial and `null` for `driver`,
+`model`, every flag, `metrics` and `battery_module_metrics` — null meaning "not
+established", where an empty list would claim a device known to produce nothing.
+Only when no device is configured at all is `devices` empty.
+
 ## `GET /api/history`
 
 Inverter metrics over a time range.

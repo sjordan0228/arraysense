@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
-import pytest
+from datetime import UTC, datetime
+from pathlib import Path
 
+import pytest
+from fastapi.testclient import TestClient
+
+from arraysense.api.app import create_app
+from arraysense.collector.service import CollectorService
+from arraysense.config import Config
+from arraysense.drivers.base import Capabilities, EnergyReporting
+from arraysense.drivers.fake.source import FakeSource
 from arraysense.metrics import (
     ALL_METRICS,
     BATTERY_MODULE_METRICS,
     INVERTER_METRICS,
+    MetricSpec,
     column_names,
     lookup,
 )
+from arraysense.models import Sample
+from arraysense.store.sqlite_store import SqliteStore
+from arraysense.validate import validate_sample
+from conftest import TEST_DEVICE
 
 
 def test_every_spec_is_well_formed() -> None:
@@ -123,3 +137,80 @@ def test_module_expansion_preserves_aggregation() -> None:
     for slot in (1, 2, 3, 4):
         assert lookup(f"battery_module{slot}_cycle_count").aggregation == "max"
         assert lookup(f"battery_module{slot}_cell_min_voltage_v").aggregation == "min"
+
+
+def test_adding_an_inverter_metric_to_the_registry_is_one_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The registry's core promise, held under driver declarations.
+
+    Scoped deliberately to an *inverter* metric, because that is where the
+    one-line rule holds whole. A per-module metric is one line in the registry
+    plus its field on BatteryModuleSample in models.py — the sample is a fixed
+    dataclass and the store reads module values off its fields, so a template
+    with no field gets its column and then dies with AttributeError at the
+    first write. That pairing predates driver declarations and is noted at
+    the registry's module template list.
+
+    The three monkeypatches below are what one line added to INVERTER_METRICS
+    produces at import: the tuple itself, and the ALL_METRICS and _BY_NAME
+    views the module derives from it. Nothing else is patched, so the paths
+    exercised here — schema generation, the store's open and write, bounds
+    validation, and the capabilities endpoint — must all be reading the
+    registry at call time rather than holding import-time copies. It proves no
+    more than that: a module this test never drives can still hold a copy
+    (routes.py's live-view name list is one), and only the paths a metric
+    actually flows through on its way to a column, a check and a declaration
+    are what the one-line rule is about. A driver that declares the new name
+    gets its column, its bounds check, and its line on the capabilities
+    endpoint with no other file edited.
+    """
+    import arraysense.metrics as metrics_module
+
+    spec = MetricSpec("coolant_temperature_c", "\N{DEGREE SIGN}C", 10, -40.0, 150.0)
+    inverter = (*metrics_module.INVERTER_METRICS, spec)
+    everything = (*inverter, *metrics_module.BATTERY_MODULE_METRICS)
+    monkeypatch.setattr(metrics_module, "INVERTER_METRICS", inverter)
+    monkeypatch.setattr(metrics_module, "ALL_METRICS", everything)
+    monkeypatch.setattr(metrics_module, "_BY_NAME", {s.name: s for s in everything})
+
+    # Registration accepts a declaration naming it: the registry is what the
+    # driver's declared set is validated against.
+    declared = Capabilities(
+        pv_strings=0,
+        energy=EnergyReporting.ESTIMATED,
+        metrics=frozenset({"pv_total_power_w", "coolant_temperature_c"}),
+    )
+
+    # The schema follows: a store opened for that declaration has the column,
+    # stores the reading at the registry's scale, and hands it back.
+    when = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store = SqliteStore(str(tmp_path / "flow.db"), device=TEST_DEVICE, metrics=declared.metrics)
+    store.append(Sample(timestamp=when, readings={"coolant_temperature_c": 21.7}))
+    row = store.latest(["coolant_temperature_c"])
+    assert row is not None
+    assert row["coolant_temperature_c"] == 21.7
+
+    # Validation follows: the bounds live on the same registry line.
+    verdict = validate_sample(Sample(timestamp=when, readings={"coolant_temperature_c": 400.0}))
+    assert [failure.metric for failure in verdict.failures] == ["coolant_temperature_c"]
+
+    # The API follows: a device declaring the metric reports it.
+    class _Declaring(FakeSource):
+        @property
+        def capabilities(self) -> Capabilities:
+            return declared
+
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "flow.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=_Declaring(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as client:
+        body = client.get("/api/capabilities").json()
+    store.close()
+    assert "coolant_temperature_c" in body["devices"][0]["metrics"]

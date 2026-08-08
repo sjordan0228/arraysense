@@ -1489,3 +1489,75 @@ def test_naming_the_configured_device_answers_as_usual(client: Any) -> None:
     plain = client.get("/api/live").json()
     named = client.get("/api/live", params={"device": client.app.state.store.device}).json()
     assert named["inverter"] == plain["inverter"]
+
+
+# --- capabilities: what the device produces ----------------------------------
+#
+# A page that enumerates metrics by hand shows a one-string machine two
+# permanently empty charts. This endpoint is where a page learns what the
+# device it is looking at actually produces, straight from the driver's own
+# declaration — no inverter round trip, no store query.
+
+
+def test_capabilities_names_what_the_device_produces(client: Any) -> None:
+    body = client.get("/api/capabilities").json()
+    assert len(body["devices"]) == 1
+    device = body["devices"][0]
+    assert device["driver"] == "fake"
+    assert device["device"] == "CE00000000"
+    assert device["model"] == "simulated"
+    assert device["pv_strings"] == 3
+    assert device["energy"] == "estimated"
+    assert device["per_module_battery"] is True
+    # Inverter-level names come from the driver's declaration, in registry
+    # order — the fake reports a total but nothing per string.
+    assert "pv_total_power_w" in device["metrics"]
+    assert "pv1_power_w" not in device["metrics"]
+    assert device["metrics"][0] == "pv_total_power_w"
+    # Module names are the bare per-module ones the battery endpoints accept.
+    assert "soc_pct" in device["battery_module_metrics"]
+    assert "status_code" not in device["battery_module_metrics"]
+
+
+def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> None:
+    # The collector only requires an InverterSource, which names its device but
+    # carries no identity and no declaration. Absent capability is not absent
+    # data, and it is not an absent device either: the serial is known, so the
+    # device is reported — with null where the declaration would be, meaning
+    # "not established". An empty metrics list would claim the opposite: a
+    # device known to produce nothing.
+    class _Mute:
+        device = TEST_DEVICE
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def read(self) -> Sample:
+            return Sample(timestamp=datetime.now(tz=UTC), readings={})
+
+    store = SqliteStore(str(tmp_path / "mute.db"), device=TEST_DEVICE)
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "mute.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=_Mute(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        body = c.get("/api/capabilities").json()
+    store.close()
+    assert len(body["devices"]) == 1
+    device = body["devices"][0]
+    assert device["device"] == TEST_DEVICE
+    assert device["driver"] is None
+    assert device["model"] is None
+    assert device["pv_strings"] is None
+    assert device["energy"] is None
+    assert device["per_module_battery"] is None
+    assert device["metrics"] is None
+    assert device["battery_module_metrics"] is None
