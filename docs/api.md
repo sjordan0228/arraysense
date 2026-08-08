@@ -186,9 +186,21 @@ How far the per-pack state-of-charge estimates have drifted from reality.
 
 Each pack estimates its charge by counting amp-hours and cannot correct itself until
 it charges fully, so the useful question is not what the packs say but how long it has
-been since anything forced them to agree with reality. A full charge is only credited
-when the bank held at its own BMS charge reference **and** every pack reported full
-during that window; either piece of evidence alone gives a wrong answer.
+been since anything forced them to agree with reality.
+
+A full charge needs evidence from the inverter's terminals **and** from the packs'
+counters, because either alone gives a wrong answer: absorb voltage without the packs
+agreeing is a charge that was cut short, and a pack reading 100% with no absorb behind
+it is a counter that has drifted high, which is the very condition being detected.
+What the two halves trade off is *duration*. A bank that holds at its BMS charge
+reference for twenty minutes needs only every pack to have peaked full within that
+window. A bank that finishes faster — the reference installation crosses absorb and
+tapers to zero in about three minutes — has to show the packs *arriving* at full
+together: every pack the bank is known to hold at or above 99% within a couple of
+minutes of one another, at least one of them measured below full beforehand, and the
+current settled. Four counters cannot independently drift to full inside two minutes,
+and a bank whose counters have all been pegged at 100% for weeks shows no arrival at
+all, so neither is credited.
 
 | `severity` | Meaning |
 | --- | --- |

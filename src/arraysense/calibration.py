@@ -88,6 +88,26 @@ PACK_COMPARE_MAX_SKEW = timedelta(minutes=2)
 # at 99 would otherwise be treated as never having recalibrated.
 PACK_RECALIBRATED_SOC = 99.0
 
+# The hold required of a bank whose packs are doing the arguing. The reference
+# installation crosses absorb, finishes and tapers to zero in about three
+# minutes — sixteen raw samples above the bar at an eleven-second poll, four
+# rows of the minute tier — so ``MIN_ABSORB`` cannot be met there at all, and
+# the sixty-day search came back empty with the charge sitting in the history.
+# One minute is two consecutive rows of the tier this scans, which is the
+# cheapest thing a single misrouted reply cannot fake; the dongle crosses
+# replies often enough that one high row is a real hazard. Duration is not what
+# makes this safe — see ``bank_recalibrated_at``.
+CORROBORATING_ABSORB = timedelta(minutes=1)
+
+# How long after the bank leaves absorb a pack may still snap its counter and
+# count as part of the same charge. On 8 August 2026 three packs reset two
+# minutes into the absorb and the fourth three minutes after the inverter's own
+# terminal voltage had fallen back below the reference, so a search confined to
+# the voltage window misses the pack that completes the set. Fifteen minutes
+# leaves room for the round-robin slot rotation and a BMS that reports whole
+# percent, while staying far short of the hours between one charge and the next.
+PACK_RESET_LAG = timedelta(minutes=15)
+
 # Days since the last full charge, and what each means. Seven is early enough
 # to be useful and quiet enough to ignore. Fourteen is roughly where this
 # hardware's drift reaches the ten points EG4's own manual stops calling
@@ -254,6 +274,128 @@ def packs_recalibrated(
     return all(soc >= PACK_RECALIBRATED_SOC for soc in peak.values())
 
 
+def bank_recalibrated_at(
+    module_rows: Sequence[dict[str, Any]],
+    since: datetime,
+    expected: Sequence[str] | None = None,
+    skew: timedelta = PACK_COMPARE_MAX_SKEW,
+) -> datetime | None:
+    """Return the instant the whole bank was first seen *arriving* at full together.
+
+    This is the evidence a twenty-minute hold was standing in for, and it is
+    stronger than the hold ever was. One counter reading 100% proves nothing —
+    that is drift, the condition being detected. Every counter reaching it
+    within a couple of minutes of the others cannot be independent drifts,
+    because drift is slow: the ladder above is calibrated on this hardware
+    taking a fortnight to open ten points, which is under a point a day and
+    cannot walk a bank to full inside two minutes. Simultaneity is what
+    separates a reset from a coincidence, and it is why this asks for the packs
+    to be full at one *instant* rather than to have peaked somewhere in a range
+    the way ``packs_recalibrated`` does. Peaks scattered across half an hour are
+    the drift signature itself.
+
+    The second requirement is what keeps the older hole shut. Standby draw
+    makes every counter read high, so a bank left alone long enough has all of
+    them pegged at 100% while it sits at half charge — a standing unanimity no
+    charge caused. Some pack in the bank therefore has to have been *measured*
+    below full before ``since``, which is the moment the bank reached its charge
+    reference. A charge is a transition; only a transition counts. Requiring the
+    spread to fall by some number of points would have done the same job on this
+    installation and then failed on the next one, because a bank charged
+    nightly has no spread left to collapse.
+
+    ``module_rows`` covers the charge and the minutes either side of it, each
+    row carrying ``timestamp``, ``serial`` and ``soc_pct``; rows before
+    ``since`` are read only for that below-full evidence. ``expected`` names the
+    serials the bank is known to hold, and a pack that said nothing fails the
+    check as surely as one that read 80% — silence is not consent. With
+    ``expected`` omitted the roster is whatever reported.
+    """
+    stamped = sorted(
+        (
+            row
+            for row in module_rows
+            if isinstance(row.get("timestamp"), datetime)
+            and isinstance(row.get("soc_pct"), int | float)
+        ),
+        key=lambda row: row["timestamp"],
+    )
+    roster = set(expected) if expected is not None else {str(row["serial"]) for row in stamped}
+    if not roster:
+        return None
+
+    latest: dict[str, tuple[datetime, float]] = {}
+    was_below = False
+    for row in stamped:
+        when: datetime = row["timestamp"]
+        serial = str(row["serial"])
+        soc = float(row["soc_pct"])
+        latest[serial] = (when, soc)
+        if when < since:
+            if serial in roster and soc < PACK_RECALIBRATED_SOC:
+                was_below = True
+            continue
+        if not was_below or not roster.issubset(latest):
+            continue
+        if all(
+            when - latest[s][0] <= skew and latest[s][1] >= PACK_RECALIBRATED_SOC for s in roster
+        ):
+            return when
+    logger.debug(
+        "no simultaneous reset after %s: %d packs seen, any below full first: %s",
+        since,
+        len(latest),
+        was_below,
+    )
+    return None
+
+
+def charge_completed_at(
+    start: datetime,
+    end: datetime,
+    module_rows: Sequence[dict[str, Any]],
+    expected: Sequence[str] | None = None,
+    min_absorb: timedelta = MIN_ABSORB,
+    lag: timedelta = PACK_RESET_LAG,
+) -> datetime | None:
+    """Decide whether one absorb window was a completed charge, and when it completed.
+
+    Two doors, and a bank only has to pass one. The first is the original: the
+    bank held at its charge reference for ``min_absorb`` and every pack peaked
+    at full inside that window. The second asks nothing of duration and
+    everything of the packs — see ``bank_recalibrated_at`` — and exists because
+    the reference hardware finishes a charge in three minutes and would
+    otherwise never register one.
+
+    The order matters. A bank that already reads full and charges again shows no
+    transition for the second door to find, so the long-hold door has to be
+    tried first or a grid-tied bank kept at 100% would report itself uncharged.
+
+    ``module_rows`` spans ``start - lag`` to ``end + lag``; this slices out the
+    window itself for the first door. Both doors return the instant the counters
+    were reset, which is the end of the absorb for the first and the moment the
+    last pack arrived at full for the second.
+    """
+    within = [
+        row
+        for row in module_rows
+        if isinstance(row.get("timestamp"), datetime) and start <= row["timestamp"] <= end
+    ]
+    if end - start >= min_absorb and packs_recalibrated(within, expected=expected):
+        return end
+    # Bounded at both ends, and the earlier bound is the load-bearing one. A
+    # pack measured below full a month ago says nothing about whether this
+    # charge was a transition; leaving the lookback open would let ancient rows
+    # vouch for a bank that has been pegged at 100% for weeks.
+    nearby = [
+        row
+        for row in module_rows
+        if isinstance(row.get("timestamp"), datetime)
+        and start - lag <= row["timestamp"] <= end + lag
+    ]
+    return bank_recalibrated_at(nearby, start, expected=expected)
+
+
 def last_full_charge(
     inverter_rows: Sequence[dict[str, Any]],
     module_rows: Sequence[dict[str, Any]],
@@ -261,27 +403,26 @@ def last_full_charge(
 ) -> datetime | None:
     """Return when the bank last genuinely reached full, or None if never seen.
 
-    Both halves of the evidence are required. The bank must have been held at
-    its charge reference, and every pack that reported during that period must
-    have read full. Either alone gives a wrong answer: absorb voltage without
-    the packs agreeing means the charge was cut short, and a pack reading 100%
-    outside an absorb window is a pack whose counter has drifted high, which is
-    precisely the condition being detected rather than evidence against it.
+    The inverter's own terminals and the packs' own counters are both required,
+    and neither is sufficient. Absorb voltage without the packs agreeing is a
+    charge that was cut short; packs reading 100% with no absorb behind them are
+    counters that have drifted high, which is the condition being detected
+    rather than evidence against it. What the two halves are allowed to trade
+    off is duration: a bank that holds at its reference for twenty minutes needs
+    only every pack to have peaked full in that time, while a bank that finishes
+    in three needs the packs seen arriving at full together.
 
     ``module_rows`` spans the same range as ``inverter_rows``, each row
-    carrying ``timestamp``, ``serial`` and ``soc_pct``. What comes back is the
-    *end* of the most recent qualifying charge, since that is the instant the
-    counters reset.
+    carrying ``timestamp``, ``serial`` and ``soc_pct``. ``min_absorb`` is the
+    hold the *long* door asks for and nothing else; the short door has its own,
+    which is only long enough to rule out a single misrouted reply. What comes
+    back is the instant the counters reset in the most recent qualifying charge.
     """
-    for start, end in reversed(full_charge_windows(inverter_rows, min_absorb)):
-        within = [
-            row
-            for row in module_rows
-            if row.get("timestamp") is not None and start <= row["timestamp"] <= end
-        ]
-        if packs_recalibrated(within):
-            return end
-        logger.debug("absorb window %s to %s rejected: %d module rows", start, end, len(within))
+    for start, end in reversed(full_charge_windows(inverter_rows, CORROBORATING_ABSORB)):
+        when = charge_completed_at(start, end, module_rows, min_absorb=min_absorb)
+        if when is not None:
+            return when
+        logger.debug("absorb window %s to %s credited no reset", start, end)
     return None
 
 
