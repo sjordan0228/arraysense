@@ -62,3 +62,27 @@ def test_the_unit_file_and_the_docs_agree_on_the_restart_policy() -> None:
         assert f"Restart={stated}" in docs, (
             f"the unit ships Restart={stated} and the installation docs do not say so"
         )
+
+
+def test_the_measured_battery_colours_are_pinned_in_common_js() -> None:
+    # Charge green and discharge red were chosen by measuring every pair under
+    # simulated protanopia, deuteranopia and tritanopia against the panel
+    # surface, not by eye. Nudging either value by eye is exactly the failure
+    # this project cares about, so the declarations the palette ships are pinned
+    # here rather than trusted to a comment.
+    #
+    # Searching the whole file is not enough: both values also appear in the
+    # INK_FALLBACK map, so deleting the real CSS declaration while leaving the
+    # fallback behind would still pass and the charts would silently change.
+    # The :root block is what the browser actually reads, so that is what is
+    # pinned, and the fallback is checked separately for agreeing with it.
+    common = (
+        Path(__file__).resolve().parents[1] / "src" / "arraysense" / "web" / "common.js"
+    ).read_text()
+    root = common.split(":root{", 1)[-1].split("}", 1)[0]
+    assert "--batt:#2aa198" in root, "the shipped :root palette no longer declares --batt"
+    assert "--batt-dis:#d1495b" in root, "the shipped :root palette no longer declares --batt-dis"
+    fallback = common.split("INK_FALLBACK", 1)[-1].split("};", 1)[0]
+    assert "'--batt':'#2aa198'" in fallback and "'--batt-dis':'#d1495b'" in fallback, (
+        "INK_FALLBACK has drifted from the :root palette it stands in for"
+    )

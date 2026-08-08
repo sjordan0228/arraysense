@@ -27,11 +27,12 @@ const BASE_CSS = `
        ΔE 1.9 apart under protan, which is indistinguishable, and 9.8 apart even
        with full colour vision. These four are worst-pair ΔE 9.0 under CVD and
        16.1 with normal vision, against this panel's own surface.
-       Charge and discharge deliberately share one hue: they are one series with
-       a sign, separated by the zero line, and position carries that far better
-       than a fifth colour could. */
+       Charge is green and discharge red — the pair that shares a chart separates
+       at ΔE 20.6 protan / 27.3 deutan / 70.7 tritan, chosen by measurement and
+       not by eye. Position still carries the sign: the fill sits above or below
+       the zero line whatever the hue does, so the colour is reinforcement. */
     --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
-    --batt-dis:#14625f;
+    --batt-dis:#d1495b;
     --ink:#fff; --ink2:#c8cbd9; --ink3:#8d92a8;
     --grid-line:rgba(255,255,255,.08);
     --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
@@ -823,7 +824,7 @@ const SYNC_KEY = 'arraysense';
 // below is only reached when there is no computed style to read at all.
 const INK_FALLBACK = {
   '--pv':'#cf7b26', '--load':'#4678cc', '--batt':'#2aa198', '--grid':'#b0486e',
-  '--batt-dis':'#14625f', '--ink3':'#8d92a8', '--grid-line':'rgba(255,255,255,.08)',
+  '--batt-dis':'#d1495b', '--ink2':'#c8cbd9', '--ink3':'#8d92a8', '--grid-line':'rgba(255,255,255,.08)',
 };
 const inkCache = {};
 function ink(name) {
@@ -846,7 +847,13 @@ function fade(name, alpha) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
 }
 
-const AXIS_FONT = '9.5px system-ui,-apple-system,"Segoe UI",sans-serif';
+// Tick labels were 9.5px, the smallest text anywhere on the page against a body
+// of 14px, and unreadable on a normal-DPI display. 12px puts them in the same
+// range as the legend and the range buttons, which is where a label somebody is
+// expected to read belongs. The gutters below grew with it: a taller label needs
+// more height under the plot, and a wider one needs more room beside it, or the
+// text clips instead of shrinking.
+const AXIS_FONT = '12px system-ui,-apple-system,"Segoe UI",sans-serif';
 
 // A gap is a break, never bridged. A null reading, or a row the collector
 // wrote with an error because the poll failed, enters the series as null and
@@ -884,14 +891,20 @@ const kwTicks = (u, splits) =>
 // Fresh objects every call: uPlot fills defaults into the axis it is handed,
 // and two axes sharing one nested grid object would share the result.
 const axis = (extra) => Object.assign({
-  stroke: () => ink('--ink3'),
+  stroke: () => ink('--ink2'),
   font: AXIS_FONT,
   ticks: { show: false },
   grid: { stroke: () => ink('--grid-line'), width: 1 },
 }, extra);
 
-const timeAxis = () => axis({ size: 26, values: timeTicks });
-const kwAxis = () => axis({ size: 48, gap: 6, values: kwTicks });
+// `space` is the minimum room uPlot leaves between ticks before it drops to a
+// coarser increment. Its default is 50px, which was fine at 9.5px type and is
+// not at 12px: "12:00 PM" measures about 53px, so neighbouring labels touched.
+// uPlot centres labels and does no collision avoidance of its own, so the
+// spacing is the only thing standing between a readable axis and an overlapping
+// one — 80 leaves a clear gap at the widest format timeTicks produces.
+const timeAxis = () => axis({ size: 32, space: 80, values: timeTicks });
+const kwAxis = () => axis({ size: 56, gap: 6, values: kwTicks });
 
 // The zero line is not a gridline: it is the thing a signed reading is signed
 // against. Drawn brighter, over the grid and under the series, which is where
@@ -1017,11 +1030,13 @@ function gridFill(u) {
   return grad;
 }
 
-// Charge and discharge share one hue and differ only in lightness, which is
-// the distinction that survives every form of colour blindness. The split is
-// exactly at the zero line, so position carries the meaning and the shade only
-// confirms it. The darker half is given more opacity because it has to show
-// through against a dark panel at all.
+// Charge is green and discharge red, a pair measured under simulated
+// protanopia, deuteranopia and tritanopia rather than chosen by eye — those
+// three, not "every form", because that is what was actually run. The split is
+// exactly at the zero
+// line, so position carries the sign and the hue only reinforces it. The
+// discharge half is given more opacity because it has to show through against
+// a dark panel at all.
 function battFill(u) {
   const { top, height } = u.bbox;
   const grad = u.ctx.createLinearGradient(0, top, 0, top + height);

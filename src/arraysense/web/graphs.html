@@ -80,8 +80,9 @@
     <div id="packBands"><div class="empty">waiting for per-pack readings</div></div>
     <!-- Two same-coloured traces, and a third column deliberately not drawn,
          both need saying out loud once. The alternative to the first is a
-         second hue, and the palette has four that were checked against each
-         other; a fifth would be one nobody checked. -->
+         second hue, and every hue in the palette was measured against every
+         other under simulated colour-vision deficiency; an unmeasured one would
+         be a hue nobody checked. -->
     <p class="why">Two traces to a pack, in one colour because they are one
       quantity from one battery: its hottest cell solid, its coldest dashed. The
       hottest cannot sit below the coldest, so position separates the pair and
@@ -295,8 +296,9 @@ const KINDS = {
 // page where the twelfth quietly differs from the other eleven.
 //
 // Colour is by what the series is about — solar, home, battery, grid — and
-// never by which band it is. Four hues, validated against protanopia,
-// deuteranopia and tritanopia; a fifth would be a hue nobody checked.
+// never by which band it is. Every hue is validated against protanopia,
+// deuteranopia and tritanopia, every pair against every other; adding one
+// without measuring it is the thing that must not happen.
 // ---------------------------------------------------------------------------
 
 const BANDS = [
