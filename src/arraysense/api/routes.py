@@ -396,6 +396,13 @@ async def live(request: Request, device: str | None = None) -> dict[str, Any]:
     # two places drifts — the Costs page already proved that with money. The
     # page prints what this says.
     status = operating_mode.assess(inverter or {})
+    # The battery block: how fast the bank is filling or emptying, and its
+    # voltage. The rate is derived from readings the driver already collects:
+    # capacity comes from battery_full_capacity_ah and battery_voltage_v, and
+    # the sign follows battery_power_w so discharge reads negative. A bank
+    # whose capacity or power nobody reported carries null for the rate; zero
+    # is a real reading (an idle bank) and stays zero.
+    battery_block = _battery_block(inverter)
     return {
         "inverter": _isoformat_row(inverter) if inverter else None,
         "modules": [_isoformat_row(m) for m in modules],
@@ -405,6 +412,7 @@ async def live(request: Request, device: str | None = None) -> dict[str, Any]:
             "why": status.why,
             "known": status.known,
         },
+        "battery": battery_block,
     }
 
 
@@ -1353,6 +1361,58 @@ async def resume(request: Request) -> dict[str, Any]:
     """Take the dongle back before the yield timer runs out."""
     await request.app.state.service.resume()
     return {"yielding": False}
+
+
+def _battery_block(inverter: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Build the battery block for the /api/live response.
+
+    Returns capacity_kwh, rate_pct_per_hour, and pack_voltage_v. The capacity
+    is derived from battery_full_capacity_ah and battery_voltage_v (Ah x V =
+    Wh, divided by 1000 for kWh). The rate is battery_power_w divided by
+    capacity_kwh, scaled to percent per hour. The sign follows the power:
+    positive for charging, negative for discharging.
+
+    Absent data is absent: null, never zero. A bank with no capacity reading
+    shows no rate. An idle bank (power = 0) reports 0.0 for the rate.
+    """
+    if inverter is None:
+        return {"capacity_kwh": None, "rate_pct_per_hour": None, "pack_voltage_v": None}
+
+    capacity_ah = inverter.get("battery_full_capacity_ah")
+    voltage_v = inverter.get("battery_voltage_v")
+    power_w = inverter.get("battery_power_w")
+
+    # Amp-hours at the pack's own voltage, in kWh. Kept unrounded for the
+    # division below and rounded only on the way out: dividing by the rounded
+    # figure would compute the rate from what the card displays rather than from
+    # what the bank reported.
+    #
+    # This is energy at the voltage measured right now, not the bank's rated
+    # size, and the two differ: 1120 Ah reads 57.2 kWh at the nominal 51.1 V and
+    # 61.5 kWh at the 54.9 V a full bank sits at. So it drifts about seven
+    # percent across a charge cycle, which is the right basis for "how fast is
+    # this filling" and the wrong one for "how big is this bank". It is not shown
+    # as a bank size anywhere for that reason — the card prints the rate, the
+    # state of charge and the voltage, and leaves this as the working.
+    exact_kwh: float | None = None
+    if capacity_ah is not None and voltage_v is not None:
+        exact_kwh = (capacity_ah * voltage_v) / 1000.0
+
+    # A capacity of zero is inside the metric's own plausible range, so it
+    # arrives as an ordinary reading rather than an error — and dividing by it
+    # took down /api/live, which is the endpoint the whole dashboard polls. It
+    # is also not a bank filling at any rate: a bank that holds nothing has no
+    # rate to report, which is exactly what absent means here.
+    rate_pct_per_hour: float | None = None
+    if exact_kwh and power_w is not None:
+        # W / kWh gives %/h once the watts are kilowatts: (power/1000)/kWh*100.
+        rate_pct_per_hour = round(power_w / exact_kwh / 10.0, 2)
+
+    return {
+        "capacity_kwh": None if exact_kwh is None else round(exact_kwh, 1),
+        "rate_pct_per_hour": rate_pct_per_hour,
+        "pack_voltage_v": voltage_v,
+    }
 
 
 def _isoformat_row(row: dict[str, Any]) -> dict[str, Any]:

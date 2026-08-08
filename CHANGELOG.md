@@ -7,6 +7,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.0 — 8 August 2026
+
+### Added
+
+- **The battery card says how fast the bank is filling or emptying**
+  ([#44](https://github.com/sjordan0228/arraysense/issues/44)). A power figure
+  says how hard the bank is working, not what that means for it: +7 kW into a
+  57 kWh bank is a different afternoon from +7 kW into a 14 kWh one. The card now
+  reads `+5.09 kW · bank 64% · +8.5 %/hr · 53.7 V`.
+
+  The rate is worked out by the service, from the bank's own reported capacity
+  rather than a number typed into the code. An idle bank reads `0 %/hr`, which is
+  a real state; a bank whose capacity was not reported shows no rate at all
+  rather than a zero standing in for something nobody knew.
+
+- **A battery icon on the card**, filled to the state of charge. The fill is the
+  part that carries the meaning and the percentage is printed beside it, so the
+  colour is a third telling rather than the only one — the icon reads correctly
+  whether or not its colours are distinguishable. Below 20% it is red, to 50%
+  amber, above that green.
+
+- **The pack voltage**, beside the rest.
+
 ## 0.5.9 — 8 August 2026
 
 ### Changed

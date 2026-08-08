@@ -72,6 +72,18 @@
     .mod .face{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
     .mod .face .kv{margin-top:4px}
   }
+  /* The battery icon. The fill tracks the state of charge and is the encoding
+     that carries; the percentage beside it says the same thing in a
+     number, and the colour is reinforcement on top of both. Three states were
+     chosen by the owner having seen them measured against the alternatives. */
+  .battrow{display:flex;align-items:center;gap:9px}
+  .batticon{flex:0 0 auto;line-height:0}
+  .batticon .shell{fill:none;stroke:var(--ink3);stroke-width:1}
+  .batticon .cap{fill:var(--ink3)}
+  .batticon .lvl{fill:var(--batt)}
+  .batticon.low .lvl{fill:var(--bad)}
+  .batticon.mid .lvl{fill:var(--warn)}
+  .batticon.high .lvl{fill:var(--good)}
   .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
   .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
   .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
@@ -295,7 +307,15 @@
            for the same reason the solar one does, and it is why there is no
            second request: /api/live already carries every column. -->
       <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b><span class="sub" id="battState">—</span></div>
+      <!-- The icon sits beside the power figure rather than replacing the
+           percentage: the fill is a shape somebody reads at a glance,
+           and the number is what they read when the glance is not enough. One
+           encodes, the other confirms, and colour is the third and least of
+           them. -->
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span>
+        <div class="battrow"><span class="batticon" id="battIcon"></span><b id="batt">—</b></div>
+        <span class="sub" id="battState">—</span>
+        <span class="sub" id="battPack"></span></div>
       <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
   </div>
@@ -447,6 +467,52 @@ const MODE_TINT = {
   'Importing': 'grid',
 };
 
+// The battery icon, hand-written the way the Sankey is — uPlot is for time axes
+// and this is a static shape. The fill width tracks the state of charge — the
+// battery lies on its side, so the level reads left to right rather than bottom
+// to top — and the shape says the level before any number is read; the
+// percentage beside it says
+// the same thing exactly, and the colour is a third telling on top of two that
+// already work without it. That order matters: a reader who cannot separate the
+// three fill colours still reads this correctly from the fill alone.
+//
+// Absent is a hollow shell, not an empty one. A bank nobody has heard from is
+// not a flat bank, and drawing it at 0% is the mistake this whole project is
+// about.
+const BATT_W = 34;
+const BATT_H = 17;
+
+function batteryIcon(soc) {
+  const capW = 3;
+  const bodyW = BATT_W - capW - 1;
+  const inset = 3;
+  const innerW = bodyW - inset * 2;
+  const innerH = BATT_H - inset * 2;
+  const level = soc === null ? null : Math.max(0, Math.min(100, soc));
+  const fillW = level === null ? 0 : Math.round((innerW * level) / 100);
+  return `<svg width="${BATT_W}" height="${BATT_H}" viewBox="0 0 ${BATT_W} ${BATT_H}"`
+    + ` role="img" aria-label="${level === null ? 'state of charge unknown'
+        : 'battery at ' + level.toFixed(0) + ' percent'}">`
+    + `<rect class="shell" x="0.5" y="0.5" width="${bodyW - 1}" height="${BATT_H - 1}" rx="3"/>`
+    + `<rect class="cap" x="${bodyW + 1}" y="${Math.round(BATT_H * 0.3)}" width="${capW}"`
+    + ` height="${Math.round(BATT_H * 0.4)}" rx="1"/>`
+    + (fillW > 0
+      ? `<rect class="lvl" x="${inset}" y="${inset}" width="${fillW}" height="${innerH}" rx="1.5"/>`
+      : '')
+    + '</svg>';
+}
+
+// Which of the three colours the fill takes. The thresholds are the owner's:
+// below a fifth is low, below half is middling, above that is fine.
+function battClass(soc) {
+  if (soc === null) return 'batticon';
+  if (soc < 20) return 'batticon low';
+  // Inclusive at fifty: the middle band is "twenty to fifty", so the boundary
+  // itself belongs to it. Excluding it put exactly 50% in the green.
+  if (soc <= 50) return 'batticon mid';
+  return 'batticon high';
+}
+
 // The system's state in words. Both halves come from /api/live, judged once in
 // arraysense.mode — the page prints the verdict and never recomputes it.
 function showMode(m, i) {
@@ -469,6 +535,31 @@ function showMode(m, i) {
   const soc = numOrNull(i.battery_soc_pct);
   $('modeBatt').textContent = soc === null ? '' : `· bank ${soc.toFixed(0)}%`;
   $('battState').textContent = m.battery;
+}
+
+// The battery card's own three lines: the icon beside the power figure, the rate
+// of change the power implies, and the pack voltage. The rate is handed over by
+// the service already worked out — it divides by the bank's measured capacity,
+// and a browser doing that arithmetic on readings is how the Costs page came to
+// disagree with the service about money.
+function showBattery(battery, inverter) {
+  const soc = numOrNull(inverter && inverter.battery_soc_pct);
+  const icon = $('battIcon');
+  if (icon) {
+    icon.className = battClass(soc);
+    icon.innerHTML = batteryIcon(soc);
+  }
+  const rate = numOrNull(battery && battery.rate_pct_per_hour);
+  const volts = numOrNull(battery && battery.pack_voltage_v);
+  // Each part is shown only if it was measured. A rate of zero is a real
+  // reading — the bank is idle — and is printed; a rate nobody could work out
+  // is left off entirely rather than shown as a zero or a dash-shaped guess.
+  const parts = [];
+  if (soc !== null) parts.push(`bank ${soc.toFixed(0)}%`);
+  if (rate !== null) parts.push(`${rate >= 0 ? '+' : ''}${rate.toFixed(1)} %/hr`);
+  if (volts !== null) parts.push(`${volts.toFixed(1)} V`);
+  const pack = $('battPack');
+  if (pack) pack.textContent = parts.join(' · ');
 }
 
 async function loadLive() {
@@ -520,6 +611,7 @@ async function loadLive() {
     // latest_modules, so they are dropped before anything compares them.
     const packs = reporting(live.modules);
     drawModules(packs);
+    showBattery(live.battery, i);
     drawSankey(i);
     // Same payload, no second request: /api/live already carries every column.
     renderDetail(i, packs);
