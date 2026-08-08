@@ -751,3 +751,183 @@ def test_a_blank_device_is_refused_rather_than_silently_empty(tmp_path: Path) ->
     with pytest.raises(ValueError):
         store.latest(["pv_total_power_w"], device="   ")
     store.close()
+
+
+# --- a store opened for what its driver declares ------------------------------
+#
+# A driver declares the metrics its device produces, and the store lays its
+# schema for exactly those. A fresh database then has no column that can never
+# be filled — while a database made before drivers declared subsets keeps every
+# column it has, because narrowing what will be written must never touch what
+# was.
+
+# One PV reading and one per-module template. Declaring one slot's expansion
+# declares the template for every slot, since the module tables carry one bare
+# column per template.
+_DECLARED = frozenset({"pv_total_power_w", "battery_module1_soc_pct"})
+
+
+def test_a_narrowed_store_creates_only_declared_columns(tmp_path: Path) -> None:
+    path = tmp_path / "narrow.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE, metrics=_DECLARED)
+    store.close()
+    conn = _open_db(path)
+    inverter = _metric_columns(conn)
+    modules = [
+        r[1]
+        for r in conn.execute("PRAGMA table_info(module_raw)")
+        if r[1] not in ("timestamp", "device", "module_id")
+    ]
+    conn.close()
+    assert inverter == ("pv_total_power_w",)
+    assert modules == ["soc_pct"]
+
+
+def test_an_undeclared_registry_metric_reads_back_as_none(tmp_path: Path) -> None:
+    # The live page asks for every registry metric whatever the device is. A
+    # metric the driver never declared has no column, and the honest answer is
+    # the same None an unreported reading gives — never an SQL error.
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 500.0}))
+    rows = store.query(["pv_total_power_w", "load_power_w"], _ts() - timedelta(minutes=1), _ts())
+    latest = store.latest(["pv_total_power_w", "load_power_w"])
+    store.close()
+    assert rows[0]["pv_total_power_w"] == 500.0
+    assert rows[0]["load_power_w"] is None
+    assert latest is not None
+    assert latest["load_power_w"] is None
+
+
+def test_an_undeclared_module_metric_reads_back_as_none(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="BA1", slot=1, soc_pct=64.0),),
+        )
+    )
+    rows = store.query_modules(["soc_pct", "voltage_v"], _ts() - timedelta(minutes=1), _ts())
+    modules = store.latest_modules(["soc_pct", "voltage_v"])
+    store.close()
+    assert rows[0]["soc_pct"] == 64.0
+    assert rows[0]["voltage_v"] is None
+    assert modules[0]["voltage_v"] is None
+
+
+def test_append_refuses_a_reading_the_driver_never_declared(tmp_path: Path) -> None:
+    # A reading the schema has no column for would otherwise vanish without a
+    # trace on its way to the store — the one failure this project exists to
+    # prevent. It means the driver's declaration and its output have drifted,
+    # which is a bug to surface, not a value to drop.
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    with pytest.raises(KeyError, match="load_power_w"):
+        store.append(Sample(timestamp=_ts(), readings={"load_power_w": 100.0}))
+    store.close()
+
+
+def test_append_refuses_an_undeclared_module_reading(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    with pytest.raises(KeyError, match="voltage_v"):
+        store.append(
+            Sample(
+                timestamp=_ts(),
+                readings={},
+                battery_modules=(
+                    BatteryModuleSample(serial="BA1", slot=1, soc_pct=64.0, voltage_v=53.7),
+                ),
+            )
+        )
+    store.close()
+
+
+def test_a_narrowed_store_opens_a_full_database_and_leaves_it_whole(tmp_path: Path) -> None:
+    # The compatible behaviour, exercised end to end: the declared set governs
+    # tables that do not exist yet, and an installation whose tables already
+    # carry the full registry keeps every column — and every reading — it has.
+    path = tmp_path / "grown.db"
+    full = SqliteStore(str(path), device=TEST_DEVICE)
+    full.append(Sample(timestamp=_ts(), readings={"load_power_w": 2810.0}))
+    full.close()
+
+    store = SqliteStore(str(path), device=TEST_DEVICE, metrics=_DECLARED)
+    # The undeclared column survives, and its history stays readable.
+    conn = _open_db(path)
+    cols = _metric_columns(conn)
+    conn.close()
+    assert "load_power_w" in cols
+    rows = store.query(["load_power_w"], _ts() - timedelta(minutes=1), _ts())
+    assert rows[0]["load_power_w"] == 2810.0
+    # Writing still follows the declaration.
+    store.append(Sample(timestamp=_ts() + timedelta(minutes=1), readings={"pv_total_power_w": 1.0}))
+    store.close()
+
+
+def test_a_newly_declared_metric_gains_its_column_on_open(tmp_path: Path) -> None:
+    # Adding a metric to the registry and a driver's declaration stays a
+    # no-migration change: the column arrives the next time the store opens.
+    path = tmp_path / "grow.db"
+    SqliteStore(str(path), device=TEST_DEVICE, metrics=frozenset({"pv_total_power_w"})).close()
+    store = SqliteStore(str(path), device=TEST_DEVICE, metrics=_DECLARED | {"load_power_w"})
+    store.append(Sample(timestamp=_ts(), readings={"load_power_w": 100.0}))
+    latest = store.latest(["load_power_w"])
+    store.close()
+    assert latest is not None
+    assert latest["load_power_w"] == 100.0
+
+
+def test_an_empty_declaration_still_records_a_gap(tmp_path: Path) -> None:
+    # A declaration with no inverter metric at all is legal, and a gap row
+    # carries no readings anyway — only a timestamp, a device and its reason.
+    # The upsert must survive an empty column list; it once generated
+    # "DO UPDATE SET , error=..." and broke gap recording outright for the
+    # whole device class this narrowing exists for. Appended twice, because
+    # the retry path is the DO UPDATE branch.
+    store = SqliteStore(str(tmp_path / "empty.db"), device=TEST_DEVICE, metrics=frozenset())
+    store.append(Sample.failed(_ts(), "inverter unreachable"))
+    store.append(Sample.failed(_ts(), "inverter unreachable"))
+    rows = store.query([], _ts() - timedelta(minutes=1), _ts())
+    store.close()
+    assert len(rows) == 1
+    assert rows[0]["error"] == "inverter unreachable"
+
+
+def test_a_module_only_declaration_records_gaps_and_module_readings(tmp_path: Path) -> None:
+    # The bank-summary-inverted device: everything it reports is per-module.
+    # Its inverter tiers hold nothing but timestamps and gap reasons, and both
+    # halves must keep working.
+    store = SqliteStore(
+        str(tmp_path / "mod.db"),
+        device=TEST_DEVICE,
+        metrics=frozenset({"battery_module1_soc_pct"}),
+    )
+    store.append(Sample.failed(_ts(), "inverter unreachable"))
+    store.append(
+        Sample(
+            timestamp=_ts() + timedelta(minutes=1),
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="BA1", slot=1, soc_pct=64.0),),
+        )
+    )
+    gap = store.query([], _ts() - timedelta(minutes=1), _ts())
+    modules = store.latest_modules(["soc_pct"])
+    store.close()
+    assert gap[0]["error"] == "inverter unreachable"
+    assert modules[0]["soc_pct"] == 64.0
+
+
+def test_a_module_carrying_identity_alone_survives_an_empty_declaration(tmp_path: Path) -> None:
+    # With no template declared, a module row is nothing but identity and a
+    # timestamp — and a collector retry of that row has nothing to update.
+    # Both writes must succeed; the second is the ON CONFLICT branch.
+    store = SqliteStore(str(tmp_path / "ident.db"), device=TEST_DEVICE, metrics=frozenset())
+    sample = Sample(
+        timestamp=_ts(),
+        readings={},
+        battery_modules=(BatteryModuleSample(serial="BA1", slot=1),),
+    )
+    store.append(sample)
+    store.append(sample)
+    modules = store.latest_modules([])
+    store.close()
+    assert [m["serial"] for m in modules] == ["BA1"]

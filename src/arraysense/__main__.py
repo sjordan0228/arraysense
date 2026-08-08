@@ -69,7 +69,13 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     collector on the way out, and the app alone does not expose them.
     """
     Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
-    store = SqliteStore(config.database_path, device=config.inverter_serial)
+    # The store lays its schema for what the configured driver declares it can
+    # produce, so a fresh database has no column that can never be filled. The
+    # settings overlay below cannot change the driver — only the file names it
+    # — so the declaration is safe to resolve before the store exists to read
+    # settings from.
+    declared = drivers.get(config.driver).capabilities.metrics
+    store = SqliteStore(config.database_path, device=config.inverter_serial, metrics=declared)
 
     # Anything set from the settings page wins over the file. The merge happens
     # here rather than inside load() because the settings live in the database,
@@ -88,7 +94,7 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             config.inverter_serial,
         )
         store.close()
-        store = SqliteStore(config.database_path, device=config.inverter_serial)
+        store = SqliteStore(config.database_path, device=config.inverter_serial, metrics=declared)
 
     # Logged here rather than in main() because this is the first point at
     # which the values are the ones the collector will actually use. Logging

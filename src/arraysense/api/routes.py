@@ -39,7 +39,7 @@ from arraysense.costs import bucket_energy, period_energy, price_period, unprice
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SettingsStore, describe, lookup_setting
-from arraysense.store.schema import module_metric_columns
+from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
 from arraysense.tariff import (
@@ -332,6 +332,81 @@ async def live(request: Request, device: str | None = None) -> dict[str, Any]:
             "known": status.known,
         },
     }
+
+
+@router.get("/capabilities")
+async def capabilities(request: Request) -> dict[str, Any]:
+    """What each device is and which metrics it produces, for pages to draw from.
+
+    The store answers every query for every registry metric — one this device
+    cannot produce reads back null, the same null a reading nobody took gives —
+    so nothing in the data itself separates "cannot produce" from "did not
+    report". This list is the only thing that does, and a page honours the
+    difference by drawing what is declared here instead of enumerating the
+    reference inverter's registers by hand, which shows a one-string machine
+    two permanently empty charts.
+
+    The answer is the driver's own declaration, read off the already-built
+    source. No inverter round trip: capabilities are what the device *is*, and
+    a leaflet must not cost the dongle's single TCP slot.
+
+    ``metrics`` holds the inverter-level registry names and
+    ``battery_module_metrics`` the bare per-module names this device produces —
+    the same bare form the battery endpoints take, though those accept any
+    registry template — both in registry order so every page renders one
+    metric order.
+    ``energy`` says whether kWh figures are counters the inverter keeps itself
+    or an estimate integrated from power — a page must be able to tell a meter
+    reading from a guess.
+
+    ``devices`` is a list because a parallel stack is several inverters behind
+    one service, even though today's collector polls one. Three states, kept
+    apart on the project's own rule that absent capability is not absent data:
+    a driver that describes itself gets a full entry; a bare InverterSource —
+    which names its device but carries no declaration — gets an entry with its
+    known serial and null everywhere a declaration would answer, because "not
+    established" must not read as "produces nothing" (null metrics, never an
+    empty list); and only a source that cannot even name a device contributes
+    nothing at all.
+    """
+    source = request.app.state.service.source
+    identity = getattr(source, "identity", None)
+    declared = getattr(source, "capabilities", None)
+    serial = identity.serial if identity is not None else getattr(source, "device", None)
+    devices: list[dict[str, Any]] = []
+    if serial is not None:
+        entry: dict[str, Any] = {
+            "device": serial,
+            "driver": identity.driver if identity is not None else None,
+            "model": identity.model if identity is not None else None,
+            "pv_strings": None,
+            "energy": None,
+            "backup_output": None,
+            "generator_input": None,
+            "split_phase": None,
+            "three_phase": None,
+            "parallel_capable": None,
+            "per_module_battery": None,
+            "metrics": None,
+            "battery_module_metrics": None,
+        }
+        if declared is not None:
+            entry.update(
+                {
+                    "pv_strings": declared.pv_strings,
+                    "energy": declared.energy.value,
+                    "backup_output": declared.backup_output,
+                    "generator_input": declared.generator_input,
+                    "split_phase": declared.split_phase,
+                    "three_phase": declared.three_phase,
+                    "parallel_capable": declared.parallel_capable,
+                    "per_module_battery": declared.per_module_battery,
+                    "metrics": list(inverter_metric_columns(declared.metrics)),
+                    "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+                }
+            )
+        devices.append(entry)
+    return {"devices": devices}
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:

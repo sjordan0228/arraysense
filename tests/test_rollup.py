@@ -702,3 +702,86 @@ def test_one_inverters_failed_polls_do_not_erase_the_others_bucket() -> None:
     rows = conn.execute("SELECT device, pv_total_power_w FROM inverter_minute").fetchall()
     conn.close()
     assert rows == [(OTHER_DEVICE, 4000)]
+
+
+def test_rollups_cover_a_schema_narrowed_to_a_declaration() -> None:
+    # A database created for a driver that declares a subset has columns for
+    # that subset alone. The rebuilds must roll up what the tables hold rather
+    # than what the registry could hold, or the first maintenance pass on such
+    # an installation names columns that do not exist and dies.
+    conn = sqlite3.connect(":memory:")
+    conn.execute(FOREIGN_KEYS_PRAGMA)
+    conn.executescript(schema_ddl(frozenset({"pv_total_power_w", "battery_module1_soc_pct"})))
+    for sec, power in ((61, 10), (62, 20), (63, 30)):
+        conn.execute(
+            f"INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) "
+            f"VALUES (?, '{TEST_DEVICE}', ?)",
+            (sec, power),
+        )
+    conn.execute(
+        f"INSERT INTO serials (id, device, serial) VALUES (1, '{TEST_DEVICE}', 'BA00000001')"
+    )
+    for sec, soc in ((3660, 60), (3720, 62)):
+        conn.execute(
+            f"INSERT INTO module_raw (timestamp, device, module_id, soc_pct) "
+            f"VALUES (?, '{TEST_DEVICE}', 1, ?)",
+            (sec, soc),
+        )
+    rebuild_inverter_minute(conn, 60, 120)
+    rebuild_inverter_hourly(conn, 0, 3600)
+    rebuild_module_hourly(conn, 3600, 7200)
+    minute = conn.execute("SELECT timestamp, pv_total_power_w FROM inverter_minute").fetchone()
+    hourly = conn.execute("SELECT timestamp, pv_total_power_w FROM inverter_hourly").fetchone()
+    module = conn.execute("SELECT timestamp, soc_pct FROM module_hourly").fetchone()
+    conn.close()
+    assert minute == (60, 20)
+    assert hourly == (0, 20)
+    assert module == (3600, 61)
+
+
+def test_a_declaration_with_no_module_templates_rolls_up_without_error() -> None:
+    # A device that reports only a bank-level summary declares no per-module
+    # template at all — drivers/base.py allows that on purpose. Its module
+    # tables then hold no metric columns, and a rebuild that still assembled
+    # SQL for them produced "COUNT(*) AS sample_count,  FROM ..." — a syntax
+    # error raised by every sixty-second maintenance pass for the life of the
+    # service. Nothing to roll up must mean no rebuild, not a broken one.
+    conn = sqlite3.connect(":memory:")
+    conn.execute(FOREIGN_KEYS_PRAGMA)
+    conn.executescript(schema_ddl(frozenset({"pv_total_power_w", "battery_soc_pct"})))
+    for sec, power in ((61, 10), (62, 20), (63, 30)):
+        conn.execute(
+            f"INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) "
+            f"VALUES (?, '{TEST_DEVICE}', ?)",
+            (sec, power),
+        )
+    rebuild_module_hourly(conn, 0, 7200)  # must not raise
+    rebuild_inverter_minute(conn, 60, 120)  # the inverter side still rolls up
+    minute = conn.execute("SELECT timestamp, pv_total_power_w FROM inverter_minute").fetchone()
+    modules = conn.execute("SELECT COUNT(*) FROM module_hourly").fetchone()[0]
+    conn.close()
+    assert minute == (60, 20)
+    assert modules == 0
+
+
+def test_a_declaration_with_no_inverter_metrics_rolls_up_without_error() -> None:
+    # The same failure from the other side: a declaration holding only module
+    # templates leaves the inverter tiers without a single metric column.
+    conn = sqlite3.connect(":memory:")
+    conn.execute(FOREIGN_KEYS_PRAGMA)
+    conn.executescript(schema_ddl(frozenset({"battery_module1_soc_pct"})))
+    conn.execute(
+        f"INSERT INTO serials (id, device, serial) VALUES (1, '{TEST_DEVICE}', 'BA00000001')"
+    )
+    conn.execute(
+        f"INSERT INTO module_raw (timestamp, device, module_id, soc_pct) "
+        f"VALUES (3660, '{TEST_DEVICE}', 1, 60)"
+    )
+    rebuild_inverter_minute(conn, 60, 120)  # must not raise
+    rebuild_inverter_hourly(conn, 0, 3600)  # must not raise
+    rebuild_module_hourly(conn, 3600, 7200)  # the module side still rolls up
+    module = conn.execute("SELECT timestamp, soc_pct FROM module_hourly").fetchone()
+    inverter = conn.execute("SELECT COUNT(*) FROM inverter_minute").fetchone()[0]
+    conn.close()
+    assert module == (3600, 60)
+    assert inverter == 0

@@ -28,15 +28,24 @@ default is a default and not an assumption: the ``device`` argument reaches
 every read and every write, because a parallel stack writes through one store
 and a row that took the store's default would be filed under whichever
 inverter happened to open it.
+
+A store can also be opened for what its driver declares. The declared metric
+set narrows the schema a fresh database is created with and the columns a
+sample may write, so a device that cannot produce a reading has no column for
+it — while reads answer from whatever columns the tables actually have, since
+an older database may carry the full registry and its history must stay
+readable. A metric the registry knows but this database has no column for
+reads back as None, exactly like a reading the inverter never sent, because to
+the caller both are the same fact: nothing was measured here.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
-from arraysense.metrics import INVERTER_METRICS, lookup
+from arraysense.metrics import lookup
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.migrate import needs_device_migration
 from arraysense.store.schema import (
@@ -44,14 +53,11 @@ from arraysense.store.schema import (
     INVERTER_TIERS,
     MODULE_TIERS,
     expected_columns,
+    inverter_metric_columns,
     migration_ddl,
     module_metric_columns,
     schema_ddl,
 )
-
-# The inverter_raw table carries exactly the inverter registry, so a reading
-# name outside this set is a programming error, not bad data.
-_INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 
 
 def _inverter_table(tier: str) -> str:
@@ -92,9 +98,18 @@ class SqliteStore:
     SQL is built. A typo therefore raises KeyError instead of returning a column
     of Nones, which would otherwise read exactly like an inverter that never
     reported the metric at all.
+
+    One asymmetry to know before opening a database this class did not just
+    create: ``metrics=None`` means the whole registry, so opening an existing
+    *narrowed* database without the argument re-widens it — ``migration_ddl``
+    adds every registry column the tables lack, permanently, since nothing here
+    ever drops one. No production caller does that; the service always passes
+    its driver's declaration. A tool that opens somebody's database read-mostly
+    must pass the declared set (or query through a bare connection) rather than
+    take the default and quietly grow ninety columns.
     """
 
-    def __init__(self, path: str, device: str) -> None:
+    def __init__(self, path: str, device: str, metrics: Iterable[str] | None = None) -> None:
         """Open the database for one inverter, creating file and schema if absent.
 
         ``device`` is that inverter's serial and becomes the default for every
@@ -102,6 +117,15 @@ class SqliteStore:
         there is no honest default: a row stamped with a placeholder identity
         looks attributed and is not, and the next unit added to the stack would
         inherit its history.
+
+        ``metrics`` is the set of metric names the installed driver declares —
+        ``Capabilities.metrics``, handed through untouched — and None means the
+        whole registry. It governs what a fresh database gets columns for and
+        what a sample may write; it never governs reads, which answer from the
+        columns the tables actually have, so a database from before drivers
+        declared subsets keeps its full history readable. A declared metric an
+        older database is missing gains its column here, exactly as a metric
+        newly added to the registry always has.
 
         The generated DDL is idempotent, so opening is also the upgrade path: a
         database made before a metric was added to the registry gains the missing
@@ -120,6 +144,7 @@ class SqliteStore:
         Raises:
             ValueError: ``device`` is blank, or the database predates device
                 identity and has not been migrated.
+            KeyError: ``metrics`` names something the registry does not hold.
         """
         # Normalised on the way in, not merely validated. The migration
         # resolves the same serial and strips it, so a stored setting with a
@@ -135,6 +160,22 @@ class SqliteStore:
                 "migrated before it can be opened. Run `arraysense --migrate`."
             )
         self.device = device
+        declared = None if metrics is None else frozenset(metrics)
+        # What this store writes: the declared metrics, in registry order so
+        # every database created for one driver lays its columns down the same
+        # way. The full-registry name sets beside them answer "is this a
+        # registry metric at all", which is a different question from "does
+        # this driver produce it" — a typo and an undeclared reading both fail
+        # loudly, but they are different mistakes and get different messages.
+        self._columns = inverter_metric_columns(declared)
+        self._specs = tuple(lookup(name) for name in self._columns)
+        self._writable = frozenset(self._columns)
+        self._module_columns = module_metric_columns(declared)
+        self._inverter_names = frozenset(inverter_metric_columns())
+        self._module_names = frozenset(module_metric_columns())
+        self._undeclared_module_fields = tuple(
+            name for name in module_metric_columns() if name not in set(self._module_columns)
+        )
         # check_same_thread=False because the collector writes from the event
         # loop while the web server answers requests on a threadpool, and a
         # connection bound to its creating thread refuses the second one
@@ -146,13 +187,21 @@ class SqliteStore:
         # Wait rather than failing immediately if a write is in progress; the
         # alternative is an intermittent "database is locked" under load.
         self._conn.execute("PRAGMA busy_timeout = 5000")
-        self._conn.executescript(schema_ddl())
+        self._conn.executescript(schema_ddl(declared))
         existing = {
             table: tuple(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
+            for table in expected_columns(declared)
+        }
+        for statement in migration_ddl(existing, declared):
+            self._conn.execute(statement)
+        # What each tier actually has, read back after the migrations so a
+        # column just added is counted. Reads answer from this rather than from
+        # the declaration: an older database carries columns this driver never
+        # declared, and the history in them belongs to whoever asks.
+        self._present: dict[str, frozenset[str]] = {
+            table: frozenset(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
             for table in expected_columns()
         }
-        for statement in migration_ddl(existing):
-            self._conn.execute(statement)
 
     def close(self) -> None:
         """Release the database connection.
@@ -210,8 +259,19 @@ class SqliteStore:
         belongs and puts it out of order with its neighbours.
 
         Raises:
-            KeyError: a reading names something that is not an inverter metric — a
-                typo, or a per-module metric that belongs in ``battery_modules``.
+            KeyError: a reading names something that is not an inverter metric —
+                a typo, or a per-module metric that belongs in
+                ``battery_modules``; a reading names a registry metric outside
+                the set this store was opened for; or a battery module carries a
+                value for an undeclared template. The last two are declaration
+                drift — the driver emits what it did not declare. Note that
+                KeyError is not among the collector's ``STORE_ERRORS``, so a
+                sample that raises here stops the poll loop (logged, and the
+                watchdog restarts the process) rather than being recorded as a
+                gap. That is deliberate: every one of these is a deterministic
+                programming error that would fail every sample identically, and
+                recording it as a gap per poll would leave a service that looks
+                like it is riding out an outage while it writes nothing, forever.
         """
         epoch = int(sample.timestamp.timestamp())
         unit = self._device(device)
@@ -236,13 +296,12 @@ class SqliteStore:
                         "VALUES (?, ?, ?, ?, NULL)",
                         (epoch, unit, name, value),
                     )
-            columns = tuple(spec.name for spec in INVERTER_METRICS)
             values: list[int | str | None] = [
                 spec.encode(sample.readings[spec.name]) if spec.name in sample.readings else None
-                for spec in INVERTER_METRICS
+                for spec in self._specs
             ]
             values.append(sample.error)
-            self._upsert_inverter_row(cur, epoch, unit, columns, values)
+            self._upsert_inverter_row(cur, epoch, unit, self._columns, values)
             self._append_modules(cur, epoch, unit, sample.battery_modules)
 
     def query(
@@ -276,8 +335,11 @@ class SqliteStore:
         names = self._check_inverter_names(metrics)
         counted = tier != "full"
         columns = ["timestamp", *names, "error"] + (["sample_count"] if counted else [])
+        selected = ["timestamp", *(self._selected(table, n) for n in names), "error"] + (
+            ["sample_count"] if counted else []
+        )
         rows = self._conn.execute(
-            f"SELECT {', '.join(columns)} FROM {table} "
+            f"SELECT {', '.join(selected)} FROM {table} "
             "WHERE timestamp BETWEEN ? AND ? AND device = ? ORDER BY timestamp",
             (int(start.timestamp()), int(end.timestamp()), self._device(device)),
         ).fetchall()
@@ -312,7 +374,7 @@ class SqliteStore:
         table = _module_table(tier)
         names = self._check_module_names(metrics)
         counted = tier != "full"
-        selected = ["m.timestamp", "s.serial", *(f"m.{n}" for n in names)]
+        selected = ["m.timestamp", "s.serial", *(self._selected(table, n, "m.") for n in names)]
         if counted:
             selected.append("m.sample_count")
         sql = (
@@ -353,8 +415,9 @@ class SqliteStore:
         """
         names = self._check_inverter_names(metrics)
         columns = ["timestamp", *names, "error"]
+        selected = ["timestamp", *(self._selected("inverter_raw", n) for n in names), "error"]
         row = self._conn.execute(
-            f"SELECT {', '.join(columns)} FROM inverter_raw WHERE device = ? "
+            f"SELECT {', '.join(selected)} FROM inverter_raw WHERE device = ? "
             "ORDER BY timestamp DESC LIMIT 1",
             (self._device(device),),
         ).fetchone()
@@ -378,7 +441,11 @@ class SqliteStore:
         so nothing that compares packs against each other may see both at once.
         """
         names = self._check_module_names(metrics)
-        selected = ["m.timestamp", "s.serial", *(f"m.{n}" for n in names)]
+        selected = [
+            "m.timestamp",
+            "s.serial",
+            *(self._selected("module_raw", n, "m.") for n in names),
+        ]
         rows = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM module_raw m "
             "JOIN serials s ON s.id = m.module_id "
@@ -391,19 +458,38 @@ class SqliteStore:
         return [self._decode_row(columns, row, names, module=True) for row in rows]
 
     def _check_inverter_names(self, metrics: Sequence[str]) -> list[str]:
-        """Return ``metrics`` unchanged, raising if any is not an inverter metric."""
-        unknown = [m for m in metrics if m not in _INVERTER_NAMES]
+        """Return ``metrics`` unchanged, raising if any is not an inverter metric.
+
+        Checked against the whole registry rather than the declared set: a read
+        is a question about history, and an older database may hold columns for
+        metrics this driver never declared. A registry metric this database has
+        no column for is answered with None per row instead — see ``_selected``.
+        """
+        unknown = [m for m in metrics if m not in self._inverter_names]
         if unknown:
             raise KeyError(f"unknown inverter metric(s): {unknown}")
         return list(metrics)
 
     def _check_module_names(self, metrics: Sequence[str]) -> list[str]:
         """Return ``metrics`` unchanged, raising if any is not a module metric."""
-        known = set(module_metric_columns())
-        unknown = [m for m in metrics if m not in known]
+        unknown = [m for m in metrics if m not in self._module_names]
         if unknown:
             raise KeyError(f"unknown module metric(s): {unknown}")
         return list(metrics)
+
+    def _selected(self, table: str, name: str, prefix: str = "") -> str:
+        """Return the SELECT expression for one metric column of ``table``.
+
+        A registry metric the table has no column for — this driver never
+        declared it, so no schema was ever laid down for it — selects as
+        ``NULL AS name``: the same None a reading nobody took decodes to, and
+        to the caller the same fact. Raising instead would make the live page,
+        which asks for every registry metric whatever the device, fail on
+        precisely the hardware this narrowing exists for.
+        """
+        if name in self._present[table]:
+            return f"{prefix}{name}"
+        return f"NULL AS {name}"
 
     def _decode_row(
         self,
@@ -435,7 +521,7 @@ class SqliteStore:
         return out
 
     def _validate_reading_names(self, readings: dict[str, float]) -> None:
-        """Raise KeyError for any reading name that is not an inverter metric.
+        """Raise KeyError for any reading this store has no column to write.
 
         A name outside the inverter registry — a typo, or a per-module metric that
         belongs in ``battery_modules`` — is a programming error, and the row builder
@@ -443,11 +529,19 @@ class SqliteStore:
         the metric would read for all time as one the inverter never reported.
         Checking up front is what turns that into a loud failure, and doing it
         before the transaction opens is what stops a half-written sample.
+
+        A registry metric outside the declared set fails just as loudly, as its
+        own mistake: the driver's declaration and its output have drifted, and
+        a declaration that under-claims silently drops real measurements — the
+        same vanishing, one layer up.
         """
-        unknown = set(readings) - _INVERTER_NAMES
-        if unknown:
-            name = next(iter(unknown))
+        unknown = sorted(set(readings) - self._writable)
+        if not unknown:
+            return
+        name = unknown[0]
+        if name not in self._inverter_names:
             raise KeyError(f"unknown metric name: {name!r}")
+        raise KeyError(f"metric {name!r} is not among those declared for this store")
 
     def _upsert_inverter_row(
         self,
@@ -471,11 +565,18 @@ class SqliteStore:
         together straight from the registry: a list assembled any other way is still
         the right length, so it writes cleanly and files every metric under the
         wrong column name.
+
+        ``columns`` may be empty — a declaration with no inverter metric is
+        legal, and a gap row has a reason to store regardless — so the update
+        list is joined as one list with ``error`` inside it. Concatenating the
+        error clause onto a joined string put a bare leading comma in the SQL
+        whenever the columns were empty, which broke gap recording for exactly
+        the device class the empty declaration describes.
         """
         all_cols = ("timestamp", "device", *columns, "error")
         cols_sql = ", ".join(all_cols)
         placeholders = ", ".join("?" for _ in all_cols)
-        updates = ", ".join(f"{c}=excluded.{c}" for c in columns) + ", error=excluded.error"
+        updates = ", ".join([*(f"{c}=excluded.{c}" for c in columns), "error=excluded.error"])
         cur.execute(
             f"INSERT INTO inverter_raw ({cols_sql}) VALUES ({placeholders}) "
             f"ON CONFLICT(timestamp, device) DO UPDATE SET {updates}",
@@ -504,9 +605,20 @@ class SqliteStore:
         serial, so a suspect reading stays attributable to the pack that produced it.
 
         A failed poll carries no modules, so nothing is written for one.
+
+        A module reading outside the declared templates raises KeyError. The
+        check runs per module, so the inverter row — and any earlier module's
+        rows — may already have executed when a later module raises; it is the
+        transaction around the whole sample that makes the outcome clean,
+        rolling every one of them back. The raise itself is the point: the
+        driver's declaration and its output have drifted, and writing around
+        the missing column would drop the measurement without a trace.
         """
-        columns = module_metric_columns()
+        columns = self._module_columns
         for module in modules:
+            for name in self._undeclared_module_fields:
+                if getattr(module, name) is not None:
+                    raise KeyError(f"metric {name!r} is not among those declared for this store")
             module_id = self._resolve_serial(cur, device, module.serial)
             # The row upsert is idempotent, so the flags must be too. Clearing
             # this module's flags for the timestamp before rewriting makes a
@@ -582,15 +694,21 @@ class SqliteStore:
         a partial failure idempotent exactly as it does on the inverter row: never
         a duplicate, and the second write's values — NULLs included, for fields it
         did not report — replace the first's. ``values`` is positional against
-        ``columns``, and the caller builds both from ``module_metric_columns()`` in
-        one pass so the row's order is always the table's order.
+        ``columns``, and the caller builds both from the store's declared module
+        templates in one pass so the row's order is always the table's order.
+
+        With no template declared at all the row is identity and a timestamp,
+        and a retry of it has nothing to update: the conflict clause becomes
+        DO NOTHING, which for identical rows is the same idempotency. DO UPDATE
+        with an empty assignment list is a syntax error, not a no-op.
         """
         all_cols = ("timestamp", "device", "module_id", *columns)
         cols_sql = ", ".join(all_cols)
         placeholders = ", ".join("?" for _ in all_cols)
         updates = ", ".join(f"{c}=excluded.{c}" for c in columns)
+        conflict = f"DO UPDATE SET {updates}" if columns else "DO NOTHING"
         cur.execute(
             f"INSERT INTO module_raw ({cols_sql}) VALUES ({placeholders}) "
-            f"ON CONFLICT(timestamp, device, module_id) DO UPDATE SET {updates}",
+            f"ON CONFLICT(timestamp, device, module_id) {conflict}",
             (epoch, device, module_id, *values),
         )

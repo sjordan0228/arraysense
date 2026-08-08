@@ -321,7 +321,12 @@ _MODULE_SLOTS = 4
 
 # Per-module metrics share one template each; the registry expands each across
 # the four slots the inverter exposes. Adding a per-module metric is one line
-# here rather than four edits.
+# here rather than four edits — plus one field on BatteryModuleSample in
+# models.py, which is where a driver hands the reading over. The schema and
+# validation follow this line alone, but the store reads module values off the
+# sample's fields, so a template with no matching field gets its column and
+# then fails with AttributeError at the first write. Inverter metrics have no
+# such pairing: for them one line here really is the whole change.
 _MODULE_METRIC_SPECS: tuple[MetricSpec, ...] = (
     MetricSpec("soc_pct", "%", 1, 0.0, 100.0),
     MetricSpec("soh_pct", "%", 1, 0.0, 100.0),
