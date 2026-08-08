@@ -292,6 +292,29 @@ _ENERGY_METRICS: tuple[tuple[str, str], ...] = (
 # timestamp.
 ENERGY_STALE_AFTER_DUE = timedelta(minutes=5)
 
+# How old a module's ``last_seen`` stamp may be before its block counts as held
+# rather than read this poll. pylxpweb's round-robin accumulator serves every
+# pack it has ever seen on every read, freezing the registers of a pack the
+# firmware did not surface this cycle at their last real values, so the only way
+# to tell a held block from a read one is this stamp against the poll time.
+#
+# Tighter than calibration.PACK_COMPARE_MAX_SKEW (two minutes), so that any
+# pack passing this gate is also inside the window the comparison guards
+# assume — a held voltage must not reach a spread that is only meant to compare
+# packs read at the same instant. Loose enough to survive a slow read and
+# ordinary clock jitter: the reference system polls every eleven seconds.
+#
+# Measured on the reference bank rather than assumed: over 107 consecutive polls
+# every one carried all four packs, so a healthy pack there is never more than a
+# single poll old and this threshold drops nothing real. It is deliberately not
+# tightened towards one poll interval, because the library rotates packs through
+# pages on larger banks and a gate near the cadence would drop packs that were
+# read perfectly well, one page at a time. What it does not catch is a bank whose
+# rotation dwells between a poll and a minute: those blocks are held but young
+# enough to pass. That is a narrower hole than the fifteen minutes to nine hours
+# this was written for, not a closed one.
+MODULE_STALE_AFTER = timedelta(seconds=60)
+
 # Directional register pairs that collapse into one signed reading, as
 # (metric name, positive attribute, negative attribute).
 _RUNTIME_SIGNED_PAIRS: tuple[tuple[str, str, str], ...] = (
@@ -631,7 +654,66 @@ def _bms_is_answering(source: object, witnesses: tuple[str, ...]) -> bool:
     return False
 
 
-def _module_sample(module: object) -> BatteryModuleSample | None:
+def _held_for(module: object, timestamp: datetime) -> timedelta | None:
+    """How long a battery block's data has been held, or None if it was read this poll.
+
+    pylxpweb's round-robin accumulator serves every pack it has ever seen on
+    every read, and a pack the firmware did not surface this cycle comes back
+    with its registers frozen at their last real values. That held block would
+    pass ``_bms_is_answering`` — the held cell voltages are the last real ones,
+    and so non-zero — and would then be stamped with the current poll's time.
+    Every guard downstream filters on that timestamp, so the block always looks
+    freshly read: a held voltage compared against a live one raises a wiring
+    fault that is not there, and the spread bands satisfy their "every known
+    pack reported at this instant" rule using stale values. The library's
+    ``last_seen`` stamp is the only thing that tells the two apart.
+
+    Returns None when the block should be kept — either ``last_seen`` is the
+    dataclass default, or the reading is inside ``MODULE_STALE_AFTER``. That is a
+    minute rather than one poll, so "kept" means recent, not necessarily read on
+    this very cycle; see the constant for why it is not tightened further.
+    Otherwise it returns the age of the held data, for the caller to log.
+
+    ``None`` counts as fresh. It is the dataclass default, so a library build
+    that does not stamp it must not make every pack vanish — that would trade a
+    wrong reading for no readings at all, which is worse. It looks like an
+    oversight otherwise.
+
+    A naive stamp keeps the block and says so loudly, rather than being converted.
+    Verified in the installed library it is stamped ``datetime.now(UTC)`` at both
+    sites, aware on purpose and commented as such, so a naive one would mean the
+    library changed underneath us and this gate is judging something it no longer
+    understands. Attaching a zone to guess at it is the worse move of the two:
+    assume UTC against a stamp that is really local time and every reading looks
+    hours old, so a healthy bank loses every pack and the charts empty out. Being
+    wrong in the direction of keeping data is recoverable; being wrong in the
+    direction of discarding it is not. The warning is deliberately per call — if
+    the library ever does change this, a log line every poll is what gets it
+    noticed.
+
+    Two ways this gate fails open, both preferred to their alternatives and
+    neither silent in effect: the ``None`` above, and the library's own
+    bookkeeping, which sets ``b.last_seen = last_seen.get(b.battery_index, now)``
+    and so stamps the current time wherever it holds no record for an index. The
+    gate is only as good as that bookkeeping — strictly better than trusting every
+    block, and not a guarantee.
+    """
+    last_seen = getattr(module, "last_seen", None)
+    if last_seen is None:
+        return None
+    if last_seen.tzinfo is None:
+        logger.warning(
+            "module %s carries a naive last_seen (%s); keeping the block, "
+            "the staleness gate cannot judge it without a zone",
+            getattr(module, "serial_number", None),
+            last_seen,
+        )
+        return None
+    age = timestamp - last_seen
+    return None if age <= MODULE_STALE_AFTER else age
+
+
+def _module_sample(module: object, timestamp: datetime | None = None) -> BatteryModuleSample | None:
     """Convert one library battery record into a BatteryModuleSample.
 
     A record that cannot be identified is dropped instead. The library defaults
@@ -641,6 +723,14 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     identified by serial and never by slot, a record missing its serial — or
     missing the index that says which slot it sat in — has nothing to attach
     its history to.
+
+    A record whose data is held rather than read is dropped too, not kept and
+    back-dated: a frozen block is not a measurement. ``timestamp`` is the poll
+    time the sample is being built for, and the block's ``last_seen`` is judged
+    against it — see ``_held_for`` for what counts as held and why ``None`` and
+    naive stamps are each treated as they are. When no poll time is given the
+    staleness gate is skipped, because there is no clock to hold against;
+    ``to_sample`` always passes one.
 
     Raises:
         ValueError: the record claims a slot below one, which means the 0-based
@@ -659,6 +749,17 @@ def _module_sample(module: object) -> BatteryModuleSample | None:
     if not _bms_is_answering(module, _BANK_WITNESSES):
         logger.debug("module %s reports no cell data; treating the block as absent", serial)
         return None
+    # A block whose registers are held rather than read is not a reading either,
+    # however non-zero they look. The witness gate above catches a CAN drop,
+    # where the values go to *zero*; this catches the accumulator serving a
+    # pack it did not surface, where they are merely old. Only judged when a
+    # poll time is supplied — ``to_sample`` always supplies one; a caller with
+    # no clock cannot tell a held block from a read one.
+    if timestamp is not None:
+        held = _held_for(module, timestamp)
+        if held is not None:
+            logger.debug("module %s last seen %s ago; dropping as held", serial, held)
+            return None
 
     # The library indexes modules from zero; slots are 1-based to match the
     # battery_module1..4 columns in the registry. The library's names for the
@@ -715,6 +816,9 @@ def to_sample(
     The library stamps its data objects with a naive local-time timestamp,
     which cannot be compared across a daylight-saving boundary, so the poll
     time is taken here instead and an explicit one has to be timezone-aware.
+    The same poll time ages the per-module blocks: a pack the accumulator
+    served without the firmware reading it this cycle is dropped by comparing
+    its ``last_seen`` stamp against it (see ``_module_sample``).
 
     A bank whose CAN link is down arrives as None, and that is an absence
     rather than a failed poll. The sample then carries whatever the inverter's
@@ -729,6 +833,13 @@ def to_sample(
             packs than the registry names columns for.
     """
     readings: dict[str, float] = {}
+    # One poll time serves the whole sample: the store writes one timestamp per
+    # poll, and the module staleness check compares each block's ``last_seen``
+    # against the same clock. A naive explicit timestamp is rejected here so the
+    # comparison cannot be silently made against a naive clock.
+    if timestamp is not None and timestamp.tzinfo is None:
+        raise ValueError("timestamp must be timezone-aware")
+    now = timestamp if timestamp is not None else datetime.now(tz=UTC)
     _collect(runtime, _RUNTIME_METRICS, readings)
     _collect(runtime, _RUNTIME_TERMINAL_METRICS, readings)
     _collect_signed(runtime, _RUNTIME_SIGNED_PAIRS, readings)
@@ -769,7 +880,7 @@ def to_sample(
                 soh = bank_soh
         records = getattr(bank, "batteries", None) or ()
         modules = tuple(
-            sample for sample in (_module_sample(record) for record in records) if sample
+            sample for sample in (_module_sample(record, now) for record in records) if sample
         )
 
     if battery_power is not None:
@@ -778,7 +889,7 @@ def to_sample(
         readings["battery_soh_pct"] = soh
 
     return Sample(
-        timestamp=timestamp if timestamp is not None else datetime.now(tz=UTC),
+        timestamp=now,
         readings=readings,
         battery_modules=modules,
     )
