@@ -7,6 +7,30 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.5.6 — 8 August 2026
+
+### Changed
+
+- **Chart tick labels can be read** ([#45](https://github.com/sjordan0228/arraysense/issues/45)).
+  They were 9.5px — the smallest text anywhere on a page whose body type is 14px —
+  in the dimmest ink the palette has, measuring 5.6:1 against the panel. They are
+  now 12px in `--ink2`, which measures 10.7:1, with the axis gutters and the
+  minimum tick spacing grown to match so nothing clips or overlaps. Applies to
+  every chart on every page, since they share one axis definition.
+
+- **Battery charge and discharge are green and red.** They were one hue at two
+  lightnesses. The zero line still carries the meaning — charge above it,
+  discharge below — so the colour reinforces the split rather than being the only
+  thing that says which is which.
+
+  The pair was measured, not chosen: every combination scored under simulated
+  protanopia, deuteranopia and tritanopia against the panel background. Charging
+  keeps `#2aa198`; discharging is `#d1495b`, which separates from it by ΔE 20.6 at
+  worst — better than any pair already in the palette. A more obvious red,
+  `#e0603d`, was rejected because it collapses into the solar orange under
+  deuteranopia at ΔE 3.3. That is the whole reason these are measured rather than
+  picked by eye, and there is now a test pinning the two values so neither drifts.
+
 ## 0.5.5 — 8 August 2026
 
 ### Fixed

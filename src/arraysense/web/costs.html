@@ -57,7 +57,7 @@
   /* Peak against off-peak, as two bars over the same width: the point is that
      a band's share of the cost is not its share of the energy. One hue for all
      bands — they are the same grid supply at different hours — separated by
-     lightness and by the label, never by a fifth colour. */
+     lightness and by the label, never by a hue of their own. */
   .split{margin:2px 0 14px}
   .splitrow{display:flex;align-items:center;gap:9px;margin-top:7px}
   .splitrow .sl{flex:0 0 74px;font-size:9.5px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink3)}
@@ -632,8 +632,8 @@ function drawSankey(p) {
   const snk = stack([
     { name: 'Paid to the grid', v: p.energyCost, col: 'var(--grid)' },
     // Money that never left the house is drawn as an outline rather than a
-    // solid: it is the one quantity here that was not spent, and a fifth
-    // colour would be a hue the palette was never checked for.
+    // solid: it is the one quantity here that was not spent, and a new colour
+    // here would be a hue the palette was never checked for.
     { name: 'Kept — solar and battery', v: p.savings, col: 'var(--ink)', hollow: true },
   ], X3);
   if (!hub.length || !src.length) { hold('nothing to draw yet'); return; }

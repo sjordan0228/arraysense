@@ -1244,8 +1244,8 @@ function drawBattery(points) {
       scales: { x: { time: true }, y: { range: batteryRange } },
       axes: [timeAxis(), kwAxis()],
       // Filled to the zero line so the direction reads without consulting the
-      // legend, and split at the crossing so charging and discharging carry
-      // different shades of the one hue.
+      // legend, and split at the crossing so charging is green and discharging
+      // is red. Position still carries the sign; the hue reinforces it.
       series: [
         {},
         trace('Battery', '--batt', 1.6, { fill: battFill, fillTo: () => 0 }),

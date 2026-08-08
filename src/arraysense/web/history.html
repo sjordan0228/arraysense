@@ -466,7 +466,7 @@ function drawTotals(span, rows, places) {
 
 // Exported energy is drawn below the zero line so the grid reads as one
 // quantity with a direction, which is the same idiom the battery chart uses for
-// charge and discharge — and the reason neither needs a fifth colour. The sign
+// charge and discharge. The sign
 // exists only on the canvas: the table, the totals and the readout all carry
 // the positive number the inverter actually counted.
 function column(rows, key, sign) {
@@ -645,7 +645,7 @@ function drawChart(rows) {
         axis({ size: 26, splits: bucketSplits, values: bucketTicks }),
         axis({ size: 52, gap: 6, values: kwhTicks }),
       ],
-      // Four quantities and three of the four palette hues, so identity is
+      // Four quantities and three of the palette's hues, so identity is
       // carried by form as much as by colour: solar a filled area because it is
       // volume the array harvested, home the heaviest line because it is the
       // one the owner acts on, grid used a thin dashed trace above the line,
