@@ -18,7 +18,7 @@ writing a row.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 
 from arraysense.metrics import MetricSpec, lookup
 from arraysense.models import BatteryModuleSample, Sample
@@ -44,9 +44,11 @@ class BoundsFailure:
 
     ``serial`` identifies the battery module a per-module reading came from,
     and is None for an inverter-level reading. Modules are identified by serial
-    and never by slot: the inverter rotates modules through its four register
-    slots. The slot survives only inside ``metric``, which names the per-slot
-    spec the value was measured against.
+    and never by slot: the inverter rotates modules through a fixed set of
+    register slots, which a bank may outnumber. The slot survives only inside
+    ``metric``, as a label saying where the value was read from — the bounds it
+    was checked against come from the shared per-module template, so a pack
+    beyond the slots the registry names is still checked.
     """
 
     spec: MetricSpec
@@ -55,7 +57,14 @@ class BoundsFailure:
 
     @property
     def metric(self) -> str:
-        """Registry name of the metric that failed, e.g. ``battery_module3_soc_pct``."""
+        """Name of the metric that failed, e.g. ``battery_module3_soc_pct``.
+
+        A registry name for an inverter reading and for a pack in a slot the
+        registry expands. For a pack beyond those the slot number is composed
+        into the same shape, so the name says which pack the value came from even
+        where no such column exists — the bounds behind it come from the shared
+        per-module template either way.
+        """
         return self.spec.name
 
     @property
@@ -139,24 +148,33 @@ def _check(
 
 
 def _validate_module(module: BatteryModuleSample) -> list[BoundsFailure]:
-    """Check one battery module's readings against its slot's specs.
+    """Check one battery module's readings against the per-module specs.
 
-    A module resolves its specs through the slot it was read from —
-    ``battery_module3_soc_pct`` for slot 3 — because that is where the registry
-    describes the register. The failure is still attributed to the serial, since
-    the inverter rotates modules through its four slots and only the serial
-    identifies a pack from one poll to the next. Readings are checked in model
-    field order, so the same module always produces the same report.
+    Bounds come from the template rather than from the slot. The registry
+    expands one template across slots and every slot's spec is identical to it
+    apart from the name, so slot 1 answers for all of them — and a bank holding
+    more packs than the registry names columns for still validates, where
+    resolving by slot number raised ``KeyError`` on the fifth pack. This matches
+    what the store does when it writes the same readings; the two must not
+    resolve scale by different rules.
+
+    The slot survives in the reported name, which is a label rather than a
+    lookup, so a failure still says which slot the value was read from. The
+    failure is attributed to the serial, since the inverter rotates modules
+    through its slots and only the serial identifies a pack from one poll to the
+    next. Readings are checked in model field order, so the same module always
+    produces the same report.
 
     Raises:
-        KeyError: the module carries a reading with no matching per-slot metric
+        KeyError: the module carries a reading with no matching per-module metric
             in the registry, which means the model and the registry have
             diverged.
     """
     failures: list[BoundsFailure] = []
     for name in _MODULE_READING_FIELDS:
         value: float | None = getattr(module, name)
-        spec = lookup(f"battery_module{module.slot}_{name}")
+        template = lookup(f"battery_module1_{name}")
+        spec = replace(template, name=f"battery_module{module.slot}_{name}")
         failure = _check(spec, value, module.serial)
         if failure is not None:
             failures.append(failure)

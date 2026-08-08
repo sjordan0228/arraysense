@@ -390,6 +390,25 @@ def test_out_of_bounds_module_reading_is_stored_and_flagged(tmp_path: Path) -> N
     assert invalid[0][3] == "CE12345678"
 
 
+def test_an_out_of_bounds_reading_names_the_pack_that_produced_it(tmp_path: Path) -> None:
+    # The bounds come from the shared per-module template, because the registry
+    # names columns for four slots and a fifth pack has none. The flag still has
+    # to say which pack it was: labelling every pack battery_module1_* put one
+    # condition in the database under two names and disagreed with the name
+    # validate.py reports for the same reading. Both now name the slot.
+    path = tmp_path / "store.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    module = BatteryModuleSample(serial="CE12345675", slot=5, soc_pct=137.0)
+    store.append(Sample(timestamp=_ts(), readings={}, battery_modules=(module,)))
+    store.close()
+    conn = _open_db(path)
+    invalid = conn.execute("SELECT metric, value, serial FROM invalid_readings").fetchall()
+    conn.close()
+    assert len(invalid) == 1
+    assert invalid[0][0] == "battery_module5_soc_pct"
+    assert invalid[0][2] == "CE12345675"
+
+
 def test_module_reading_becoming_valid_clears_its_stale_flag(tmp_path: Path) -> None:
     # If a retry reports a plausible value, the earlier module flag must not
     # linger and imply the reading is still suspect.
@@ -931,3 +950,80 @@ def test_a_module_carrying_identity_alone_survives_an_empty_declaration(tmp_path
     modules = store.latest_modules([])
     store.close()
     assert [m["serial"] for m in modules] == ["BA1"]
+
+
+# --- banks larger than four modules (#29) --------------------------------------
+#
+# Nothing in storage requires four. module_raw is keyed on (timestamp, module_id)
+# with the serial resolving to a stable id, so a fifth pack is another row and not
+# another column. What refuses it is the registry lookup: the store finds a
+# reading's scale through ``battery_module{slot}_{name}``, the registry expands
+# those names over four slots, and every slot's spec is generated from the same
+# template — so the slot number only ever locates a spec identical to its
+# neighbours. It contributes nothing but a bound to trip over.
+
+
+def test_a_bank_of_five_modules_stores_every_one(tmp_path: Path) -> None:
+    path = tmp_path / "store.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    modules = tuple(
+        BatteryModuleSample(serial=f"CE0000000{i}", slot=i, soc_pct=float(50 + i))
+        for i in range(1, 6)
+    )
+    store.append(Sample(timestamp=_ts(), readings={}, battery_modules=modules))
+    store.close()
+    conn = _open_db(path)
+    rows = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    conn.close()
+    assert rows == 5
+
+
+def test_the_fifth_module_reads_back_with_the_same_scale_as_the_first(tmp_path: Path) -> None:
+    # The slot decides which registry spec is consulted for the scale, and every
+    # slot's spec comes from one template, so a fifth pack must encode exactly as
+    # the first does. A fifth that stored raw while the first stored scaled would
+    # put two units in one column.
+    path = tmp_path / "store.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    modules = (
+        BatteryModuleSample(serial="CE00000001", slot=1, voltage_v=53.25),
+        BatteryModuleSample(serial="CE00000005", slot=5, voltage_v=53.25),
+    )
+    store.append(Sample(timestamp=_ts(), readings={}, battery_modules=modules))
+    got = {m["serial"]: m["voltage_v"] for m in store.latest_modules(["voltage_v"])}
+    store.close()
+    assert got["CE00000001"] == 53.25
+    assert got["CE00000005"] == 53.25
+
+
+def test_a_database_written_with_four_packs_accepts_a_fifth(tmp_path: Path) -> None:
+    # The upgrade path: an installation that has been running four packs gains one.
+    # No migration should be needed, because the fifth is a row and not a column.
+    path = tmp_path / "store.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=tuple(
+                BatteryModuleSample(serial=f"CE0000000{i}", slot=i, soc_pct=60.0)
+                for i in range(1, 5)
+            ),
+        )
+    )
+    store.close()
+
+    reopened = SqliteStore(str(path), device=TEST_DEVICE)
+    reopened.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=tuple(
+                BatteryModuleSample(serial=f"CE0000000{i}", slot=i, soc_pct=61.0)
+                for i in range(1, 6)
+            ),
+        )
+    )
+    serials = {m["serial"] for m in reopened.latest_modules(["soc_pct"])}
+    reopened.close()
+    assert serials == {f"CE0000000{i}" for i in range(1, 6)}

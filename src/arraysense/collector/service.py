@@ -69,6 +69,20 @@ TRANSPORT_ERRORS = (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError
 # and belongs with the other temporary conditions.
 STORE_ERRORS = (sqlite3.Error,)
 
+# Errors that mean "the driver could not turn what the inverter returned into a
+# sample". The driver builds Sample and BatteryModuleSample objects, and their
+# validation raises ValueError on a malformed one — a slot the model refuses, a
+# naive timestamp, an empty serial, a failed poll that also carries readings.
+# Such a failure is deterministic: it will repeat identically on every poll, so
+# retrying cannot fix it, but stopping the loop is worse — the web server keeps
+# serving over a collector that has died, with no gap row written and no process
+# exit for the watchdog to see. It is therefore recorded as a gap and backed off
+# from, exactly as an unreachable inverter is. ValueError is deliberately narrow
+# and separate from TRANSPORT_ERRORS: a genuine programming error in our own
+# code — an AttributeError or TypeError — still surfaces rather than being
+# mislabelled as an outage.
+BUILD_ERRORS = (ValueError,)
+
 # How many times the backoff may double before the cap is certain to have been
 # reached. 2**40 seconds is longer than the age of the universe in any interval
 # anyone would configure, so no reachable setting is capped early by this.
@@ -90,6 +104,13 @@ class ServiceStatus:
     last_success: datetime | None = None
     last_failure: datetime | None = None
     last_error: str | None = None
+    # Which layer the most recent failure happened at: "transport" when the
+    # inverter could not be reached, "store" when it answered but the write
+    # failed, "build" when it answered and the driver could not turn the reply
+    # into a sample. ``connected`` alone used to carry this, which worked while
+    # there were only two answers; a third one had to land on one of them and
+    # named the inverter as the fault while it was answering every poll.
+    last_failure_kind: str | None = None
     consecutive_failures: int = 0
     total_samples: int = 0
     total_failures: int = 0
@@ -161,19 +182,40 @@ class CollectorService:
         """Stop polling and release the connection.
 
         Safe to call twice, and safe to call on a service that never started.
+
+        Awaiting a task that died of its own exception re-raises it, and letting
+        that escape used to skip the disconnect below — leaving the dongle's
+        single TCP slot held until it timed out, which blocks both the restart
+        and the owner's vendor app. ``gather`` collects those exceptions instead
+        of raising them, so every task is still awaited and the release is
+        reached whatever any of them did. It is also why there is no broad
+        ``except`` here: ``return_exceptions`` does that job without one, and the
+        alternative of wrapping only the disconnect in ``finally`` would abandon
+        the second task the moment the first one raised.
+
+        A death is logged rather than re-raised. ``_loop`` has already recorded
+        it with a traceback and cleared ``running``, so the fault is on the
+        record before this is reached; raising again from a shutdown path would
+        only break the caller that asked to shut down.
         """
-        for task in (self._yield_task, self._task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        self._task = None
-        self._yield_task = None
-        with contextlib.suppress(*TRANSPORT_ERRORS):
-            await self._source.disconnect()
-        self.status.running = False
-        self.status.connected = False
-        logger.info("collector stopped")
+        tasks = [task for task in (self._yield_task, self._task) if task is not None]
+        for task in tasks:
+            task.cancel()
+        try:
+            outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            self._task = None
+            self._yield_task = None
+            with contextlib.suppress(*TRANSPORT_ERRORS):
+                await self._source.disconnect()
+            self.status.running = False
+            self.status.connected = False
+            logger.info("collector stopped")
+        for outcome in outcomes:
+            if isinstance(outcome, BaseException) and not isinstance(
+                outcome, asyncio.CancelledError
+            ):
+                logger.error("poll task had already died before stop(): %s", outcome)
 
     async def yield_for(self, seconds: float) -> datetime:
         """Release the dongle for *seconds*, then resume polling by itself.
@@ -251,17 +293,21 @@ class CollectorService:
         timestamp = datetime.now(tz=UTC)
         try:
             await self._source.connect()
+        except TRANSPORT_ERRORS as exc:
+            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+
+        try:
             sample = await self._source.read()
         except TRANSPORT_ERRORS as exc:
-            reason = f"{type(exc).__name__}: {exc}"
-            gap = Sample.failed(timestamp, reason)
-            # No second reason if the gap itself cannot be written. The read
-            # already failed and that is what gets recorded; a database that is
-            # also busy just means this outage goes unmarked.
-            self._store_failure(gap)
-            self.status.connected = False
-            self._count_failure(timestamp, reason)
-            return gap
+            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+        except BUILD_ERRORS as exc:
+            # A sample the driver could not build is deterministic — it will
+            # fail identically on every poll, so retrying cannot fix it — but
+            # the loop must survive it and the history must show the hole,
+            # exactly as for an unreachable inverter. BUILD_ERRORS is scoped to
+            # read() rather than covering connect(), so a genuine bug in our own
+            # code still surfaces instead of being recorded as an outage.
+            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="build")
 
         # Set before the write is attempted, because it is the read that
         # establishes it and the read has already happened. Leaving it to the
@@ -276,14 +322,46 @@ class CollectorService:
             # this reading. Counted as a failure all the same, so the loop backs
             # off instead of hammering a database that is busy — and so the
             # watchdog sees the silence if it never clears.
-            self._count_failure(timestamp, failed)
+            self._count_failure(timestamp, failed, kind="store")
             return None
 
         self.status.last_success = timestamp
         self.status.last_error = None
+        self.status.last_failure_kind = None
         self.status.consecutive_failures = 0
         self.status.total_samples += 1
         return sample
+
+    def _record_gap(self, timestamp: datetime, reason: str, *, kind: str) -> Sample:
+        """Record a failed poll as a gap and count it, returning the sample.
+
+        Shared by the transport- and build-error paths in ``poll_once`` so the
+        two cannot diverge: each files the gap against the source's device and
+        counts the failure so the loop backs off. A gap is data even when nothing
+        could be read — a chart that quietly skips an outage is worse than one
+        that shows it.
+
+        Only a transport failure marks the connection down. On the build path the
+        inverter answered — ``connect()`` returned and the registers arrived — and
+        only turning the reply into a sample failed, so reporting the connection
+        as lost would send whoever read it after the dongle, the WiFi and the
+        breaker over a fault that is in our own decoding.
+        """
+        gap = Sample.failed(timestamp, reason)
+        # No second reason if the gap itself cannot be written. The read
+        # already failed and that is what gets recorded; a database that is
+        # also busy just means this outage goes unmarked.
+        self._store_failure(gap)
+        if kind == "transport":
+            self.status.connected = False
+        elif kind == "build":
+            # ``connect()`` returned before this, so the dongle answered. Leaving
+            # the flag at its old value would report a connection that is up as
+            # down on the very first poll, which is the misdiagnosis this whole
+            # distinction exists to avoid.
+            self.status.connected = True
+        self._count_failure(timestamp, reason, kind=kind)
+        return gap
 
     def _store_failure(self, sample: Sample) -> str | None:
         """Write a sample against this source's inverter, returning why it could not be.
@@ -306,10 +384,17 @@ class CollectorService:
             return reason
         return None
 
-    def _count_failure(self, timestamp: datetime, reason: str) -> None:
-        """Record a failed poll against the status, whatever it failed at."""
+    def _count_failure(self, timestamp: datetime, reason: str, *, kind: str) -> None:
+        """Record a failed poll against the status, whatever it failed at.
+
+        ``kind`` is required rather than defaulted so that a new failure path
+        cannot be added without saying which layer it belongs to. A stale kind
+        would name the wrong fault on the status page, which is the mistake this
+        field exists to stop.
+        """
         self.status.last_failure = timestamp
         self.status.last_error = reason
+        self.status.last_failure_kind = kind
         self.status.consecutive_failures += 1
         self.status.total_failures += 1
         logger.warning("poll failed (%d consecutive): %s", self.status.consecutive_failures, reason)

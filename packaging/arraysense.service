@@ -34,8 +34,11 @@ TimeoutStopSec=30
 
 # An inverter that is unreachable is expected, not exceptional — the collector
 # already backs off and retries on its own. Restarting covers the case where
-# the process itself died.
-Restart=on-failure
+# the process itself died. It is always, not on-failure, because the watchdog
+# restarts a stalled loop by sending SIGTERM, and systemd treats a SIGTERM as a
+# clean exit by default — on-failure would never restart after exactly the
+# restart the watchdog exists to trigger.
+Restart=always
 RestartSec=10
 
 # The database is the only thing this writes, and it needs no privileges beyond

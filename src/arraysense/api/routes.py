@@ -148,6 +148,19 @@ STALE_AFTER = timedelta(minutes=15)
 # reaction, and inventing a number for the second would be the more precise lie.
 READING_SEARCH = timedelta(hours=6)
 
+# Which layer the service says failed, and what the page calls it. A reply the
+# driver could not turn into a sample is neither an outage nor a disk fault: the
+# inverter answered and our own decoding refused it, so naming it after either
+# of the other two sends the reader somewhere there is nothing to find.
+_FAULT_VERDICT = {"transport": "inverter", "store": "storage", "build": "driver"}
+
+# The verdicts that name a fault, and so the ones allowed to quote the recorded
+# reason. Derived from the mapping above rather than listed again, because the
+# two drifted apart the moment a third fault was added: the new verdict rendered
+# with its cause suppressed, which for a decode failure is the only thing on the
+# page that says what was refused.
+_NAMED_FAULTS = frozenset(_FAULT_VERDICT.values())
+
 
 class YieldRequest(BaseModel):
     """How long to hand the dongle over for."""
@@ -247,11 +260,15 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
     inverter from a database refusing writes, because the service records both
     in ``last_error``, and it guessed the inverter — sending whoever read it
     after the dongle, the WiFi and the breaker while the disk was the problem.
-    Here the two are separable: ``connected`` is set from the read, before the
-    write is attempted, so a poll that failed with the connection up failed at
-    the store. ``consecutive_failures`` gates the whole question, because it is
-    cleared by a success and ``last_failure`` never is — reading that field
-    alone is what let the banner fire over a poll that had just worked.
+    The service now says which layer failed, so the answer is read rather than
+    inferred. That mattered once there were three answers instead of two: a
+    reply the driver could not turn into a sample arrives with the connection
+    up, so deriving the fault from ``connected`` alone blamed the store, and
+    marking the connection down to avoid that blamed the inverter while it was
+    answering every poll. ``consecutive_failures`` gates the whole question,
+    because it is cleared by a success and ``last_failure`` never is — reading
+    that field alone is what let the banner fire over a poll that had just
+    worked.
     """
     s = service.status
     stalled: timedelta | None = service.stalled_for(now)
@@ -270,7 +287,9 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
     elif not s.running:
         verdict = "not_running"
     elif s.consecutive_failures:
-        verdict = "storage" if s.connected else "inverter"
+        verdict = _FAULT_VERDICT.get(
+            s.last_failure_kind or "", "storage" if s.connected else "inverter"
+        )
     elif stale:
         verdict = "silent"
     else:
@@ -287,7 +306,7 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
         # Only where the verdict names a failure. The field is left set by the
         # service long after the fault it describes has cleared, so quoting it
         # beside any other verdict attaches an old cause to a new condition.
-        "reason": s.last_error if verdict in {"inverter", "storage"} else None,
+        "reason": s.last_error if verdict in _NAMED_FAULTS else None,
     }
 
 
@@ -835,7 +854,7 @@ async def battery_history(
     """One inverter's per-module battery readings over a range, keyed by serial.
 
     Modules are identified by serial rather than slot, so a bank that rotates
-    modules through the inverter's four register slots neither splits one
+    modules through the inverter's register slots neither splits one
     battery into two series nor merges two into one. ``device`` picks the
     inverter whose bank is being asked about and defaults to the configured
     one; a serial is unique within a device, not across them.

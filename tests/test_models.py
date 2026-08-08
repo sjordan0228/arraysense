@@ -91,13 +91,21 @@ def test_naive_timestamp_is_rejected() -> None:
         Sample(timestamp=datetime(2026, 8, 6, 12, 0), readings={})
 
 
-def test_slot_must_be_one_based_within_range() -> None:
-    # The registry names columns battery_module1..4; pylxpweb reports a 0-based
-    # battery_index, so an adapter must add one. Catch the off-by-one here
-    # rather than writing to a column that does not exist.
-    for bad in (0, 5, -1):
+def test_slot_must_be_one_based() -> None:
+    # pylxpweb reports a 0-based battery_index, so an adapter must add one, and
+    # catching that off-by-one here beats discovering it further down. What is
+    # *not* checked any more is an upper bound: it used to be four, because the
+    # registry named columns battery_module1..4 and a fifth pack had nowhere to
+    # go. Storage is keyed on the serial now, so a fifth pack is another row —
+    # and the bound was refusing real hardware rather than catching a mistake
+    # (#29). A bank of ten stacked EG4 units is an ordinary configuration.
+    for bad in (0, -1):
         with pytest.raises(ValueError, match="slot"):
             BatteryModuleSample(serial="BA12345678", slot=bad)
+
+
+def test_a_fifth_slot_is_a_bank_that_is_bigger_not_a_mistake() -> None:
+    assert BatteryModuleSample(serial="BA12345678", slot=5).slot == 5
 
 
 def test_empty_serial_is_rejected() -> None:

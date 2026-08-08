@@ -192,6 +192,28 @@ def test_status_blames_the_database_when_the_write_is_what_failed(empty_client: 
     assert body["reason"] == "OperationalError: database is locked"
 
 
+def test_status_names_the_driver_when_the_reply_could_not_be_decoded(empty_client: Any) -> None:
+    # The third fault, and the one with nowhere honest to go until it was named.
+    # The inverter answered and the driver refused the reply: called an outage it
+    # sends the reader after the dongle, called a storage fault it sends them to
+    # a disk that is fine. Deriving it from `connected` alone could only ever
+    # produce one of those two wrong answers.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=20), readings={"pv_total_power_w": 1000.0})
+    )
+    service = _polling(empty_client, now - timedelta(minutes=20))
+    service.status.last_failure = now
+    service.status.last_error = "ValueError: serial must not be empty; it is the module identity"
+    service.status.last_failure_kind = "build"
+    service.status.consecutive_failures = 3
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True
+    assert body["verdict"] == "driver"
+    assert body["reason"] == "ValueError: serial must not be empty; it is the module identity"
+
+
 def test_status_blames_the_inverter_when_the_read_is_what_failed(empty_client: Any) -> None:
     now = datetime.now(tz=UTC)
     empty_client.app.state.store.append(
