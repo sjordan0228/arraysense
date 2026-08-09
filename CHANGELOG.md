@@ -7,6 +7,38 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.6 — 9 August 2026
+
+### Changed
+
+- **Rollup maintenance rebuilds three hours of the past instead of forty-eight**
+  ([#60](https://github.com/sjordan0228/arraysense/issues/60)). 0.6.5 moved the
+  once-a-minute pass off the event loop, which stopped it freezing open pages but
+  left it doing the same work: re-deriving two days of hourly buckets every sixty
+  seconds. The window was wall-clock, so the rows inside it were set entirely by
+  how often the inverter is polled — halve the interval and the work doubles,
+  permanently. On the reference box that is 10,842 raw rows a pass today, and it
+  is the reason a direct RS485 transport could not simply be dropped in: at a
+  two-second cadence the same window holds around eight times as many rows and
+  the pass no longer fits between the polls it runs beside.
+
+  Nothing needed those forty-eight hours. The constant's own comment argued for
+  "a few hours" while the value was sixteen times that, and the gap was never
+  explained. Every writer that can dirty an hourly bucket was checked instead of
+  assumed: readings and gaps are stamped when the poll happens, a held battery
+  block is dropped rather than back-dated, the store's upsert can only replace a
+  row from the instant it was stamped, and both the SolarAssistant importer and
+  the out-of-bounds scrub write every tier they touch directly rather than
+  leaving a later rebuild to notice. None of them reaches back beyond the hour in
+  progress.
+
+  Existing data is untouched and no migration is needed. One edge is worth
+  knowing: a pass reads raw at the moment it runs, so if the service dies less
+  than a minute after one and then stays down longer than three hours, that
+  single hour's average is built from marginally fewer rows than it holds. The
+  bucket's sample count records it, the raw readings are still there, and the
+  minute tier has had the same bound since it was written.
+
 ## 0.6.5 — 8 August 2026
 
 ### Fixed

@@ -7,6 +7,7 @@ import contextlib
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -64,10 +65,70 @@ async def test_maintenance_is_idempotent(tmp_path: Path) -> None:
     service = CollectorService(source=FakeSource(), store=store, interval=3600)
     await service.maintain_rollups(now=now)
     first = store.query(["pv_total_power_w"], now - timedelta(days=1), now, tier="minute")
+    first_hourly = store.query(["pv_total_power_w"], now - timedelta(days=1), now, tier="hourly")
     await service.maintain_rollups(now=now)
     second = store.query(["pv_total_power_w"], now - timedelta(days=1), now, tier="minute")
+    second_hourly = store.query(["pv_total_power_w"], now - timedelta(days=1), now, tier="hourly")
     assert [r["timestamp"] for r in first] == [r["timestamp"] for r in second]
     assert [r["pv_total_power_w"] for r in first] == [r["pv_total_power_w"] for r in second]
+    assert first_hourly == second_hourly
+    store.close()
+
+
+async def test_maintenance_drops_a_recent_hour_when_its_raw_rows_are_gone(
+    tmp_path: Path,
+) -> None:
+    # Maintenance is delete-and-reinsert, not an upsert over whatever happened
+    # to be there. If retention or a repair removes every source row in a
+    # covered bucket, the stale average must disappear with them.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    sample_at = now - timedelta(minutes=30)
+    store.append(Sample(timestamp=sample_at, readings={"pv_total_power_w": 4000.0}))
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    await service.maintain_rollups(now=now)
+    before = store.query(["pv_total_power_w"], now - timedelta(hours=3), now, tier="hourly")
+    assert before
+
+    with store._conn:
+        store._conn.execute(
+            "DELETE FROM inverter_raw WHERE timestamp = ? AND device = ?",
+            (int(sample_at.timestamp()), TEST_DEVICE),
+        )
+    await service.maintain_rollups(now=now)
+
+    after = store.query(["pv_total_power_w"], now - timedelta(hours=3), now, tier="hourly")
+    assert after == []
+    store.close()
+
+
+async def test_hourly_maintenance_rebuilds_only_the_justified_three_hour_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqliteStore(":memory:", device=TEST_DEVICE)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    now = datetime(2026, 8, 9, 12, 34, 56, tzinfo=UTC)
+    calls: list[tuple[str, int, int]] = []
+
+    def record(name: str) -> Callable[[sqlite3.Connection, int, int], None]:
+        def rebuild(conn: sqlite3.Connection, start: int, end: int) -> None:
+            calls.append((name, start, end))
+
+        return rebuild
+
+    monkeypatch.setattr(service_module, "rebuild_inverter_minute", record("minute"))
+    monkeypatch.setattr(service_module, "rebuild_inverter_hourly", record("inverter_hourly"))
+    monkeypatch.setattr(service_module, "rebuild_module_hourly", record("module_hourly"))
+
+    await service.maintain_rollups(now=now)
+
+    end = int(now.timestamp()) + 60
+    assert calls == [
+        ("minute", end - 3 * 3600, end),
+        ("inverter_hourly", end - 3 * 3600, end),
+        ("module_hourly", end - 3 * 3600, end),
+    ]
     store.close()
 
 
