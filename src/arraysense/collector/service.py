@@ -156,6 +156,8 @@ class CollectorService:
         interval: float = 10.0,
         max_backoff: float = MAX_BACKOFF_SECONDS,
         stall_after: timedelta = STALL_AFTER,
+        *,
+        owns_store: bool = False,
     ) -> None:
         """Wire a source to a store, polling every *interval* seconds."""
         if interval <= 0:
@@ -167,6 +169,9 @@ class CollectorService:
         self._stall_after = stall_after
         self._task: asyncio.Task[None] | None = None
         self._yield_task: asyncio.Task[None] | None = None
+        self._store_write_lock = asyncio.Lock()
+        self._owns_store = owns_store
+        self._store_closed = False
         self.status = ServiceStatus()
 
     @property
@@ -195,6 +200,8 @@ class CollectorService:
         if self._task is not None and not self._task.done():
             logger.debug("start() called while already running; ignoring")
             return
+        if self._store_closed:
+            raise RuntimeError("cannot restart a collector after its owned store was closed")
         self.status.running = True
         self.status.started_at = datetime.now(tz=UTC)
         self._task = asyncio.create_task(self._loop())
@@ -238,6 +245,21 @@ class CollectorService:
                 outcome, asyncio.CancelledError
             ):
                 logger.error("poll task had already died before stop(): %s", outcome)
+
+    async def close(self) -> None:
+        """Stop the collector and close a store it was explicitly given ownership of.
+
+        Most tests and library callers manage the store themselves, so ownership
+        is opt-in. Application assembly opens a dedicated collector connection
+        and transfers it here; keeping that lifecycle beside the poll task means
+        shutdown cannot close SQLite while an off-loop write is still finishing.
+        """
+        try:
+            await self.stop()
+        finally:
+            if self._owns_store and not self._store_closed:
+                self._store.close()
+                self._store_closed = True
 
     async def yield_for(self, seconds: float) -> datetime:
         """Release the dongle for *seconds*, then resume polling by itself.
@@ -348,12 +370,16 @@ class CollectorService:
         try:
             await self._source.connect()
         except TRANSPORT_ERRORS as exc:
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+            return await self._record_gap(
+                timestamp, f"{type(exc).__name__}: {exc}", kind="transport"
+            )
 
         try:
             sample = await self._source.read()
         except TRANSPORT_ERRORS as exc:
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+            return await self._record_gap(
+                timestamp, f"{type(exc).__name__}: {exc}", kind="transport"
+            )
         except BUILD_ERRORS as exc:
             # A sample the driver could not build is deterministic — it will
             # fail identically on every poll, so retrying cannot fix it — but
@@ -361,7 +387,7 @@ class CollectorService:
             # exactly as for an unreachable inverter. BUILD_ERRORS is scoped to
             # read() rather than covering connect(), so a genuine bug in our own
             # code still surfaces instead of being recorded as an outage.
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="build")
+            return await self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="build")
 
         # Set before the write is attempted, because it is the read that
         # establishes it and the read has already happened. Leaving it to the
@@ -370,7 +396,7 @@ class CollectorService:
         # the WiFi and the breaker while the actual problem was the disk.
         self.status.connected = True
 
-        failed = self._store_failure(sample)
+        failed = await self._store_failure(sample)
         if failed is not None:
             # The inverter answered, so the connection is fine. What is lost is
             # this reading. Counted as a failure all the same, so the loop backs
@@ -386,7 +412,7 @@ class CollectorService:
         self.status.total_samples += 1
         return sample
 
-    def _record_gap(self, timestamp: datetime, reason: str, *, kind: str) -> Sample:
+    async def _record_gap(self, timestamp: datetime, reason: str, *, kind: str) -> Sample:
         """Record a failed poll as a gap and count it, returning the sample.
 
         Shared by the transport- and build-error paths in ``poll_once`` so the
@@ -405,7 +431,7 @@ class CollectorService:
         # No second reason if the gap itself cannot be written. The read
         # already failed and that is what gets recorded; a database that is
         # also busy just means this outage goes unmarked.
-        self._store_failure(gap)
+        await self._store_failure(gap)
         if kind == "transport":
             self.status.connected = False
         elif kind == "build":
@@ -417,7 +443,7 @@ class CollectorService:
         self._count_failure(timestamp, reason, kind=kind)
         return gap
 
-    def _store_failure(self, sample: Sample) -> str | None:
+    async def _store_failure(self, sample: Sample) -> str | None:
         """Write a sample against this source's inverter, returning why it could not be.
 
         Exists so the two write sites in ``poll_once`` cannot differ, and so a
@@ -431,7 +457,38 @@ class CollectorService:
         outage on the wrong machine.
         """
         try:
-            self._store.append(sample, device=self._source.device)
+            # ``append`` includes SQLite's commit and therefore the filesystem's
+            # durability wait. On the reference ZFS volume that wait can take
+            # about half a second; running it directly in this coroutine froze
+            # every HTTP response on the process's one event loop for the same
+            # interval. A dedicated collector connection (wired in build_app)
+            # lets the write move to a worker without taking the API connection's
+            # SQLite mutex with it.
+            #
+            # Shielding is about shutdown correctness, not latency. Cancelling
+            # an asyncio task cannot stop code already running in a thread. If
+            # stop() closed the connection while that worker was committing, the
+            # shutdown path would race the one sample it is meant to preserve.
+            # Wait for the worker to finish, then propagate cancellation.
+            async with self._store_write_lock:
+                write = asyncio.create_task(
+                    asyncio.to_thread(
+                        self._store.append,
+                        sample,
+                        device=self._source.device,
+                    )
+                )
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    # Retrieve an ordinary write failure without letting it
+                    # replace cancellation. Otherwise a locked database that
+                    # finishes failing during shutdown is caught by the outer
+                    # STORE_ERRORS handler, the cancellation disappears, and
+                    # the supposedly stopped poll loop carries on running.
+                    with contextlib.suppress(*STORE_ERRORS):
+                        await write
+                    raise
         except STORE_ERRORS as exc:
             reason = f"{type(exc).__name__}: {exc}"
             logger.warning("could not store reading: %s", reason)

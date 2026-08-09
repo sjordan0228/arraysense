@@ -33,6 +33,24 @@ def test_an_unset_setting_reads_its_default(settings: SettingsStore) -> None:
     assert settings.get("display.temperature_unit") == "F"
 
 
+def test_constructing_a_settings_reader_executes_no_schema_ddl(tmp_path: Path) -> None:
+    # Request handlers construct this object to read current settings. Schema
+    # creation belongs to store startup: even CREATE TABLE IF NOT EXISTS is a
+    # schema operation and can wait behind another connection's transaction.
+    # A read path must never issue it on the event-loop thread.
+    store = SqliteStore(str(tmp_path / "read-only.db"), device=TEST_DEVICE)
+    statements: list[str] = []
+    store._conn.set_trace_callback(statements.append)
+
+    SettingsStore(store).get("display.temperature_unit")
+
+    store._conn.set_trace_callback(None)
+    store.close()
+    assert not any(
+        statement.lstrip().upper().startswith("CREATE TABLE") for statement in statements
+    )
+
+
 def test_a_stored_value_wins_over_the_default(settings: SettingsStore) -> None:
     settings.set("display.temperature_unit", "C")
     assert settings.get("display.temperature_unit") == "C"

@@ -8,6 +8,7 @@ released on the way out.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 from arraysense.__main__ import build_app, build_parser, main
@@ -57,10 +58,22 @@ def _config(tmp_path: Path) -> Config:
 def test_build_app_creates_the_database_directory(tmp_path: Path) -> None:
     # Someone deploying this should not have to mkdir by hand.
     app, store, service = build_app(_config(tmp_path))
+    asyncio.run(service.close())
     store.close()
     assert (tmp_path / "nested").is_dir()
     assert app.title == "Solar ArraySense"
     assert service.status.running is False
+
+
+def test_the_collector_and_api_use_separate_sqlite_connections(tmp_path: Path) -> None:
+    """A slow collector commit must not take the API's connection mutex."""
+    _app, store, service = build_app(_config(tmp_path))
+    try:
+        assert service._store is not store
+        assert service._store._conn is not store._conn
+    finally:
+        asyncio.run(service.close())
+        store.close()
 
 
 def test_the_api_is_actually_reachable(tmp_path: Path) -> None:
@@ -69,7 +82,7 @@ def test_the_api_is_actually_reachable(tmp_path: Path) -> None:
     # are not flattened into app.routes and inspecting them proves nothing.
     from fastapi.testclient import TestClient
 
-    app, store, _service = build_app(_config(tmp_path))
+    app, store, service = build_app(_config(tmp_path))
     try:
         # No context manager: entering it would run the lifespan hook and
         # start the collector dialling a nonexistent inverter.
@@ -79,6 +92,7 @@ def test_the_api_is_actually_reachable(tmp_path: Path) -> None:
         # /history needs arguments; a bare call must be rejected, not 404.
         assert client.get("/api/history").status_code == 422
     finally:
+        asyncio.run(service.close())
         store.close()
 
 
@@ -161,10 +175,13 @@ def test_the_store_follows_a_serial_changed_from_the_settings_page(tmp_path: Pat
     SettingsStore(first).update({"connection.inverter_serial": "CE99999999"})
     first.close()
 
-    _app, store, _service = build_app(config)
+    _app, store, service = build_app(config)
     device = store.device
+    collector_device = service._store.device
+    asyncio.run(service.close())
     store.close()
     assert device == "CE99999999"
+    assert collector_device == "CE99999999"
 
 
 def test_the_migration_uses_the_serial_the_service_will_read_by(tmp_path: Path) -> None:

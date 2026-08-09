@@ -63,10 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
-    """Open the store, build the collector, and assemble the application.
+    """Open dedicated API and collector stores and assemble the application.
 
-    Returns all three because the caller has to close the store and stop the
-    collector on the way out, and the app alone does not expose them.
+    Returns all three because the caller has to close the API store and close
+    the collector on the way out, and the app alone does not expose them.
     """
     Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
     # The store lays its schema for what the configured driver declares it can
@@ -111,11 +111,29 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         config.database_path,
     )
 
-    service = CollectorService(
-        source=drivers.create(config),
-        store=store,
-        interval=config.poll_interval,
-    )
+    # The raw append and its filesystem durability wait run in a worker thread.
+    # It needs its own connection as well: sqlite serialises operations on one
+    # connection, so sharing with the API would merely move the event-loop stall
+    # from Python into that connection's mutex. WAL lets this writer and the API
+    # reader proceed concurrently against the same database.
+    collector_store: SqliteStore | None = None
+    try:
+        collector_store = SqliteStore(
+            config.database_path,
+            device=config.inverter_serial,
+            metrics=declared,
+        )
+        service = CollectorService(
+            source=drivers.create(config),
+            store=collector_store,
+            interval=config.poll_interval,
+            owns_store=True,
+        )
+    except (OSError, sqlite3.Error, ValueError, KeyError):
+        if collector_store is not None:
+            collector_store.close()
+        store.close()
+        raise
     app = create_app(store=store, service=service, config=config)
 
     @contextlib.asynccontextmanager
@@ -130,7 +148,7 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
                 await watchdog
             # Release the dongle's single slot before the process goes away,
             # or the next start — and the vendor's app — find it occupied.
-            await service.stop()
+            await service.close()
             store.close()
 
     app.router.lifespan_context = lifespan

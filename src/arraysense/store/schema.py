@@ -119,6 +119,7 @@ MODULE_TIERS: tuple[Tier, ...] = (
 
 SERIALS_TABLE = "serials"
 INVALID_TABLE = "invalid_readings"
+SETTINGS_TABLE = "settings"
 
 _MODULE_PREFIX = re.compile(r"^battery_module\d+_")
 
@@ -255,6 +256,23 @@ def _invalid_readings_ddl(as_name: str) -> str:
     )
 
 
+def _settings_ddl(as_name: str) -> str:
+    """Return the DDL for installation-wide settings.
+
+    Settings are part of store initialization even though they carry no
+    readings. Creating this table lazily from ``SettingsStore`` made every
+    settings read execute schema DDL; request handlers build that lightweight
+    reader on the event-loop thread, so a read path was performing a
+    lock-taking operation before its SELECT.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    key TEXT NOT NULL PRIMARY KEY,\n"
+        "    value TEXT NOT NULL\n"
+        f") {_TABLE_OPTIONS}"
+    )
+
+
 def _inverter_tier_ddl(tier: Tier, metric_names: tuple[str, ...], as_name: str) -> str:
     """Return the DDL for one inverter-tier wide-row table.
 
@@ -338,6 +356,8 @@ def ddl_for(table: str, as_name: str | None = None, declared: Iterable[str] | No
             metric the registry does not hold.
     """
     name = table if as_name is None else as_name
+    if table == SETTINGS_TABLE:
+        return _settings_ddl(name)
     if table == SERIALS_TABLE:
         return _serials_ddl(name)
     if table == INVALID_TABLE:
@@ -480,7 +500,9 @@ def schema_ddl(declared: Iterable[str] | None = None) -> str:
     left exactly as it is, silently. That is why the device column arrived as
     an explicit migration rather than as an edit here.
     """
-    statements: list[str] = []
+    # Settings carry no device and are deliberately separate from
+    # DEVICED_TABLES, whose members the device-identity migration rebuilds.
+    statements: list[str] = [ddl_for(SETTINGS_TABLE)]
     for table in DEVICED_TABLES:
         statements.append(ddl_for(table, declared=declared))
         statements.extend(indexes_for(table))

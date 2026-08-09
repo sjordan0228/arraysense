@@ -7,6 +7,8 @@ tiny so the suite stays fast; nothing sleeps for a real second.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,49 @@ async def test_a_successful_poll_is_stored(tmp_path: Path) -> None:
     assert rows[0]["pv_total_power_w"] == 7614.0
     assert svc.status.total_samples == 1
     assert svc.status.consecutive_failures == 0
+
+
+async def test_a_slow_store_commit_does_not_block_the_event_loop(tmp_path: Path) -> None:
+    """A filesystem stall while committing a poll must not freeze HTTP work.
+
+    The production symptom is process-wide, so this test measures the property
+    that matters without pretending a Mac filesystem reproduces the LXC's ZFS
+    latency. A timer thread releases the fake slow commit; while it is held, an
+    asyncio task must continue to run.
+    """
+    svc, store = _service(tmp_path)
+    real_append = store.append
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_append(sample: Sample, device: str | None = None) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0), "test did not release the fake commit"
+        real_append(sample, device=device)
+
+    store.append = slow_append  # type: ignore[method-assign]
+    ticks = 0
+
+    async def count_event_loop_turns() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(count_event_loop_turns())
+    release_timer = threading.Timer(0.25, release.set)
+    release_timer.start()
+    try:
+        await svc.poll_once()
+    finally:
+        release.set()
+        release_timer.join()
+        ticker.cancel()
+        await asyncio.gather(ticker, return_exceptions=True)
+        store.close()
+
+    assert entered.is_set(), "the test never reached the store write"
+    assert ticks >= 5, f"the event loop made only {ticks} turns during the slow commit"
 
 
 async def test_a_failed_read_is_stored_as_a_gap(tmp_path: Path) -> None:
@@ -141,6 +186,74 @@ async def test_start_and_stop_are_idempotent(tmp_path: Path) -> None:
     await svc.stop()
     store.close()
     assert not svc.status.running
+
+
+async def test_close_waits_for_an_off_loop_write_before_closing_its_store(
+    tmp_path: Path,
+) -> None:
+    """Cancellation cannot stop a worker thread already inside append()."""
+    store = SqliteStore(str(tmp_path / "owned.db"), device=TEST_DEVICE)
+    svc = CollectorService(
+        source=FakeSource(),
+        store=store,
+        interval=3600,
+        owns_store=True,
+    )
+    real_append = store.append
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_append(sample: Sample, device: str | None = None) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0), "test did not release the held append"
+        real_append(sample, device=device)
+
+    store.append = held_append  # type: ignore[method-assign]
+    await svc.start()
+    assert await asyncio.to_thread(entered.wait, 2.0), "the poll never entered append"
+
+    closing = asyncio.create_task(svc.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done(), "close raced a write still running in its worker"
+    assert store._conn.execute("SELECT 1").fetchone() == (1,)
+
+    release.set()
+    await closing
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        store._conn.execute("SELECT 1")
+
+
+async def test_a_write_failure_finishing_during_close_does_not_swallow_cancellation(
+    tmp_path: Path,
+) -> None:
+    """A worker's SQLite error must not replace the poll task's cancellation."""
+    store = SqliteStore(str(tmp_path / "owned-failure.db"), device=TEST_DEVICE)
+    svc = CollectorService(
+        source=FakeSource(),
+        store=store,
+        interval=3600,
+        owns_store=True,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def held_failure(sample: Sample, device: str | None = None) -> None:
+        entered.set()
+        assert release.wait(timeout=2.0), "test did not release the held append"
+        raise sqlite3.OperationalError("database is locked")
+
+    store.append = held_failure  # type: ignore[method-assign]
+    await svc.start()
+    assert await asyncio.to_thread(entered.wait, 2.0), "the poll never entered append"
+
+    closing = asyncio.create_task(svc.close())
+    await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.wait_for(closing, timeout=1.0)
+
+    assert svc.status.running is False
+    with pytest.raises(sqlite3.ProgrammingError, match="closed database"):
+        store._conn.execute("SELECT 1")
 
 
 async def test_the_loop_collects_repeatedly(tmp_path: Path) -> None:
