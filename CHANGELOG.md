@@ -7,6 +7,64 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.4 — 8 August 2026
+
+### Fixed
+
+- **An unknown timezone asked of `/api/costs` is refused, not answered with a
+  server error** ([#49](https://github.com/sjordan0228/arraysense/issues/49)).
+  Asking for costs in a zone the tz database does not know raised out of the
+  endpoint and became a 500, telling a caller who sent a bad zone that the
+  service is broken and sending them to look at the wrong thing. It now answers
+  400 with the zone named, which is what `/api/energy` and `/api/bands` already
+  do.
+
+  `/api/status` still falls back instead of refusing, and the difference is what
+  each answer is for: the banner only says whether the screen is current, which
+  is worth answering in some nearby zone rather than withholding over a browser's
+  stale name, while a month's cost is cut at a midnight and one cut in the wrong
+  place looks entirely normal.
+
+  An installation that has set its own timezone was never affected and still is
+  not — where a zone is configured, the caller's is not consulted at all, not
+  even to reject it, so a phone carrying a stale zone cannot refuse a request the
+  service can answer perfectly well.
+
+## 0.6.3 — 8 August 2026
+
+### Fixed
+
+- **A tariff band whose window was partly unmeasured now says so**
+  ([#31](https://github.com/sjordan0228/arraysense/issues/31)). The Costs page
+  marked its totals and its cards when a counter went quiet, but left the band
+  table alone — so an evening the inverter never reported could sit in the table
+  as `On-peak 0.0 kWh / $0.00`, unmarked, beside a total that was flagged. Read
+  plainly it said the peak hours had cost nothing, which is the most expensive
+  thing on the page to get wrong.
+
+  Each band row is now marked when some of the period's unplaced energy could
+  belong to it, and the marks are per column: the house figures stay clean when
+  the house counter was fine and only the import counter went quiet. What the
+  mark claims is deliberately narrow. Which band the energy belongs to cannot be
+  known — inside a gap the amount is exact in total and unplaceable within it —
+  so the wording says the window was partly unmeasured and names no amount and
+  no owner. A band measured end to end is not marked, and neither is a complete
+  period.
+
+  Three cases the first cut of this missed, all of which would have read as
+  clean data. A counter that stops and never resumes leaves no gap behind to
+  find — there is no later reading to close one — so an outage running to the end
+  of the month marked nothing at all. The same for a counter with no readings in
+  the period whatsoever. And merging days into a month dropped the band names,
+  which is exactly the path the History footer takes.
+
+  The mark on the split bars was invisible. It was drawn in the page's warning
+  amber, which measures 1.0:1 against the bar it sits on in light mode; it is now
+  a hatch in the page's own foreground colour, which inverts with the theme and
+  measures above the 3:1 floor on every band shade in both. The segment that
+  needed it most was also the one with no width to draw in — a band reading zero
+  — so a marked segment now keeps a few pixels of its own.
+
 ## 0.6.2 — 8 August 2026
 
 ### Added

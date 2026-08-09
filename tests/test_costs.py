@@ -24,6 +24,7 @@ from arraysense.tariff import (
     Tariff,
     compute_cost,
     estimate_bill,
+    merge_shortfalls,
     parse_bands,
 )
 
@@ -1010,3 +1011,190 @@ def test_the_bucket_path_flags_the_day_whose_money_is_short() -> None:
     assert second is not None and first is not None
     assert second.cost_is_short is True
     assert first.cost_is_short is False
+
+
+# --- which bands the unplaced energy could belong to (#31) ----------------------
+#
+# A band row is a figure, and #23's rule is that a figure whose window was partly
+# unmeasured must say so. The period already knows: `shortfall.grid_import` reports
+# the unattributed kilowatt-hours. What it does not say is *which band* they might
+# have fallen in, so the Costs page could mark its totals row and its cards while
+# leaving "On-peak 0.0 kWh / $0.00" standing unmarked beside them.
+#
+# Exact per-band attribution is not achievable and this does not attempt it: a
+# dropped span's energy is known in total and unlocatable within the span. What is
+# achievable is naming the bands it *could* belong to, which is enough to mark a row
+# honestly and claims no number.
+
+
+def _rows_with_hole(start: datetime, hours: int, hole: range) -> list[dict[str, object]]:
+    """Counters climbing hourly, with the grid-import counter absent for a stretch.
+
+    The reading still arrives; only that counter is missing from it, which is how a
+    real gap in one register looks beside the others.
+    """
+    out: list[dict[str, object]] = []
+    for h in range(hours + 1):
+        row: dict[str, object] = {
+            "timestamp": start + timedelta(hours=h),
+            "load_energy_total_kwh": 2000.0 + h * 2,
+            "grid_export_energy_total_kwh": 5.0,
+        }
+        if h not in hole:
+            row["grid_import_energy_total_kwh"] = 1000.0 + h
+        out.append(row)
+    return out
+
+
+def test_a_band_whose_window_was_partly_unmeasured_names_itself() -> None:
+    # The hole covers 14:00-21:00 local, which swallows the whole 15:00-20:00 peak
+    # window and part of the evening off-peak either side of it.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    energy = period_energy(COSERV, _rows_with_hole(start, 24, range(14, 22)), start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    assert "On-peak" in short.bands_possibly_short
+
+
+def test_a_band_measured_throughout_does_not_name_itself() -> None:
+    # Same hole. The Winter band is out of season in July and never occurs, so it
+    # cannot be short — and naming it would put a mark on a row that is not there.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    energy = period_energy(COSERV, _rows_with_hole(start, 24, range(14, 22)), start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    assert "Winter" not in short.bands_possibly_short
+
+
+def test_a_clean_period_names_no_band_at_all() -> None:
+    # Nothing missing, so nothing may be marked. A marker on a complete period is
+    # the same failure as a missing marker on a partial one, in the other direction.
+    #
+    # Only the counters the fixture actually feeds: it carries no battery counter,
+    # so battery discharge has been `unknowable` here since long before bands were
+    # named — see the test below, which pins that case on its own rather than
+    # letting it ride along in a loop over every key.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    energy = period_energy(COSERV, _rows(start, 24, 1.0), start, end, TZ)
+    for name in ("grid_import", "load", "grid_export"):
+        short = (energy.shortfall or {})[name]
+        assert short.short is False, f"{name} is not clean; the fixture has changed"
+        assert short.bands_possibly_short == frozenset()
+
+
+def test_a_counter_that_never_reported_names_every_band() -> None:
+    # A counter with no readings at all reached nothing, so every band's window is
+    # unmeasured for it and every one is a candidate. This is not a new verdict —
+    # the missing bounds have made it `unknowable` since #23 — only the same verdict
+    # carried down to the rows, and marking fewer bands than that would be the page
+    # claiming a window was measured when no reading exists anywhere in the period.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    energy = period_energy(COSERV, _rows(start, 24, 1.0), start, end, TZ)
+    battery = (energy.shortfall or {})["battery_discharge"]
+    assert battery.unknowable is True
+    assert battery.bands_possibly_short == frozenset({"On-peak", "Off-peak"})
+
+
+def test_the_emptiness_signal_alone_would_miss_this() -> None:
+    # The trap recorded on the issue. A band that reported 0.0 rather than None is
+    # not "empty", because the band has intervals on other days that did report and
+    # the split hands it a zero. A fix built only on the empty-interval check passes
+    # every other test here and still leaves the defect on the page, so this pins
+    # the case directly: the peak window is wholly inside the hole, and the band
+    # must be named even though its split value is a number rather than absent.
+    start, end = _day(2026, 7, 14), _day(2026, 7, 17)
+    hole = range(38, 46)  # 14:00-21:00 local on the middle day only
+    energy = period_energy(COSERV, _rows_with_hole(start, 72, hole), start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    peak = (energy.grid_import_kwh or {}).get("On-peak")
+    assert peak is not None, "the fixture no longer reproduces the case: peak is absent, not zero"
+    assert "On-peak" in short.bands_possibly_short
+
+
+def test_the_flag_does_not_disturb_the_existing_shortfall_fields() -> None:
+    # `short` and the two kilowatt-hour figures decide the totals row and the cards,
+    # which #23 settled. This adds a field beside them and must not move them.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    rows = _rows_with_hole(start, 24, range(14, 22))
+    energy = period_energy(COSERV, rows, start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    assert short.unattributed_kwh > 0.0
+    assert short.short is True
+
+
+def test_export_names_no_band_because_it_has_no_band_split() -> None:
+    # Export is priced at one flat rate, so an interval-level verdict means
+    # nothing for it — which is why the emptiness check beside this already skips
+    # it, having once flagged provably exact export credits. Naming bands for it
+    # would qualify a figure the spans and bounds proved exact, and would hand the
+    # page a set it could only draw wrongly.
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    rows: list[dict[str, object]] = []
+    for h in range(25):
+        row: dict[str, object] = {
+            "timestamp": start + timedelta(hours=h),
+            "grid_import_energy_total_kwh": 1000.0 + h,
+            "load_energy_total_kwh": 2000.0 + h * 2,
+        }
+        # The export counter alone is missing across the peak window's edges.
+        if h not in range(15, 21):
+            row["grid_export_energy_total_kwh"] = 5.0 + h * 0.5
+        rows.append(row)
+    energy = period_energy(COSERV, rows, start, end, TZ)
+    export = (energy.shortfall or {})["grid_export"]
+    assert export.unattributed_kwh > 0.0, "the fixture no longer produces an export shortfall"
+    assert export.bands_possibly_short == frozenset()
+
+
+def test_a_counter_that_dies_mid_period_names_the_bands_it_never_reached() -> None:
+    # A counter that stops and never resumes leaves no dropped span behind, because
+    # a span needs a reading on both sides of the hole and there is no reading after
+    # this one. Its own reach is the only evidence, and the bounds check turns that
+    # into `unknowable`. But `unknowable` is a period-level verdict: it marks the
+    # totals row and says nothing about which band rows to mark, so a fix that
+    # collects bands only from spans leaves every row on a three-day outage clean.
+    start, end = _day(2026, 7, 14), _day(2026, 7, 17)
+    rows = _rows_with_hole(start, 72, range(38, 73))
+    energy = period_energy(COSERV, rows, start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    assert short.unknowable is True, "the fixture no longer reproduces a bounds-only shortfall"
+    assert "On-peak" in short.bands_possibly_short
+    assert "Off-peak" in short.bands_possibly_short
+
+
+def test_a_present_band_measured_throughout_is_not_named() -> None:
+    # Discrimination between bands that all occur, which the Winter case above
+    # cannot show: Winter is out of season in July and has no intervals at all, so
+    # its absence proves only that a band with no window is not named. COSERV alone
+    # cannot show it either — its peak is bracketed by off-peak on both sides, so
+    # any span ambiguous enough to be dropped touches both bands by construction.
+    #
+    # Four bands across the day, and a hole from 16:00 to 21:00 local. It spans the
+    # Peak/Evening boundary, so the energy could have fallen either side and both
+    # are named; Night and Day are measured end to end and must stay clean.
+    tariff = Tariff(
+        bands=parse_bands(
+            "Night | 0.05 | 00:00-06:00; Day | 0.10 | 06:00-15:00; "
+            "Peak | 0.30 | 15:00-20:00; Evening | 0.15 | 20:00-24:00"
+        ),
+        fixed_monthly=15.0,
+    )
+    start, end = _day(2026, 7, 15), _day(2026, 7, 16)
+    energy = period_energy(tariff, _rows_with_hole(start, 24, range(17, 21)), start, end, TZ)
+    short = (energy.shortfall or {})["grid_import"]
+    assert short.short is True, "the fixture no longer produces a shortfall"
+    assert short.bands_possibly_short == frozenset({"Peak", "Evening"})
+
+
+def test_merging_buckets_keeps_the_bands_each_one_named() -> None:
+    # The History footer prices thirty-one days as one period by merging the
+    # buckets' accounting. A merge that drops the band names hands that footer an
+    # empty set, so a month containing an outage prices its band rows as though
+    # every window had been measured — the totals stay flagged and the rows do not.
+    first = _day(2026, 7, 15)
+    second = _day(2026, 7, 16)
+    third = _day(2026, 7, 17)
+    holed = period_energy(COSERV, _rows_with_hole(first, 24, range(14, 22)), first, second, TZ)
+    clean = period_energy(COSERV, _rows(second, 24, 1.0), second, third, TZ)
+    assert "On-peak" in (holed.shortfall or {})["grid_import"].bands_possibly_short
+    merged = merge_shortfalls([holed, clean])
+    assert merged is not None
+    assert "On-peak" in merged["grid_import"].bands_possibly_short

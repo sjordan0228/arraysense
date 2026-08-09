@@ -503,6 +503,10 @@ def _shortfall(
     timestamps and the period bounds arrive in the owner's zone, and two
     aware datetimes only compare correctly across a fold when they do not
     share a tzinfo — going through UTC sidesteps the question entirely.
+
+    Returns a mapping keyed by counter name, each entry holding the attributed
+    and unattributed kilowatt-hours, the unknowable flag, and the set of band
+    names whose windows were partly unmeasured (#31).
     """
     lo, hi = start.astimezone(UTC), end.astimezone(UTC)
     values: dict[str, Mapping[str, float | None]] = {
@@ -516,6 +520,11 @@ def _shortfall(
         unattributed = 0.0
         unknowable = False
         inside: list[tuple[datetime, datetime]] = []
+        # Bands whose windows were partly unmeasured, gathered from all three
+        # things that can say so below: an interval that reported nothing, a
+        # dropped span overlapping one, and an interval outside the counter's
+        # reach. Any one of them is enough to qualify the row.
+        implicated_bands: set[str] = set()
         for span in spans:
             span_lo, span_hi = span.start.astimezone(UTC), span.end.astimezone(UTC)
             if span_hi <= lo or span_lo >= hi:
@@ -554,12 +563,45 @@ def _shortfall(
         # check anyway flagged provably exact export credits.
         if not unknowable and name != "grid_export":
             covered = _coalesced(inside)
-            unknowable = any(
-                _unexplained(interval, bucket, field, covered, reach)
-                for interval, bucket in zip(intervals, buckets, strict=True)
+            for interval, bucket in zip(intervals, buckets, strict=True):
+                if _unexplained(interval, bucket, field, covered, reach):
+                    if interval.band is not None:
+                        implicated_bands.add(interval.band)
+                    unknowable = True
+        # Two more ways a band's window goes unmeasured, both invisible to the
+        # emptiness check above and both skipped for export — export takes no
+        # band split, a flat rate prices the total, and naming bands for it
+        # would qualify a credit the spans and bounds already proved exact.
+        #
+        # Neither is guarded on ``unknowable``: a period already flagged for
+        # another reason still has bands whose rows need marking, and the flag
+        # is period-level in any case.
+        if name != "grid_export":
+            # A dropped span overlapping an interval. A band with intervals on
+            # other days that did report is handed 0.0 rather than None, so it
+            # never looks empty — and the whole defect in #31 was a peak window
+            # reading 0.0 kWh with no mark on it.
+            implicated_bands |= _bands_overlapping(
+                intervals,
+                [
+                    (span.start.astimezone(UTC), span.end.astimezone(UTC))
+                    for span in spans
+                    # A pure coverage span proves zero energy; it implicates nobody.
+                    if span.kwh != 0.0
+                ],
             )
+            # An interval outside the counter's reach. No span can say so: a span
+            # needs a reading on both sides of the hole, and past the last answer
+            # there is none. ``_unexplained`` calls such an interval explained for
+            # exactly that reason, leaving the bounds check to raise the flag — but
+            # that flag says nothing about which rows to mark, so a counter that
+            # died mid-month marked the totals and left every band row clean.
+            implicated_bands |= _bands_overlapping(intervals, _unreached(reach, lo, hi, max_gap))
         out[name] = EnergyShortfall(
-            attributed_kwh=attributed, unattributed_kwh=unattributed, unknowable=unknowable
+            attributed_kwh=attributed,
+            unattributed_kwh=unattributed,
+            unknowable=unknowable,
+            bands_possibly_short=frozenset(implicated_bands),
         )
     return out
 
@@ -605,6 +647,61 @@ def _unexplained(
     if reach is None or interval_hi <= reach[0] or interval_lo >= reach[1]:
         return False
     return not any(span_lo <= interval_lo and interval_hi <= span_hi for span_lo, span_hi in spans)
+
+
+def _bands_overlapping(
+    intervals: Sequence[BandInterval], windows: Sequence[tuple[datetime, datetime]]
+) -> set[str]:
+    """Names of the bands whose intervals share any time with one of the windows.
+
+    The windows are stretches nobody measured, and this is the whole of what can
+    honestly be said about where their energy went: a band whose window overlaps
+    one *could* be holding some of it. Exact attribution is not achievable —
+    inside a dropped span the energy is known in total and unlocatable — so the
+    answer is a set of candidates rather than a number, and every caller here
+    unions into the same set for that reason.
+
+    Comparison is in UTC because the intervals arrive in the owner's zone: two
+    aware datetimes sharing a tzinfo compare as naive across a fold.
+    """
+    if not windows:
+        return set()
+    found: set[str] = set()
+    for interval in intervals:
+        if interval.band is None or interval.band in found:
+            continue
+        interval_lo = interval.start.astimezone(UTC)
+        interval_hi = interval.end.astimezone(UTC)
+        if any(interval_lo < hi and interval_hi > lo for lo, hi in windows):
+            found.add(interval.band)
+    return found
+
+
+def _unreached(
+    reach: tuple[datetime, datetime] | None,
+    lo: datetime,
+    hi: datetime,
+    max_gap: timedelta,
+) -> list[tuple[datetime, datetime]]:
+    """The stretches of a period lying outside what the counter actually read.
+
+    A counter that never answered reached nothing, so the whole period is
+    unmeasured. One that stopped early leaves everything past its last reading
+    unmeasured, and one that started late everything before its first.
+
+    The same ``max_gap`` tolerance the bounds check uses governs here, and it
+    has to: a counter answering a few minutes after the period opens is normal
+    on an 11-second poll, and treating that as an outage would put a mark on
+    every band row of every clean month.
+    """
+    if reach is None:
+        return [(lo, hi)]
+    out: list[tuple[datetime, datetime]] = []
+    if reach[0] - lo > max_gap:
+        out.append((lo, reach[0]))
+    if hi - reach[1] > max_gap:
+        out.append((reach[1], hi))
+    return out
 
 
 def _log_dropped(attribution: EnergyAttribution) -> None:

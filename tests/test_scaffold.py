@@ -193,3 +193,40 @@ def test_the_theme_is_applied_after_the_constants_it_reads() -> None:
         "applyStoredTheme() is called above the constants it reads; the resolver "
         "will hit the temporal dead zone and quietly fall back to 'system'"
     )
+
+
+def test_a_marked_split_segment_is_actually_drawn() -> None:
+    # The mark on a split bar was applied as class="part" while the only rule for
+    # `part` was `td.part`, so every segment mark rendered as nothing — and the
+    # DOM looked right, which is how it survived a check that read attributes
+    # rather than pixels. The minimum width matters as much as the outline: the
+    # segment #31 exists for is the 0.0 kWh band, which has no width to draw in.
+    page = _web("costs.html")
+    assert "td.part{" in page, "the table's own mark is gone"
+    rule = re.search(r"\.splitbar span\.part\{([^}]*)\}", page)
+    assert rule is not None, "split segments take class=part but nothing styles them"
+    assert "min-width" in rule.group(1), (
+        "a marked segment with a zero share has no width, so the mark cannot render"
+    )
+    drawn = re.search(r"\.splitbar span\.part::after\{([^}]*)\}", page, re.S)
+    assert drawn is not None, "the marked segment has width but nothing is drawn in it"
+    # --warn is the marker colour everywhere else on this page and is wrong here:
+    # measured against the segment fills it sits on it reaches 1.0:1 in light mode.
+    # --ink inverts with the theme, which is what holds the mark above 3:1 on both.
+    assert "var(--ink)" in drawn.group(1), "the segment mark must use the theme's ink"
+    assert "var(--warn)" not in drawn.group(1), (
+        "--warn on the split fills measures 1.0:1 in light mode — invisible, not subtle"
+    )
+
+
+def test_the_shortfall_mark_claims_no_unplaced_amount() -> None:
+    # A band is named whenever its window was partly unmeasured, and that happens
+    # with nothing unplaced at all — a counter that never reported over the window
+    # leaves `unattributed_kwh` at zero while every band stays a candidate. Wording
+    # that says "some of the unplaced energy" asserts a quantity that need not
+    # exist, which is the same class of error as presenting a partial as whole.
+    page = _web("costs.html")
+    assert "unplaced energy" not in page, (
+        "the mark claims unplaced energy exists; a named band need not have any"
+    )
+    assert "was not measured" in page, "the mark no longer says why the figure is qualified"

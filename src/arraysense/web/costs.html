@@ -72,6 +72,23 @@
   .bandbar i{display:block;height:100%;width:0;border-radius:2px;background:var(--grid)}
   td.part{position:relative}
   td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
+  /* A marked segment of a split bar. Two things the table's dot cannot do here.
+     A segment is a flex child sized from its share, and the one #31 exists for is
+     the 0.0 kWh band — zero share, zero width, so a mark drawn inside it renders
+     as nothing at all; hence a minimum width of its own. It costs a few pixels of
+     accuracy on the smallest segments, which is the right way round: a band that
+     may be under-reported is the last thing to render as absent.
+
+     And the mark cannot be --warn. Measured against the segment fills it sits on,
+     amber reaches 1.0:1 contrast in light mode — invisible, not subtle. --ink is
+     the page's own foreground and inverts with the theme, which is what keeps it
+     above the 3:1 floor for non-text marks on every fill in both themes (light
+     9.6/7.0/5.1, dark 4.4/4.8/5.0 across the shade range). The hatch is the
+     second encoding the palette rule asks for, and it is already this file's
+     word for absent data: .splitbar.none hatches the whole bar the same way. */
+  .splitbar span.part{min-width:7px;position:relative}
+  .splitbar span.part::after{content:'';position:absolute;inset:0;pointer-events:none;
+    background:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 5px)}
   /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
      it — uppercase at .17em tracking turns an explanation into shouting. */
   .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
@@ -684,7 +701,7 @@ function drawSankey(p) {
 function renderSplit(p) {
   const box = $('bandSplit');
   const shades = [0.9, 0.62, 0.42, 0.28];
-  const bar = (label, values) => {
+  const bar = (label, values, shortFlag) => {
     const total = values.reduce((a, b) => a + (b.v === null ? 0 : b.v), 0);
     if (!values.length || values.some((v) => v.v === null) || total <= 0) {
       return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
@@ -693,16 +710,26 @@ function renderSplit(p) {
     const cells = values.map((v, i) => {
       const share = v.v / total;
       const shade = shades[Math.min(i, shades.length - 1)];
-      return `<span style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
-        + ` title="${esc(v.name)} ${esc(pctStr(share))}">`
+      // Mark the segment whose band window was partly unmeasured (#31). The
+      // title has to carry the reason as the table's cells do: a hatch says
+      // something is off about this segment and cannot say what.
+      const short = Boolean(shortFlag && shortFlag[i]);
+      const why = short ? ' — part of this window was not measured' : '';
+      return `<span${short ? ' class="part"' : ''}`
+        + ` style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+        + ` title="${esc(v.name)} ${esc(pctStr(share))}${esc(why)}">`
         + `${share > 0.13 ? esc(pctStr(share)) : ''}</span>`;
     }).join('');
     return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
       + `<div class="splitbar">${cells}</div></div>`;
   };
+  // Both bars below are import-derived — energy from the grid and what it cost —
+  // so both take the import flags. There is deliberately no house equivalent
+  // here; adding one would mark a segment against a counter it does not draw.
+  const importShort = p.rows.map((r) => r.importShort === true);
   box.innerHTML =
-    bar('Energy', p.rows.map((r) => ({ name: r.band.name, v: r.importKwh })))
-    + bar('Cost', p.rows.map((r) => ({ name: r.band.name, v: r.cost })));
+    bar('Energy', p.rows.map((r) => ({ name: r.band.name, v: r.importKwh })), importShort)
+    + bar('Cost', p.rows.map((r) => ({ name: r.band.name, v: r.cost })), importShort);
 }
 
 function renderBands(p) {
@@ -710,6 +737,20 @@ function renderBands(p) {
   const cur = p.currency;
   const costs = p.rows.map((r) => (r.cost === null ? 0 : r.cost));
   const widest = Math.max(...costs, 0);
+  // A marked cell has to say what the mark means, the way the totals row's own
+  // marker does — a dot nobody can hover for an explanation is decoration.
+  //
+  // The wording claims neither an owner nor an amount, because the flag supports
+  // neither. Not an owner: a dropped span's energy is exact in total and
+  // unlocatable within the span, so which band holds it is precisely what cannot
+  // be known. Not an amount either — a band is named whenever its window was
+  // partly unmeasured, and that happens with nothing unplaced at all when a
+  // counter simply never reported over the window. Saying "some of the unplaced
+  // energy" there would assert a quantity that does not exist.
+  const markCell = (short) => (short
+    ? ' class="part" title="Part of this band’s window was not measured, so this'
+      + ' figure may be incomplete — see the note below the table"'
+    : '');
   const body = p.rows.map((r) => {
     const bar = widest > 0 && r.cost !== null
       ? `<div class="bandbar"><i style="width:${Math.max(2, (r.cost / widest) * 100).toFixed(1)}%">`
@@ -718,11 +759,11 @@ function renderBands(p) {
     return `<tr>
       <td>${esc(r.band.name)}<div class="hours">${esc(r.hours)}</div></td>
       <td>${esc(rateStr(r.band.price, cur))}</td>
-      <td>${esc(uStr(r.importKwh, 1, 'kWh'))}</td>
-      <td>${esc(money(r.cost, cur))}${bar}</td>
-      <td>${esc(uStr(r.houseKwh, 1, 'kWh'))}</td>
-      <td>${esc(money(r.houseCost, cur))}</td>
-      <td>${esc(money(r.saved, cur))}</td>
+      <td${markCell(r.importShort)}>${esc(uStr(r.importKwh, 1, 'kWh'))}</td>
+      <td${markCell(r.importShort)}>${esc(money(r.cost, cur))}${bar}</td>
+      <td${markCell(r.houseShort)}>${esc(uStr(r.houseKwh, 1, 'kWh'))}</td>
+      <td${markCell(r.houseShort)}>${esc(money(r.houseCost, cur))}</td>
+      <td${markCell(r.importShort || r.houseShort)}>${esc(money(r.saved, cur))}</td>
     </tr>`;
   }).join('');
   // The month-to-date kilowatt-hours come from the reply's own accounting,
@@ -758,9 +799,16 @@ function renderBands(p) {
     .filter((r) => r.batteryKwh !== null && r.batteryKwh > 0.05 && r.batteryValue !== null)
     .sort((a, b) => b.batteryValue - a.batteryValue)[0];
   if (carried) {
+    // The same rule the table cells follow: a figure whose band window was
+    // partly unmeasured says so rather than reading as the whole of it. A
+    // sentence is easier to believe than a number, so an unqualified one here
+    // would be the more misleading of the two.
+    const partly = carried.batteryShort
+      ? ' Part of that band’s window was not measured, so this is not the whole of it.'
+      : '';
     notes.push(`The bank supplied ${esc(uStr(carried.batteryKwh, 1, 'kWh'))} during `
       + `${esc(carried.band.name)}, which would have cost `
-      + `${esc(money(carried.batteryValue, cur))} at that band’s rate.`);
+      + `${esc(money(carried.batteryValue, cur))} at that band’s rate.${partly}`);
   }
   const dearest = p.rows
     .filter((r) => r.cost !== null && r.importKwh !== null)
@@ -909,6 +957,10 @@ function fromQuote(quote) {
     houseCost: numOrNull(r.house_cost),
     batteryValue: numOrNull(r.battery_value),
     saved: numOrNull(r.saved),
+    // Per-row shortness flags from the server (#31)
+    importShort: r.import_short === true,
+    houseShort: r.house_short === true,
+    batteryShort: r.battery_short === true,
   }));
 
   const measured = numOrNull(quote.measured_minutes);
