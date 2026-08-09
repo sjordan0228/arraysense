@@ -1288,6 +1288,26 @@ function powerTable(rows) {
 // changing range repaints the bands that range actually has.
 let powerBands = null;
 
+// The shading legend. Split out of the load so a theme change can rewrite it:
+// the wash inverts with the theme, and a label left saying "brighter" while the
+// shading went dark points the reader at the cheapest hours on the chart. The
+// chart repaints itself on a theme change; this is the half that does not.
+function writeBandNote() {
+  const bandNote = document.getElementById('bandNote');
+  if (!bandNote) return;
+  const priced = powerBands
+    ? new Set(powerBands.filter((w) => w.band).map((w) => w.band))
+    : new Set();
+  const dir = isLightTheme() ? 'darker' : 'brighter';
+  bandNote.textContent = priced.size
+    ? `shading: ${[...priced].join(' \u00b7 ')} \u2014 ${dir} = higher rate`
+    : '';
+}
+
+document.addEventListener('themechange', writeBandNote);
+
+
+
 function drawPower(points) {
   const f = frame(points);
   const pv = f.of('pv_total_power_w');
@@ -1546,20 +1566,7 @@ async function loadHistory() {
   // tariff band" tells a reader a shade means something without telling them
   // which way round it goes. Cleared when nothing is shaded.
   powerBands = bands;
-  const bandNote = document.getElementById('bandNote');
-  if (bandNote) {
-    const priced = bands ? new Set(bands.filter((w) => w.band).map((w) => w.band)) : new Set();
-    // Says which way round the shading goes, in words somebody reads once and
-    // does not have to decode. The wash is light on a dark panel (more opacity
-    // = lighter = higher rate) and dark on a light panel (more opacity =
-    // darker = higher rate). "higher rate" rather than a shorter word for it:
-    // this sits on a dashboard, not in a style guide.
-    const isLight = isLightTheme();
-    const dir = isLight ? 'darker' : 'brighter';
-    bandNote.textContent = priced.size
-      ? `shading: ${[...priced].join(' · ')} — ${dir} = higher rate`
-      : '';
-  }
+  writeBandNote();
 
   try {
     drawPower(body.points || []);

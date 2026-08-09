@@ -176,3 +176,20 @@ def test_both_themes_declare_the_chart_palette() -> None:
     light = common.split("prefers-color-scheme", 1)[-1]
     for token in ("--ink", "--panel", "--grid-line"):
         assert token in light, f"the light theme does not redeclare {token}"
+
+
+def test_the_theme_is_applied_after_the_constants_it_reads() -> None:
+    # A `const` is not hoisted, so calling the resolver above its own constants
+    # lands in the temporal dead zone. That happened: the ReferenceError was
+    # caught by the guard around localStorage and answered "system", so a saved
+    # theme was silently ignored — nothing in the console, every test green, and
+    # only visible by loading the page and reading the attribute that was never
+    # set. Source order is the only thing that prevents it, so source order is
+    # what this checks.
+    common = _web("common.js")
+    declared = common.index("const THEME_KEY")
+    applied = common.index("applyStoredTheme();")
+    assert declared < applied, (
+        "applyStoredTheme() is called above the constants it reads; the resolver "
+        "will hit the temporal dead zone and quietly fall back to 'system'"
+    )

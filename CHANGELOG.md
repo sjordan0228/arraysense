@@ -7,6 +7,18 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.2 — 8 August 2026
+
+### Added
+
+- **A theme button, in the header of every page**
+  ([#33](https://github.com/sjordan0228/arraysense/issues/33)). It cycles between
+  following the device, light, and dark, and remembers the choice for that
+  browser — so a wall tablet can stay dark while a laptop follows the room it is
+  in. The charts repaint in place rather than needing a reload, and the band
+  shading legend turns round with them: "brighter = higher rate" on a dark page,
+  "darker" on a light one.
+
 ## 0.6.1 — 8 August 2026
 
 ### Added
