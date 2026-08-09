@@ -32,12 +32,34 @@ from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
 
-# How much of the recent past each maintenance pass rebuilds. The builders
-# delete and reinsert whatever they cover, so a window only has to be wide
-# enough to include any bucket still open when the last pass ran — a few hours
-# covers a restart, and everything older is already final.
+# How much of the recent past each maintenance pass rebuilds. Three hours is a
+# conservative bound for both tiers, not a backfill mechanism:
+#
+# - the collector's gap path and the production driver stamp rows at poll time,
+#   so none can arrive in a materially older bucket;
+# - a pass every ROLLUP_INTERVAL only has the current hour open, and after a
+#   restart the first poll attempt runs a pass before sleeping;
+# - import_solar_assistant writes raw, minute and hourly tiers together for
+#   arbitrary historical timestamps;
+# - scrub_out_of_bounds corrects every affected tier directly rather than
+#   relying on a later rebuild; and
+# - a raw row is rewritten only by the store's own upsert, whose conflict target
+#   is the timestamp itself, so a retry can replace a row from the instant it was
+#   stamped and never one from an older bucket.
+#
+# The builders delete and reinsert the buckets they cover, so the extra hours
+# also repair a recently closed bucket after a retry or restart. Older buckets
+# are final: scanning 48 hours here made every pass proportional to poll cadence
+# even though no steady-state writer could change those rows.
+#
+# What the narrowing does give up, stated rather than glossed: a pass reads raw
+# at the instant it runs, so rows written between one pass and a crash — under a
+# minute of them — are not in the bucket yet. A restart inside the window repairs
+# that; one after it leaves that single hour averaged over slightly fewer rows
+# than it holds, recorded in the bucket's SAMPLE_COUNT rather than hidden. The
+# minute tier has carried exactly this bound since it was written.
 MINUTE_REBUILD_WINDOW = 3 * 3600
-HOURLY_REBUILD_WINDOW = 48 * 3600
+HOURLY_REBUILD_WINDOW = 3 * 3600
 
 # How often maintenance runs, in seconds. Not on every poll: at an eleven-second
 # cadence that would rebuild the same buckets three hundred times an hour for a
@@ -258,9 +280,9 @@ class CollectorService:
 
         Only a recent window is rebuilt. The builders delete and reinsert the
         buckets they cover, so this is idempotent and cheap, and anything older
-        than the window is already final. The minute window is short because
-        minute buckets close quickly; the hourly one reaches back far enough to
-        pick up a bucket that was still open when the service last stopped.
+        than the window is already final. Three hours covers the open bucket,
+        the maintenance interval and any restart that lands inside it; historical
+        import and correction tools update every affected tier explicitly.
 
         A SQLite failure is logged rather than raised. This is housekeeping
         running beside the poll loop, and the poll is the thing that cannot be
