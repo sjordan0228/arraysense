@@ -7,6 +7,43 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.7 — 9 August 2026
+
+### Fixed
+
+- **A page request could commit the collector's half-written reading.** Every
+  request that needed the installation's timezone — which includes every call to
+  `/api/status` — built a settings reader, and building one executed
+  `CREATE TABLE IF NOT EXISTS settings` and then committed. That commit landed on
+  the connection the collector shares with the web server, and on a SQLite
+  connection a commit is not scoped to whoever issued it: it ends whatever
+  transaction is open. A reading being written at that moment would be committed
+  half-formed by a page doing nothing but asking what time zone to draw in.
+
+  The settings table is now created once at startup with the rest of the schema,
+  and a settings reader only reads. It is the same hazard fixed in 0.6.5 for the
+  rollup pass — one connection, two threads, one transaction between them — found
+  on the request path this time.
+
+  Nothing about an installation's data changes and no migration is needed;
+  existing settings are left exactly as they are.
+
+### Changed
+
+- **The durability of a stored reading no longer depends on how SQLite was
+  built.** Raw samples are the one thing here that cannot be reconstructed, and
+  their `synchronous = FULL` guarantee was inherited from SQLite's compile-time
+  default rather than asked for. Both machines this runs on default to FULL
+  today, so nothing was actually at risk — but a package built with
+  `SQLITE_DEFAULT_SYNCHRONOUS=1` would have quietly weakened it with no test able
+  to notice. It is now set explicitly, and the test forces a connection to the
+  weaker setting first to prove the setting is doing the work.
+
+- **A maintenance connection stops re-declaring WAL journalling.** WAL is
+  persistent state in the database file, established once when the store opens.
+  Asking for it again every sixty seconds set state that was already set, and
+  took locks to do it.
+
 ## 0.6.6 — 9 August 2026
 
 ### Changed
