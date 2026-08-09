@@ -40,6 +40,18 @@ if TYPE_CHECKING:
     from arraysense.config import Config
     from arraysense.models import Sample
 
+
+class SampleBuildError(Exception):
+    """The inverter answered and the reply could not be made into a sample.
+
+    ValueError is raised both by our own decoding mistakes and by a sample
+    constructor refusing malformed data; the driver wraps the latter so the
+    collector can record a driver-initiated gap rather than killing the loop.
+    This exception marks that boundary: a SampleBuildError is a rejected reply,
+    not a transport failure, and is treated as a gap with backoff.
+    """
+
+
 # A metric belonging to one numbered PV string, as in ``pv2_voltage_v``. The
 # number is what makes a declaration checkable against the string count.
 _STRING_METRIC = re.compile(r"^pv([1-9])_")

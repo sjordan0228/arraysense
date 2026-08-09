@@ -61,6 +61,7 @@ from arraysense.drivers.base import (
     Capabilities,
     DeviceIdentity,
     EnergyReporting,
+    SampleBuildError,
     expand_module_metrics,
 )
 from arraysense.models import BatteryModuleSample, Sample
@@ -733,7 +734,7 @@ def _module_sample(module: object, timestamp: datetime | None = None) -> Battery
     ``to_sample`` always passes one.
 
     Raises:
-        ValueError: the record claims a slot below one, which means the 0-based
+        SampleBuildError: the record claims a slot below one, which means the 0-based
             index the library reports was not adjusted. Loud is right here:
             silently dropping a real module would lose its history for good.
             There is no upper bound any more — a bank may hold more packs than
@@ -765,39 +766,42 @@ def _module_sample(module: object, timestamp: datetime | None = None) -> Battery
     # battery_module1..4 columns in the registry. The library's names for the
     # cell extremes also do not follow its own bank naming, hence the spelling
     # differences below.
-    return BatteryModuleSample(
-        serial=serial,
-        slot=index + 1,
-        soc_pct=_reading(module, "soc"),
-        soh_pct=_measured_soh(module, "soh"),
-        voltage_v=_reading(module, "voltage"),
-        current_a=_reading(module, "current"),
-        temperature_c=_reading(module, "temperature"),
-        cycle_count=_int_reading(module, "cycle_count"),
-        cell_max_voltage_v=_reading(module, "max_cell_voltage"),
-        cell_min_voltage_v=_reading(module, "min_cell_voltage"),
-        cell_max_temperature_c=_reading(module, "max_cell_temperature"),
-        cell_min_temperature_c=_reading(module, "min_cell_temperature"),
-        cell_max_voltage_num=_int_reading(module, "max_cell_num_voltage"),
-        cell_min_voltage_num=_int_reading(module, "min_cell_num_voltage"),
-        cell_max_temperature_num=_int_reading(module, "max_cell_num_temp"),
-        cell_min_temperature_num=_int_reading(module, "min_cell_num_temp"),
-        # Derived, not measured: ``max_capacity * soc / 100`` (data.py:1281).
-        # It is this module's SOC in amp-hours and cannot corroborate it.
-        remaining_capacity_ah=_reading(module, "current_capacity"),
-        full_capacity_ah=_reading(module, "max_capacity"),
-        charge_current_limit_a=_reading(module, "charge_current_limit"),
-        discharge_current_limit_a=_reading(module, "discharge_current_limit"),
-        status_code=_int_reading(module, "status"),
-        # fault_code and warning_code are deliberately not mapped. BatteryData
-        # declares both as ``int = 0`` (data.py:1031-1032) and
-        # ``from_modbus_registers`` passes neither, because none of the 21
-        # entries in BATTERY_REGISTERS carries either quantity. Every module of
-        # every poll therefore arrives with a zero that means "never read",
-        # while a stored 0 in a fault column means "no fault" — health asserted
-        # about a pack nobody asked. ``status`` above is different: the
-        # constructor sets it from the slot's status header register.
-    )
+    try:
+        return BatteryModuleSample(
+            serial=serial,
+            slot=index + 1,
+            soc_pct=_reading(module, "soc"),
+            soh_pct=_measured_soh(module, "soh"),
+            voltage_v=_reading(module, "voltage"),
+            current_a=_reading(module, "current"),
+            temperature_c=_reading(module, "temperature"),
+            cycle_count=_int_reading(module, "cycle_count"),
+            cell_max_voltage_v=_reading(module, "max_cell_voltage"),
+            cell_min_voltage_v=_reading(module, "min_cell_voltage"),
+            cell_max_temperature_c=_reading(module, "max_cell_temperature"),
+            cell_min_temperature_c=_reading(module, "min_cell_temperature"),
+            cell_max_voltage_num=_int_reading(module, "max_cell_num_voltage"),
+            cell_min_voltage_num=_int_reading(module, "min_cell_num_voltage"),
+            cell_max_temperature_num=_int_reading(module, "max_cell_num_temp"),
+            cell_min_temperature_num=_int_reading(module, "min_cell_num_temp"),
+            # Derived, not measured: ``max_capacity * soc / 100`` (data.py:1281).
+            # It is this module's SOC in amp-hours and cannot corroborate it.
+            remaining_capacity_ah=_reading(module, "current_capacity"),
+            full_capacity_ah=_reading(module, "max_capacity"),
+            charge_current_limit_a=_reading(module, "charge_current_limit"),
+            discharge_current_limit_a=_reading(module, "discharge_current_limit"),
+            status_code=_int_reading(module, "status"),
+            # fault_code and warning_code are deliberately not mapped. BatteryData
+            # declares both as ``int = 0`` (data.py:1031-1032) and
+            # ``from_modbus_registers`` passes neither, because none of the 21
+            # entries in BATTERY_REGISTERS carries either quantity. Every module of
+            # every poll therefore arrives with a zero that means "never read",
+            # while a stored 0 in a fault column means "no fault" — health asserted
+            # about a pack nobody asked. ``status`` above is different: the
+            # constructor sets it from the slot's status header register.
+        )
+    except ValueError as exc:
+        raise SampleBuildError(f"BatteryModuleSample refused the reply: {exc}") from exc
 
 
 def to_sample(
@@ -827,7 +831,7 @@ def to_sample(
     since those come back as a block of zeroes rather than as nothing.
 
     Raises:
-        ValueError: a battery record claims a slot below one, which means the
+        SampleBuildError: a battery record claims a slot below one, which means the
             library's 0-based index was not adjusted, or an explicit
             ``timestamp`` is naive. There is no upper bound: a bank may hold more
             packs than the registry names columns for.
@@ -888,11 +892,14 @@ def to_sample(
     if soh is not None:
         readings["battery_soh_pct"] = soh
 
-    return Sample(
-        timestamp=now,
-        readings=readings,
-        battery_modules=modules,
-    )
+    try:
+        return Sample(
+            timestamp=now,
+            readings=readings,
+            battery_modules=modules,
+        )
+    except ValueError as exc:
+        raise SampleBuildError(f"Sample refused the reply: {exc}") from exc
 
 
 class _Transport(Protocol):

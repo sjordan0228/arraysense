@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
+from arraysense.drivers.base import SampleBuildError
+from arraysense.drivers.eg4_luxpower import source as source_module
 from arraysense.models import Sample
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
@@ -417,14 +420,18 @@ async def test_a_recorded_gap_names_the_inverter_that_went_quiet(tmp_path: Path)
     assert rows == [("CE00000001", "ConnectionError: gone")]
 
 
-# --- a sample that cannot be built (#29) ---------------------------------------
+# --- a sample that cannot be built (#29, narrowed by #42) ----------------------
 #
-# A malformed sample is deterministic: it will fail identically on every poll, so
-# retrying is pointless — but stopping the loop is worse. The ValueError a sample
-# raises when it refuses what the driver assembled escapes poll_once today, kills
-# the asyncio task while uvicorn keeps serving, and nothing restarts it: the
-# watchdog only fires on a stalled loop and systemd sees no process exit. Not one
-# gap row is written either, so the outage leaves no trace at all.
+# A reply the driver cannot turn into a sample refuses identically for that
+# reply, though a later reply may well be fine — so this is not a permanent
+# condition, and retrying is not pointless. Stopping the loop is still worse:
+# it kills the asyncio task while uvicorn keeps serving, nothing restarts it,
+# the watchdog only fires on a stalled loop, systemd sees no process exit, and
+# not one gap row is written, so the outage leaves no trace at all.
+#
+# Since #42 the driver raises SampleBuildError for that case and BUILD_ERRORS
+# catches only it. A bare ValueError is a bug in our own code and is deliberately
+# left to escape.
 
 
 class _MalformedSource(FakeSource):
@@ -436,15 +443,15 @@ class _MalformedSource(FakeSource):
     """
 
     async def read(self) -> Sample:
-        raise ValueError("serial must not be empty; it is the module identity")
+        raise SampleBuildError("serial must not be empty; it is the module identity")
 
 
 class _CrashingSource(FakeSource):
     """A source whose read raises what nothing catches, so the loop really dies.
 
-    ``_MalformedSource`` cannot stand in for this: its ValueError is caught and
-    recorded as a gap, so the loop survives and ``stop()`` only ever cancels a
-    live task — which is how the release-the-dongle test below passed while
+    ``_MalformedSource`` cannot stand in for this: its SampleBuildError is caught
+    and recorded as a gap, so the loop survives and ``stop()`` only ever cancels
+    a live task — which is how the release-the-dongle test below passed while
     proving nothing. Demonstrating that a *dead* loop still releases the socket
     needs a failure that escapes ``poll_once`` altogether, which is what a bug in
     our own code is: neither a transport fault nor a sample that would not build.
@@ -518,3 +525,112 @@ async def test_the_dongle_is_released_even_when_the_loop_died(tmp_path: Path) ->
     await svc.stop()
     store.close()
     assert source.connected is False
+
+
+class _BuildErrorSource:
+    """A source that raises SampleBuildError on read."""
+
+    device: str
+    connected: bool
+
+    def __init__(self, device: str = "CE00000000") -> None:
+        self.device = device
+        self.connected = False
+
+    async def connect(self) -> None:
+        self.connected = True
+
+    async def disconnect(self) -> None:
+        self.connected = False
+
+    async def read(self) -> Sample:
+        raise SampleBuildError("to_sample refused the reply: slot must be positive")
+
+
+async def test_a_samplebuilderror_is_recorded_as_a_gap(tmp_path: Path) -> None:
+    # A SampleBuildError means the driver could not turn what the inverter
+    # returned into a sample. It is deterministic for that reply — it will
+    # repeat identically if the inverter sends the same malformed data — so it
+    # is recorded as a gap and backed off from, exactly as an unreachable
+    # inverter is.
+    source = _BuildErrorSource()
+    svc, store = _service(tmp_path, source=source)
+
+    sample = await svc.poll_once()
+    assert sample is not None and sample.is_failed
+    assert "SampleBuildError" in (sample.error or "")
+    assert "to_sample refused the reply" in (sample.error or "")
+    assert svc.status.consecutive_failures == 1
+    assert svc.status.total_failures == 1
+    assert svc.status.connected is True  # the inverter answered
+    store.close()
+
+
+async def test_a_bare_valueerror_is_not_absorbed(tmp_path: Path) -> None:
+    # A bare ValueError from somewhere other than sample construction is a
+    # programming error and must surface rather than being recorded as a gap.
+    # The collector should let it reach _loop, which logs it and lets the task
+    # die so the watchdog and systemd can see it.
+
+    class _BareValueErrorSource:
+        device: str
+        connected: bool
+
+        def __init__(self) -> None:
+            self.device = "CE00000000"
+            self.connected = False
+
+        async def connect(self) -> None:
+            self.connected = True
+
+        async def disconnect(self) -> None:
+            self.connected = False
+
+        async def read(self) -> Sample:
+            # A ValueError from somewhere other than Sample construction
+            raise ValueError("unpack of incorrect length")
+
+    source = _BareValueErrorSource()
+    svc, store = _service(tmp_path, source=source)
+
+    # Start the collector and wait for the task to die from the uncaught ValueError
+    await svc.start()
+    try:
+        # Give the loop time to hit the error and die
+        for _ in range(20):
+            if not svc.status.running:
+                break
+            await asyncio.sleep(0.1)
+        assert not svc.status.running, "task should have died from uncaught ValueError"
+    finally:
+        await svc.stop()
+    store.close()
+
+
+def test_a_model_refusal_is_wrapped_as_a_build_error_with_its_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The wrap sits on the construction site itself, so what it converts is a
+    # model refusing what the driver assembled from a reply. Nothing a real
+    # reply contains can make Sample refuse today — to_sample validates the
+    # timestamp before it builds anything — so the refusal is injected rather
+    # than contrived from a record, which would test the mapper, not the wrap.
+    #
+    # Deliberately not driven through to_sample's naive-timestamp guard: that
+    # fires before any construction and is a caller's programming error, not a
+    # malformed reply, so it must keep escaping as a bare ValueError. Wrapping
+    # it would put a bug of ours back inside the gap path this exists to empty.
+    def refuse(*args: object, **kwargs: object) -> Sample:
+        raise ValueError("timestamp must be timezone-aware")
+
+    monkeypatch.setattr(source_module, "Sample", refuse)
+    runtime = SimpleNamespace(serial_number="CE00000000")
+
+    with pytest.raises(SampleBuildError, match="Sample refused the reply"):
+        source_module.to_sample(runtime, None)
+
+    try:
+        source_module.to_sample(runtime, None)
+    except SampleBuildError as exc:
+        assert isinstance(exc.__cause__, ValueError), "the original refusal must be chained"
+        assert "timezone-aware" in str(exc.__cause__), "the cause must survive intact"
