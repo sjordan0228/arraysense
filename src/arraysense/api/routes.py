@@ -785,6 +785,17 @@ def _month_charge(tariff: Tariff, start: datetime, zone: ZoneInfo) -> float | No
     )
 
 
+def _short_bands(entries: Mapping[str, EnergyShortfall], counter: str) -> frozenset[str]:
+    """Bands one counter named as partly unmeasured, or none if it did not report.
+
+    Written once rather than three times inline because the absent-counter case
+    is easy to get subtly different between copies, and a band row marked from
+    one counter and not another is precisely the bug this is here to prevent.
+    """
+    entry = entries.get(counter)
+    return frozenset() if entry is None else entry.bands_possibly_short
+
+
 def _band_rows(
     tariff: Tariff, energy: PeriodEnergy, result: CostResult | None
 ) -> list[dict[str, Any]]:
@@ -794,12 +805,24 @@ def _band_rows(
     by a kilowatt-hour is the same mistake as the page parsing a tariff, only
     smaller and harder to spot. Every number below is either measured or
     absent; none of them is a zero standing in for something nobody knew.
+
+    Per-row shortness flags map counter to column: import/cost ride on grid
+    import, house columns on load, battery columns on battery discharge.
     """
     if result is None:
         return []
     house = dict(energy.load_kwh or {})
     battery = dict(energy.battery_discharge_kwh or {})
     by_name = {band.name: band for band in tariff.bands}
+    # The candidate bands each counter reported, resolved once. A counter with no
+    # accounting at all is not a counter with nothing to declare, but there is no
+    # third state to send: the period-level flags already say the figures may not
+    # be whole, and marking every row off a missing entry would say more than is
+    # known. Empty here means "this counter named no band".
+    entries = energy.shortfall or {}
+    import_bands = _short_bands(entries, "grid_import")
+    load_bands = _short_bands(entries, "load")
+    discharge_bands = _short_bands(entries, "battery_discharge")
 
     rows: list[dict[str, Any]] = []
     for priced in result.bands:
@@ -829,6 +852,12 @@ def _band_rows(
                     if house_cost is None or priced.cost is None
                     else round(house_cost - priced.cost, 2)
                 ),
+                # The band's name in one of these sets means its window was
+                # partly unmeasured, so the columns drawn from that counter
+                # must be qualified rather than read as whole (#31).
+                "import_short": priced.name in import_bands,
+                "house_short": priced.name in load_bands,
+                "battery_short": priced.name in discharge_bands,
             }
         )
     return rows
