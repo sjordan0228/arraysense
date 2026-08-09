@@ -17,6 +17,7 @@ from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
     MODULE_TIERS,
+    SETTINGS_TABLE,
     expected_columns,
     inverter_metric_columns,
     migration_ddl,
@@ -104,6 +105,11 @@ def test_serials_and_failed_readings_tables_present() -> None:
     assert "CREATE TABLE IF NOT EXISTS invalid_readings" in ddl
 
 
+def test_settings_table_is_created_at_store_initialization() -> None:
+    # Request-time SettingsStore instances are readers, not lazy schema setup.
+    assert f"CREATE TABLE IF NOT EXISTS {SETTINGS_TABLE}" in schema_ddl()
+
+
 def test_inverter_tables_mark_failed_polls() -> None:
     # A failed poll is data, not a hole: it carries its reason in the row.
     ddl = schema_ddl()
@@ -132,7 +138,15 @@ def test_executing_ddl_creates_expected_tables() -> None:
     conn.executescript(ddl)
     rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
     tables = {row[0] for row in rows}
-    expected = _inverter_table_names() | _module_table_names() | {"serials", "invalid_readings"}
+    expected = (
+        _inverter_table_names()
+        | _module_table_names()
+        | {
+            "serials",
+            "invalid_readings",
+            SETTINGS_TABLE,
+        }
+    )
     assert tables == expected
     conn.close()
 
