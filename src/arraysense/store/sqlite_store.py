@@ -41,6 +41,7 @@ the caller both are the same fact: nothing was measured here.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
@@ -58,6 +59,23 @@ from arraysense.store.schema import (
     module_metric_columns,
     schema_ddl,
 )
+
+
+def _is_memory_path(path: str) -> bool:
+    """Say whether ``path`` names a database that lives only in memory.
+
+    It matters because a memory database cannot be reopened: every
+    ``sqlite3.connect(":memory:")`` makes a *new* empty one. Code that opens a
+    second connection expecting to reach the same data would instead find an
+    empty database, roll nothing up, and report success — which is the silent
+    kind of wrong this project treats as a bug. Callers check this first.
+
+    The URI forms are included because ``file::memory:`` and a ``mode=memory``
+    query string reach the same place by a different spelling.
+    """
+    if path in {":memory:", ""}:
+        return True
+    return path.startswith("file::memory:") or "mode=memory" in path
 
 
 def _inverter_table(tier: str) -> str:
@@ -181,12 +199,15 @@ class SqliteStore:
         # connection bound to its creating thread refuses the second one
         # outright. SQLite's default threading mode serialises access, and WAL
         # lets a reader work while a write is in flight.
+        # Held absolute so a second connection reaches the same file even if the
+        # working directory moves under a long-running service. A memory
+        # database has no file to reopen and is recorded as such rather than
+        # being turned into a path that would silently address a different,
+        # empty database.
+        self.is_memory_backed = _is_memory_path(path)
+        self._path = path if self.is_memory_backed else os.path.abspath(path)
         self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.execute(FOREIGN_KEYS_PRAGMA)
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        # Wait rather than failing immediately if a write is in progress; the
-        # alternative is an intermittent "database is locked" under load.
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._apply_connection_pragmas(self._conn)
         self._conn.executescript(schema_ddl(declared))
         existing = {
             table: tuple(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
@@ -214,6 +235,58 @@ class SqliteStore:
         rely on shutdown to save it.
         """
         self._conn.close()
+
+    def _apply_connection_pragmas(self, conn: sqlite3.Connection) -> None:
+        """Configure a connection the one way every connection here is configured.
+
+        Foreign keys because the module tables' serial reference is decorative
+        until they are on; WAL because it is what makes a commit per sample cheap
+        enough to do at all, and what lets a reader work while a write is in
+        flight; and a busy timeout so a connection waits rather than failing
+        outright while another is writing — the alternative is an intermittent
+        "database is locked" under load.
+
+        This exists so the settings are written once rather than once per
+        connection. A second copy drifts, and the drift that costs most is a
+        maintenance connection opened without the busy timeout: it turns ordinary
+        contention with the collector's own writes into a hard failure.
+        """
+        conn.execute(FOREIGN_KEYS_PRAGMA)
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+
+    def maintenance_connection(self) -> sqlite3.Connection:
+        """Open a second connection to this database, for work done off the loop.
+
+        Long housekeeping — the rollup pass is the one that prompted this — has
+        to run in a thread or it freezes every HTTP response for its duration.
+        A thread alone is not enough: on a ``sqlite3.Connection`` ``with conn:``
+        is transaction state rather than a lock, so two threads entering it on
+        one connection share a single commit and a single rollback. The
+        collector's per-sample commit would then land a rollup's half-built
+        tiers, and a failed rollup would roll back a reading that had been
+        stored successfully. Losing a reading is the failure this project exists
+        to prevent, so the work gets its own connection and its own transactions.
+
+        WAL is what makes that affordable: readers are never blocked by the
+        writer, so the API keeps answering throughout. What remains is writer
+        contention with the collector itself, which the busy timeout absorbs.
+
+        The caller closes it, and should do so on the same thread that used it.
+
+        Raises:
+            ValueError: the store is memory-backed, where a second connection
+                would address a different and empty database rather than this
+                one — see ``is_memory_backed``.
+        """
+        if self.is_memory_backed:
+            raise ValueError(
+                "a memory-backed store has no second connection: ':memory:' opens a "
+                "new empty database each time. Check is_memory_backed and run inline."
+            )
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._apply_connection_pragmas(conn)
+        return conn
 
     def _device(self, device: str | None) -> str:
         """Resolve a caller's device against the one this store was opened for.
