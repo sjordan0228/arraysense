@@ -72,7 +72,19 @@
     .mod .face{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));column-gap:12px}
     .mod .face .kv{margin-top:4px}
   }
-  .track{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin:9px 0 8px;overflow:hidden}
+  /* The battery icon. The fill tracks the state of charge and is the encoding
+     that carries; the percentage beside it says the same thing in a
+     number, and the colour is reinforcement on top of both. Three states were
+     chosen by the owner having seen them measured against the alternatives. */
+  .battrow{display:flex;align-items:center;gap:9px}
+  .batticon{flex:0 0 auto;line-height:0}
+  .batticon .shell{fill:none;stroke:var(--ink3);stroke-width:1}
+  .batticon .cap{fill:var(--ink3)}
+  .batticon .lvl{fill:var(--batt)}
+  .batticon.low .lvl{fill:var(--bad)}
+  .batticon.mid .lvl{fill:var(--warn)}
+  .batticon.high .lvl{fill:var(--good)}
+  .track{height:5px;border-radius:3px;background:var(--tint-2);margin:9px 0 8px;overflow:hidden}
   .track i{display:block;height:100%;background:var(--batt);border-radius:3px}
   .sank .nn{fill:var(--ink);font:600 11.5px system-ui;letter-spacing:-.005em}
   .sank .nv{fill:var(--ink3);font:11px system-ui;font-variant-numeric:tabular-nums}
@@ -88,10 +100,10 @@
   .cal .calbody{min-width:0}
   /* The dismiss control sits with the message rather than floating over it, so
      it cannot land on the text at a narrow width. */
-  .cal .calhide{align-self:flex-start;flex:0 0 auto;background:rgba(255,255,255,.09);
+  .cal .calhide{align-self:flex-start;flex:0 0 auto;background:var(--tint);
     border:1px solid var(--panel-b);color:var(--ink2);border-radius:7px;
     padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
-  .cal .calhide:hover{background:rgba(255,255,255,.17);color:var(--ink)}
+  .cal .calhide:hover{background:var(--tint-3);color:var(--ink)}
   .cal .calwhen{margin-top:7px;font-size:10px;letter-spacing:.02em}
   .cal .calmark{flex:0 0 auto;font-size:13px;line-height:1.65;color:var(--ink3)}
   .cal.sev-warning{border-left-color:var(--warn)}
@@ -120,26 +132,26 @@
      its own; a long bar next to a short one is the reading. They are drawn to
      the same shape and deliberately not to a shared scale. */
   .agree{margin-bottom:11px;padding:11px 13px;border:1px solid var(--panel-b);
-    border-radius:11px;background:rgba(255,255,255,.045)}
+    border-radius:11px;background:var(--tint)}
   .agree[hidden]{display:none}
   .agree .pair{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:8px}
   .agree .v{font-size:21px;font-weight:300;letter-spacing:-.02em;margin-top:2px}
   .agree .v span{font-size:11px;opacity:.6;font-weight:400;margin-left:4px}
-  .agree .bar{height:5px;border-radius:3px;background:rgba(255,255,255,.13);margin-top:7px;overflow:hidden}
+  .agree .bar{height:5px;border-radius:3px;background:var(--tint-2);margin-top:7px;overflow:hidden}
   .agree .bar i{display:block;height:100%;width:0;border-radius:3px;background:var(--batt)}
   .agree .bar.wide i{background:var(--warn)}
   .agree .bar.bad i{background:var(--bad)}
   /* Nothing reported is not the same as nothing to report: an empty bar would
      read as perfect agreement, so an unknown spread is hatched instead. */
   .agree .bar.none,.track.unknown{
-    background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
-    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+    background:repeating-linear-gradient(45deg,var(--tint-2) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px var(--tint-2)}
   /* A drifted counter is not a measurement. The tilde carries across a room, the
      hatched fill says the same thing without words, and the tag explains it up
      close. Bank state of charge is left plain — it is not the number that drifts. */
   .mod.est .soc{color:var(--ink2)}
   .est-tag{margin-left:7px;font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
-    color:var(--ink);background:rgba(255,255,255,.15);border-radius:5px;padding:2px 6px;
+    color:var(--ink);background:var(--tint-3);border-radius:5px;padding:2px 6px;
     vertical-align:4px;text-decoration:none;cursor:help}
   .track i.odd{background:var(--warn)}
   .mod.est .track i{background:repeating-linear-gradient(112deg,var(--batt) 0 6px,rgba(25,158,112,.3) 6px 12px)}
@@ -162,10 +174,10 @@
     letter-spacing:0;text-transform:none;color:var(--ink3)}
   .dtl .strrow{display:grid;grid-template-columns:22px 1fr 106px;gap:9px;align-items:center;
     font-size:11px;color:var(--ink2);margin-bottom:7px}
-  .dtl .bar{height:15px;border-radius:4px;background:rgba(255,255,255,.09);position:relative;overflow:hidden}
+  .dtl .bar{height:15px;border-radius:4px;background:var(--tint);position:relative;overflow:hidden}
   .dtl .bar i{position:absolute;inset:0 auto 0 0;border-radius:4px;display:block}
   .dtl .bar span{position:absolute;right:6px;top:0;line-height:15px;font-size:10px;
-    color:rgba(255,255,255,.92);font-variant-numeric:tabular-nums}
+    color:rgba(255,255,255,.92) /* on a filled bar, not the panel */;font-variant-numeric:tabular-nums}
   .dtl .sublab{font-size:9.5px;color:var(--ink3);font-variant-numeric:tabular-nums}
   .dtl .legs{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin:3px 0 9px}
   .dtl .leg{height:34px;border-radius:5px;display:flex;align-items:center;padding:0 9px;
@@ -185,12 +197,12 @@
   .dtl .pill.y{background:rgba(12,163,12,.2);color:#5fd45f}
   .dtl .pill.n{background:rgba(208,59,59,.22);color:#ff8a8a}
   .dtl .pill.w{background:rgba(250,178,25,.2);color:#ffd479}
-  .dtl .pill.q{background:rgba(255,255,255,.11);color:var(--ink3)}
+  .dtl .pill.q{background:var(--tint-2);color:var(--ink3)}
   /* An unknown reading gets the hatch the rest of the page already uses for
      one. An empty bar would read as zero, which is the one thing it is not. */
   .dtl .bar.none,.dtl .pairbar div.none{
-    background:repeating-linear-gradient(45deg,rgba(255,255,255,.13) 0 4px,transparent 4px 9px);
-    box-shadow:inset 0 0 0 1px rgba(255,255,255,.11)}
+    background:repeating-linear-gradient(45deg,var(--tint-2) 0 4px,transparent 4px 9px);
+    box-shadow:inset 0 0 0 1px var(--tint-2)}
   .dtl .pairbar div.none{height:100%}
   /* The extra per-module rows belong to the same disclosure as the panels: the
      across-the-room view is four numbers a pack, not fourteen. */
@@ -295,7 +307,15 @@
            for the same reason the solar one does, and it is why there is no
            second request: /api/live already carries every column. -->
       <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span><b id="batt">—</b><span class="sub" id="battState">—</span></div>
+      <!-- The icon sits beside the power figure rather than replacing the
+           percentage: the fill is a shape somebody reads at a glance,
+           and the number is what they read when the glance is not enough. One
+           encodes, the other confirms, and colour is the third and least of
+           them. -->
+      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span>
+        <div class="battrow"><span class="batticon" id="battIcon"></span><b id="batt">—</b></div>
+        <span class="sub" id="battState">—</span>
+        <span class="sub" id="battPack"></span></div>
       <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
   </div>
@@ -318,6 +338,10 @@
              a fourth line on this chart would need a second axis, and a
              temperature plotted against kilowatts shares no scale with them. -->
         <span class="muted" id="invTemp"></span>
+        <!-- Filled in only when there is shading to explain. Left standing with
+             no tariff configured, it would describe a feature that is not on
+             the chart and send the reader looking for it. -->
+        <span class="muted" id="bandNote"></span>
       </div>
       <div class="rng" id="ranges"></div>
     </div>
@@ -443,6 +467,52 @@ const MODE_TINT = {
   'Importing': 'grid',
 };
 
+// The battery icon, hand-written the way the Sankey is — uPlot is for time axes
+// and this is a static shape. The fill width tracks the state of charge — the
+// battery lies on its side, so the level reads left to right rather than bottom
+// to top — and the shape says the level before any number is read; the
+// percentage beside it says
+// the same thing exactly, and the colour is a third telling on top of two that
+// already work without it. That order matters: a reader who cannot separate the
+// three fill colours still reads this correctly from the fill alone.
+//
+// Absent is a hollow shell, not an empty one. A bank nobody has heard from is
+// not a flat bank, and drawing it at 0% is the mistake this whole project is
+// about.
+const BATT_W = 34;
+const BATT_H = 17;
+
+function batteryIcon(soc) {
+  const capW = 3;
+  const bodyW = BATT_W - capW - 1;
+  const inset = 3;
+  const innerW = bodyW - inset * 2;
+  const innerH = BATT_H - inset * 2;
+  const level = soc === null ? null : Math.max(0, Math.min(100, soc));
+  const fillW = level === null ? 0 : Math.round((innerW * level) / 100);
+  return `<svg width="${BATT_W}" height="${BATT_H}" viewBox="0 0 ${BATT_W} ${BATT_H}"`
+    + ` role="img" aria-label="${level === null ? 'state of charge unknown'
+        : 'battery at ' + level.toFixed(0) + ' percent'}">`
+    + `<rect class="shell" x="0.5" y="0.5" width="${bodyW - 1}" height="${BATT_H - 1}" rx="3"/>`
+    + `<rect class="cap" x="${bodyW + 1}" y="${Math.round(BATT_H * 0.3)}" width="${capW}"`
+    + ` height="${Math.round(BATT_H * 0.4)}" rx="1"/>`
+    + (fillW > 0
+      ? `<rect class="lvl" x="${inset}" y="${inset}" width="${fillW}" height="${innerH}" rx="1.5"/>`
+      : '')
+    + '</svg>';
+}
+
+// Which of the three colours the fill takes. The thresholds are the owner's:
+// below a fifth is low, below half is middling, above that is fine.
+function battClass(soc) {
+  if (soc === null) return 'batticon';
+  if (soc < 20) return 'batticon low';
+  // Inclusive at fifty: the middle band is "twenty to fifty", so the boundary
+  // itself belongs to it. Excluding it put exactly 50% in the green.
+  if (soc <= 50) return 'batticon mid';
+  return 'batticon high';
+}
+
 // The system's state in words. Both halves come from /api/live, judged once in
 // arraysense.mode — the page prints the verdict and never recomputes it.
 function showMode(m, i) {
@@ -465,6 +535,31 @@ function showMode(m, i) {
   const soc = numOrNull(i.battery_soc_pct);
   $('modeBatt').textContent = soc === null ? '' : `· bank ${soc.toFixed(0)}%`;
   $('battState').textContent = m.battery;
+}
+
+// The battery card's own three lines: the icon beside the power figure, the rate
+// of change the power implies, and the pack voltage. The rate is handed over by
+// the service already worked out — it divides by the bank's measured capacity,
+// and a browser doing that arithmetic on readings is how the Costs page came to
+// disagree with the service about money.
+function showBattery(battery, inverter) {
+  const soc = numOrNull(inverter && inverter.battery_soc_pct);
+  const icon = $('battIcon');
+  if (icon) {
+    icon.className = battClass(soc);
+    icon.innerHTML = batteryIcon(soc);
+  }
+  const rate = numOrNull(battery && battery.rate_pct_per_hour);
+  const volts = numOrNull(battery && battery.pack_voltage_v);
+  // Each part is shown only if it was measured. A rate of zero is a real
+  // reading — the bank is idle — and is printed; a rate nobody could work out
+  // is left off entirely rather than shown as a zero or a dash-shaped guess.
+  const parts = [];
+  if (soc !== null) parts.push(`bank ${soc.toFixed(0)}%`);
+  if (rate !== null) parts.push(`${rate >= 0 ? '+' : ''}${rate.toFixed(1)} %/hr`);
+  if (volts !== null) parts.push(`${volts.toFixed(1)} V`);
+  const pack = $('battPack');
+  if (pack) pack.textContent = parts.join(' · ');
 }
 
 async function loadLive() {
@@ -516,6 +611,7 @@ async function loadLive() {
     // latest_modules, so they are dropped before anything compares them.
     const packs = reporting(live.modules);
     drawModules(packs);
+    showBattery(live.battery, i);
     drawSankey(i);
     // Same payload, no second request: /api/live already carries every column.
     renderDetail(i, packs);
@@ -959,7 +1055,11 @@ function detailHeat(i) {
     : `<div style="height:${Math.max(2, Math.min(100, c / HEATSINK_FULL_C * 100)).toFixed(1)}%;`
       + `background:${grad}"></div>`;
   const hot = 'linear-gradient(180deg,var(--warn),rgba(250,178,25,.28))';
-  const cool = 'linear-gradient(180deg,rgba(255,255,255,.5),rgba(255,255,255,.13))';
+  // A cool radiator is drawn in the ink colour rather than in white, so it stays
+  // visible when the panel behind it is light. The hot one is --warn and needs
+  // no such treatment: a hue reads on either surface, which is the whole reason
+  // only the neutral tints had to be tokenised.
+  const cool = `linear-gradient(180deg,${ink('--ink3')},var(--tint-2))`;
   const one = (c) => { const v = tempOf(c); return v === null ? DASH : v.toFixed(0); };
   // The rows label the bars in the order they are drawn — the two radiators,
   // then the two readings taken inside the case — so a pair with nothing in it
@@ -1181,6 +1281,33 @@ function powerTable(rows) {
     <td>${kw(p.battery_power_w)}</td><td>${kw(p.grid_power_w)}</td></tr>`).join('');
 }
 
+// The windows the shading paints, held here rather than passed in. ``paint``
+// builds each chart once and afterwards only calls ``setData``, so a plugin
+// rebuilt on a later draw is thrown away — the chart keeps the one it was
+// constructed with. The long-lived plugin reads this on every frame instead, so
+// changing range repaints the bands that range actually has.
+let powerBands = null;
+
+// The shading legend. Split out of the load so a theme change can rewrite it:
+// the wash inverts with the theme, and a label left saying "brighter" while the
+// shading went dark points the reader at the cheapest hours on the chart. The
+// chart repaints itself on a theme change; this is the half that does not.
+function writeBandNote() {
+  const bandNote = document.getElementById('bandNote');
+  if (!bandNote) return;
+  const priced = powerBands
+    ? new Set(powerBands.filter((w) => w.band).map((w) => w.band))
+    : new Set();
+  const dir = isLightTheme() ? 'darker' : 'brighter';
+  bandNote.textContent = priced.size
+    ? `shading: ${[...priced].join(' \u00b7 ')} \u2014 ${dir} = higher rate`
+    : '';
+}
+
+document.addEventListener('themechange', writeBandNote);
+
+
+
 function drawPower(points) {
   const f = frame(points);
   const pv = f.of('pv_total_power_w');
@@ -1196,10 +1323,10 @@ function drawPower(points) {
       axes: [timeAxis(), kwAxis()],
       // Three series at equal weight is three things competing, and where they
       // cross you lose which is which. So identity is carried by form as well
-      // as by hue — solar a filled area because it is volume the array
-      // harvested, home the heaviest line because it is the one the owner
-      // acts on, grid a thin dashed trace because it is usually zero and only
-      // matters when it is not. The chart still reads when the colours do not.
+      // as by hue — solar a line, home the heaviest line because it is the one
+      // the owner acts on, grid a filled area because when the house runs on
+      // the grid, import equals load to the watt and a line would vanish under
+      // it. The chart still reads when the colours do not.
       //
       // Grid is an area, not a line, and that is the second time this series
       // has been re-drawn. When the house runs on the grid, import *is* the
@@ -1211,16 +1338,15 @@ function drawPower(points) {
       // reader this palette exists for.
       //
       // An area cannot hide that way. Its body shows below the coincident line
-      // whatever the top edge is doing, and it says the same thing solar's fill
-      // says — volume, not rate. So the order returns to fills underneath and
-      // home over them, and home is again the line that is never obscured.
+      // whatever the top edge is doing. So grid keeps the fill, underneath, and
+      // home stays over it as the line that is never obscured.
       series: [
         {},
-        trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
+        trace('Solar', '--pv', 1.6),
         trace('Grid', '--grid', 1.4, { fill: gridFill, fillTo: () => 0 }),
         trace('Home', '--load', 2.1),
       ],
-      plugins: [zeroRule(), readout('power', [
+      plugins: [bandShade(() => powerBands), zeroRule(), readout('power', [
         ['Solar', 1, kw], ['Home', 3, kw], ['Grid', 2, kw],
       ])],
     }),
@@ -1244,8 +1370,8 @@ function drawBattery(points) {
       scales: { x: { time: true }, y: { range: batteryRange } },
       axes: [timeAxis(), kwAxis()],
       // Filled to the zero line so the direction reads without consulting the
-      // legend, and split at the crossing so charging and discharging carry
-      // different shades of the one hue.
+      // legend, and split at the crossing so charging is green and discharging
+      // is red. Position still carries the sign; the hue reinforces it.
       series: [
         {},
         trace('Battery', '--batt', 1.6, { fill: battFill, fillTo: () => 0 }),
@@ -1412,6 +1538,36 @@ async function loadHistory() {
     note('history unavailable — showing the last successful read');
     return;
   }
+
+  // Fetch tariff bands for shading. A 400 (unknown zone or range too long) or
+  // no tariff configured means no shading, not a broken page.
+  let bands = null;
+  try {
+    // zoneQuery() is built to be appended to a bare path — it leads with '?'.
+    // Appended after a query string it lands mid-URL, the zone becomes part of
+    // the end timestamp, and the request comes back 422. The failure is silent
+    // from here: the catch below draws the chart unshaded, which looks exactly
+    // like a tariff nobody configured.
+    const zone = zoneQuery().replace(/^\?/, '&');
+    const bandUrl = `/api/bands?start=${start.toISOString()}&end=${end.toISOString()}${zone}`;
+    const resp = await fetch(bandUrl);
+    if (resp.ok) {
+      const b = await resp.json();
+      if (b.configured && b.windows && b.windows.length) {
+        bands = b.windows;
+      }
+    }
+  } catch (e) {
+    // Bands unavailable — draw without shading.
+    bands = null;
+  }
+
+  // Name the encoding rather than only announcing that it exists: "shading =
+  // tariff band" tells a reader a shade means something without telling them
+  // which way round it goes. Cleared when nothing is shaded.
+  powerBands = bands;
+  writeBandNote();
+
   try {
     drawPower(body.points || []);
     drawBattery(body.points || []);

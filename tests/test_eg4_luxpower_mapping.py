@@ -8,6 +8,7 @@ mappings this file guards were wrong in ways only real hardware exposed.
 from __future__ import annotations
 
 from dataclasses import fields
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from pylxpweb.transports.data import (
 )
 from pylxpweb.transports.exceptions import TransportError
 
+from arraysense.calibration import PACK_COMPARE_MAX_SKEW
 from arraysense.config import Config
 from arraysense.drivers.eg4_luxpower import source as eg4_source
 from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource, to_sample
@@ -315,6 +317,127 @@ def test_a_module_holding_only_zeroes_is_dropped_even_with_a_serial() -> None:
     )
     modules = to_sample(_runtime(), bank).battery_modules
     assert [m.serial for m in modules] == ["Battery_ID_01"]
+
+
+# --- a pack the inverter did not surface this poll (#40) ------------------------
+#
+# The library's accumulator serves every pack it has ever seen on every read, with
+# the registers of packs the firmware did not surface frozen at their last real
+# values and `last_seen` left at the old stamp. A held block passes the witness
+# gate above, because its cell voltages are the last real ones and so non-zero,
+# and it is then written with the current poll's timestamp. Every guard downstream
+# filters on that timestamp — calibration's 15-minute age and 2-minute skew — so a
+# held pack always looks freshly read, and a stale voltage compared against a live
+# one raises a wiring fault that is not there.
+
+_POLL = datetime(2026, 8, 8, 20, 44, 56, tzinfo=UTC)
+
+
+def _pack(serial: str, index: int, *, last_seen: datetime | None, soc: int = 64) -> SimpleNamespace:
+    """One battery record shaped like the library's, with a staleness stamp."""
+    return SimpleNamespace(
+        serial_number=serial,
+        battery_index=index,
+        soc=soc,
+        max_cell_voltage=3.364,
+        min_cell_voltage=3.358,
+        max_capacity=280.0,
+        last_seen=last_seen,
+    )
+
+
+def _bank_of(*packs: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        max_cell_voltage=3.36,
+        min_cell_voltage=3.35,
+        max_capacity=1120.0,
+        batteries=list(packs),
+    )
+
+
+def test_a_held_pack_is_absent_rather_than_stamped_with_this_poll() -> None:
+    # Non-zero cell voltages, so the witness gate would pass it. What disqualifies
+    # it is that the reading is a quarter of an hour old and would be stored as if
+    # taken now.
+    bank = _bank_of(_pack("Battery_ID_01", 0, last_seen=_POLL - timedelta(minutes=15)))
+    assert to_sample(_runtime(), bank, _POLL).battery_modules == ()
+
+
+def test_a_pack_read_this_poll_is_kept_with_its_readings() -> None:
+    bank = _bank_of(_pack("Battery_ID_01", 0, last_seen=_POLL - timedelta(seconds=5)))
+    modules = to_sample(_runtime(), bank, _POLL).battery_modules
+    assert [m.serial for m in modules] == ["Battery_ID_01"]
+    assert modules[0].soc_pct == 64.0
+
+
+def test_a_pack_with_no_staleness_stamp_is_kept() -> None:
+    # None is the dataclass default. A library build that does not stamp it must
+    # not make every pack vanish — that trades a wrong reading for no reading,
+    # which is worse.
+    bank = _bank_of(_pack("Battery_ID_01", 0, last_seen=None))
+    modules = to_sample(_runtime(), bank, _POLL).battery_modules
+    assert [m.serial for m in modules] == ["Battery_ID_01"]
+
+
+def test_only_the_live_pack_survives_a_bank_where_one_went_quiet() -> None:
+    # Identified by serial, never by slot: the live pack is the second record.
+    bank = _bank_of(
+        _pack("Battery_ID_01", 0, last_seen=_POLL - timedelta(minutes=30)),
+        _pack("Battery_ID_02", 1, last_seen=_POLL - timedelta(seconds=3)),
+    )
+    modules = to_sample(_runtime(), bank, _POLL).battery_modules
+    assert [m.serial for m in modules] == ["Battery_ID_02"]
+
+
+def test_the_gate_stays_inside_the_window_the_comparison_guards_assume() -> None:
+    # The 60 seconds itself is not pinned: asserting a literal would be a change
+    # detector that fails whenever the value is tuned and proves nothing about
+    # whether the new value is right. The relationship is what has to hold — a
+    # pack this driver calls fresh must also be inside calibration's comparison
+    # skew, or a block that cleared this gate reaches a spread that is only
+    # meant to compare packs read at the same instant, which is the false
+    # wiring-fault verdict #40 exists to stop.
+    assert eg4_source.MODULE_STALE_AFTER < PACK_COMPARE_MAX_SKEW
+
+
+def test_the_threshold_boundary_is_inclusive() -> None:
+    # Pins MODULE_STALE_AFTER's meaning at the boundary. Without this the
+    # constant could drift to any value and every other test here would still
+    # pass, since they all sit far to one side of it or the other.
+    inside = _bank_of(_pack("Battery_ID_01", 0, last_seen=_POLL - eg4_source.MODULE_STALE_AFTER))
+    outside = _bank_of(
+        _pack(
+            "Battery_ID_01",
+            0,
+            last_seen=_POLL - eg4_source.MODULE_STALE_AFTER - timedelta(seconds=1),
+        )
+    )
+    assert len(to_sample(_runtime(), inside, _POLL).battery_modules) == 1
+    assert to_sample(_runtime(), outside, _POLL).battery_modules == ()
+
+
+def test_a_naive_stamp_keeps_the_block_rather_than_guessing_a_zone() -> None:
+    # A naive stamp means the library changed under us: it stamps
+    # datetime.now(UTC) at both sites, deliberately. Guessing a zone is the worse
+    # error — assume UTC against a local-time stamp and a healthy bank looks
+    # hours old, so every pack disappears. Keep the data and complain in the log.
+    bank = _bank_of(_pack("Battery_ID_01", 0, last_seen=datetime(2026, 8, 8, 20, 44, 50)))
+    modules = to_sample(_runtime(), bank, _POLL).battery_modules
+    assert [m.serial for m in modules] == ["Battery_ID_01"]
+
+
+def test_dropping_a_held_pack_leaves_the_inverter_readings_alone() -> None:
+    # The inverter measures at its own terminals and does not stop doing so
+    # because the BMS rotation skipped a pack. Dropping the pack must not drop
+    # anything the inverter reported for itself.
+    bank = _bank_of(_pack("Battery_ID_01", 0, last_seen=_POLL - timedelta(hours=9)))
+    sample = to_sample(_runtime(), bank, _POLL)
+    assert sample.battery_modules == ()
+    # A reading the fixture genuinely carries, so this asserts the inverter's own
+    # data survived rather than quietly requiring the driver to invent a figure
+    # the reply did not contain.
+    assert sample.readings["pv1_power_w"] == 2253.0
+    assert not sample.is_failed
 
 
 def test_a_state_of_health_of_exactly_100_is_not_stored() -> None:

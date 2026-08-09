@@ -7,6 +7,172 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.2 — 8 August 2026
+
+### Added
+
+- **A theme button, in the header of every page**
+  ([#33](https://github.com/sjordan0228/arraysense/issues/33)). It cycles between
+  following the device, light, and dark, and remembers the choice for that
+  browser — so a wall tablet can stay dark while a laptop follows the room it is
+  in. The charts repaint in place rather than needing a reload, and the band
+  shading legend turns round with them: "brighter = higher rate" on a dark page,
+  "darker" on a light one.
+
+## 0.6.1 — 8 August 2026
+
+### Added
+
+- **Light mode, following the system setting**
+  ([#33](https://github.com/sjordan0228/arraysense/issues/33)). A machine set to a
+  light appearance gets light pages. Nothing changes for anyone who has not
+  asked for it — the dark theme is unchanged down to the pixel.
+
+  The chart colours are the same in both. A pair of colours sits the same
+  distance apart whatever is behind them, so the ones already validated stay
+  validated; what changes is the page under them. Two things had to be reversed
+  rather than restyled, because they are painted onto the chart itself rather
+  than set in the stylesheet: the tariff band shading, which is a pale wash on a
+  dark page and a dark one on a light page, and the zero line on the battery
+  chart. The shading legend reverses with it — "brighter = higher rate" on dark,
+  "darker = higher rate" on light — because naming it the wrong way round would
+  point the reader at exactly the wrong hours.
+
+## 0.6.0 — 8 August 2026
+
+### Added
+
+- **The battery card says how fast the bank is filling or emptying**
+  ([#44](https://github.com/sjordan0228/arraysense/issues/44)). A power figure
+  says how hard the bank is working, not what that means for it: +7 kW into a
+  57 kWh bank is a different afternoon from +7 kW into a 14 kWh one. The card now
+  reads `+5.09 kW · bank 64% · +8.5 %/hr · 53.7 V`.
+
+  The rate is worked out by the service, from the bank's own reported capacity
+  rather than a number typed into the code. An idle bank reads `0 %/hr`, which is
+  a real state; a bank whose capacity was not reported shows no rate at all
+  rather than a zero standing in for something nobody knew.
+
+- **A battery icon on the card**, filled to the state of charge. The fill is the
+  part that carries the meaning and the percentage is printed beside it, so the
+  colour is a third telling rather than the only one — the icon reads correctly
+  whether or not its colours are distinguishable. Below 20% it is red, to 50%
+  amber, above that green.
+
+- **The pack voltage**, beside the rest.
+
+## 0.5.9 — 8 August 2026
+
+### Changed
+
+- **The band shading legend says what it means in plain words.** It read
+  "brighter is dearer", which is compressed and not how most people say it. It now
+  reads "brighter = higher rate".
+
+## 0.5.8 — 8 August 2026
+
+### Added
+
+- **The Power flow chart shows which hours were expensive**
+  ([#46](https://github.com/sjordan0228/arraysense/issues/46)). Peak hours are
+  shaded brighter behind the lines, so a spike of grid import can be read against
+  what it cost rather than only how large it was. The legend names the bands and
+  says which way round the shading goes.
+
+  The shading varies **brightness, not colour**. A tariff has as many bands as it
+  likes and two colours could never say that, and every colour on these charts has
+  to be checked against every other for a reader who cannot tell some of them
+  apart — so a band with a colour of its own would be one nobody had checked.
+  Brightness needs no such check and works for everybody.
+
+  With no tariff configured nothing is shaded, and a stretch of time no band
+  covers is left plain rather than shaded as though it had a middling price.
+
+### Changed
+
+- **Solar is drawn as a line rather than a filled area.** Two filled areas left no
+  room to read the shading behind them, and on a sunny day the solar one covers
+  most of the chart. Grid keeps its fill: when the house runs on the grid, import
+  equals house load to the watt, so a grid line lies exactly under the home line
+  and disappears beneath it.
+
+## 0.5.7 — 8 August 2026
+
+### Added
+
+- **An endpoint that says which tariff band a stretch of time fell in**
+  ([#46](https://github.com/sjordan0228/arraysense/issues/46)). `GET /api/bands`
+  returns the ordered windows covering a range, each with its band, its price and
+  its exact bounds. This is the groundwork for shading the Power flow chart by
+  band, so grid import can be read against what it cost rather than only how much
+  there was. The chart itself comes next; nothing on any page changes yet.
+
+  The windows are worked out here rather than in the browser for the same reason
+  the pricing is. When the page had its own copy of the tariff rules the two
+  disagreed within a day: it rejected the seasonal format the parser accepts, so a
+  real tariff priced nothing at all, and in the older format it had no notion of a
+  season and charged a January evening at the summer peak rate.
+
+  With no tariff configured the answer is no windows, rather than one window
+  implying the whole day was cheap. A range longer than can be walked is refused
+  with a clear message instead of a server error.
+
+## 0.5.6 — 8 August 2026
+
+### Changed
+
+- **Chart tick labels can be read** ([#45](https://github.com/sjordan0228/arraysense/issues/45)).
+  They were 9.5px — the smallest text anywhere on a page whose body type is 14px —
+  in the dimmest ink the palette has, measuring 5.6:1 against the panel. They are
+  now 12px in `--ink2`, which measures 10.7:1, with the axis gutters and the
+  minimum tick spacing grown to match so nothing clips or overlaps. Applies to
+  every chart on every page, since they share one axis definition.
+
+- **Battery charge and discharge are green and red.** They were one hue at two
+  lightnesses. The zero line still carries the meaning — charge above it,
+  discharge below — so the colour reinforces the split rather than being the only
+  thing that says which is which.
+
+  The pair was measured, not chosen: every combination scored under simulated
+  protanopia, deuteranopia and tritanopia against the panel background. Charging
+  keeps `#2aa198`; discharging is `#d1495b`, which separates from it by ΔE 20.6 at
+  worst — better than any pair already in the palette. A more obvious red,
+  `#e0603d`, was rejected because it collapses into the solar orange under
+  deuteranopia at ΔE 3.3. That is the whole reason these are measured rather than
+  picked by eye, and there is now a test pinning the two values so neither drifts.
+
+## 0.5.5 — 8 August 2026
+
+### Fixed
+
+- **A battery pack the inverter did not read was recorded as though it had
+  been** ([#40](https://github.com/sjordan0228/arraysense/issues/40)). The
+  inverter library serves every pack it has ever seen on every read, and a pack
+  the firmware did not surface on a given cycle comes back with its registers
+  frozen at their last real values. Nothing checked for that, so held readings
+  were stored stamped with the current time — a pack last actually measured
+  fifteen minutes or nine hours ago looked as fresh as one measured a second ago.
+
+  The consequences were not cosmetic. Every safeguard downstream decides what to
+  trust by looking at that timestamp, so none of them could fire: the checks that
+  drop a reading too old to compare, and the ones that require packs to have been
+  read at the same moment, both saw a bank where every pack was current. A held
+  voltage compared against a live one could raise a **wiring fault that was not
+  there**, and the charge- and voltage-spread graphs could draw a spread that was
+  partly the gap between a fresh reading and a stale one.
+
+  A held pack is now left out of the reading rather than recorded, the same way a
+  pack whose BMS has gone quiet already was. **Expect the spread graphs to look
+  sparser as a result**: moments where a pack was not actually read now show a
+  break instead of a line drawn from old values. That is the honest picture
+  replacing a misleading one, not a regression.
+
+  Two cases deliberately keep the pack rather than dropping it, because being
+  wrong in the direction of keeping data can be recovered from and being wrong in
+  the direction of discarding it cannot: a library build that does not stamp the
+  reading time at all, and one that stamps it without a timezone. The second logs
+  a warning every poll, because it would mean the library changed underneath us.
+
 ## 0.5.4 — 8 August 2026
 
 ### Fixed

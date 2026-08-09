@@ -20,6 +20,49 @@
 // specialises by simply writing a rule, with no !important anywhere.
 // ---------------------------------------------------------------------------
 
+const LIGHT_TOKENS = `
+    /* Light theme tokens. The chart hues separate identically on light or dark
+         — a pair's distance does not depend on the background — but their contrast
+         against the surface changes. These values are the dark theme's until
+         measured against a light panel like #f7f8fb. */
+      --ink:#1a1a1a; --ink2:#333333; --ink3:#555555;
+      --grid-line:rgba(0,0,0,.12);
+      --panel:rgba(255,255,255,.85); --panel-b:rgba(0,0,0,.15);
+      /* Light-theme chart hues need measuring against the light surface. For now,
+         reuse the dark values — the relationships between them are already validated. */
+      --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
+      --batt-dis:#d1495b;
+      --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+      /* The three canvas tokens, inverted. A white wash on a light panel is
+         invisible, and a white zero rule with it — these are the whole reason
+         the canvas needs telling rather than inheriting. */
+      --theme:light;
+      --zero-rule:rgba(0,0,0,.34);
+      --wash-rgb:0,0,0;
+      --tint:rgba(0,0,0,.05); --tint-2:rgba(0,0,0,.10);
+      --tint-3:rgba(0,0,0,.16);
+      /* The same walk through the same hues, lightened: dawn rather than dusk.
+         Keeping the shape means the page still reads as this installation's
+         rather than as a generic light theme. */
+      --page:linear-gradient(168deg,#eef1f8 0%,#e7ebf5 34%,#efe8f3 62%,#f8ece3 85%,#fdf4e7 100%);
+      --glow:radial-gradient(circle,rgba(255,186,96,.20),transparent 66%);
+  `;
+
+// One definition, applied two ways: when the device asks for light and nothing
+// has overridden it, and when something explicitly has. Written once and
+// interpolated rather than pasted twice — two copies of a palette is how the two
+// drift, which is the same reason there is one copy of the tariff grammar.
+//
+// The media query is scoped to :root:not([data-theme]) so an explicit choice
+// always wins over the device's. With data-theme set, only the attribute rules
+// match, and :root's own dark values stand unless the light ones override them.
+const LIGHT_TOKEN_BLOCK = `
+  :root[data-theme="light"] { ${LIGHT_TOKENS} }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) { ${LIGHT_TOKENS} }
+  }
+`;
+
 const BASE_CSS = `
   :root {
     /* Validated against protanopia, deuteranopia and tritanopia across every
@@ -27,29 +70,60 @@ const BASE_CSS = `
        ΔE 1.9 apart under protan, which is indistinguishable, and 9.8 apart even
        with full colour vision. These four are worst-pair ΔE 9.0 under CVD and
        16.1 with normal vision, against this panel's own surface.
-       Charge and discharge deliberately share one hue: they are one series with
-       a sign, separated by the zero line, and position carries that far better
-       than a fifth colour could. */
+       Charge is green and discharge red — the pair that shares a chart separates
+       at ΔE 20.6 protan / 27.3 deutan / 70.7 tritan, chosen by measurement and
+       not by eye. Position still carries the sign: the fill sits above or below
+       the zero line whatever the hue does, so the colour is reinforcement. */
     --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
-    --batt-dis:#14625f;
+    --batt-dis:#d1495b;
     --ink:#fff; --ink2:#c8cbd9; --ink3:#8d92a8;
     --grid-line:rgba(255,255,255,.08);
     --panel:rgba(9,11,24,.55); --panel-b:rgba(255,255,255,.14);
     --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+    /* Canvas cannot read a stylesheet, so anything drawn to one has to be told
+       its colour. These three exist for that: the chart code reads them at draw
+       time the same way it reads a series hue, and they are the only thing that
+       has to change for a canvas to follow the theme.
+       --wash-rgb is a bare triplet rather than a colour because the band shading
+       composes it with a different opacity per band. --theme is read as a word,
+       so nothing has to infer the theme by inspecting a colour. */
+    --theme:dark;
+    --zero-rule:rgba(255,255,255,.28);
+    --wash-rgb:255,255,255;
+    /* Tints laid over a panel — track backgrounds, input fills, pressed states.
+       They are the surface's own colour at low opacity, so on a light panel a
+       white one is invisible and they have to invert with the theme. */
+    --tint:rgba(255,255,255,.07); --tint-2:rgba(255,255,255,.12);
+    --tint-3:rgba(255,255,255,.19);
+    /* The page itself. Left as a literal, a light theme put light panels and
+       dark text on a dark page: the headings sat on their own background and
+       vanished. The panels are translucent over this, so it is the one colour
+       everything else is read against. */
+    --page:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
+    --glow:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);
   }
+  ${LIGHT_TOKEN_BLOCK}
   * { box-sizing:border-box; }
   body {
     margin:0; min-height:100vh; color:var(--ink);
     font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;
-    background:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
+    background:var(--page);
     background-attachment:fixed;
   }
   .sunglow{position:fixed;width:420px;height:420px;border-radius:50%;right:-140px;top:-160px;
-    background:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);filter:blur(16px);pointer-events:none}
+    background:var(--glow);filter:blur(16px);pointer-events:none}
   main{position:relative;max-width:1180px;margin:0 auto;padding:22px 20px 40px}
   header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
   h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
   .conn{font-size:11.5px;color:var(--ink3)}
+  /* The theme button. Sized and shaped like the settings gear beside it, because
+     they are the same kind of thing: a control that belongs to this browser
+     rather than a reading from the inverter. */
+  .themebtn{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:9px;width:30px;height:30px;line-height:1;cursor:pointer;font-size:14px;
+    display:inline-flex;align-items:center;justify-content:center;font-family:inherit}
+  .themebtn:hover{background:var(--tint-2);color:var(--ink)}
+  .themebtn:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
   .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
   .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
@@ -772,10 +846,19 @@ function startStaleWatch() {
 
 // common.js is loaded from <head>, so on most pages there is no <nav> to hang
 // the banner under yet.
+//
+// The theme is applied here rather than waiting for the document: everything
+// after this reads resolved colours, and a chart built before the attribute is
+// set would take the previous theme's palette from the ink cache. The button
+// itself has to wait for a <header> to exist.
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', startStaleWatch);
+  document.addEventListener('DOMContentLoaded', () => {
+    startStaleWatch();
+    mountThemeButton();
+  });
 } else {
   startStaleWatch();
+  mountThemeButton();
 }
 
 // ---------------------------------------------------------------------------
@@ -821,9 +904,16 @@ const SYNC_KEY = 'arraysense';
 // OKLCH space against a protan, deutan and tritan checker, and a second copy
 // of them is a copy that drifts away from the one that was validated. The map
 // below is only reached when there is no computed style to read at all.
+//
+// The fallback values are dark-theme defaults. When the stylesheet is not
+// available, the canvas falls back to these; when it is, the computed style
+// wins and respects prefers-color-scheme.
 const INK_FALLBACK = {
   '--pv':'#cf7b26', '--load':'#4678cc', '--batt':'#2aa198', '--grid':'#b0486e',
-  '--batt-dis':'#14625f', '--ink3':'#8d92a8', '--grid-line':'rgba(255,255,255,.08)',
+  '--batt-dis':'#d1495b', '--ink2':'#c8cbd9', '--ink3':'#8d92a8', '--grid-line':'rgba(255,255,255,.08)',
+  // Reached only when there is no computed style at all, which is the dark
+  // theme's case by definition — with a stylesheet the media query answers.
+  '--theme':'dark', '--zero-rule':'rgba(255,255,255,.28)', '--wash-rgb':'255,255,255',
 };
 const inkCache = {};
 function ink(name) {
@@ -834,6 +924,102 @@ function ink(name) {
     inkCache[name] = value || INK_FALLBACK[name];
   }
   return inkCache[name];
+}
+// Which theme this browser wants: what the device says unless somebody has said
+// otherwise here. Kept per browser on purpose — one household can want the wall
+// tablet dark and the laptop following the room, so this is the override and the
+// installation-wide default belongs in the settings registry beside it.
+const THEME_KEY = 'arraysense-theme';
+const THEME_ORDER = ['system', 'light', 'dark'];
+const THEME_GLYPH = { system: '\u25D1', light: '\u2600', dark: '\u263E' };
+const THEME_SAYS = {
+  system: 'Theme: following this device',
+  light: 'Theme: light',
+  dark: 'Theme: dark',
+};
+
+function themeChoice() {
+  let held = null;
+  try {
+    // Only the read is guarded, and only because private browsing refuses
+    // localStorage outright. Wrapping the whole function meant a programming
+    // error inside it came back as a plausible answer instead of a stack trace.
+    held = localStorage.getItem(THEME_KEY);
+  } catch (e) {
+    return 'system';
+  }
+  return THEME_ORDER.includes(held) ? held : 'system';
+}
+
+// Applying a choice is one attribute: the stylesheet keys off it, and its absence
+// is what lets the media query answer instead. The ink cache has to go with it —
+// it holds resolved colours, and a chart drawn after a change would otherwise
+// paint the previous theme's palette onto the new one's surface.
+// Just the attribute, for the earliest possible moment — before any chart or
+// cached colour exists, so there is nothing yet to invalidate or repaint.
+function applyStoredTheme() {
+  const choice = themeChoice();
+  const root = document.documentElement;
+  if (choice === 'system') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', choice);
+}
+
+function applyTheme(choice) {
+  const root = document.documentElement;
+  if (choice === 'system') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', choice);
+  for (const key of Object.keys(inkCache)) delete inkCache[key];
+  for (const id of Object.keys(CHARTS)) {
+    const held = CHARTS[id];
+    if (held && held.u) held.u.redraw();
+  }
+  document.dispatchEvent(new CustomEvent('themechange', { detail: { choice } }));
+}
+
+// The control itself, put into every page's header from here rather than into
+// five headers by hand. A page that adds a header gets it for nothing, and a page
+// that forgets cannot end up without it.
+function mountThemeButton() {
+  const header = document.querySelector('header');
+  if (!header || header.querySelector('.themebtn')) return;
+  const button = document.createElement('button');
+  button.className = 'themebtn';
+  button.type = 'button';
+  const paint = () => {
+    const choice = themeChoice();
+    button.textContent = THEME_GLYPH[choice];
+    button.title = THEME_SAYS[choice] + ' \u2014 click to change';
+    button.setAttribute('aria-label', THEME_SAYS[choice]);
+  };
+  button.addEventListener('click', () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(themeChoice()) + 1) % THEME_ORDER.length];
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch (e) {
+      // Nothing to persist to; the choice still applies for this page.
+    }
+    applyTheme(next);
+    paint();
+  });
+  paint();
+  const right = header.lastElementChild;
+  if (right && right !== header.firstElementChild) right.appendChild(button);
+  else header.appendChild(button);
+}
+
+// Applied as soon as the theme block is defined, and deliberately not earlier:
+// THEME_KEY and friends are const, so a call above them lands in the temporal
+// dead zone. That happened, and the try below caught the ReferenceError and
+// answered 'system' — a saved choice silently ignored, with nothing in the
+// console and every test still green.
+applyStoredTheme();
+
+// Whether the light theme is in force, read as a word the stylesheet declares
+// rather than inferred from a colour. Inferring it meant parsing --panel's rgba
+// and summing the channels against a threshold, which is a rule nobody would
+// know they had broken by restyling a panel.
+function isLightTheme() {
+  return ink('--theme') === 'light';
 }
 
 // Fills are the series colour at lower opacity and never a colour of their
@@ -846,7 +1032,13 @@ function fade(name, alpha) {
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${alpha})`;
 }
 
-const AXIS_FONT = '9.5px system-ui,-apple-system,"Segoe UI",sans-serif';
+// Tick labels were 9.5px, the smallest text anywhere on the page against a body
+// of 14px, and unreadable on a normal-DPI display. 12px puts them in the same
+// range as the legend and the range buttons, which is where a label somebody is
+// expected to read belongs. The gutters below grew with it: a taller label needs
+// more height under the plot, and a wider one needs more room beside it, or the
+// text clips instead of shrinking.
+const AXIS_FONT = '12px system-ui,-apple-system,"Segoe UI",sans-serif';
 
 // A gap is a break, never bridged. A null reading, or a row the collector
 // wrote with an error because the poll failed, enters the series as null and
@@ -884,14 +1076,20 @@ const kwTicks = (u, splits) =>
 // Fresh objects every call: uPlot fills defaults into the axis it is handed,
 // and two axes sharing one nested grid object would share the result.
 const axis = (extra) => Object.assign({
-  stroke: () => ink('--ink3'),
+  stroke: () => ink('--ink2'),
   font: AXIS_FONT,
   ticks: { show: false },
   grid: { stroke: () => ink('--grid-line'), width: 1 },
 }, extra);
 
-const timeAxis = () => axis({ size: 26, values: timeTicks });
-const kwAxis = () => axis({ size: 48, gap: 6, values: kwTicks });
+// `space` is the minimum room uPlot leaves between ticks before it drops to a
+// coarser increment. Its default is 50px, which was fine at 9.5px type and is
+// not at 12px: "12:00 PM" measures about 53px, so neighbouring labels touched.
+// uPlot centres labels and does no collision avoidance of its own, so the
+// spacing is the only thing standing between a readable axis and an overlapping
+// one — 80 leaves a clear gap at the widest format timeTicks produces.
+const timeAxis = () => axis({ size: 32, space: 80, values: timeTicks });
+const kwAxis = () => axis({ size: 56, gap: 6, values: kwTicks });
 
 // The zero line is not a gridline: it is the thing a signed reading is signed
 // against. Drawn brighter, over the grid and under the series, which is where
@@ -906,7 +1104,7 @@ const zeroRule = () => ({
       if (y < top || y > top + height) return;
       const ctx = u.ctx;
       ctx.save();
-      ctx.strokeStyle = 'rgba(255,255,255,.28)';
+      ctx.strokeStyle = ink('--zero-rule');
       ctx.lineWidth = uPlot.pxRatio || 1;
       ctx.beginPath();
       ctx.moveTo(left, y);
@@ -916,6 +1114,91 @@ const zeroRule = () => ({
     },
   },
 });
+
+// Band shading plugin. Draws tariff band windows as background shading, varying
+// opacity only — no new hue. The maintainer is colour blind and every hue has to
+// be measured against every other, so a band with its own colour would be one
+// nobody checked; a tariff also has as many bands as it likes, which two colours
+// could never say. Luminance carries it instead, and luminance is the one
+// distinction that survives every form of colour vision deficiency.
+//
+// On a dark panel the wash is white, so more opacity reads *brighter*. The more
+// expensive the band, the more it stands out, which puts the eye on the costly
+// hours. On a light panel the wash is dark, so more opacity reads *darker* —
+// the expensive hours are still the ones that stand out, just in the opposite
+// direction. The legend text must reverse accordingly.
+//
+// ``getWindows`` is a function, not an array, and that is load-bearing. ``paint``
+// builds a chart once and afterwards only calls ``setData`` on it, so a plugin
+// rebuilt with fresh windows on a later draw is discarded — the chart keeps the
+// plugin it was constructed with. Closing over an array therefore froze the
+// shading at whatever range was drawn first: switching from 24 hours to 30 days
+// left twenty-nine of those days shaded from yesterday's windows, while the
+// legend beside it described the new ones. Reading through a function means the
+// one long-lived plugin always paints what was last fetched.
+//
+// Windows are handed in rather than fetched here because drawing is synchronous.
+// No shading at all when there are none; absent data is not zero.
+function bandShade(getWindows) {
+  const scale = (windows) => {
+    const prices = [...new Set(windows.map((w) => w.price_per_kwh))]
+      .filter((p) => p !== null && p !== undefined)
+      .sort((a, b) => a - b);
+    const out = {};
+    // Cheapest barely there, dearest clearly visible. Spread across however many
+    // distinct prices there are rather than capped at a fixed number of steps: a
+    // tariff may have four bands, and clamping would give the top two the same
+    // shade and quietly say they cost the same.
+    const LOW = 0.04;
+    const HIGH = 0.18;
+    const last = prices.length - 1;
+    prices.forEach((p, i) => {
+      out[p] = last <= 0 ? HIGH : LOW + ((HIGH - LOW) * i) / last;
+    });
+    return out;
+  };
+
+  return {
+    hooks: {
+      drawAxes: (u) => {
+        const windows = getWindows();
+        if (!windows || !windows.length) return;
+        const opacities = scale(windows);
+        const { left, top, width, height } = u.bbox;
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, width, height);
+        ctx.clip();
+        // ``ink`` caches, as it does for every token, so switching the system
+        // theme with the page open keeps the old wash until a reload. That is
+        // the same for every colour on every chart and not worth a cache
+        // invalidation of its own; it is written down so nobody reads this as
+        // live and is surprised.
+        const wash = ink('--wash-rgb');
+
+        for (const w of windows) {
+          // A stretch no band covers comes back with a null band and no price —
+          // the endpoint returns it rather than dropping it, so unpriced energy
+          // shows up instead of quietly vanishing. It must not be shaded: any
+          // wash here would read as a band, and a middling one would read as a
+          // middling rate. Absent is absent, so it is left plain.
+          const opacity = opacities[w.price_per_kwh];
+          if (opacity === undefined) continue;
+
+          const x0 = Math.max(left, u.valToPos(new Date(w.start).getTime() / 1000, 'x', true));
+          const x1 = Math.min(left + width, u.valToPos(new Date(w.end).getTime() / 1000, 'x', true));
+          if (x1 <= x0) continue;
+
+          ctx.fillStyle = `rgba(${wash},${opacity})`;
+          ctx.fillRect(x0, top, x1 - x0, height);
+        }
+
+        ctx.restore();
+      },
+    },
+  };
+}
 
 // Which chart the pointer is on, if any. One variable rather than a flag per
 // chart, because the question is which chart owns the readout: the synced
@@ -994,8 +1277,13 @@ const trace = (label, name, width, extra) => Object.assign({
 // answers the reverse. A hidden series takes no part in ranging its scale.
 const carried = () => ({ show: false, scale: 'y', spanGaps: false });
 
-// Solar is what the array harvested, so it reads as volume rather than as a
-// line. Filled to the zero line rather than to the floor of the chart, or a
+// Kept, and no longer used on the Power flow chart. Solar read as volume there
+// rather than as a line, which was the better picture of a harvest — but two
+// area fills leave no room for the tariff shading behind them, and on a sunny
+// day this one covers most of the plot. Grid keeps its fill because a grid line
+// vanishes under the home line; solar has no such problem, so solar gave way.
+// Left defined because the volume reading is a real if minor loss and may be
+// wanted back. Filled to the zero line rather than the floor of the chart, or a
 // negative axis would put the fill on the wrong side of nothing.
 function pvFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
@@ -1004,7 +1292,7 @@ function pvFill(u) {
   return grad;
 }
 
-// Grid import is filled for the same reason solar is, and for one more: when
+// Grid import is filled, and it is now the only series here that is. When
 // the house runs on the grid, import *equals* house load to the watt, so a grid
 // line lies exactly under the home line and vanishes beneath it. An area cannot
 // vanish that way — the body of it shows below the coincident line even where
@@ -1017,11 +1305,13 @@ function gridFill(u) {
   return grad;
 }
 
-// Charge and discharge share one hue and differ only in lightness, which is
-// the distinction that survives every form of colour blindness. The split is
-// exactly at the zero line, so position carries the meaning and the shade only
-// confirms it. The darker half is given more opacity because it has to show
-// through against a dark panel at all.
+// Charge is green and discharge red, a pair measured under simulated
+// protanopia, deuteranopia and tritanopia rather than chosen by eye — those
+// three, not "every form", because that is what was actually run. The split is
+// exactly at the zero
+// line, so position carries the sign and the hue only reinforces it. The
+// discharge half is given more opacity because it has to show through against
+// a dark panel at all.
 function battFill(u) {
   const { top, height } = u.bbox;
   const grad = u.ctx.createLinearGradient(0, top, 0, top + height);
