@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import sqlite3
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+from arraysense.collector import service as service_module
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.models import Sample
@@ -66,9 +74,15 @@ async def test_maintenance_is_idempotent(tmp_path: Path) -> None:
 async def test_maintenance_does_not_fail_the_poll_loop(tmp_path: Path) -> None:
     # Rollup maintenance is housekeeping. A failure in it must never stop the
     # collector, which is the thing that cannot be caught up on later.
+    #
+    # Since #30 the pass opens its own connection, so closing the store no
+    # longer makes the rebuilds raise — what this now pins is that a pass
+    # against a closed store is still survivable, which is the shape of a
+    # shutdown racing a timer. The unopenable-database path is covered by
+    # test_a_pass_that_cannot_open_its_database_is_survivable.
     store = _store(tmp_path)
     service = CollectorService(source=FakeSource(), store=store, interval=3600)
-    store.close()  # every rollup query will now raise
+    store.close()
     await service.maintain_rollups(now=datetime.now(tz=UTC))
 
 
@@ -102,3 +116,128 @@ async def test_the_running_collector_builds_the_tiers_on_its_own(tmp_path: Path)
     finally:
         await service.stop()
         store.close()
+
+
+# The pass must not block the event loop it shares with the API (#30). Measured
+# on the reference LXC it costs 830 ms, and because it is synchronous SQLite in
+# an `async def` with no thread, every open page's status poll and every chart
+# request stalls for that whole time — once a minute, on the same loop.
+async def test_maintenance_lets_the_event_loop_keep_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = _store(tmp_path)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    # Stand in for the real cost. Synchronous, exactly as the rebuilds are.
+    def slow_rebuild(conn: sqlite3.Connection, start: int, end: int) -> None:
+        time.sleep(0.3)
+
+    monkeypatch.setattr(service_module, "rebuild_inverter_minute", slow_rebuild)
+
+    # Anything else wanting the loop while the pass runs — an API request, in
+    # production. It should get many turns during a 300 ms rebuild, not none.
+    ticks = 0
+
+    async def other_work() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    ticker = asyncio.create_task(other_work())
+    await service.maintain_rollups(now=datetime.now(tz=UTC))
+    ticker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await ticker
+
+    assert ticks >= 5, (
+        f"the loop got {ticks} turns during a 300 ms pass — a synchronous "
+        "rollup is blocking every HTTP response for its whole duration"
+    )
+    store.close()
+
+
+async def test_a_sample_stored_while_a_pass_is_in_flight_survives_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The pass must not put the collector's own writes inside its transaction.
+    # On a sqlite3.Connection `with conn:` is transaction state, not a lock, so
+    # two threads entering it on ONE connection share a single commit and a
+    # single rollback: the collector's commit would land the rollup's half-built
+    # tiers, and a failed rollup would discard a sample that stored fine.
+    #
+    # The write has to happen while the pass is genuinely under way, or this
+    # proves nothing — an earlier version used `asyncio.sleep(0)` and passed
+    # against the old wholly synchronous code, because the pass simply finished
+    # first. The two events below pin the ordering instead of hoping for it.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    for i in range(120):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(seconds=11 * i),
+                readings={"battery_voltage_v": 55.9},
+            )
+        )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    started = threading.Event()
+    may_finish = threading.Event()
+
+    def blocking_rebuild(conn: sqlite3.Connection, start: int, end: int) -> None:
+        started.set()
+        may_finish.wait(10)
+
+    monkeypatch.setattr(service_module, "rebuild_inverter_minute", blocking_rebuild)
+
+    task = asyncio.create_task(service.maintain_rollups(now=now))
+    assert await asyncio.to_thread(started.wait, 10), "the pass never started"
+    assert not task.done(), "the pass finished before the concurrent write — it ran inline"
+
+    store.append(Sample(timestamp=now + timedelta(seconds=1), readings={"battery_voltage_v": 56.4}))
+    may_finish.set()
+    await task
+
+    rows = store.query(["battery_voltage_v"], now, now + timedelta(minutes=1), tier="full")
+    assert any(r["battery_voltage_v"] == 56.4 for r in rows), (
+        "a sample stored while the rollup was in flight was lost with it"
+    )
+    store.close()
+
+
+async def test_a_pass_that_cannot_open_its_database_is_survivable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Housekeeping failure must never stop the collector, which is the thing
+    # that cannot be caught up on later. Closing the store no longer produces a
+    # failure — the pass opens its own connection now — so this points the
+    # store at something unopenable instead, which is what a vanished mount or a
+    # permission change looks like from here.
+    store = _store(tmp_path)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    monkeypatch.setattr(store, "_path", str(tmp_path))  # a directory, not a file
+
+    await service.maintain_rollups(now=datetime.now(tz=UTC))  # must not raise
+    store.close()
+
+
+async def test_a_memory_backed_store_still_builds_its_tiers(tmp_path: Path) -> None:
+    # ":memory:" cannot be reopened — every connect() makes a new empty database
+    # — so a threaded pass would rebuild an unrelated one, find no rows, and
+    # report success while the real tiers stayed empty. Silent and total.
+    store = SqliteStore(":memory:", device=TEST_DEVICE)
+    assert store.is_memory_backed
+    now = datetime.now(tz=UTC)
+    for i in range(400):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(seconds=11 * i),
+                readings={"battery_voltage_v": 55.9},
+            )
+        )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    await service.maintain_rollups(now=now)
+
+    minute = store.query(["battery_voltage_v"], now - timedelta(days=1), now, tier="minute")
+    assert minute, "the pass reported success but rolled up a different database"
+    store.close()

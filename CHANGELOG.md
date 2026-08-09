@@ -7,6 +7,34 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.5 — 8 August 2026
+
+### Fixed
+
+- **The once-a-minute rollup no longer freezes every open page**
+  ([#30](https://github.com/sjordan0228/arraysense/issues/30)). Maintenance
+  rebuilt the coarse tiers with synchronous SQLite inside an `async def`, on the
+  event loop the HTTP API runs on. Measured on the reference box, `/api/status`
+  answered in 4 ms at the median and then stalled for **1141 ms**, twice in a
+  150-second window — once per pass, landing on every open page, every chart
+  request and the collector's own read at the same instant.
+
+  The pass now runs in a thread, on a second database connection it opens and
+  closes itself. The second connection is the part that matters and is not
+  obvious: on a SQLite connection `with conn:` is transaction state rather than
+  a lock, so two threads entering it on one connection share a single commit and
+  a single rollback. The collector's per-sample commit would have landed a
+  half-built tier, and a failed rollup would have rolled back a reading that had
+  stored successfully — losing a reading being the failure this project exists
+  to prevent.
+
+  A pass still delays *this collector's* next poll, and that is the intended
+  trade rather than an oversight: a slow rebuild costs the collector its lock
+  instead of costing every open page its response. What the pass costs has not
+  changed; where it is paid has.
+
+  Nothing about an installation's data changes, and no migration is needed.
+
 ## 0.6.4 — 8 August 2026
 
 ### Fixed
