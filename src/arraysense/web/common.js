@@ -20,6 +20,49 @@
 // specialises by simply writing a rule, with no !important anywhere.
 // ---------------------------------------------------------------------------
 
+const LIGHT_TOKENS = `
+    /* Light theme tokens. The chart hues separate identically on light or dark
+         — a pair's distance does not depend on the background — but their contrast
+         against the surface changes. These values are the dark theme's until
+         measured against a light panel like #f7f8fb. */
+      --ink:#1a1a1a; --ink2:#333333; --ink3:#555555;
+      --grid-line:rgba(0,0,0,.12);
+      --panel:rgba(255,255,255,.85); --panel-b:rgba(0,0,0,.15);
+      /* Light-theme chart hues need measuring against the light surface. For now,
+         reuse the dark values — the relationships between them are already validated. */
+      --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
+      --batt-dis:#d1495b;
+      --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
+      /* The three canvas tokens, inverted. A white wash on a light panel is
+         invisible, and a white zero rule with it — these are the whole reason
+         the canvas needs telling rather than inheriting. */
+      --theme:light;
+      --zero-rule:rgba(0,0,0,.34);
+      --wash-rgb:0,0,0;
+      --tint:rgba(0,0,0,.05); --tint-2:rgba(0,0,0,.10);
+      --tint-3:rgba(0,0,0,.16);
+      /* The same walk through the same hues, lightened: dawn rather than dusk.
+         Keeping the shape means the page still reads as this installation's
+         rather than as a generic light theme. */
+      --page:linear-gradient(168deg,#eef1f8 0%,#e7ebf5 34%,#efe8f3 62%,#f8ece3 85%,#fdf4e7 100%);
+      --glow:radial-gradient(circle,rgba(255,186,96,.20),transparent 66%);
+  `;
+
+// One definition, applied two ways: when the device asks for light and nothing
+// has overridden it, and when something explicitly has. Written once and
+// interpolated rather than pasted twice — two copies of a palette is how the two
+// drift, which is the same reason there is one copy of the tariff grammar.
+//
+// The media query is scoped to :root:not([data-theme]) so an explicit choice
+// always wins over the device's. With data-theme set, only the attribute rules
+// match, and :root's own dark values stand unless the light ones override them.
+const LIGHT_TOKEN_BLOCK = `
+  :root[data-theme="light"] { ${LIGHT_TOKENS} }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme]) { ${LIGHT_TOKENS} }
+  }
+`;
+
 const BASE_CSS = `
   :root {
     /* Validated against protanopia, deuteranopia and tritanopia across every
@@ -59,35 +102,7 @@ const BASE_CSS = `
     --page:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
     --glow:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);
   }
-  @media (prefers-color-scheme: light) {
-    :root {
-      /* Light theme tokens. The chart hues separate identically on light or dark
-         — a pair's distance does not depend on the background — but their contrast
-         against the surface changes. These values are the dark theme's until
-         measured against a light panel like #f7f8fb. */
-      --ink:#1a1a1a; --ink2:#333333; --ink3:#555555;
-      --grid-line:rgba(0,0,0,.12);
-      --panel:rgba(255,255,255,.85); --panel-b:rgba(0,0,0,.15);
-      /* Light-theme chart hues need measuring against the light surface. For now,
-         reuse the dark values — the relationships between them are already validated. */
-      --pv:#cf7b26; --load:#4678cc; --batt:#2aa198; --grid:#b0486e;
-      --batt-dis:#d1495b;
-      --good:#0ca30c; --warn:#fab219; --bad:#d03b3b;
-      /* The three canvas tokens, inverted. A white wash on a light panel is
-         invisible, and a white zero rule with it — these are the whole reason
-         the canvas needs telling rather than inheriting. */
-      --theme:light;
-      --zero-rule:rgba(0,0,0,.34);
-      --wash-rgb:0,0,0;
-      --tint:rgba(0,0,0,.05); --tint-2:rgba(0,0,0,.10);
-      --tint-3:rgba(0,0,0,.16);
-      /* The same walk through the same hues, lightened: dawn rather than dusk.
-         Keeping the shape means the page still reads as this installation's
-         rather than as a generic light theme. */
-      --page:linear-gradient(168deg,#eef1f8 0%,#e7ebf5 34%,#efe8f3 62%,#f8ece3 85%,#fdf4e7 100%);
-      --glow:radial-gradient(circle,rgba(255,186,96,.20),transparent 66%);
-    }
-  }
+  ${LIGHT_TOKEN_BLOCK}
   * { box-sizing:border-box; }
   body {
     margin:0; min-height:100vh; color:var(--ink);
@@ -101,6 +116,14 @@ const BASE_CSS = `
   header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
   h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
   .conn{font-size:11.5px;color:var(--ink3)}
+  /* The theme button. Sized and shaped like the settings gear beside it, because
+     they are the same kind of thing: a control that belongs to this browser
+     rather than a reading from the inverter. */
+  .themebtn{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:9px;width:30px;height:30px;line-height:1;cursor:pointer;font-size:14px;
+    display:inline-flex;align-items:center;justify-content:center;font-family:inherit}
+  .themebtn:hover{background:var(--tint-2);color:var(--ink)}
+  .themebtn:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
   .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
   .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
@@ -823,10 +846,19 @@ function startStaleWatch() {
 
 // common.js is loaded from <head>, so on most pages there is no <nav> to hang
 // the banner under yet.
+//
+// The theme is applied here rather than waiting for the document: everything
+// after this reads resolved colours, and a chart built before the attribute is
+// set would take the previous theme's palette from the ink cache. The button
+// itself has to wait for a <header> to exist.
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', startStaleWatch);
+  document.addEventListener('DOMContentLoaded', () => {
+    startStaleWatch();
+    mountThemeButton();
+  });
 } else {
   startStaleWatch();
+  mountThemeButton();
 }
 
 // ---------------------------------------------------------------------------
@@ -893,6 +925,95 @@ function ink(name) {
   }
   return inkCache[name];
 }
+// Which theme this browser wants: what the device says unless somebody has said
+// otherwise here. Kept per browser on purpose — one household can want the wall
+// tablet dark and the laptop following the room, so this is the override and the
+// installation-wide default belongs in the settings registry beside it.
+const THEME_KEY = 'arraysense-theme';
+const THEME_ORDER = ['system', 'light', 'dark'];
+const THEME_GLYPH = { system: '\u25D1', light: '\u2600', dark: '\u263E' };
+const THEME_SAYS = {
+  system: 'Theme: following this device',
+  light: 'Theme: light',
+  dark: 'Theme: dark',
+};
+
+function themeChoice() {
+  let held = null;
+  try {
+    // Only the read is guarded, and only because private browsing refuses
+    // localStorage outright. Wrapping the whole function meant a programming
+    // error inside it came back as a plausible answer instead of a stack trace.
+    held = localStorage.getItem(THEME_KEY);
+  } catch (e) {
+    return 'system';
+  }
+  return THEME_ORDER.includes(held) ? held : 'system';
+}
+
+// Applying a choice is one attribute: the stylesheet keys off it, and its absence
+// is what lets the media query answer instead. The ink cache has to go with it —
+// it holds resolved colours, and a chart drawn after a change would otherwise
+// paint the previous theme's palette onto the new one's surface.
+// Just the attribute, for the earliest possible moment — before any chart or
+// cached colour exists, so there is nothing yet to invalidate or repaint.
+function applyStoredTheme() {
+  const choice = themeChoice();
+  const root = document.documentElement;
+  if (choice === 'system') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', choice);
+}
+
+function applyTheme(choice) {
+  const root = document.documentElement;
+  if (choice === 'system') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', choice);
+  for (const key of Object.keys(inkCache)) delete inkCache[key];
+  for (const id of Object.keys(CHARTS)) {
+    const held = CHARTS[id];
+    if (held && held.u) held.u.redraw();
+  }
+  document.dispatchEvent(new CustomEvent('themechange', { detail: { choice } }));
+}
+
+// The control itself, put into every page's header from here rather than into
+// five headers by hand. A page that adds a header gets it for nothing, and a page
+// that forgets cannot end up without it.
+function mountThemeButton() {
+  const header = document.querySelector('header');
+  if (!header || header.querySelector('.themebtn')) return;
+  const button = document.createElement('button');
+  button.className = 'themebtn';
+  button.type = 'button';
+  const paint = () => {
+    const choice = themeChoice();
+    button.textContent = THEME_GLYPH[choice];
+    button.title = THEME_SAYS[choice] + ' \u2014 click to change';
+    button.setAttribute('aria-label', THEME_SAYS[choice]);
+  };
+  button.addEventListener('click', () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(themeChoice()) + 1) % THEME_ORDER.length];
+    try {
+      localStorage.setItem(THEME_KEY, next);
+    } catch (e) {
+      // Nothing to persist to; the choice still applies for this page.
+    }
+    applyTheme(next);
+    paint();
+  });
+  paint();
+  const right = header.lastElementChild;
+  if (right && right !== header.firstElementChild) right.appendChild(button);
+  else header.appendChild(button);
+}
+
+// Applied as soon as the theme block is defined, and deliberately not earlier:
+// THEME_KEY and friends are const, so a call above them lands in the temporal
+// dead zone. That happened, and the try below caught the ReferenceError and
+// answered 'system' — a saved choice silently ignored, with nothing in the
+// console and every test still green.
+applyStoredTheme();
+
 // Whether the light theme is in force, read as a word the stylesheet declares
 // rather than inferred from a colour. Inferring it meant parsing --panel's rgba
 // and summing the channels against a threshold, which is a rule nobody would
