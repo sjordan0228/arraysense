@@ -260,6 +260,9 @@ class SqliteStore:
         uses FULL. Relying on SQLite's compile-time default would silently weaken
         that guarantee in a build configured with NORMAL as its default, while a
         test running against the usual FULL default would never expose it.
+        Maintenance writes only derived tiers and uses NORMAL: a power loss may
+        discard its newest transaction, which the next pass rebuilds from raw,
+        without forcing a durable sync for each derived-tier commit.
 
         This helper keeps the shared rules together. A second copy drifts, and
         the drift that costs most is a maintenance connection opened without
@@ -270,6 +273,8 @@ class SqliteStore:
         if establish_wal:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = FULL")
+        else:
+            conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA busy_timeout = 5000")
 
     def maintenance_connection(self) -> sqlite3.Connection:

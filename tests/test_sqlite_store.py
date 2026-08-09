@@ -128,19 +128,21 @@ def test_maintenance_connection_inherits_wal_mode_established_at_startup(tmp_pat
     assert mode is not None and mode[0] == "wal"
 
 
-def test_maintenance_connection_keeps_per_connection_safety_pragmas(tmp_path: Path) -> None:
-    """Every maintenance connection keeps integrity and contention safeguards."""
+def test_maintenance_connection_uses_rebuild_safe_pragmas(tmp_path: Path) -> None:
+    """Derived-tier commits avoid FULL fsync without losing connection safeguards."""
     store = SqliteStore(str(tmp_path / "store.db"), device=TEST_DEVICE)
     maintenance = store.maintenance_connection()
     maintenance_pragmas = {
         "foreign_keys": maintenance.execute("PRAGMA foreign_keys").fetchone(),
         "busy_timeout": maintenance.execute("PRAGMA busy_timeout").fetchone(),
+        "synchronous": maintenance.execute("PRAGMA synchronous").fetchone(),
     }
     maintenance.close()
     store.close()
 
     assert maintenance_pragmas["foreign_keys"] == (1,)
     assert maintenance_pragmas["busy_timeout"] == (5000,)
+    assert maintenance_pragmas["synchronous"] == (1,)  # NORMAL
 
 
 def test_appended_reading_is_stored_scaled(tmp_path: Path) -> None:
