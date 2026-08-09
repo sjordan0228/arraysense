@@ -403,11 +403,21 @@ class EnergyShortfall:
     This is what both reverted attempts at #23 lacked: attempt one had no way
     to show a figure at all, and attempt two derived its labels from minutes
     watched, which read 100% while a counter sat silent.
+
+    ``bands_possibly_short`` names the bands whose windows were partly unmeasured,
+    which is all that can be said and rather less than it sounds. It does not say
+    the band is missing energy: a window can go unmeasured with nothing unplaced
+    at all, as it does when a counter simply never reported over it. Nor does it
+    say which band any unplaced energy belongs to — inside a dropped span the
+    amount is exact in total and unlocatable within it, so the answer is a set of
+    candidates and never a number. It exists to decide which band rows carry a
+    qualification, and anything rendered from it must claim no amount (#31).
     """
 
     attributed_kwh: float
     unattributed_kwh: float
     unknowable: bool
+    bands_possibly_short: frozenset[str] = frozenset()
 
     @property
     def short(self) -> bool:
@@ -1021,6 +1031,14 @@ def merge_shortfalls(spans: Sequence[PeriodEnergy]) -> Mapping[str, EnergyShortf
             unattributed_kwh=sum(e.unattributed_kwh for e in entries if e is not None),
             # A counter one bucket never accounted for is not a clean merge.
             unknowable=any(e is None or e.unknowable for e in entries),
+            # Candidate bands union: a band short in any one bucket is short over
+            # the run containing it, the same way unknowability spreads. Dropping
+            # them here would hand the History footer an empty set, so a month
+            # holding an outage would flag its totals and price every band row as
+            # though every window had been measured.
+            bands_possibly_short=frozenset().union(
+                *(e.bands_possibly_short for e in entries if e is not None)
+            ),
         )
     return out
 
