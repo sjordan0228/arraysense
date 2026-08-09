@@ -262,17 +262,49 @@ class CollectorService:
         minute buckets close quickly; the hourly one reaches back far enough to
         pick up a bucket that was still open when the service last stopped.
 
-        Never raises. This is housekeeping running beside the poll loop, and
-        the poll is the thing that cannot be caught up on later — a rollup can
-        always be rebuilt from raw on the next pass.
+        A SQLite failure is logged rather than raised. This is housekeeping
+        running beside the poll loop, and the poll is the thing that cannot be
+        caught up on later — a rollup can always be rebuilt from raw on the next
+        pass. Cancellation is *not* swallowed, because that is how shutdown
+        arrives and a pass that refused to stop would hang it.
+
+        The pass runs off the event loop in a thread, so it no longer blocks
+        HTTP responses — which was the whole of #30, measured at a 4 ms median
+        rising to 1141 ms twice a minute on the reference box. It does still
+        delay this collector's *own* next poll, because the loop awaits it, and
+        that is the intended trade: a slow rebuild costs the collector its lock
+        rather than costing every open page its response.
+
+        The connection is opened and closed inside the worker. Handing a thread
+        a connection owned by the event loop means a cancellation can close it
+        from underneath a statement still running — which blocks the loop on
+        SQLite's own mutex, exactly the stall this change exists to remove.
         """
         moment = now or datetime.now(tz=UTC)
         end = int(moment.timestamp()) + 60
+
+        def _rebuild_all(conn: sqlite3.Connection) -> None:
+            rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
+            rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+
+        def _rebuild_on_own_connection() -> None:
+            conn = self._store.maintenance_connection()
+            try:
+                _rebuild_all(conn)
+            finally:
+                conn.close()
+
         try:
-            with self._store._conn:
-                rebuild_inverter_minute(self._store._conn, end - MINUTE_REBUILD_WINDOW, end)
-                rebuild_inverter_hourly(self._store._conn, end - HOURLY_REBUILD_WINDOW, end)
-                rebuild_module_hourly(self._store._conn, end - HOURLY_REBUILD_WINDOW, end)
+            if self._store.is_memory_backed:
+                # A second connection to ":memory:" is a *different*, empty
+                # database, so a threaded pass would rebuild nothing and report
+                # success — the tiers would sit empty with no error anywhere.
+                # An in-memory store is a test fixture and costs microseconds,
+                # so it runs inline rather than silently doing nothing.
+                _rebuild_all(self._store._conn)
+            else:
+                await asyncio.to_thread(_rebuild_on_own_connection)
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
 
