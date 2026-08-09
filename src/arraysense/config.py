@@ -41,7 +41,27 @@ DEFAULT_DONGLE_PORT = 8000
 # traceback.
 DEFAULT_DRIVER = "eg4_luxpower"
 
-_REQUIRED = ("dongle_host", "dongle_serial", "inverter_serial", "database_path")
+# Required whatever the transport: the identity rows are filed under, and
+# somewhere to file them.
+_REQUIRED = ("inverter_serial", "database_path")
+
+# Required only by the transport that uses them. A serial installation has no
+# dongle to name, and demanding a placeholder host from it would make the
+# transport choice a fiction.
+_REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
+    "dongle": ("dongle_host", "dongle_serial"),
+    "modbus_serial": ("serial_device",),
+}
+
+
+def _required_for(transport: str) -> tuple[str, ...]:
+    """Return the settings an installation on ``transport`` cannot start without."""
+    return _REQUIRED + _REQUIRED_BY_TRANSPORT.get(transport, ())
+
+
+# Valid transport types. The default preserves the existing dongle behaviour;
+# modbus_serial is the alternative path for USB-to-RS485 adapters.
+_VALID_TRANSPORTS = frozenset({"dongle", "modbus_serial"})
 
 
 @dataclass(frozen=True)
@@ -71,6 +91,10 @@ class Config:
     names are listed by ``arraysense.drivers``; an unknown one is reported
     there rather than here, so that this module does not have to import the
     drivers that import it.
+
+    ``transport`` chooses how to reach the inverter. The default "dongle" uses
+    the WiFi dongle's TCP port as before. "modbus_serial" uses a USB-to-RS485
+    adapter. When "modbus_serial" is chosen, ``serial_device`` must be set.
     """
 
     dongle_host: str
@@ -80,6 +104,10 @@ class Config:
     poll_interval: float = DEFAULT_POLL_INTERVAL
     dongle_port: int = DEFAULT_DONGLE_PORT
     driver: str = DEFAULT_DRIVER
+    transport: str = "dongle"
+    serial_device: str = ""
+    serial_baud: int = 19200
+    serial_unit_id: int = 1
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -90,8 +118,20 @@ class Config:
         nobody is watching. A blank serial or a zero interval is only ever
         discovered at the wire otherwise.
         """
-        for field in _REQUIRED:
+        # Before the field check, because "transport must be one of ..." is a
+        # more useful first complaint than a missing field the reader has never
+        # heard of because it belongs to a transport they did not choose.
+        if self.transport not in _VALID_TRANSPORTS:
+            raise ValueError(
+                f"transport must be one of {sorted(_VALID_TRANSPORTS)}, got {self.transport!r}"
+            )
+        for field in _required_for(self.transport):
             if not str(getattr(self, field)).strip():
+                # Name the transport when the field is only required because of
+                # it. "serial_device must be set" alone sends someone hunting
+                # through a file where that setting may not even appear.
+                if field in _REQUIRED_BY_TRANSPORT.get(self.transport, ()):
+                    raise ValueError(f"{field} must be set when transport is {self.transport!r}")
                 raise ValueError(f"{field} must be set")
         if self.poll_interval <= 0:
             raise ValueError(f"poll_interval must be positive, got {self.poll_interval}")
@@ -103,6 +143,13 @@ class Config:
         # ''", which reads like a bug in the software rather than in the file.
         if not self.driver.strip():
             raise ValueError("driver must be set")
+        if self.serial_baud <= 0:
+            raise ValueError(f"serial_baud must be positive, got {self.serial_baud}")
+        # 0 is the Modbus broadcast address: it is write-only by specification
+        # and never answers a read, so a collector pointed at it would poll a
+        # silent bus forever. 248 upward is reserved.
+        if not 1 <= self.serial_unit_id <= 247:
+            raise ValueError(f"serial_unit_id must be between 1 and 247, got {self.serial_unit_id}")
 
 
 def _number(data: dict[str, object], field: str, default: float) -> float:
@@ -143,25 +190,37 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
     if not path.exists():
         raise FileNotFoundError(
             f"no configuration at {path}. Copy config.example.toml and fill in "
-            "your dongle address and serial numbers."
+            "how to reach the inverter — a dongle address, or a serial device "
+            'path with transport = "modbus_serial" — and the inverter serial.'
         )
     try:
         data = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"{path} is not valid TOML: {exc}") from exc
 
-    missing = [f for f in _REQUIRED if not str(data.get(f, "")).strip()]
+    missing = [
+        f
+        for f in _required_for(str(data.get("transport", "dongle")))
+        if not str(data.get(f, "")).strip()
+    ]
     if missing:
         raise ValueError(f"{path} is missing required setting(s): {', '.join(missing)}")
 
     return Config(
-        dongle_host=str(data["dongle_host"]),
-        dongle_serial=str(data["dongle_serial"]),
+        # ``get`` rather than indexing: a serial installation legitimately has
+        # no dongle settings, and the missing check above has already refused
+        # anything genuinely required for the chosen transport.
+        dongle_host=str(data.get("dongle_host", "")),
+        dongle_serial=str(data.get("dongle_serial", "")),
         inverter_serial=str(data["inverter_serial"]),
         database_path=str(data["database_path"]),
         poll_interval=_number(data, "poll_interval", DEFAULT_POLL_INTERVAL),
         dongle_port=round(_number(data, "dongle_port", DEFAULT_DONGLE_PORT)),
         driver=str(data.get("driver", DEFAULT_DRIVER)),
+        transport=str(data.get("transport", "dongle")),
+        serial_device=str(data.get("serial_device", "")),
+        serial_baud=round(_number(data, "serial_baud", 19200)),
+        serial_unit_id=round(_number(data, "serial_unit_id", 1)),
     )
 
 
@@ -229,4 +288,22 @@ def example_toml() -> str:
         "\n"
         "# Where the database is written. Prefer an SSD over a Pi's SD card.\n"
         'database_path = "/var/lib/arraysense/arraysense.db"\n'
+        "\n"
+        "# How to reach the inverter: 'dongle' (default) for the WiFi dongle's\n"
+        "# TCP port, or 'modbus_serial' for a USB-to-RS485 adapter. When set to\n"
+        "# 'modbus_serial', serial_device must also be set.\n"
+        'transport = "dongle"\n'
+        "\n"
+        "# Device path for the USB-to-RS485 adapter. Only used when transport\n"
+        "# is 'modbus_serial'. Nothing expands a glob here, so give a real path:\n"
+        "# '/dev/ttyUSB0', or better a stable one that survives replugging, such\n"
+        "# as '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0' or a udev symlink.\n"
+        'serial_device = ""\n'
+        "\n"
+        "# Baud rate for the serial connection. Defaults to 19200, which is the\n"
+        "# standard for EG4/LuxPower inverters.\n"
+        "serial_baud = 19200\n"
+        "\n"
+        "# Modbus unit ID for the serial connection. Defaults to 1.\n"
+        "serial_unit_id = 1\n"
     )

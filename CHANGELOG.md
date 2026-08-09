@@ -7,6 +7,52 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.9 — 9 August 2026
+
+### Added
+
+- **An installation can choose how it reaches the inverter**
+  ([#41](https://github.com/sjordan0228/arraysense/issues/41)). Until now the
+  driver dialled the WiFi dongle and nothing else. Newer dongle firmware closes
+  the local TCP port that depends on, and the Ethernet dongle never had it, so
+  somebody buying an inverter today could be unable to run this at all.
+
+  `transport = "modbus_serial"` with a `serial_device` now reaches the inverter
+  over a USB-to-RS485 adapter instead. An installation that sets nothing keeps
+  the dongle and behaves exactly as before, and a serial one is no longer asked
+  for a dongle address it does not have.
+
+  Measured on the reference inverter: a full poll of 90 readings takes about
+  3.6 seconds against the dongle's 12 to 17, and the serial link runs alongside
+  the dongle without either disturbing the other. The transport is
+  latency-limited rather than transfer-limited — a Modbus transaction costs
+  about 250 ms whether it carries one register or thirty-two — so the way to
+  make it faster is fewer, larger reads, not a higher baud rate.
+
+  This adds `pyserial` to the runtime dependencies, the first addition in a long
+  while, because the library's serial transport cannot open a port without it.
+
+### Fixed
+
+- **A serial installation is checked against the inverter it claims.** Readings
+  are filed under the serial in the configuration, and the dongle made that safe
+  by refusing any reply whose serial did not match — a typo produced no data
+  rather than misfiled data. Modbus offers nothing equivalent: a request selects
+  a unit by address, and whichever inverter holds that address answers.
+
+  A serial installation now reads the inverter's own serial before it takes a
+  single reading, and refuses to collect if it disagrees. That refusal stops the
+  service rather than being recorded as a gap, because a mistyped serial cannot
+  come right on its own and every poll it survived would add another row to
+  another machine's history.
+
+  Checked once, at startup. Doing it per poll would have been better and is not
+  possible: any successful register read resets the counter the library uses to
+  decide a dead bus needs reconnecting, so a repeated check would have quietly
+  disabled its own recovery. What that leaves uncovered — rewiring the bus to a
+  different inverter without restarting — is written down beside the check
+  rather than left to be discovered.
+
 ## 0.6.8 — 9 August 2026
 
 ### Fixed
