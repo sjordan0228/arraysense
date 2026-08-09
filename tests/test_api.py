@@ -107,10 +107,15 @@ def test_status_names_the_calendar_it_would_answer_on(client: Any) -> None:
 
 
 def test_status_answers_even_when_the_caller_names_a_zone_it_does_not_know(client: Any) -> None:
-    # /api/energy refuses an unknown zone with a 400 and the page's answer is
-    # to ask again without it. Refusing here too would take down the banner
-    # over a stale browser zone, and the fallback is the same zone that retry
-    # lands on — so the calendar the page builds still matches the reply.
+    # The data endpoints refuse an unknown zone with a 400 — /api/energy,
+    # /api/bands, and /api/costs since #49 — because each of their answers is
+    # cut at a midnight and one cut in the wrong place looks entirely normal.
+    #
+    # This one falls back instead, and the difference is what the answer is for:
+    # the banner says whether the screen is current, which is worth answering in
+    # some nearby zone and not worth withholding over a browser's stale name. No
+    # page retries without ``tz`` — a page that takes a 400 says so and leaves
+    # what it already drew — so refusing here would simply lose the banner.
     r = client.get("/api/status", params={"tz": "Mars/Olympus_Mons"})
     assert r.status_code == 200
     assert r.json()["timezone"] == client.get("/api/status").json()["timezone"]
@@ -1190,6 +1195,41 @@ def test_costs_says_whether_a_stored_tariff_is_merely_absent_or_unreadable(clien
     ).json()
     assert body["configured"] is False
     assert body["unreadable"] is False
+
+
+def test_costs_refuses_a_zone_the_tz_database_does_not_know(client: Any) -> None:
+    # A 400 rather than the 500 a bare KeyError out of _request_zone became. The
+    # caller sent a bad zone; telling them the service is broken sends them to
+    # look at the wrong thing. /api/energy and /api/bands already answer this way
+    # and this endpoint is the one whose answer is money, so it belongs with them
+    # rather than with /api/status, which falls back on purpose (#49).
+    r = client.get(
+        "/api/costs",
+        params={
+            "start": "2026-07-15T00:00:00Z",
+            "end": "2026-07-16T00:00:00Z",
+            "tz": "Mars/Olympus_Mons",
+        },
+    )
+    assert r.status_code == 400
+    assert "Mars/Olympus_Mons" in r.json()["detail"]
+
+
+def test_costs_ignores_a_bad_browser_zone_when_the_installation_has_its_own(
+    client: Any,
+) -> None:
+    # The refusal above must not reach an install that has stated its own zone.
+    # resolve_zone does not consult the caller's name at all in that case — not
+    # even to reject it — because the answer is already fully determined, and a
+    # phone carrying a stale zone must not be able to refuse a request the
+    # service can answer perfectly well.
+    client.put("/api/settings", json={"site.timezone": "America/Chicago"})
+    params = {"start": "2026-07-15T00:00:00Z", "end": "2026-07-16T00:00:00Z"}
+    r = client.get("/api/costs", params={**params, "tz": "Mars/Olympus_Mons"})
+    assert r.status_code == 200
+    assert r.json()["timezone"] == "America/Chicago"
+    # And identical to the answer with no zone named at all.
+    assert r.json()["timezone"] == client.get("/api/costs", params=params).json()["timezone"]
 
 
 def test_a_malformed_tariff_is_refused_when_it_is_saved(client: Any) -> None:

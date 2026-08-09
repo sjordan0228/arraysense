@@ -7,6 +7,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.4 — 8 August 2026
+
+### Fixed
+
+- **An unknown timezone asked of `/api/costs` is refused, not answered with a
+  server error** ([#49](https://github.com/sjordan0228/arraysense/issues/49)).
+  Asking for costs in a zone the tz database does not know raised out of the
+  endpoint and became a 500, telling a caller who sent a bad zone that the
+  service is broken and sending them to look at the wrong thing. It now answers
+  400 with the zone named, which is what `/api/energy` and `/api/bands` already
+  do.
+
+  `/api/status` still falls back instead of refusing, and the difference is what
+  each answer is for: the banner only says whether the screen is current, which
+  is worth answering in some nearby zone rather than withholding over a browser's
+  stale name, while a month's cost is cut at a midnight and one cut in the wrong
+  place looks entirely normal.
+
+  An installation that has set its own timezone was never affected and still is
+  not — where a zone is configured, the caller's is not consulted at all, not
+  even to reject it, so a phone carrying a stale zone cannot refuse a request the
+  service can answer perfectly well.
+
 ## 0.6.3 — 8 August 2026
 
 ### Fixed
