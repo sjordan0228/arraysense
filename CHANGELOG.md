@@ -7,6 +7,31 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.8 — 9 August 2026
+
+### Fixed
+
+- **A bug in our own decoding was being filed as an inverter outage**
+  ([#42](https://github.com/sjordan0228/arraysense/issues/42)). The collector
+  recognised "the driver could not turn this reply into a sample" by catching
+  `ValueError`. That is what a sample raises when it refuses malformed data — and
+  also what `int("")`, `float(None)`, an unpack of the wrong length and a failed
+  date parse raise. Any of those, anywhere in a driver's read, was recorded as a
+  gap and retried with backoff forever, looking exactly like an inverter that had
+  stopped answering.
+
+  Refusals now raise a `SampleBuildError` the driver puts on them, and only that
+  is caught. A bare `ValueError` reaches the poll loop, is logged with its
+  traceback, and stops the collector so the watchdog and systemd can see it —
+  which is what should have happened all along.
+
+  Two statements softened in 0.5.4 because the code could not support them have
+  been settled rather than left hedged. One was removed as still untrue: a
+  refused reply is deterministic for *that* reply, but a later reply may be fine,
+  so the fault is not permanent and the page no longer implies it is.
+
+  Nothing about an installation's data changes and no migration is needed.
+
 ## 0.6.7 — 9 August 2026
 
 ### Fixed
@@ -349,11 +374,7 @@ migration says so at the top of its entry.
   to show where the history stopped. Such a reading is now recorded as a gap
   carrying its reason and backed off from, exactly as an unreachable inverter is,
   and the status page names it as a condition of its own instead of borrowing the
-  name of an unreachable inverter or a failing disk. One limitation is worth
-  knowing: the reading is recognised by the `ValueError` a sample raises when it
-  refuses what the driver assembled, which is broader than it ought to be, so a
-  `ValueError` from an unrelated mistake in our own code is recorded the same way
-  rather than surfacing. A dedicated decode error is the next step.
+  name of an unreachable inverter or a failing disk.
 
 - **The dongle was not released when the poll loop died.** Stopping the service
   re-raised the dead loop's error before it reached the disconnect, so the
