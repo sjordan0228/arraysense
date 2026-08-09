@@ -679,7 +679,18 @@ async def costs(
     # The installation's zone decides which wall-clock hours a band covers, and
     # ``tz`` only speaks for the browser. This is the endpoint where getting it
     # wrong is a mispriced day rather than a shifted chart.
-    zone = _request_zone(store, tz)
+    #
+    # So an unknown zone is refused, as ``/api/energy`` and ``/api/bands`` refuse
+    # it, rather than fallen back on the way ``/api/status`` deliberately does.
+    # A status banner cut on the wrong calendar is cosmetic; a month's cost is
+    # not, and one cut on a zone the caller did not ask for is wrong in a way
+    # nothing on the page reveals. Reaching here at all takes an install with no
+    # zone configured — where one is set, ``resolve_zone`` never consults the
+    # caller's name, not even to reject it (#49).
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if tariff is None:
         # Two different situations, and conflating them tells somebody staring
