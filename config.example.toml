@@ -26,3 +26,21 @@ driver = "eg4_luxpower"
 
 # Where the database is written. Prefer an SSD over a Pi's SD card.
 database_path = "/var/lib/arraysense/arraysense.db"
+
+# How to reach the inverter: 'dongle' (default) for the WiFi dongle's
+# TCP port, or 'modbus_serial' for a USB-to-RS485 adapter. When set to
+# 'modbus_serial', serial_device must also be set.
+transport = "dongle"
+
+# Device path for the USB-to-RS485 adapter. Only used when transport
+# is 'modbus_serial'. Nothing expands a glob here, so give a real path:
+# '/dev/ttyUSB0', or better a stable one that survives replugging, such
+# as '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0' or a udev symlink.
+serial_device = ""
+
+# Baud rate for the serial connection. Defaults to 19200, which is the
+# standard for EG4/LuxPower inverters.
+serial_baud = 19200
+
+# Modbus unit ID for the serial connection. Defaults to 1.
+serial_unit_id = 1

@@ -113,6 +113,74 @@ def test_a_wrong_typed_port_is_also_a_value_error(tmp_path: Path) -> None:
         load(p)
 
 
+def test_transport_defaults_to_dongle(tmp_path: Path) -> None:
+    # An existing installation needs no edit: the default preserves the
+    # existing behaviour byte for byte.
+    p = tmp_path / "c.toml"
+    p.write_text(GOOD)
+    cfg = load(p)
+    assert cfg.transport == "dongle"
+    assert cfg.serial_device == ""
+    assert cfg.serial_baud == 19200
+    assert cfg.serial_unit_id == 1
+
+
+def test_unknown_transport_is_rejected() -> None:
+    with pytest.raises(ValueError, match="transport") as exc_info:
+        Config(
+            dongle_host="h",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            transport="unknown_transport",
+        )
+    assert "dongle" in str(exc_info.value)
+    assert "modbus_serial" in str(exc_info.value)
+
+
+def test_modbus_serial_requires_serial_device() -> None:
+    with pytest.raises(ValueError, match="serial_device") as exc_info:
+        Config(
+            dongle_host="h",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            transport="modbus_serial",
+            serial_device="",
+        )
+    assert "modbus_serial" in str(exc_info.value)
+
+
+def test_modbus_serial_with_device_is_accepted() -> None:
+    cfg = Config(
+        dongle_host="h",
+        dongle_serial="BA12345678",
+        inverter_serial="CE12345678",
+        database_path="/tmp/x.db",
+        transport="modbus_serial",
+        serial_device="/dev/ttyUSB0",
+    )
+    assert cfg.transport == "modbus_serial"
+    assert cfg.serial_device == "/dev/ttyUSB0"
+    assert cfg.serial_baud == 19200
+    assert cfg.serial_unit_id == 1
+
+
+def test_serial_settings_load_from_toml(tmp_path: Path) -> None:
+    p = tmp_path / "c.toml"
+    p.write_text(
+        GOOD + 'transport = "modbus_serial"\n'
+        'serial_device = "/dev/ttyUSB0"\n'
+        "serial_baud = 38400\n"
+        "serial_unit_id = 2\n"
+    )
+    cfg = load(p)
+    assert cfg.transport == "modbus_serial"
+    assert cfg.serial_device == "/dev/ttyUSB0"
+    assert cfg.serial_baud == 38400
+    assert cfg.serial_unit_id == 2
+
+
 def test_the_shipped_example_matches_its_generator() -> None:
     # config.example.toml is generated, and the two drifted apart once already
     # when the poll interval changed. A shipped example that disagrees with the
@@ -159,3 +227,66 @@ def test_an_empty_stored_value_does_not_blank_the_file_setting(tmp_path: Path) -
     merged = effective(load(p), settings)
     assert merged.dongle_serial == load(p).dongle_serial
     store.close()
+
+
+def test_a_serial_installation_needs_no_dongle_settings() -> None:
+    # The point of a transport choice. Demanding a placeholder host and dongle
+    # serial from a machine wired to RS485 would make the choice a fiction, and
+    # a placeholder in a required field is a value nobody can tell from a real
+    # one later.
+    config = Config(
+        dongle_host="",
+        dongle_serial="",
+        inverter_serial="CE12345678",
+        database_path="/tmp/x.db",
+        transport="modbus_serial",
+        serial_device="/dev/rs485",
+    )
+    assert config.transport == "modbus_serial"
+
+
+def test_a_dongle_installation_still_needs_its_dongle_settings() -> None:
+    # The other half: relaxing the requirement per transport must not relax it
+    # for the transport that has always needed them.
+    with pytest.raises(ValueError, match="dongle_host must be set"):
+        Config(
+            dongle_host="",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+        )
+
+
+def test_the_broadcast_address_is_refused() -> None:
+    # Unit 0 is the Modbus broadcast address: write-only by specification, and
+    # it never answers a read. A collector pointed at it would poll a silent
+    # bus forever while reporting itself configured.
+    with pytest.raises(ValueError, match="serial_unit_id must be between 1 and 247"):
+        Config(
+            dongle_host="",
+            dongle_serial="",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            transport="modbus_serial",
+            serial_device="/dev/rs485",
+            serial_unit_id=0,
+        )
+
+
+def test_a_nonsense_baud_rate_is_refused() -> None:
+    with pytest.raises(ValueError, match="serial_baud must be positive"):
+        Config(
+            dongle_host="",
+            dongle_serial="",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            transport="modbus_serial",
+            serial_device="/dev/rs485",
+            serial_baud=-1,
+        )
+
+
+def test_the_example_config_names_a_path_that_can_actually_be_opened() -> None:
+    # Nothing here expands a glob, so a starred example is a path that fails to
+    # open with a message about a missing file rather than about a wildcard.
+    assert "usbserial-*" not in example_toml()

@@ -100,12 +100,18 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # which the values are the ones the collector will actually use. Logging
     # the file's values before the merge would print a startup line that
     # disagrees with what the service then does.
+    # Name the endpoint that will actually be used. Printing a dongle host and
+    # port on a serial installation would be a startup line that disagrees with
+    # what the service then does, which is the thing this log exists to avoid.
+    if config.transport == "modbus_serial":
+        endpoint = f"{config.serial_device} unit {config.serial_unit_id}"
+    else:
+        endpoint = f"{config.dongle_host}:{config.dongle_port}"
     logger.info(
-        "arraysense %s — inverter %s via %s:%d using the %s driver, every %.0fs, database %s",
+        "arraysense %s — inverter %s via %s using the %s driver, every %.0fs, database %s",
         __version__,
         config.inverter_serial,
-        config.dongle_host,
-        config.dongle_port,
+        endpoint,
         config.driver,
         config.poll_interval,
         config.database_path,
@@ -128,8 +134,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             watchdog.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watchdog
-            # Release the dongle's single slot before the process goes away,
-            # or the next start — and the vendor's app — find it occupied.
+            # Release the inverter's single client slot before the process
+            # goes away, or the next start finds it occupied — the dongle's one
+            # TCP slot, which the vendor's app also wants, or the serial port,
+            # which is opened exclusively.
             await service.stop()
             store.close()
 

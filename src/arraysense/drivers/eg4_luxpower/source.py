@@ -54,12 +54,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from pylxpweb.transports.exceptions import TransportError, TransportResponseMismatchError
-from pylxpweb.transports.factory import create_dongle_transport
+from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
+from pylxpweb.transports.modbus_serial import ModbusSerialTransport
 
 from arraysense.config import Config
 from arraysense.drivers.base import (
     Capabilities,
     DeviceIdentity,
+    DeviceIdentityError,
     EnergyReporting,
     SampleBuildError,
     expand_module_metrics,
@@ -88,6 +90,16 @@ NAME = "eg4_luxpower"
 # trip: read_runtime and read_energy go through a group reader that catches
 # every failure and re-raises a plain TransportReadError carrying the original
 # only as text and as __cause__.
+# The inverter's serial lives in five input registers holding ten ASCII
+# characters — pylxpweb's own SERIAL_NUMBER_REGISTER_COUNT and the width it
+# decodes to. Anything else is an answer this cannot identify anybody from: the
+# decoder drops bytes outside printable ASCII and the input path accepts a short
+# register list without complaint, so a wrong length may be a reply cut short or
+# a reply that arrived whole and decoded to nonsense. Either way it says nothing
+# about who answered, which is why it is a gap to retry rather than the mismatch
+# that stops the service.
+_SERIAL_REGISTER_WIDTH = 10
+
 _MISROUTED = "misrouted"
 
 # Inverter-level readings, as (metric name, library attribute).
@@ -416,6 +428,7 @@ CAPABILITIES = Capabilities(
     split_phase=True,
     parallel_capable=True,
     per_module_battery=True,
+    transport="dongle",
 )
 
 
@@ -933,10 +946,12 @@ class _Transport(Protocol):
 
 
 class Eg4LuxPowerSource:
-    """An InverterSource backed by pylxpweb's WiFi dongle transport.
+    """An InverterSource backed by one of pylxpweb's local transports.
 
-    Holds the dongle's single TCP client slot for as long as it is connected,
-    so exactly one of these may exist per inverter. All the interesting work is
+    Which one is a configuration choice: the WiFi dongle's TCP port, or a
+    USB-to-RS485 adapter. Either way exactly one of these may exist per
+    inverter — the dongle has a single client slot, and a serial port accepts
+    a single client too. All the interesting work is
     in ``to_sample``; this class exists to own the socket and to
     translate the library's failures into the ConnectionError the polling
     service expects.
@@ -955,21 +970,47 @@ class Eg4LuxPowerSource:
         records the gap and tries again rather than queueing reads behind a
         wedged socket.
 
-        Handing in a transport skips dialling the configured dongle entirely,
-        which is how a test drives this without hardware and how the wired
-        RS485 path will arrive later. Production leaves it None.
+        Handing in a transport skips building one from the configuration
+        entirely, which is how a test drives this without hardware. Production
+        leaves it None and lets ``transport`` in the config choose between the
+        dongle and a serial adapter.
+
+        One consequence worth knowing: an injected transport is not identified.
+        ``_confirm_identity`` only checks what this class built itself, so a
+        caller handing in a serial transport is vouching for which inverter is
+        on the other end.
         """
         self._config = config
         self._energy_interval = timedelta(seconds=energy_interval)
         self._energy: dict[str, float] = {}
         self._energy_at: datetime | None = None
-        self._transport: _Transport = transport or create_dongle_transport(
-            host=config.dongle_host,
-            dongle_serial=config.dongle_serial,
-            inverter_serial=config.inverter_serial,
-            port=config.dongle_port,
-            timeout=config.poll_interval,
-        )
+        self._serial: ModbusSerialTransport | None = None
+        self._identity_verified = False
+        # Choose the transport factory based on config.transport. An explicitly
+        # injected transport argument still wins over the config, as the tests
+        # depend on it.
+        if transport is not None:
+            self._transport = transport
+        elif config.transport == "modbus_serial":
+            # Kept as its own attribute as well as the transport: confirming the
+            # inverter's identity needs a method the transport Protocol does not
+            # declare, and an injected transport is a caller's own business.
+            self._serial = create_serial_transport(
+                port=config.serial_device,
+                serial=config.inverter_serial,
+                baudrate=config.serial_baud,
+                unit_id=config.serial_unit_id,
+                timeout=config.poll_interval,
+            )
+            self._transport = self._serial
+        else:
+            self._transport = create_dongle_transport(
+                host=config.dongle_host,
+                dongle_serial=config.dongle_serial,
+                inverter_serial=config.inverter_serial,
+                port=config.dongle_port,
+                timeout=config.poll_interval,
+            )
         # How many times a crossed reply was retried. Counted rather than only
         # logged, because a retry that succeeds logs at DEBUG and the service
         # runs at INFO, so the healthy and failing cases look identical from
@@ -980,13 +1021,14 @@ class Eg4LuxPowerSource:
     def device(self) -> str:
         """The configured inverter serial, which is what stored rows are filed under.
 
-        Not read off the wire, though the wire could answer: the transport has
-        a ``read_serial_number()`` and holding register 112 carries the system
-        type, and the collector reads no holding registers at all today.
-        Trusting the configured value is safe here for a reason particular to
-        this transport — it authenticates every read with that serial, so a
-        wrong one fails the read rather than filing this inverter's data under
-        another unit's identity.
+        How the configured value earns that trust depends on the transport.
+        The dongle authenticates every read with the serial, so a wrong one
+        fails the read rather than misfiling data, and nothing more is needed.
+        A Modbus request has no such notion — it selects a unit by address and
+        whichever inverter holds that address answers — so on the serial
+        transport the driver reads the serial off the wire once, before it takes
+        any reading, and refuses to collect if it disagrees. What that does and
+        does not promise is set out in ``_confirm_identity``.
         """
         return self._config.inverter_serial
 
@@ -1007,16 +1049,33 @@ class Eg4LuxPowerSource:
 
     @property
     def capabilities(self) -> Capabilities:
-        """What this family can do — the module-level declaration, not a copy.
+        """What this family can do, and how this installation is actually reached.
 
-        The same object the registry entry carries, so a caller reading it off
-        a built source and one reading it off the entry cannot be told two
-        different things.
+        Everything but the transport is the family's declaration and is shared
+        with the registry entry, so a caller reading it off a built source and
+        one reading it off the entry cannot be told two different things about
+        what the hardware can do.
+
+        The transport is the exception, because it is not a property of the
+        family at all — the same inverter is reached by a dongle at one
+        installation and a serial adapter at the next. The registry entry can
+        only carry the default; a built source knows which was configured, and a
+        page telling somebody they are connected by dongle over a serial link
+        would be worse than telling them nothing.
         """
-        return CAPABILITIES
+        return replace(CAPABILITIES, transport=self._config.transport)
 
     async def connect(self) -> None:
-        """Claim the inverter's single client slot.
+        """Claim the inverter's single client slot, if it is not already held.
+
+        The collector calls this before every poll. On the dongle that is
+        harmless, but a serial port is opened *exclusively* and the library
+        builds a fresh client on every connect without closing the last one, so
+        forwarding each call locks the port against ourselves. Measured on the
+        reference adapter: the first poll returned 90 readings and every poll
+        after it failed with "Could not exclusively lock port ... Resource
+        temporarily unavailable". Connecting only when not already connected is
+        what makes a serial installation able to poll more than once.
 
         Failing here is routine rather than exceptional: the dongle may be
         unreachable, or something else — the vendor's app, a second copy of
@@ -1024,16 +1083,113 @@ class Eg4LuxPowerSource:
         library's TransportError becomes the ConnectionError the polling
         service knows to record as a gap and back off from.
         """
+        # Only the physical open is skipped. The identity check below still
+        # runs: skipping it here meant a connection whose check had failed
+        # stayed open, and the next poll returned early and went straight to
+        # reading, storing rows under a serial nothing had confirmed.
+        if self._serial is None or not self._serial.is_connected:
+            try:
+                await self._transport.connect()
+            except (TransportError, OSError) as exc:
+                # Name the endpoint configured, not always the dongle.
+                if self._config.transport == "modbus_serial":
+                    endpoint = self._config.serial_device
+                else:
+                    endpoint = f"{self._config.dongle_host}:{self._config.dongle_port}"
+                raise ConnectionError(f"cannot reach inverter at {endpoint}: {exc}") from exc
+        await self._confirm_identity()
+
+    async def _confirm_identity(self) -> None:
+        """Check the inverter on a serial bus is the one the settings name.
+
+        Only for the serial transport. A Modbus request selects a unit by
+        address, so nothing about the reply says which machine sent it — while
+        the dongle refuses a reply whose serial does not match, making this
+        unnecessary there. Without the check a mistyped address or a second
+        inverter on the bus files its readings under this one's name, and every
+        row looks perfectly ordinary afterwards.
+
+        Asked until it is answered, then never again. In practice that is the
+        first connect; a check that cannot complete leaves the question open and
+        a later connect asks it once more, so a bus that is slow to wake does
+        not permanently skip verification. Once an answer agrees, nothing asks
+        again for the life of the process. That bound is forced by the library
+        rather than chosen for economy. The serial lives in its own registers — the runtime
+        read carries no serial at all, so there is no free answer — and *any*
+        successful register read sets pylxpweb's consecutive-error count back to
+        zero. That count is the sole trigger for its own reconnect, so a probe
+        anywhere in the poll loop wipes out the evidence of the previous poll's
+        failure on every pass: a bus gone deaf to the runtime or battery
+        registers would never reach the threshold that repairs it. Every
+        placement inside the loop trades a silent misattribution for a silent
+        outage.
+
+        What this therefore catches is a misconfiguration — a mistyped serial,
+        or an address pointing at the wrong unit — and it catches it before a
+        single row is written. What it does not catch is somebody rewiring the
+        bus to a different inverter while the service keeps running, because
+        pylxpweb reconnects itself after consecutive errors and pymodbus reopens
+        the port beneath it, and neither tells this object. That is a real gap
+        and it is stated rather than papered over.
+
+        A failure to ask is a transport problem and becomes a gap; an answer
+        that disagrees is a misconfiguration and stops the loop, because it
+        cannot come right on its own and every poll it survives adds another row
+        to the wrong history. Neither outcome depends on the connection being
+        torn down: ``connect`` skips only the physical open when the port is
+        already held, and still asks this question every time, so an unanswered
+        one stays unanswered until it is answered.
+        """
+        if self._identity_verified:
+            return
+        if self._serial is None:
+            return
         try:
-            await self._transport.connect()
+            answered = await self._serial.read_serial_number()
         except (TransportError, OSError) as exc:
+            raise ConnectionError(f"could not read the inverter's serial: {exc}") from exc
+
+        expected = self._config.inverter_serial
+        # Judged against the protocol's width, not against the configured
+        # value. Measuring against the setting would let an eight character typo
+        # match a shorter answer and call it agreement. What a wrong width means
+        # is deliberately left open — see _SERIAL_REGISTER_WIDTH — because the
+        # decoder cannot tell a truncated reply from a whole one carrying a byte
+        # it dropped. Neither identifies anybody, and that is all this needs.
+        #
+        # A wrong width is treated as a gap because it accuses nobody, not
+        # because it is known to pass. A reply carrying a byte the decoder drops
+        # would come back short every time, and the collector would go on
+        # retrying it — visibly, in the gap rows, rather than by filing readings
+        # under a serial nothing confirmed.
+        #
+        # Reading the value rather than asking the library for a yes or no is
+        # what separates the two failures: a short answer is a passing condition
+        # and becomes a gap, a complete but different one cannot come right on
+        # its own and must stop the loop. Treating them alike would restart the
+        # service forever over one truncated reply.
+        if len(answered) != _SERIAL_REGISTER_WIDTH:
             raise ConnectionError(
-                f"cannot reach inverter at {self._config.dongle_host}:"
-                f"{self._config.dongle_port}: {exc}"
-            ) from exc
+                f"the inverter's serial came back incomplete ({answered!r}); "
+                "cannot confirm which unit answered"
+            )
+        if answered != expected:
+            raise DeviceIdentityError(
+                f"the inverter at {self._config.serial_device} unit "
+                f"{self._config.serial_unit_id} is not {expected}; "
+                "refusing to file its readings under that serial"
+            )
+        self._identity_verified = True
 
     async def disconnect(self) -> None:
-        """Release the connection and the client slot it holds."""
+        """Release the connection and the client slot it holds.
+
+        The identity answer deliberately survives this. It is a statement about
+        the configuration having matched the hardware at startup, not about the
+        connection being continuously the same one — see ``_confirm_identity``
+        for why the library makes the stronger claim impossible to keep
+        honestly, and what that leaves uncovered.
+        """
         await self._transport.disconnect()
 
     @property
