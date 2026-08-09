@@ -40,6 +40,34 @@ if TYPE_CHECKING:
     from arraysense.config import Config
     from arraysense.models import Sample
 
+
+class DeviceIdentityError(Exception):
+    """The inverter that answered is not the one this installation configured.
+
+    Readings are filed under the configured serial, so if the wire reaches a
+    different unit than the settings claim, perfectly valid readings land in
+    another inverter's history — and nothing downstream can tell, because every
+    row looks exactly as it should. Refusing to collect is recoverable; a
+    history silently merged from two machines is not.
+
+    Deliberately outside every error tuple the collector catches. This is a
+    misconfiguration that cannot heal itself, so it must stop the loop where a
+    watchdog and an operator can see it, rather than be filed as a gap and
+    retried politely forever.
+    """
+
+
+class SampleBuildError(Exception):
+    """The inverter answered and the reply could not be made into a sample.
+
+    ValueError is raised both by our own decoding mistakes and by a sample
+    constructor refusing malformed data; the driver wraps the latter so the
+    collector can record a driver-initiated gap rather than killing the loop.
+    This exception marks that boundary: a SampleBuildError is a rejected reply,
+    not a transport failure, and is treated as a gap with backoff.
+    """
+
+
 # A metric belonging to one numbered PV string, as in ``pv2_voltage_v``. The
 # number is what makes a declaration checkable against the string count.
 _STRING_METRIC = re.compile(r"^pv([1-9])_")
@@ -155,6 +183,13 @@ class Capabilities:
     # Whether the device reports each battery module separately, or only a
     # bank-level summary. Per-pack drift is invisible in the summary.
     per_module_battery: bool = False
+    # How the driver reaches the inverter: "dongle" for the WiFi dongle's TCP
+    # port, "modbus_serial" for a USB-to-RS485 adapter. This is a constant for
+    # a given installation. The registry entry carries the family default; a
+    # built source reports what its own configuration actually chose, because a
+    # page saying "connected by dongle" over a serial link would be worse than
+    # saying nothing at all.
+    transport: str = "dongle"
 
     def __post_init__(self) -> None:
         """Reject a declaration that contradicts itself or the metric registry.
@@ -235,22 +270,28 @@ class InverterSource(Protocol):
         says, so two sources polling two inverters into one store keep their
         readings apart without either of them coordinating.
 
-        It is not read off the wire today, and not for want of a way to: the
-        transport's ``read_serial_number()`` reads input registers 115 to 119,
-        which is the same kind of read every poll already makes — see
-        docs/pylxpweb-inventory.md. Nothing calls it, so the configured serial
-        is the identity for now.
+        How the configured value earns that trust depends on the transport,
+        and the difference matters. The dongle authenticates with it: the
+        inverter serial on every reply is compared against the configured one
+        and a reply carrying a different one is refused, so a wrong serial
+        fails the read rather than misfiling data.
 
-        Trusting the configured value is defensible because the dongle
-        transport authenticates with it: the inverter serial on every reply is
-        compared against the configured one and a reply carrying a different
-        one is refused. A wrong serial fails the read rather than filing this
-        inverter's data under another unit's identity.
+        Modbus offers nothing equivalent. A request selects a unit by its
+        address alone, and whichever inverter answers that address answers,
+        whatever its serial. A driver on that transport has to read the serial
+        off the wire and check it — ``read_serial_number()`` on the transport
+        does exactly that, from input registers 115 to 119 — or the same wrong
+        setting quietly files one machine's readings under another's name.
         """
         ...
 
     async def connect(self) -> None:
-        """Establish the connection, claiming the dongle's single client slot."""
+        """Establish the connection, claiming whatever single slot it needs.
+
+        Every local transport this covers admits one client at a time — the
+        dongle has a single TCP slot and a serial port is opened exclusively —
+        so an implementation may be claiming either.
+        """
         ...
 
     async def disconnect(self) -> None:
@@ -309,8 +350,16 @@ class DriverEntry:
     Capabilities sit on the entry as well as on the built source so that a
     caller can ask what a driver supports without dialling an inverter — the
     dongle admits one client, so constructing a source to read a leaflet would
-    be a real cost. Both hand back the same object; a driver that computed them
-    twice could disagree with itself.
+    be a real cost. A driver that computed them twice could disagree with
+    itself, so what a source reports is the entry's declaration and not a second
+    opinion about the hardware.
+
+    One field is necessarily an exception. ``transport`` is not a property of
+    the family — the same inverter is reached by a dongle at one installation
+    and a serial adapter at the next — so a built source answers with the one
+    its own configuration chose, and the entry can only carry the default. That
+    is the single field on which the two may differ, and they differ about the
+    installation rather than about the device.
 
     ``build`` takes the whole Config rather than a bag of connection settings.
     Which of them a driver needs is the driver's business: the dongle host and

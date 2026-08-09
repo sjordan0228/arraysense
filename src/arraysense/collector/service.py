@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from arraysense.collector.source import InverterSource
+from arraysense.drivers.base import SampleBuildError
 from arraysense.models import Sample
 from arraysense.store.rollup import (
     rebuild_inverter_hourly,
@@ -92,18 +93,24 @@ TRANSPORT_ERRORS = (ConnectionError, OSError, TimeoutError, asyncio.TimeoutError
 STORE_ERRORS = (sqlite3.Error,)
 
 # Errors that mean "the driver could not turn what the inverter returned into a
-# sample". The driver builds Sample and BatteryModuleSample objects, and their
-# validation raises ValueError on a malformed one — a slot the model refuses, a
-# naive timestamp, an empty serial, a failed poll that also carries readings.
-# Such a failure is deterministic: it will repeat identically on every poll, so
-# retrying cannot fix it, but stopping the loop is worse — the web server keeps
-# serving over a collector that has died, with no gap row written and no process
-# exit for the watchdog to see. It is therefore recorded as a gap and backed off
-# from, exactly as an unreachable inverter is. ValueError is deliberately narrow
-# and separate from TRANSPORT_ERRORS: a genuine programming error in our own
-# code — an AttributeError or TypeError — still surfaces rather than being
-# mislabelled as an outage.
-BUILD_ERRORS = (ValueError,)
+# sample". A driver raises SampleBuildError when a model refuses what it
+# assembled from a reply; the models themselves raise ValueError, and wrapping is
+# the driver's job. Only the wrapped form is caught here, so a bare ValueError —
+# a bug in our own code — surfaces instead of being filed as an outage.
+#
+# Worth knowing before relying on it: on the EG4 path both wrap sites are
+# currently defensive rather than exercised: that driver validates the poll
+# timestamp before it builds anything, drops unidentifiable module records
+# before construction, and is fed module indices that cannot be out of range,
+# so no real reply reaches either constructor's validation. The boundary exists
+# for drivers that can hit it, and for the day that one can.
+#
+# Recording it as a gap rather than stopping is deliberate. The failure repeats
+# for that reply, but a later reply may be fine, so this is not a permanent
+# condition. Stopping the loop is worse either way: it kills the task while
+# uvicorn keeps serving, the watchdog only fires on a stalled loop, systemd sees
+# no process exit, and no gap row is written, so the outage leaves no trace.
+BUILD_ERRORS = (SampleBuildError,)
 
 # How many times the backoff may double before the cap is certain to have been
 # reached. 2**40 seconds is longer than the age of the universe in any interval
@@ -355,8 +362,9 @@ class CollectorService:
         except TRANSPORT_ERRORS as exc:
             return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
         except BUILD_ERRORS as exc:
-            # A sample the driver could not build is deterministic — it will
-            # fail identically on every poll, so retrying cannot fix it — but
+            # A sample the driver could not build is deterministic for that
+            # reply — the same bytes refuse again — but a later reply may be
+            # fine, so this is not a permanent condition. Either way
             # the loop must survive it and the history must show the hole,
             # exactly as for an unreachable inverter. BUILD_ERRORS is scoped to
             # read() rather than covering connect(), so a genuine bug in our own

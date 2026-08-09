@@ -520,13 +520,6 @@ SETTINGS: tuple[SettingSpec, ...] = (
 
 _BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTINGS}
 
-SETTINGS_DDL = """
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT NOT NULL PRIMARY KEY,
-    value TEXT NOT NULL
-) STRICT, WITHOUT ROWID
-"""
-
 
 def lookup_setting(key: str) -> SettingSpec:
     """Return the spec for ``key``, raising KeyError if nothing is registered under it.
@@ -550,7 +543,12 @@ class SettingsStore:
     """
 
     def __init__(self, store: SqliteStore) -> None:
-        """Attach to an open store and make sure the settings table exists.
+        """Attach to an open store.
+
+        ``SqliteStore`` creates the settings table with the rest of the schema
+        before request handling begins. This constructor must stay read-only:
+        API routes construct it on the event-loop thread, and even idempotent
+        schema DDL is a lock-taking operation that does not belong in a read.
 
         Takes the store rather than a raw connection so settings share its
         transaction and its lifetime: a settings write and a reading write in
@@ -558,8 +556,6 @@ class SettingsStore:
         was reading from.
         """
         self._conn: sqlite3.Connection = store._conn
-        self._conn.execute(SETTINGS_DDL)
-        self._conn.commit()
 
     def get(self, key: str) -> object:
         """Return the stored value for ``key``, or its registered default.

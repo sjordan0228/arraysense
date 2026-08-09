@@ -72,6 +72,77 @@ def test_wal_journaling_is_enabled(tmp_path: Path) -> None:
     assert mode == "wal"
 
 
+def test_primary_connection_explicitly_restores_full_synchronous(tmp_path: Path) -> None:
+    """Raw durability must not depend on SQLite's compile-time default."""
+    store = SqliteStore(str(tmp_path / "store.db"), device=TEST_DEVICE)
+    store._conn.execute("PRAGMA synchronous = NORMAL")
+
+    store._apply_connection_pragmas(store._conn, establish_wal=True)
+    synchronous = store._conn.execute("PRAGMA synchronous").fetchone()
+    store.close()
+
+    assert synchronous == (2,)  # FULL
+
+
+def test_maintenance_connection_does_not_renegotiate_persistent_wal_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The primary connection establishes WAL once at startup and SQLite keeps
+    # that mode in the database. Reissuing PRAGMA journal_mode=WAL when every
+    # maintenance connection opens is a lock-taking operation on the exact
+    # sixty-second cadence being investigated, and the builder timings begin
+    # after it, so it is both unnecessary and excluded from those measurements.
+    store = SqliteStore(str(tmp_path / "store.db"), device=TEST_DEVICE)
+    real_connect = sqlite3.connect
+    statements: list[str] = []
+
+    class RecordingConnection:
+        def __init__(self, path: str, check_same_thread: bool = True) -> None:
+            self._conn: sqlite3.Connection = real_connect(path, check_same_thread=check_same_thread)
+
+        def execute(self, sql: str) -> sqlite3.Cursor:
+            statements.append(sql)
+            cursor: sqlite3.Cursor = self._conn.execute(sql)
+            return cursor
+
+        def close(self) -> None:
+            self._conn.close()
+
+    monkeypatch.setattr(sqlite3, "connect", RecordingConnection)
+    maintenance = store.maintenance_connection()
+    maintenance.close()
+    store.close()
+
+    assert not any("JOURNAL_MODE" in statement.upper() for statement in statements)
+
+
+def test_maintenance_connection_inherits_wal_mode_established_at_startup(tmp_path: Path) -> None:
+    # WAL is database state, not a per-connection option. Skipping the setter on
+    # the once-a-minute connection must still leave that connection using WAL.
+    store = SqliteStore(str(tmp_path / "store.db"), device=TEST_DEVICE)
+    maintenance = store.maintenance_connection()
+    mode = maintenance.execute("PRAGMA journal_mode").fetchone()
+    maintenance.close()
+    store.close()
+
+    assert mode is not None and mode[0] == "wal"
+
+
+def test_maintenance_connection_keeps_per_connection_safety_pragmas(tmp_path: Path) -> None:
+    """Every maintenance connection keeps integrity and contention safeguards."""
+    store = SqliteStore(str(tmp_path / "store.db"), device=TEST_DEVICE)
+    maintenance = store.maintenance_connection()
+    maintenance_pragmas = {
+        "foreign_keys": maintenance.execute("PRAGMA foreign_keys").fetchone(),
+        "busy_timeout": maintenance.execute("PRAGMA busy_timeout").fetchone(),
+    }
+    maintenance.close()
+    store.close()
+
+    assert maintenance_pragmas["foreign_keys"] == (1,)
+    assert maintenance_pragmas["busy_timeout"] == (5000,)
+
+
 def test_appended_reading_is_stored_scaled(tmp_path: Path) -> None:
     # battery_voltage_v has scale 10 — the resolution the register carries:
     # 51.9 V must land on disk as the integer 519, not as a float.

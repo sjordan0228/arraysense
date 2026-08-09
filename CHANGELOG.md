@@ -7,6 +7,114 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.9 — 9 August 2026
+
+### Added
+
+- **An installation can choose how it reaches the inverter**
+  ([#41](https://github.com/sjordan0228/arraysense/issues/41)). Until now the
+  driver dialled the WiFi dongle and nothing else. Newer dongle firmware closes
+  the local TCP port that depends on, and the Ethernet dongle never had it, so
+  somebody buying an inverter today could be unable to run this at all.
+
+  `transport = "modbus_serial"` with a `serial_device` now reaches the inverter
+  over a USB-to-RS485 adapter instead. An installation that sets nothing keeps
+  the dongle and behaves exactly as before, and a serial one is no longer asked
+  for a dongle address it does not have.
+
+  Measured on the reference inverter: a full poll of 90 readings takes about
+  3.6 seconds against the dongle's 12 to 17, and the serial link runs alongside
+  the dongle without either disturbing the other. The transport is
+  latency-limited rather than transfer-limited — a Modbus transaction costs
+  about 250 ms whether it carries one register or thirty-two — so the way to
+  make it faster is fewer, larger reads, not a higher baud rate.
+
+  This adds `pyserial` to the runtime dependencies, the first addition in a long
+  while, because the library's serial transport cannot open a port without it.
+
+### Fixed
+
+- **A serial installation is checked against the inverter it claims.** Readings
+  are filed under the serial in the configuration, and the dongle made that safe
+  by refusing any reply whose serial did not match — a typo produced no data
+  rather than misfiled data. Modbus offers nothing equivalent: a request selects
+  a unit by address, and whichever inverter holds that address answers.
+
+  A serial installation now reads the inverter's own serial before it takes a
+  single reading, and refuses to collect if it disagrees. That refusal stops the
+  service rather than being recorded as a gap, because a mistyped serial cannot
+  come right on its own and every poll it survived would add another row to
+  another machine's history.
+
+  Checked once, at startup. Doing it per poll would have been better and is not
+  possible: any successful register read resets the counter the library uses to
+  decide a dead bus needs reconnecting, so a repeated check would have quietly
+  disabled its own recovery. What that leaves uncovered — rewiring the bus to a
+  different inverter without restarting — is written down beside the check
+  rather than left to be discovered.
+
+## 0.6.8 — 9 August 2026
+
+### Fixed
+
+- **A bug in our own decoding was being filed as an inverter outage**
+  ([#42](https://github.com/sjordan0228/arraysense/issues/42)). The collector
+  recognised "the driver could not turn this reply into a sample" by catching
+  `ValueError`. That is what a sample raises when it refuses malformed data — and
+  also what `int("")`, `float(None)`, an unpack of the wrong length and a failed
+  date parse raise. Any of those, anywhere in a driver's read, was recorded as a
+  gap and retried with backoff forever, looking exactly like an inverter that had
+  stopped answering.
+
+  Refusals now raise a `SampleBuildError` the driver puts on them, and only that
+  is caught. A bare `ValueError` reaches the poll loop, is logged with its
+  traceback, and stops the collector so the watchdog and systemd can see it —
+  which is what should have happened all along.
+
+  Two statements softened in 0.5.4 because the code could not support them have
+  been settled rather than left hedged. One was removed as still untrue: a
+  refused reply is deterministic for *that* reply, but a later reply may be fine,
+  so the fault is not permanent and the page no longer implies it is.
+
+  Nothing about an installation's data changes and no migration is needed.
+
+## 0.6.7 — 9 August 2026
+
+### Fixed
+
+- **A page request could commit the collector's half-written reading.** Every
+  request that needed the installation's timezone — which includes every call to
+  `/api/status` — built a settings reader, and building one executed
+  `CREATE TABLE IF NOT EXISTS settings` and then committed. That commit landed on
+  the connection the collector shares with the web server, and on a SQLite
+  connection a commit is not scoped to whoever issued it: it ends whatever
+  transaction is open. A reading being written at that moment would be committed
+  half-formed by a page doing nothing but asking what time zone to draw in.
+
+  The settings table is now created once at startup with the rest of the schema,
+  and a settings reader only reads. It is the same hazard fixed in 0.6.5 for the
+  rollup pass — one connection, two threads, one transaction between them — found
+  on the request path this time.
+
+  Nothing about an installation's data changes and no migration is needed;
+  existing settings are left exactly as they are.
+
+### Changed
+
+- **The durability of a stored reading no longer depends on how SQLite was
+  built.** Raw samples are the one thing here that cannot be reconstructed, and
+  their `synchronous = FULL` guarantee was inherited from SQLite's compile-time
+  default rather than asked for. Both machines this runs on default to FULL
+  today, so nothing was actually at risk — but a package built with
+  `SQLITE_DEFAULT_SYNCHRONOUS=1` would have quietly weakened it with no test able
+  to notice. It is now set explicitly, and the test forces a connection to the
+  weaker setting first to prove the setting is doing the work.
+
+- **A maintenance connection stops re-declaring WAL journalling.** WAL is
+  persistent state in the database file, established once when the store opens.
+  Asking for it again every sixty seconds set state that was already set, and
+  took locks to do it.
+
 ## 0.6.6 — 9 August 2026
 
 ### Changed
@@ -312,11 +420,7 @@ migration says so at the top of its entry.
   to show where the history stopped. Such a reading is now recorded as a gap
   carrying its reason and backed off from, exactly as an unreachable inverter is,
   and the status page names it as a condition of its own instead of borrowing the
-  name of an unreachable inverter or a failing disk. One limitation is worth
-  knowing: the reading is recognised by the `ValueError` a sample raises when it
-  refuses what the driver assembled, which is broader than it ought to be, so a
-  `ValueError` from an unrelated mistake in our own code is recorded the same way
-  rather than surfacing. A dedicated decode error is the next step.
+  name of an unreachable inverter or a failing disk.
 
 - **The dongle was not released when the poll loop died.** Stopping the service
   re-raised the dead loop's error before it reached the disconnect, so the

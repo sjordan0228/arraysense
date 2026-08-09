@@ -207,7 +207,7 @@ class SqliteStore:
         self.is_memory_backed = _is_memory_path(path)
         self._path = path if self.is_memory_backed else os.path.abspath(path)
         self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._apply_connection_pragmas(self._conn)
+        self._apply_connection_pragmas(self._conn, establish_wal=True)
         self._conn.executescript(schema_ddl(declared))
         existing = {
             table: tuple(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
@@ -236,8 +236,8 @@ class SqliteStore:
         """
         self._conn.close()
 
-    def _apply_connection_pragmas(self, conn: sqlite3.Connection) -> None:
-        """Configure a connection the one way every connection here is configured.
+    def _apply_connection_pragmas(self, conn: sqlite3.Connection, *, establish_wal: bool) -> None:
+        """Apply shared safety settings and establish primary durability.
 
         Foreign keys because the module tables' serial reference is decorative
         until they are on; WAL because it is what makes a commit per sample cheap
@@ -246,13 +246,28 @@ class SqliteStore:
         outright while another is writing — the alternative is an intermittent
         "database is locked" under load.
 
-        This exists so the settings are written once rather than once per
-        connection. A second copy drifts, and the drift that costs most is a
-        maintenance connection opened without the busy timeout: it turns ordinary
-        contention with the collector's own writes into a hard failure.
+        WAL mode is persistent database state, so only the primary connection
+        establishes it at startup. Reissuing ``journal_mode = WAL`` from every
+        maintenance connection is not connection setup: it asks SQLite to set
+        persistent state again, takes locks to do so, and happens on the exact
+        sixty-second cadence maintenance is meant to keep cheap. The temporary
+        connection still needs foreign keys and its busy timeout, which really
+        are per-connection settings.
+
+        The primary connection stores irreplaceable raw samples and explicitly
+        uses FULL. Relying on SQLite's compile-time default would silently weaken
+        that guarantee in a build configured with NORMAL as its default, while a
+        test running against the usual FULL default would never expose it.
+
+        This helper keeps the shared rules together. A second copy drifts, and
+        the drift that costs most is a maintenance connection opened without
+        the busy timeout: it turns ordinary contention with the collector's own
+        writes into a hard failure.
         """
         conn.execute(FOREIGN_KEYS_PRAGMA)
-        conn.execute("PRAGMA journal_mode = WAL")
+        if establish_wal:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = FULL")
         conn.execute("PRAGMA busy_timeout = 5000")
 
     def maintenance_connection(self) -> sqlite3.Connection:
@@ -285,7 +300,7 @@ class SqliteStore:
                 "new empty database each time. Check is_memory_backed and run inline."
             )
         conn = sqlite3.connect(self._path, check_same_thread=False)
-        self._apply_connection_pragmas(conn)
+        self._apply_connection_pragmas(conn, establish_wal=False)
         return conn
 
     def _device(self, device: str | None) -> str:

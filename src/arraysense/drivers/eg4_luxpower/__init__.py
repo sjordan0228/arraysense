@@ -22,7 +22,10 @@ from arraysense.drivers.eg4_luxpower.source import (
 
 DRIVER = DriverEntry(
     name=NAME,
-    description="EG4 and LuxPower hybrid inverters over the WiFi dongle (18kPV, 6000XP, 12kPV)",
+    description=(
+        "EG4 and LuxPower hybrid inverters over the WiFi dongle or a "
+        "USB-to-RS485 adapter (18kPV, 6000XP, 12kPV)"
+    ),
     capabilities=CAPABILITIES,
     build=Eg4LuxPowerSource,
 )
