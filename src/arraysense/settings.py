@@ -516,6 +516,63 @@ SETTINGS: tuple[SettingSpec, ...] = (
         ),
         secret=True,
     ),
+    SettingSpec(
+        key="connection.transport",
+        kind="str",
+        default="",
+        choices=("dongle", "modbus_serial"),
+        label="Connection type",
+        help=(
+            "How the inverter is reached. Empty keeps the config file's "
+            "choice. Applies at the next collector restart."
+        ),
+    ),
+    SettingSpec(
+        key="connection.serial_device",
+        kind="str",
+        default="",
+        label="Serial device",
+        help=(
+            "Device path for the RS485 adapter — a udev symlink or a "
+            "/dev/serial/by-id path survives replugging; /dev/ttyUSB0 may not."
+        ),
+    ),
+    SettingSpec(
+        key="connection.serial_baud",
+        kind="int",
+        default=19200,
+        lower=1,
+        upper=1000000,
+        label="Serial baud rate",
+        help="19200 is the LuxPower convention; change it only if yours differs.",
+    ),
+    SettingSpec(
+        key="connection.serial_unit_id",
+        kind="int",
+        default=1,
+        lower=1,
+        upper=247,
+        label="Modbus unit id",
+        help="Which unit answers on the bus. 0 is broadcast and never answers reads.",
+    ),
+    SettingSpec(
+        key="connection.model",
+        kind="str",
+        default="",
+        label="Inverter model",
+        help="Which model of the chosen family this installation is.",
+    ),
+    SettingSpec(
+        key="connection.battery_source",
+        kind="str",
+        default="",
+        choices=("", "relayed", "none"),
+        label="Battery source",
+        help=(
+            "Where battery data comes from: relayed through the inverter, or "
+            "no communicating battery. Empty derives it from the driver."
+        ),
+    ),
 )
 
 _BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTINGS}

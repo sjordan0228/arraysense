@@ -360,6 +360,11 @@ def test_model_and_battery_source_load_from_the_file(tmp_path: Path) -> None:
 def test_effective_overlays_the_setup_settings(tmp_path: Path) -> None:
     # The wizard writes these; the next boot must read them. Same merge the
     # dongle fields already do, extended to everything setup lets a page change.
+    from arraysense.config import effective
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
     store = SqliteStore(str(tmp_path / "e.db"), device=TEST_DEVICE)
     settings = SettingsStore(store)
     settings.set("connection.transport", "modbus_serial")
