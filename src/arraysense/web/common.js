@@ -1754,9 +1754,14 @@ function mountSetup(host, payload, opts) {
     }).join('');
     const transSel = [['dongle', 'WiFi dongle'], ['modbus_serial', 'RS485 serial']].map(([v, lbl]) =>
       `<option value="${v}"${v === state.transport ? ' selected' : ''}>${lbl}</option>`).join('');
-    const battLabel = { relayed: 'Through the inverter', none: 'No battery data' };
+    const battLabel = {
+      relayed: 'Closed loop (through the inverter)',
+      none: 'None',
+      direct: 'Open loop — coming soon',
+    };
     const battSel = batteries.map((b) =>
-      `<option value="${esc(b)}"${b === state.battery_source ? ' selected' : ''}>${esc(battLabel[b] || b)}</option>`).join('');
+      `<option value="${esc(b)}"${b === state.battery_source ? ' selected' : ''}>${esc(battLabel[b] || b)}</option>`).join('')
+      + '<option value="direct" disabled>' + esc(battLabel.direct) + '</option>';
     const applyLabel = opts.applyLabel || (opts.mode === 'wizard' ? 'Set up and start' : 'Save and restart collector');
 
     host.classList.add('setup');

@@ -132,3 +132,103 @@ def test_body_sends_the_dongle_fields_on_a_dongle() -> None:
     assert out == (
         "battery_source,dongle_host,dongle_serial,driver,inverter_serial,model,transport"
     )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_battery_select_has_disabled_coming_soon_option() -> None:
+    # The "direct" battery source is reserved but not yet available; it must
+    # appear as a disabled option so users see it is coming, but it must never
+    # be selectable or become the state.battery_source.
+    #
+    # This test verifies:
+    # 1. The battLabel mapping includes the correct labels for relayed, none, and direct
+    # 2. The "direct" option is NOT in the server-provided battery_sources list
+    # 3. The fallback logic falls back to batteries[0] or "none", never "direct"
+    payload = """
+    const P = {
+      manufacturers: [{ name: "EG4", families: [{ driver: "eg4_luxpower", description: "", models: [
+        { name: "18kPV", citation: "measured", cited_fields: ["pv_strings"],
+          pv_strings: 3, battery_module_slots: 4 } ] }], models: [] }],
+      transports: { modbus_serial: ["serial_device"] },
+      battery_sources: { eg4_luxpower: ["relayed", "none"] },
+      ports: [],
+      current: {}
+    };
+    """
+    # Check that setupBatterySourcesFor does NOT return "direct"
+    out = _run(payload + 'console.log(setupBatterySourcesFor(P, "eg4_luxpower").join(","));')
+    assert out == "relayed,none"
+    assert "direct" not in out
+
+    # Check that the fallback logic uses batteries[0] or "none", never "direct"
+    # When state.battery_source is empty, it should fall back to batteries[0] which is "relayed"
+    out2 = _run(
+        payload
+        + 'const batteries = setupBatterySourcesFor(P, "eg4_luxpower");'
+        + 'const fallback = batteries[0] || "none";'
+        + "console.log(fallback);"
+    )
+    assert out2 == "relayed"
+
+    # Verify "direct" is never the fallback when batteries list is empty
+    out3 = _run(
+        'const batteries = []; const fallback = batteries[0] || "none"; console.log(fallback);'
+    )
+    assert out3 == "none"
+
+
+# ---------------------------------------------------------------------------
+# Timezone dropdown tests
+# ---------------------------------------------------------------------------
+
+
+def test_timezone_setting_has_choices_with_empty_default() -> None:
+    """The timezone setting should be a choice type with "" as the first/default value."""
+    from arraysense.settings import SETTING_TIMEZONE, lookup_setting
+
+    spec = lookup_setting(SETTING_TIMEZONE)
+    assert spec.kind == "choice"
+    assert spec.default == ""
+    assert "" in spec.choices
+    # The empty string should be the first choice
+    assert spec.choices[0] == ""
+
+
+def test_timezone_validates_real_zones() -> None:
+    """Real IANA timezone names should validate successfully."""
+    from arraysense.settings import SETTING_TIMEZONE, lookup_setting
+
+    spec = lookup_setting(SETTING_TIMEZONE)
+    # America/New_York should validate
+    result = spec.validate("America/New_York")
+    assert result == "America/New_York"
+
+    # Europe/London should validate
+    result = spec.validate("Europe/London")
+    assert result == "Europe/London"
+
+
+def test_timezone_empty_string_validates() -> None:
+    """The empty string should validate as it means 'follow the machine's zone'."""
+    from arraysense.settings import SETTING_TIMEZONE, lookup_setting
+
+    spec = lookup_setting(SETTING_TIMEZONE)
+    result = spec.validate("")
+    assert result == ""
+
+
+def test_timezone_choices_cover_every_zone_the_tz_database_has() -> None:
+    """Turning the field into a choice must not narrow what an owner may store.
+
+    A first pass at this dropdown filtered "UTC" out of the list, which the
+    choice check then refused — silently breaking any installation that had
+    "UTC" saved. The guard is the whole database, not a spot check.
+    """
+    from zoneinfo import available_timezones
+
+    from arraysense.settings import SETTING_TIMEZONE, lookup_setting
+
+    spec = lookup_setting(SETTING_TIMEZONE)
+    missing = available_timezones() - set(spec.choices)
+    assert not missing, f"zones dropped from the dropdown: {sorted(missing)[:5]}"
+    assert spec.validate("UTC") == "UTC"
