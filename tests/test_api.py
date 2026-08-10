@@ -2779,3 +2779,23 @@ def test_a_fresh_weather_row_does_not_mask_a_quiet_inverter(empty_client: Any) -
     body = _staleness(empty_client)
     assert body["stale"] is True, "a sky reading must not count as the inverter reporting"
     assert body["reading_at"] == (now - timedelta(minutes=40)).replace(microsecond=0).isoformat()
+
+
+def test_live_survives_a_weather_row_landing_between_polls(empty_client: Any) -> None:
+    # The caller-level proof, not just the store mechanism: /api/live asks with
+    # _LIVE_INVERTER, and if that list carried the site metrics a weather row
+    # would match on its own two columns and hand the dashboard a row of nulls
+    # for the seconds between a weather tick and the next poll. The store test
+    # proves latest() skips foreign rows for the metrics it is asked; this
+    # proves the live endpoint asks for the right ones.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(seconds=30), readings={"pv_total_power_w": 5000.0})
+    )
+    empty_client.app.state.store.append(
+        Sample(timestamp=now, readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 13.0})
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0, (
+        "a weather row must not blank the live view"
+    )

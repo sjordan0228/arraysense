@@ -114,8 +114,13 @@ _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 # A live view gets everything the inverter reports, not a chosen subset. It is
 # one row from one table either way, so narrowing it would save nothing and
 # would mean editing this file every time a panel wants a reading it does not
-# already have.
-_LIVE_INVERTER = tuple(spec.name for spec in INVERTER_METRICS)
+# already have. Everything the INVERTER reports: the site metrics are excluded,
+# because latest() answers with the newest row carrying any requested column,
+# and a weather row carries its own two — including them handed the dashboard
+# the sky's row, every inverter field null, for the seconds between a weather
+# tick and the next poll. The sky reaches a page through its own request, not
+# by riding this one.
+_LIVE_INVERTER = tuple(spec.name for spec in INVERTER_METRICS if spec.name not in SITE_METRICS)
 
 # How far back to look for the last full charge. Sixty days is twice the most
 # lenient interval any vendor publishes, so a bank that has not charged fully
