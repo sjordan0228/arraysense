@@ -29,7 +29,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+from zoneinfo import available_timezones
 
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
@@ -48,24 +48,6 @@ SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
-
-
-def check_timezone(name: str) -> ZoneInfo:
-    """Resolve an IANA zone name, raising ValueError if the tz database has no such zone.
-
-    Refused where it is typed rather than discovered later by an endpoint that
-    then has to decide what to do about it. Every daily and monthly total in
-    this project is cut at a midnight, and which midnight is exactly what this
-    value chooses; an unusable one stored here would surface as a page that
-    cannot answer at all, far from the box it was typed in.
-    """
-    try:
-        return ZoneInfo(name.strip())
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(
-            f"{name.strip()!r} is not a zone in the tz database — "
-            "use a name like America/New_York, or leave it empty to follow the machine"
-        ) from exc
 
 
 # Deliberately loose. The full grammar of an address admits quoted local parts
