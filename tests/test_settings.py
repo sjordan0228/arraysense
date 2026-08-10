@@ -490,3 +490,24 @@ def test_a_serial_device_that_is_a_url_is_refused() -> None:
         spec.validate("loop://?foo=bar")
     # A real device path is still accepted.
     assert spec.validate("/dev/serial/by-id/usb-1a86") == "/dev/serial/by-id/usb-1a86"
+
+
+def test_the_panel_strings_setting_parses_at_the_door() -> None:
+    # One grammar, one parser: the registry refuses exactly what panels.py
+    # cannot read, so a stored config is always a readable one.
+    spec = lookup_setting("panels.strings")
+    assert spec.kind == "str"
+    assert spec.multiline is True
+    assert spec.default == ""
+    spec.validate("East | 1 | 9 | 410 | 25 | 90")
+    with pytest.raises(ValueError, match="tilt"):
+        spec.validate("East | 1 | 9 | 410 | 95 | 90")
+
+
+def test_the_battery_group_is_registered_with_the_measured_default() -> None:
+    rt = lookup_setting("battery.round_trip_pct")
+    assert rt.default == 91.4  # the owner's measured round trip, not a datasheet
+    assert lookup_setting("battery.chemistry").choices == ("lifepo4", "other")
+    heater = lookup_setting("battery.heater_w")
+    assert heater.default == 0.0
+    assert lookup_setting("battery.min_soc_pct").default == 10.0
