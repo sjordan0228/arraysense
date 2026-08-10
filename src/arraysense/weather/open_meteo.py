@@ -100,7 +100,10 @@ def fetch_radiation_forecast(
         return None
 
     pairs: list[tuple[datetime, float]] = []
-    for time_str, value in zip(times, values):
+    # strict=False by intent: a reply whose two lists disagree in length is
+    # malformed at the tail, and pairing what aligns while dropping the rest
+    # is the same degrade-to-absent rule as every other failure here.
+    for time_str, value in zip(times, values, strict=False):
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             continue
         if float(value) < 0:

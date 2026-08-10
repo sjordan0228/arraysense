@@ -29,7 +29,7 @@ import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -1492,6 +1492,133 @@ def bands(
         "configured": True,
         "timezone": str(zone),
         "windows": windows,
+    }
+
+
+@router.get("/forecast")
+def forecast(
+    request: Request,
+    store: _ReadStore,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """The day's forecast curves, measured production, and how reality tracks the plan.
+
+    The page draws what this serves and computes nothing itself — the tracking
+    figure especially lives here, once, because a page-side copy is the
+    two-parsers drift this project already paid for.
+
+    The dawn curve is the earliest prediction made on the day itself for each
+    hour and is the baseline the day is tracked against. The latest curve is the
+    newest revision per hour for drawing ahead of now. Actuals come from the
+    hourly rollup — mean pv_total_power_w per hour, so each hour's energy is
+    that mean multiplied by one hour.
+
+    With no forecast rows for today every data field is null or empty: the page
+    shows nothing, not zeros.
+    """
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    now = datetime.now(tz=UTC)
+    local_now = now.astimezone(zone)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # The instant of local midnight in UTC, and the instant of the next local
+    # midnight. Adding a day in local time is the only way to land on the right
+    # UTC instant when the day is not 24 hours.
+    day_start = local_midnight.astimezone(UTC)
+    day_end = (local_midnight + timedelta(days=1)).astimezone(UTC)
+
+    curves = store.forecast_day(day_start, day_end)
+    configured = bool(curves["first"] or curves["latest"])
+
+    if not configured:
+        return {
+            "configured": False,
+            "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
+            "now": now.isoformat(),
+            "dawn": [],
+            "latest": [],
+            "actual": [],
+            "expected_today_kwh": None,
+            "actual_so_far_kwh": None,
+            "tracking_pct": None,
+        }
+
+    # Hourly mean pv_total_power_w for the day so far. Each hour's energy is the
+    # mean wattage multiplied by one hour, so the values are already in Wh.
+    actual_rows: list[dict[str, object]] = store.query(
+        ["pv_total_power_w"], day_start, day_end, tier="hourly"
+    )
+    actual: list[dict[str, object]] = [
+        {
+            "hour": cast(datetime, row["timestamp"]).isoformat(),
+            "mean_w": cast(float, row["pv_total_power_w"]),
+        }
+        for row in actual_rows
+        if not row.get("error") and row.get("pv_total_power_w") is not None
+    ]
+
+    dawn = [
+        {
+            "hour": cast(datetime, e["hour"]).isoformat(),
+            "expected_w": cast(float, e["expected_w"]),
+        }
+        for e in curves["first"]
+    ]
+    latest = [
+        {
+            "hour": cast(datetime, e["hour"]).isoformat(),
+            "expected_w": cast(float, e["expected_w"]),
+        }
+        for e in curves["latest"]
+    ]
+
+    # Expected today: sum of the latest curve in Wh, divided by 1000 for kWh.
+    latest_sum = sum(cast(float, e["expected_w"]) for e in curves["latest"])
+    expected_today_kwh: float | None = latest_sum / 1000.0 if curves["latest"] else None
+
+    # Actual production so far. Null when no hour has a reading yet — a dash,
+    # never zero, because zero means the array produced nothing and that is a
+    # different statement from "nobody has looked yet".
+    actual_by_hour: dict[datetime, float] = {}
+    actual_wh = 0.0
+    for row in actual_rows:
+        if not row.get("error") and row.get("pv_total_power_w") is not None:
+            ts = cast(datetime, row["timestamp"])
+            w = cast(float, row["pv_total_power_w"])
+            actual_by_hour[ts] = w
+            actual_wh += w
+    actual_so_far_kwh: float | None = actual_wh / 1000.0 if actual_by_hour else None
+
+    # Tracking: how actual production compares to the dawn plan, over hours that
+    # carry both a dawn expectation and a measurement. Absent before any such
+    # hour exists and absent when the dawn-plan sum over those hours is zero —
+    # never a division by zero, never a figure from mismatched hours.
+    dawn_by_hour: dict[datetime, float] = {
+        cast(datetime, e["hour"]): cast(float, e["expected_w"]) for e in curves["first"]
+    }
+    matched = set(dawn_by_hour) & set(actual_by_hour)
+    tracking_pct: float | None = None
+    if matched:
+        matched_dawn = sum(dawn_by_hour[h] for h in matched)
+        if matched_dawn > 0:
+            matched_actual = sum(actual_by_hour[h] for h in matched)
+            tracking_pct = round((matched_actual / matched_dawn - 1.0) * 100.0, 1)
+
+    return {
+        "configured": True,
+        "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
+        "now": now.isoformat(),
+        "dawn": dawn,
+        "latest": latest,
+        "actual": actual,
+        "expected_today_kwh": round(expected_today_kwh, 3)
+        if expected_today_kwh is not None
+        else None,
+        "actual_so_far_kwh": round(actual_so_far_kwh, 3) if actual_so_far_kwh is not None else None,
+        "tracking_pct": tracking_pct,
     }
 
 
