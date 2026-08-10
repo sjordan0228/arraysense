@@ -1,8 +1,10 @@
 """routes.py — the HTTP surface: live values, history, status, and yielding.
 
-Everything here reads from the store and never touches the inverter. The
-collector owns the one connection the dongle allows, so an API that reached for
-it directly would fight the poll loop for the single TCP slot.
+Everything here reads from the store and stays off the inverter's wire, with
+one deliberate exception: setup detection, which stops the collector, probes,
+and hands the wire straight back. The collector owns the one connection the
+hardware allows, so any other route that reached for it would fight the poll
+loop for the single slot.
 
 History reads pick their resolution from the requested span and the caller's
 pixel width rather than always serving the finest tier. A month at one-minute
@@ -50,7 +52,6 @@ from arraysense.costs import (
     price_period,
     unpriced_minutes,
 )
-from arraysense.drivers.base import find_model
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
@@ -1424,6 +1425,7 @@ async def setup(request: Request) -> dict[str, Any]:
 class DetectRequest(BaseModel):
     """Candidate connection parameters to probe. Nothing here is saved."""
 
+    inverter_serial: str = ""
     transport: str
     serial_device: str = ""
     serial_baud: int = 19200
@@ -1459,7 +1461,7 @@ async def _probe_serial(body: DetectRequest) -> str:
         transport = create_dongle_transport(
             host=body.dongle_host,
             dongle_serial=body.dongle_serial,
-            inverter_serial="",
+            inverter_serial=body.inverter_serial,
             port=body.dongle_port,
             timeout=10.0,
         )
@@ -1487,10 +1489,23 @@ async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
     """
     if body.transport not in ("dongle", "modbus_serial"):
         raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
+    if body.transport == "dongle" and not body.inverter_serial:
+        # The dongle protocol authenticates every request with the inverter
+        # serial, so a probe with a blank one can never receive an answer.
+        # Serial-bus detection discovers the serial; dongle detection can only
+        # confirm one the form already holds.
+        raise HTTPException(
+            status_code=400,
+            detail="dongle detection needs the inverter serial; the dongle "
+            "protocol authenticates with it",
+        )
     service = getattr(request.app.state, "service", None)
     borrowed = False
-    if service is not None and service.status.running and not service.is_yielding:
-        await service.yield_for(30)
+    if service is not None and service.status.running:
+        # stop() is the exclusive borrow: it cancels the poll task, waits out
+        # an in-flight write, and disconnects — yield mode does none of the
+        # waiting, so a poll already on the wire could fight the probe.
+        await service.stop()
         borrowed = True
     try:
         try:
@@ -1499,7 +1514,7 @@ async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         if borrowed and service is not None:
-            await service.resume()
+            await service.start()
     return {"serial": serial}
 
 
@@ -1509,6 +1524,7 @@ class ApplyRequest(BaseModel):
     Everything optional; only provided fields are validated and written.
     """
 
+    driver: str | None = None
     transport: str | None = None
     serial_device: str | None = None
     serial_baud: int | None = None
@@ -1521,6 +1537,7 @@ class ApplyRequest(BaseModel):
 
 
 _SETTING_KEYS = {
+    "driver": "connection.driver",
     "transport": "connection.transport",
     "serial_device": "connection.serial_device",
     "serial_baud": "connection.serial_baud",
@@ -1561,6 +1578,11 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     """
     config = request.app.state.config
     provided = {k: v for k, v in body.model_dump().items() if v is not None}
+    # A masked value posted back unchanged is the page echoing what /api/setup
+    # showed it, not a choice. Discarded exactly as the settings endpoint
+    # discards them, or an untouched full-form submit would write dots over
+    # real serials.
+    provided = {k: v for k, v in provided.items() if not _is_mask(_SETTING_KEYS[k], v)}
     merged: dict[str, Any] = {
         "dongle_host": config.dongle_host,
         "dongle_serial": config.dongle_serial,
@@ -1580,15 +1602,20 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     merged.update(provided)
     try:
         candidate = Config(**merged)
-        entry = drivers.get(candidate.driver)
-        if candidate.model:
-            find_model(entry, candidate.model)
+        # The registry's boot rules, not a subset: an overlay that passes here
+        # is one the next boot accepts, and one that fails here stored anyway
+        # would be a service systemd crash-loops with no page left to fix it.
+        drivers.validate(candidate)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     settings = SettingsStore(request.app.state.store)
-    for field_name, value in provided.items():
-        settings.set(_SETTING_KEYS[field_name], value)
+    try:
+        # All-or-nothing: every value validates against its spec before any
+        # row is written, in one transaction.
+        settings.set_many({_SETTING_KEYS[k]: v for k, v in provided.items()})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     _schedule_restart()
     return {"applied": sorted(provided), "restarting": True}
 

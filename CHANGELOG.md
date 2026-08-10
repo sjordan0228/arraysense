@@ -22,10 +22,15 @@ migration says so at the top of its entry.
   tree, each transport's required fields, the serial adapters the machine can
   actually see, and the current values with secrets redacted.
 
-  Two endpoints act: **detect** borrows the wire through yield mode, reads
-  the inverter's serial, and always gives the wire back — it writes nothing.
-  **apply** validates the whole merged result with the same rules the service
-  enforces at boot, writes the settings overlay, and restarts the collector.
+  Two endpoints act: **detect** stops the collector, reads the inverter's
+  serial off the candidate connection, and starts the collector again on the
+  way out whatever happened — it writes nothing, and on the dongle it needs
+  the inverter serial you typed, because that protocol authenticates with it.
+  **apply** validates the whole merged result with the registry's own boot
+  rules — an overlay it accepts is one the next boot accepts — discards any
+  masked value the form echoed back rather than storing dots over a real
+  serial, writes every setting in a single transaction or none at all, and
+  restarts the collector. Switching the driver family is part of it.
 
   A brand-new installation — no config file at all — now serves **first-run
   setup** instead of exiting with an error: pages and the setup endpoints,

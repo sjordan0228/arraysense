@@ -294,6 +294,7 @@ def effective(config: Config, settings: SettingsStore) -> Config:
         poll_interval=float(pick("collector.poll_interval", config.poll_interval)),  # type: ignore[arg-type]
         # Registered in settings.py — an unregistered overlay here is dead
         # code, which is exactly how the first attempt at these failed review.
+        driver=str(pick("connection.driver", config.driver)),
         transport=str(pick("connection.transport", config.transport)),
         serial_device=str(pick("connection.serial_device", config.serial_device)),
         serial_baud=round(float(pick("connection.serial_baud", config.serial_baud))),  # type: ignore[arg-type]

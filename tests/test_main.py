@@ -270,9 +270,33 @@ def test_first_run_apply_writes_a_config_load_accepts_and_restarts(
     assert config.inverter_serial == "CE00000000"
 
 
-def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path) -> None:
+def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path, monkeypatch: Any) -> None:
     # The candidate file is validated by load() itself before it replaces
     # anything — one rule set. A refused apply must leave no file behind.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={"driver": "fake", "transport": "modbus_serial", "inverter_serial": "CE0"},
+        )
+        assert r.status_code == 400
+    assert fired == [], "a refused first-run apply must not schedule a restart"
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_refuses_a_driver_the_registry_refuses(tmp_path: Path) -> None:
+    # load() alone cannot know which drivers exist; the registry's rules run
+    # on the candidate before the file is born, or an unbootable file would
+    # exist and setup mode would never be offered again.
     from fastapi.testclient import TestClient
 
     from arraysense.__main__ import build_setup_app
@@ -282,7 +306,14 @@ def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path) -> None:
     with TestClient(app) as client:
         r = client.post(
             "/api/setup/apply",
-            json={"driver": "fake", "transport": "modbus_serial", "inverter_serial": "CE0"},
+            json={
+                "driver": "no_such_family",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(tmp_path / "db.sqlite"),
+            },
         )
         assert r.status_code == 400
     assert not target.exists()

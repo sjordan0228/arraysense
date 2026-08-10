@@ -2302,7 +2302,9 @@ def test_setup_describes_the_machine_and_redacts_secrets(client: Any) -> None:
     makers = [m["name"] for m in body["manufacturers"]]
     assert "EG4" in makers and "Simulated" in makers
     assert "dongle" in body["transports"]
-    assert "*" in body["current"]["inverter_serial"] or body["current"]["inverter_serial"] == "*"
+    # Masked with the settings module's own masker, so an echo of this value
+    # is recognisable to the apply endpoint's discard rule.
+    assert "•" in body["current"]["inverter_serial"]
 
 
 def test_detect_returns_the_serial_the_hardware_answered(client: Any, monkeypatch: Any) -> None:
@@ -2350,16 +2352,33 @@ def test_detect_gives_the_wire_back_after_borrowing_it(client: Any, monkeypatch:
         raise ConnectionError("nothing answered")
 
     monkeypatch.setattr(routes, "_probe_serial", fake_probe)
-    r = client.post("/api/setup/detect", json={"transport": "dongle", "dongle_host": "192.0.2.9"})
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.9",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
     assert r.status_code == 502
     status = client.get("/api/status").json()
+    assert status["running"] is True, "the borrow must hand the collector back"
     assert status["yielding"] is False
 
 
-def test_apply_refuses_an_invalid_combination_without_writing(client: Any) -> None:
+def test_apply_refuses_an_invalid_combination_without_writing(
+    client: Any, monkeypatch: Any
+) -> None:
     # Validation is by constructing a real Config from the merged result, so
     # every rule the service enforces at boot refuses here first — one rule
-    # set, never two.
+    # set, never two. The scheduler is stubbed so the exact regression this
+    # guards — a refusal that schedules anyway — fails as an assertion rather
+    # than SIGTERMing the test runner.
+    from arraysense.api import routes
+
+    fired: list[str] = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: fired.append("restart"))
     r = client.post(
         "/api/setup/apply",
         json={"transport": "modbus_serial", "serial_device": ""},
@@ -2368,6 +2387,7 @@ def test_apply_refuses_an_invalid_combination_without_writing(client: Any) -> No
     assert "serial_device" in r.json()["detail"]
     values = client.get("/api/settings").json()["values"]
     assert values["connection.transport"] == "", "a refused apply must write nothing"
+    assert fired == [], "a refused apply must not schedule a restart"
 
 
 def test_apply_writes_the_overlay_and_schedules_a_restart(client: Any, monkeypatch: Any) -> None:
@@ -2383,3 +2403,68 @@ def test_apply_writes_the_overlay_and_schedules_a_restart(client: Any, monkeypat
     assert fired == ["restart"]
     values = client.get("/api/settings").json()["values"]
     assert values["connection.model"] == "18kPV"
+
+
+def test_apply_refuses_what_boot_would_refuse(client: Any, monkeypatch: Any) -> None:
+    # The review's sharpest finding: an overlay that apply accepts but boot
+    # rejects is a service systemd crash-loops with no page left to repair it.
+    # battery_source "direct" passes Config validation and fails the registry's
+    # rules — exactly the gap.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post("/api/setup/apply", json={"battery_source": "direct"})
+    assert r.status_code == 400
+    assert "not yet" in r.json()["detail"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.battery_source"] == ""
+
+
+def test_apply_is_all_or_nothing(client: Any, monkeypatch: Any) -> None:
+    # One act: a batch that stored its first key and refused its second would
+    # leave an overlay the next boot assembles from halves.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post(
+        "/api/setup/apply",
+        json={"transport": "dongle", "serial_device": "x" * 500},
+    )
+    assert r.status_code == 400
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "the batch partner must not have landed"
+
+
+def test_apply_discards_masked_echoes_rather_than_storing_dots(
+    client: Any, monkeypatch: Any
+) -> None:
+    # A full form submitted unchanged echoes the masks /api/setup showed it.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    masked = client.get("/api/setup").json()["current"]["inverter_serial"]
+    r = client.post("/api/setup/apply", json={"inverter_serial": masked, "model": "18kPV"})
+    assert r.status_code == 200
+    values = client.get("/api/settings").json()["values"]
+    assert "•" not in str(values["connection.inverter_serial"])
+
+
+def test_dongle_detect_without_the_serial_is_a_named_refusal(client: Any) -> None:
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "dongle", "dongle_host": "192.0.2.9", "dongle_serial": "BA0"},
+    )
+    assert r.status_code == 400
+    assert "authenticates" in r.json()["detail"]
+
+
+def test_apply_can_switch_the_driver_family(client: Any, monkeypatch: Any) -> None:
+    # The spec names driver switching for an existing installation; the first
+    # cut of apply forgot it.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post("/api/setup/apply", json={"driver": "fake", "model": "Simulated"})
+    assert r.status_code == 200
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.driver"] == "fake"

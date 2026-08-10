@@ -339,8 +339,12 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         probe = target.with_suffix(".candidate")
         probe.write_text(text)
         try:
-            # Every boot-time rule refuses here, before the real file exists.
-            load(probe)
+            # Every boot-time rule refuses here, before the real file exists:
+            # the loader's own checks, then the registry's — driver existence,
+            # model membership, the battery rules. A file that passed only the
+            # loader could name a driver nobody has, and the next boot would
+            # crash-loop on a file setup mode no longer offers to replace.
+            drivers.validate(load(probe))
         except (ValueError, FileNotFoundError) as exc:
             probe.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc

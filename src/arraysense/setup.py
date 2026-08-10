@@ -38,10 +38,15 @@ def list_serial_ports(dev_root: Path | str = "/dev") -> list[dict[str, str]]:
 
 
 def _redact(value: str) -> str:
-    """Show enough of a secret to recognise it and no more."""
-    if len(value) <= 4:
-        return "*" * len(value)
-    return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+    """Mask exactly as the settings API masks, so an echo is recognisable.
+
+    One masker, not two: the apply endpoint discards masked echoes by the
+    settings module's own rule, and a second masking format here would slip
+    straight past that check and overwrite a real serial with dots.
+    """
+    from arraysense.settings import _mask
+
+    return _mask(value)
 
 
 def describe_setup(config: Config, dev_root: Path | str = "/dev") -> dict[str, Any]:
@@ -59,10 +64,23 @@ def describe_setup(config: Config, dev_root: Path | str = "/dev") -> dict[str, A
         models = []
         for model in entry.models:
             resolved = resolve_model(entry.capabilities, model)
+            cited = [
+                name
+                for name, delta in (
+                    ("pv_strings", model.pv_strings),
+                    ("battery_module_slots", model.battery_module_slots),
+                )
+                if delta is not None
+            ]
             models.append(
                 {
                     "name": model.name,
                     "citation": model.citation,
+                    # Which of the values below the citation actually covers.
+                    # The rest are inherited family defaults, and a page must
+                    # be able to label the difference — a cited fact and a
+                    # conservative default are different claims.
+                    "cited_fields": cited,
                     "pv_strings": resolved.pv_strings,
                     "battery_module_slots": resolved.battery_module_slots,
                 }

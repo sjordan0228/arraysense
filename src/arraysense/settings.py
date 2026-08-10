@@ -3,8 +3,10 @@
 Editing a TOML file over SSH is a reasonable thing to ask of someone who already
 has a terminal open, and an unreasonable thing to ask of someone whose solar
 monitor is a tablet on a wall. Everything here is settable from the running
-service, takes effect without a restart, and is one value for the whole
-installation rather than per browser — a temperature unit stored in local
+service and is one value for the whole installation rather than per browser.
+Most settings take effect on the next request; the connection group is the
+exception, merged over the config file once at startup, which is why the setup
+flow's apply ends in a restart rather than a promise — a temperature unit stored in local
 storage means the tablet and the phone disagree about what 39 means.
 
 Defaults live in this registry, never in the database. A fresh install with an
@@ -517,6 +519,16 @@ SETTINGS: tuple[SettingSpec, ...] = (
         secret=True,
     ),
     SettingSpec(
+        key="connection.driver",
+        kind="str",
+        default="",
+        label="Inverter family",
+        help=(
+            "Which driver family reads this inverter. Empty keeps the config "
+            "file's choice. Applies at the next collector restart."
+        ),
+    ),
+    SettingSpec(
         key="connection.transport",
         kind="str",
         default="",
@@ -634,6 +646,32 @@ class SettingsStore:
             # working answer; refusing to start is not.
             logger.warning("setting %s holds undecodable %r; using the default", key, row[0])
             return spec.default
+
+    def set_many(self, values: dict[str, object]) -> None:
+        """Validate every value, then store all of them in one transaction.
+
+        The apply endpoint writes several connection settings as one act, and
+        one act is what it has to be: a batch that validated four keys, wrote
+        two and refused the third leaves an overlay the next boot assembles
+        from halves — a stored transport with no device path is a page-made
+        crash loop. Nothing is written until every value has passed its spec.
+        """
+        checked: list[tuple[str, str]] = []
+        for key, value in values.items():
+            spec = lookup_setting(key)
+            valid = spec.validate(value)
+            if valid is None:
+                stored = ""
+            else:
+                stored = "1" if valid is True else "0" if valid is False else str(valid)
+            checked.append((key, stored))
+        with self._conn:
+            for key, stored in checked:
+                self._conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, stored),
+                )
 
     def set(self, key: str, value: object) -> None:
         """Validate ``value`` against its spec and store it.

@@ -415,11 +415,12 @@ class DriverEntry:
     itself, so what a source reports is the entry's declaration and not a second
     opinion about the hardware.
 
-    One field is necessarily an exception. ``transport`` is not a property of
-    the family — the same inverter is reached by a dongle at one installation
-    and a serial adapter at the next — so a built source answers with the one
-    its own configuration chose, and the entry can only carry the default. That
-    is the single field on which the two may differ, and they differ about the
+    Two resolutions are necessarily exceptions, both per installation rather
+    than per family: ``transport`` — the same inverter is reached by a dongle
+    at one installation and a serial adapter at the next — and the model's
+    cited capability deltas. A built source answers with what its own
+    configuration chose; the entry can only carry the family defaults. Those
+    are the fields on which the two may differ, and they differ about the
     installation rather than about the device.
 
     ``build`` takes the whole Config rather than a bag of connection settings.

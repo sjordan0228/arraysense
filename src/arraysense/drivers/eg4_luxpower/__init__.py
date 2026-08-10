@@ -1,9 +1,11 @@
 """eg4_luxpower — the LuxPower-protocol family: 18kPV, 6000XP, 12kPV.
 
 One package per protocol family rather than per model, because these units
-share a register surface: the same 141 registers, the same three PV strings,
-the same 31 kWh counters. A model that answers differently earns its own
-package; a model that answers the same earns a line in this docstring.
+share a register surface: the same 141 registers, the same 31 kWh counters.
+How many PV strings each model actually has is a per-model fact carried with a
+citation in MODELS — only the 18kPV's is measured; the rest inherit the family
+declaration until a source exists. A model that answers differently on the
+wire earns its own package; one that answers the same earns a line in MODELS.
 
 The registry entry lives here rather than in ``source.py`` so that the module
 doing the reading does not also have to know it is being registered — and so

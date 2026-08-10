@@ -96,15 +96,14 @@ def get(name: str) -> DriverEntry:
         raise ValueError(f"no such driver: {name!r}. Available drivers: {known}") from None
 
 
-def create(config: Config) -> InverterDriver:
-    """Build the source for the driver this configuration names.
+def validate(config: Config) -> DriverEntry:
+    """Check a configuration against the registry without building anything.
 
-    The one call the entry point makes, and the reason nothing above the
-    driver layer imports a driver: which family is being read is a string in a
-    file, resolved here. Model and battery source are validated here too,
-    beside the driver lookup, because the registry is the only layer that
-    knows what each family offers — config cannot import it, and a page must
-    never learn these rules a second way.
+    The same rules create() enforces, callable where building would be wrong:
+    the apply endpoint and first-run setup validate a candidate before writing
+    it, because an overlay or file that passes here is one the next boot will
+    accept — and one that fails here stored anyway is a service systemd
+    crash-loops with no page left to repair it.
     """
     entry = get(config.driver)
     if config.model:
@@ -118,7 +117,20 @@ def create(config: Config) -> InverterDriver:
         raise ValueError(
             f"driver {entry.name!r} does not relay battery data; battery_source must be 'none'"
         )
-    return entry.build(config)
+    return entry
+
+
+def create(config: Config) -> InverterDriver:
+    """Build the source for the driver this configuration names.
+
+    The one call the entry point makes, and the reason nothing above the
+    driver layer imports a driver: which family is being read is a string in a
+    file, resolved here. Model and battery source are validated here too,
+    beside the driver lookup, because the registry is the only layer that
+    knows what each family offers — config cannot import it, and a page must
+    never learn these rules a second way.
+    """
+    return validate(config).build(config)
 
 
 # Explicit registration. One line per driver, and a driver that is not on this
