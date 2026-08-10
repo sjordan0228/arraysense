@@ -7,6 +7,24 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.11 — 9 August 2026
+
+### Fixed
+
+- **A bug in the battery mapper can no longer be filed as an inverter gap**
+  ([#66](https://github.com/sjordan0228/arraysense/issues/66)). The wrap that
+  converts a model's refusal into `SampleBuildError` enclosed the whole
+  constructor expression, so a `ValueError` raised while *evaluating* an
+  argument — a defect in this driver's own reading helpers, demonstrated with a
+  NaN cycle count reaching `round()` — was converted too, and would have been
+  recorded as an inverter outage and retried forever. The arguments are now
+  evaluated before the wrap, so it covers construction alone, and a mapper bug
+  surfaces loudly the way #42 established one layer up.
+
+  No real reply reaches either path today — the guards drop malformed records
+  earlier — so this closes a latent hole rather than a live one. Nothing about
+  an installation's data changes.
+
 ## 0.6.10 — 9 August 2026
 
 ### Added

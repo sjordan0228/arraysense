@@ -23,6 +23,7 @@ from pylxpweb.transports.exceptions import TransportError
 
 from arraysense.calibration import PACK_COMPARE_MAX_SKEW
 from arraysense.config import Config
+from arraysense.drivers.base import SampleBuildError
 from arraysense.drivers.eg4_luxpower import source as eg4_source
 from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource, to_sample
 from arraysense.metrics import lookup
@@ -512,6 +513,52 @@ def test_module_fault_and_warning_codes_are_not_stored_at_all() -> None:
     (module,) = to_sample(_runtime(), _healthy_bank(batteries=[record])).battery_modules
     assert module.fault_code is None
     assert module.warning_code is None
+
+
+# --- the SampleBuildError wrap covers construction only, not argument
+# evaluation (#66) -----------------------------------------------------------
+#
+# _module_sample used to wrap the whole BatteryModuleSample(...) expression in
+# one try, so a ValueError raised while evaluating a constructor argument —
+# a bug in _reading, _int_reading or _measured_soh, not a refusal from the
+# model — was converted to SampleBuildError and recorded as an inverter gap
+# exactly like a genuine refusal. That is the defect #42 removed one layer up,
+# reappearing here.
+
+
+def test_a_bug_in_our_own_mapping_is_not_absorbed_as_a_samplebuilderror() -> None:
+    # round() raising on a NaN is what the reviewer used to demonstrate this:
+    # identity (serial, battery_index) and the BMS-answering witness both
+    # pass, so evaluation proceeds to the hoisted argument locals — where
+    # _int_reading's round(cycle_count) raises before the constructor is ever
+    # called. That it raises during argument evaluation rather than inside
+    # BatteryModuleSample is exactly the boundary #66 draws: a bug in this
+    # driver's own mapping, not the model refusing anything.
+    record = SimpleNamespace(
+        serial_number="Battery_ID_07",
+        battery_index=0,
+        max_cell_voltage=3.364,
+        cycle_count=float("nan"),
+    )
+    with pytest.raises(ValueError) as excinfo:
+        eg4_source._module_sample(record)
+    assert not isinstance(excinfo.value, SampleBuildError)
+
+
+def test_a_refused_slot_still_reaches_the_constructor_as_samplebuilderror() -> None:
+    # The other side of the same boundary: a ValueError raised by
+    # BatteryModuleSample.__post_init__ itself is a genuine refusal and must
+    # still come out as SampleBuildError. Nothing in _module_sample checks the
+    # sign of battery_index before building slot = index + 1, so a negative
+    # index passes every guard and reaches the constructor at slot 0, which is
+    # what __post_init__ refuses.
+    record = SimpleNamespace(
+        serial_number="Battery_ID_08",
+        battery_index=-1,
+        max_cell_voltage=3.364,
+    )
+    with pytest.raises(SampleBuildError, match="slot"):
+        eg4_source._module_sample(record)
 
 
 def test_every_mapped_attribute_exists_on_the_class_it_is_read_from() -> None:
