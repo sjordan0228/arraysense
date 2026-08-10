@@ -227,6 +227,38 @@ const BASE_CSS = `
   .iconbtn.wide{font-size:11px;flex:1}
   details{margin-top:10px}
   summary{cursor:pointer;font-size:11px;color:var(--ink3)}
+  /* --- The setup wizard / connection picker --------------------------------
+     Namespaced under .setup so it shares no rule with the settings page's own
+     .f controls: one renderer, mounted in two shells, carrying its own look. */
+  .setup{display:flex;flex-direction:column;gap:14px;max-width:560px}
+  .setup .row{display:flex;flex-direction:column;gap:5px;min-width:0}
+  .setup label{font-size:12px;color:var(--ink2);font-weight:600}
+  .setup select,.setup input{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;width:100%;
+    font-variant-numeric:tabular-nums}
+  .setup select:focus,.setup input:focus{outline:2px solid var(--pv);outline-offset:1px;
+    border-color:transparent}
+  .setup .hint{font-size:11px;color:var(--ink3);line-height:1.5}
+  .setup .row.bad input,.setup .row.bad select{border-color:var(--bad)}
+  .setup .err{font-size:11px;color:var(--bad);line-height:1.5}
+  .setup .err[hidden]{display:none}
+  .setup .detectrow{display:flex;gap:8px;align-items:flex-start}
+  .setup .detectrow input{flex:1}
+  .setup .status{font-size:12px;line-height:1.55;min-height:1.2em}
+  .setup .status.ok{color:var(--good)}
+  .setup .status.bad{color:var(--bad)}
+  .setup .status.warn{color:var(--warn)}
+  .setup .status.busy{color:var(--ink2)}
+  .setup .actions{display:flex;gap:11px;align-items:center;margin-top:4px}
+  .setup .primary{background:var(--pv);border:1px solid transparent;color:#1a1204;font-weight:600;
+    font-size:13px;padding:8px 18px;border-radius:8px;cursor:pointer;font-family:inherit}
+  .setup .primary:hover{background:#e08c33}
+  .setup .primary:disabled{opacity:.45;cursor:default}
+  .setup .adv{margin-top:2px}
+  .setup .adv .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:8px}
+  @media(max-width:520px){.setup .adv .fields{grid-template-columns:1fr}}
+  .wizard{max-width:620px;margin:0 auto}
+  .wizard .welcome{font-size:13px;color:var(--ink2);line-height:1.6;margin:2px 0 18px;max-width:70ch}
 `;
 document.head.appendChild(
   Object.assign(document.createElement('style'), { textContent: BASE_CSS }));
@@ -1533,4 +1565,228 @@ function paint(id, spec, data) {
     if (keep) held.u.redraw();
   }
   fit(wrap, held.u, spec.height);
+}
+
+// ---------------------------------------------------------------------------
+// The setup renderer. One component, two shells: the first-run wizard mounts it
+// full-screen, the settings page mounts it as the Connection group. It draws the
+// whole picker from the /api/setup payload and decides nothing itself — the pure
+// functions above (setupModelsFor, setupFieldsFor, setupBatterySourcesFor,
+// buildSetupBody) make every choice, so the form can only ever offer what the
+// server would accept. Detect is internal and identical in both shells; apply is
+// handed out through opts.onApply, because what happens after a write — a
+// full-screen restart watch or a settings-page banner — is the shell's business.
+//   opts = { mode: 'wizard'|'settings', applyLabel, onApply(body) }
+// Returns { read } so a shell can read the mounted form.
+// ---------------------------------------------------------------------------
+function mountSetup(host, payload, opts) {
+  opts = opts || {};
+  const cur = (payload && payload.current) || {};
+  // First run seeds the form from the payload's TEST-NET placeholder, which is
+  // noise, so it starts from sensible defaults instead. A configured system
+  // seeds from its real (redacted) current values.
+  const firstRun = !!(payload && payload.first_run);
+  const makers = (payload && payload.manufacturers) || [];
+
+  // The initial driver/model/manufacturer. Every model option carries its own
+  // driver ("driver::model"), because one manufacturer can hold more than one
+  // family and a flat model name cannot say which built it.
+  function firstDriverModel() {
+    for (const mk of makers) {
+      for (const fam of mk.families || []) {
+        for (const m of fam.models || []) return { maker: mk.name, driver: fam.driver, model: m.name };
+      }
+    }
+    return { maker: '', driver: '', model: '' };
+  }
+  const seedDriver = !firstRun && cur.driver ? cur.driver : firstDriverModel().driver;
+  const seedModel = !firstRun && cur.model ? cur.model : firstDriverModel().model;
+  const state = {
+    manufacturer: setupMakerOf(payload, seedDriver) || firstDriverModel().maker,
+    driver: seedDriver,
+    model: seedModel,
+    transport: !firstRun && cur.transport ? cur.transport : 'dongle',
+    serial_device: !firstRun ? (cur.serial_device || '') : '',
+    serial_baud: !firstRun && cur.serial_baud ? cur.serial_baud : 19200,
+    serial_unit_id: !firstRun && cur.serial_unit_id ? cur.serial_unit_id : 1,
+    dongle_host: !firstRun ? (cur.dongle_host || '') : '',
+    dongle_port: !firstRun && cur.dongle_port ? cur.dongle_port : 8000,
+    dongle_serial: !firstRun ? (cur.dongle_serial || '') : '',
+    inverter_serial: !firstRun ? (cur.inverter_serial || '') : '',
+    battery_source: !firstRun && cur.battery_source ? cur.battery_source : '',
+  };
+  // A redacted echo (bullets) is a value the person has not retyped; treated as
+  // "leave alone", it is cleared from the form's send but kept visible so they
+  // see something is already set. buildSetupBody drops it because it stays === ''
+  // only if untouched — so we keep the mask in the input and let apply's own
+  // mask-drop (settings._is_mask) discard an unedited one server-side.
+
+  const makerNames = makers.map((m) => m.name);
+  const modelOptionsFor = (makerName) => {
+    const mk = makers.find((m) => m.name === makerName);
+    const out = [];
+    for (const fam of (mk && mk.families) || []) {
+      for (const m of fam.models || []) out.push({ driver: fam.driver, name: m.name });
+    }
+    return out;
+  };
+  const ports = (payload && payload.ports) || [];
+
+  function numRow(key, label, hint) {
+    return `<div class="row"><label for="su_${key}">${esc(label)}</label>
+      <input id="su_${key}" data-k="${key}" type="number" inputmode="numeric"
+        value="${esc(String(state[key]))}">
+      <span class="hint">${esc(hint)}</span></div>`;
+  }
+  function textRow(key, label, hint, extra) {
+    return `<div class="row"><label for="su_${key}">${esc(label)}</label>
+      <input id="su_${key}" data-k="${key}" type="text" value="${esc(String(state[key] || ''))}"${extra || ''}>
+      <span class="hint">${esc(hint)}</span><span class="err" hidden></span></div>`;
+  }
+
+  function connectionFields() {
+    if (state.transport === 'modbus_serial') {
+      const listId = 'su_ports';
+      const list = ports.length ? ` list="${listId}"` : '';
+      const datalist = ports.length
+        ? `<datalist id="${listId}">`
+          + ports.map((p) => `<option value="${esc(p.stable)}">${esc(p.target)}</option>`).join('')
+          + '</datalist>'
+        : '';
+      return textRow('serial_device', 'Serial device',
+        ports.length ? 'Pick a detected adapter or type a path. A /dev/serial/by-id path survives replugging.'
+          : 'The device path for the RS485 adapter, e.g. /dev/ttyUSB0.', list) + datalist
+        + `<details class="adv"><summary>Advanced serial settings</summary><div class="fields">`
+        + numRow('serial_baud', 'Baud rate', '19200 is the LuxPower default.')
+        + numRow('serial_unit_id', 'Modbus unit id', 'Which unit answers on the bus. Usually 1.')
+        + `</div></details>`;
+    }
+    return textRow('dongle_host', 'Dongle address', 'The IP address or hostname of the WiFi dongle.')
+      + textRow('dongle_serial', 'Dongle serial', 'Printed on the dongle, e.g. BA12345678.')
+      + `<details class="adv"><summary>Advanced dongle settings</summary><div class="fields">`
+      + numRow('dongle_port', 'Port', '8000 on current firmware.')
+      + `</div></details>`;
+  }
+
+  function render() {
+    const models = modelOptionsFor(state.manufacturer);
+    // Keep the selected model valid for the chosen manufacturer; if it moved,
+    // fall to that manufacturer's first model rather than an empty box.
+    if (!models.some((m) => m.name === state.model && m.driver === state.driver)) {
+      if (models.length) { state.driver = models[0].driver; state.model = models[0].name; }
+    }
+    const batteries = setupBatterySourcesFor(payload, state.driver);
+    if (!batteries.includes(state.battery_source)) state.battery_source = batteries[0] || 'none';
+
+    const makerSel = makerNames.map((n) =>
+      `<option value="${esc(n)}"${n === state.manufacturer ? ' selected' : ''}>${esc(n)}</option>`).join('');
+    const modelSel = models.map((m) => {
+      const v = `${m.driver}::${m.name}`;
+      const on = m.name === state.model && m.driver === state.driver;
+      return `<option value="${esc(v)}"${on ? ' selected' : ''}>${esc(m.name)}</option>`;
+    }).join('');
+    const transSel = [['dongle', 'WiFi dongle'], ['modbus_serial', 'RS485 serial']].map(([v, lbl]) =>
+      `<option value="${v}"${v === state.transport ? ' selected' : ''}>${lbl}</option>`).join('');
+    const battLabel = { relayed: 'Through the inverter', none: 'No battery data' };
+    const battSel = batteries.map((b) =>
+      `<option value="${esc(b)}"${b === state.battery_source ? ' selected' : ''}>${esc(battLabel[b] || b)}</option>`).join('');
+    const applyLabel = opts.applyLabel || (opts.mode === 'wizard' ? 'Set up and start' : 'Save and restart collector');
+
+    host.classList.add('setup');
+    host.innerHTML = `
+      <div class="row"><label for="su_maker">Manufacturer</label>
+        <select id="su_maker" data-role="maker">${makerSel}</select></div>
+      <div class="row"><label for="su_model">Model</label>
+        <select id="su_model" data-role="model">${modelSel}</select></div>
+      <div class="row"><label for="su_transport">Connection</label>
+        <select id="su_transport" data-role="transport">${transSel}</select></div>
+      <div data-role="fields">${connectionFields()}</div>
+      <div class="row"><label for="su_battery">Battery</label>
+        <select id="su_battery" data-role="battery">${battSel}</select></div>
+      <div class="row"><label for="su_inverter_serial">Inverter serial</label>
+        <div class="detectrow">
+          <input id="su_inverter_serial" data-k="inverter_serial" type="text"
+            value="${esc(String(state.inverter_serial || ''))}">
+          <button type="button" class="primary" data-role="detect">Detect</button>
+        </div>
+        <span class="hint">Read it off the inverter with Detect, or type it in.</span></div>
+      <div class="status" data-role="status" aria-live="polite"></div>
+      <div class="actions">
+        <button type="button" class="primary" data-role="apply">${esc(applyLabel)}</button>
+      </div>`;
+
+    wire();
+  }
+
+  function wire() {
+    const q = (sel) => host.querySelector(sel);
+    // Text/number inputs update state in place; no re-render, so focus is kept.
+    for (const input of host.querySelectorAll('input[data-k]')) {
+      input.addEventListener('input', () => {
+        const k = input.dataset.k;
+        state[k] = (input.type === 'number') ? (input.value === '' ? '' : Number(input.value)) : input.value;
+      });
+    }
+    q('[data-role="maker"]').addEventListener('change', (e) => {
+      state.manufacturer = e.target.value; render();
+    });
+    q('[data-role="model"]').addEventListener('change', (e) => {
+      const [driver, model] = e.target.value.split('::');
+      state.driver = driver; state.model = model; render();
+    });
+    q('[data-role="transport"]').addEventListener('change', (e) => {
+      state.transport = e.target.value; render();
+    });
+    q('[data-role="battery"]').addEventListener('change', (e) => {
+      state.battery_source = e.target.value;
+    });
+    q('[data-role="detect"]').addEventListener('click', detect);
+    q('[data-role="apply"]').addEventListener('click', apply);
+  }
+
+  function status(msg, cls) {
+    const s = host.querySelector('[data-role="status"]');
+    if (s) { s.textContent = msg || ''; s.className = 'status' + (cls ? ' ' + cls : ''); }
+  }
+
+  async function detect() {
+    const btn = host.querySelector('[data-role="detect"]');
+    btn.disabled = true;
+    status('Reading the inverter’s serial…', 'busy');
+    try {
+      const r = await fetch('/api/setup/detect', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildSetupBody(state)),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) { status(body.detail || `The probe failed (${r.status}).`, 'bad'); return; }
+      if (body.serial) {
+        state.inverter_serial = body.serial;
+        const input = host.querySelector('[data-k="inverter_serial"]');
+        if (input) input.value = body.serial;
+        status(`The inverter answered with serial ${body.serial}.`, 'ok');
+      } else {
+        status('The probe returned no serial.', 'warn');
+      }
+    } catch (e) {
+      status('The probe could not be reached.', 'bad');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function apply() {
+    if (typeof opts.onApply !== 'function') return;
+    const btn = host.querySelector('[data-role="apply"]');
+    btn.disabled = true;
+    try {
+      await opts.onApply(buildSetupBody(state), { status, reenable: () => { btn.disabled = false; } });
+    } catch (e) {
+      status('The change could not be applied.', 'bad');
+      btn.disabled = false;
+    }
+  }
+
+  render();
+  return { read: () => ({ ...state }), status };
 }
