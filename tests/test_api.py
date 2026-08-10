@@ -1916,6 +1916,17 @@ def test_capabilities_names_what_the_device_produces(client: Any) -> None:
     assert "status_code" not in device["battery_module_metrics"]
 
 
+def test_capabilities_reports_the_transport(client: Any) -> None:
+    # The dashboard labels its connection controls from this field — with it
+    # missing the page hard-coded "Dongle", which was wrong on the RS485
+    # installation the reference system now runs (#72). The value is the
+    # source's own declaration: the fake declares no override, so this is the
+    # Capabilities default. A built EG4 source substitutes its configured
+    # transport, which test_eg4_luxpower_source covers.
+    device = client.get("/api/capabilities").json()["devices"][0]
+    assert device["transport"] == "dongle"
+
+
 def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> None:
     # The collector only requires an InverterSource, which names its device but
     # carries no identity and no declaration. Absent capability is not absent
@@ -1956,6 +1967,7 @@ def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> 
     assert device["pv_strings"] is None
     assert device["energy"] is None
     assert device["per_module_battery"] is None
+    assert device["transport"] is None
     assert device["metrics"] is None
     assert device["battery_module_metrics"] is None
 
