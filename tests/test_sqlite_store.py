@@ -1216,3 +1216,67 @@ def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
     assert reading is not None
     assert reading["outside_temperature_c"] == 37.4
     assert reading["error"] is None
+
+
+def test_forecast_keeps_every_revision_and_serves_dawn_and_latest(tmp_path: Path) -> None:
+    # Two truths from one table: the dawn plan the day is tracked against, and
+    # the latest expectation for the hours still to come. A revision must never
+    # erase the plan it revises — and a forecast made yesterday is not today's
+    # dawn plan.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    noon = day.replace(hour=12)
+    one_pm = day.replace(hour=13)
+    # yesterday's forecast for today: excluded from "first"
+    store.append_forecast(day - timedelta(hours=10), [(noon, 5000.0)])
+    # dawn plan
+    store.append_forecast(day.replace(hour=6), [(noon, 6000.0), (one_pm, 6500.0)])
+    # midday revision
+    store.append_forecast(day.replace(hour=11), [(noon, 4200.0), (one_pm, 4400.0)])
+    curves = store.forecast_day(day, day + timedelta(days=1))
+    store.close()
+    first = {c["hour"]: c["expected_w"] for c in curves["first"]}
+    latest = {c["hour"]: c["expected_w"] for c in curves["latest"]}
+    assert first[noon] == 6000.0, "the dawn plan survives its revision"
+    assert first[one_pm] == 6500.0
+    assert latest[noon] == 4200.0, "the latest expectation is the revision"
+    assert latest[one_pm] == 4400.0
+
+
+def test_forecast_prune_drops_old_hours(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    old = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    new = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    store.append_forecast(old, [(old, 4000.0)])
+    store.append_forecast(new, [(new, 5000.0)])
+    removed = store.prune_forecast(datetime(2026, 6, 1, tzinfo=UTC))
+    curves = store.forecast_day(new.replace(hour=0), new.replace(hour=0) + timedelta(days=1))
+    store.close()
+    assert removed == 1
+    assert len(curves["latest"]) == 1
+
+
+def test_peak_reads_the_raw_maximum(tmp_path: Path) -> None:
+    # The forecast calibrates on the system's own observed peak — the raw tier,
+    # because a coarser tier's mean flattens exactly the peak this is for.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    for minute, watts in ((0, 9000.0), (1, 13000.0), (2, 11000.0)):
+        store.append(
+            Sample(
+                timestamp=datetime(2026, 8, 6, 12, minute, tzinfo=UTC),
+                readings={"pv_total_power_w": watts},
+            )
+        )
+    peak = store.peak(
+        "pv_total_power_w",
+        datetime(2026, 8, 1, tzinfo=UTC),
+        datetime(2026, 8, 7, tzinfo=UTC),
+    )
+    empty = store.peak(
+        "pv_total_power_w",
+        datetime(2020, 1, 1, tzinfo=UTC),
+        datetime(2020, 1, 2, tzinfo=UTC),
+    )
+    store.close()
+    assert peak == 13000.0
+    assert empty is None
