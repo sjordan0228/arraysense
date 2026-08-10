@@ -702,7 +702,7 @@ async function fetchEnergy(base, zone) {
 function stamp(body) {
   const zone = body && typeof body.timezone === 'string' ? body.timezone : '';
   const parts = [];
-  if (zone) parts.push(`${current.unitName} as reckoned in ${zoneWords(zone)}`);
+  if (zone) parts.push(`${current.unitName} in ${zoneWords(zone)} time`);
   parts.push(`read ${new Date().toLocaleTimeString()}`);
   $('conn').textContent = parts.join(' · ');
 }
