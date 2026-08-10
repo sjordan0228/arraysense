@@ -154,6 +154,11 @@
 
 let fields = [];
 let saved = {};
+// The /api/setup payload the Connection group's picker renders from. It is the
+// same renderer the first-run wizard uses — one component, two shells — so the
+// two can never drift. Null until load() reads it; a build whose /api/setup
+// cannot be read falls back to the loose registry controls for connection.
+let setupPayload = null;
 
 // The groups, in the order they are shown, keyed by the prefix of the settings
 // that belong to each. A prefix with no entry here still renders — under its
@@ -324,6 +329,19 @@ function render() {
   for (const group of order) {
     const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
     if (!mine.length) continue;
+    // The connection group is the wizard's other shell: the same Manufacturer →
+    // Model → Connection picker the first-run wizard shows, mounted from
+    // /api/setup so the two cannot drift. It replaces the loose registry
+    // controls entirely, and only when the payload is in hand — a build whose
+    // /api/setup could not be read falls through to the controls below.
+    if (group.prefix === 'connection' && setupPayload) {
+      blocks.push(`<section class="p grp">
+          <div class="chead"><h2>${esc(group.title)}</h2></div>
+          ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
+          <div id="connHost"></div>
+        </section>`);
+      continue;
+    }
     const controls = mine.map((spec) => {
       const help = [spec.help];
       if (spec.kind === 'int' || spec.kind === 'float') {
@@ -361,6 +379,13 @@ function render() {
   // already rendered rather than instead of them: each keeps the registry's
   // own field in the DOM and only writes into it.
   mountExtras();
+  // The connection picker mounts after the form's own controls, into the host
+  // the group left for it. Its Save is its own — a connection change only takes
+  // effect on restart — so it is separate from the page's Save, which never
+  // touches these fields (the picker's controls carry no data-key for pending).
+  if (setupPayload && $('connHost')) {
+    mountSetup($('connHost'), setupPayload, { mode: 'settings', onApply: applyConnection });
+  }
   dirtyCheck();
 
   const secret = fields.filter((f) => f.secret).map((f) => f.label);
@@ -1340,6 +1365,29 @@ function applyDisplay(values) {
   }
 }
 
+// The connection picker's Save. Unlike the page's own Save, which PUTs the
+// changed settings and leaves the collector running, a connection change is only
+// read at startup — so this writes the overlay through /api/setup/apply, which
+// restarts the collector, and reflects that honestly. A rejected apply keeps its
+// reason on the form; a successful one refreshes the page once the service is
+// back, so the redacted current values show what was just set.
+async function applyConnection(body, ui) {
+  ui.status('Saving and restarting the collector…', 'busy');
+  let reply;
+  try {
+    const r = await fetch('/api/setup/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(reply.detail || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+  } catch (e) {
+    ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
+  }
+  ui.status('Saved. The collector is restarting to apply the change; the page will refresh.', 'ok');
+  setTimeout(() => location.reload(), 5000);
+}
+
 async function load() {
   try {
     const response = await fetch('/api/settings');
@@ -1351,6 +1399,15 @@ async function load() {
     pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
       + 'service answers.');
     return;
+  }
+  // Best-effort: the Connection group renders through the wizard picker when the
+  // payload is in hand, and falls back to loose controls when it is not, so a
+  // failure here degrades the group rather than the whole page.
+  try {
+    const r = await fetch('/api/setup');
+    setupPayload = r.ok ? await r.json() : null;
+  } catch (e) {
+    setupPayload = null;
   }
   pageNote('');
   render();
