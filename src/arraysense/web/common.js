@@ -347,6 +347,39 @@ function buildSetupBody(s) {
 // <<< setup-logic
 
 // ---------------------------------------------------------------------------
+// The device's declaration, from /api/capabilities. The store answers every
+// query for every registry metric — one this device cannot produce reads back
+// the same null a reading nobody took gives — so the declaration is the only
+// thing that separates "this hardware does not exist" from "nothing arrived".
+// Pages gate what they draw on these two questions rather than enumerating the
+// reference inverter's shape by hand, which is how a one-string machine came
+// to show two permanently empty string charts. Pure and DOM-free so node can
+// hold them to it (tests/test_dashboard_caps_js.py), the same way the wizard's
+// decisions are checked above.
+// ---------------------------------------------------------------------------
+
+// >>> caps-logic
+// How many PV strings the device declares. null is "unknown", never zero: with
+// no declaration a page falls back to whatever it drew before capabilities
+// existed, because a missing leaflet must not erase real hardware.
+function capStrings(caps) {
+  return caps && typeof caps.pv_strings === 'number' && isFinite(caps.pv_strings)
+    ? caps.pv_strings
+    : null;
+}
+
+// Whether a metric may be drawn for this device. Only a declaration that names
+// its metrics and leaves this one out answers no. No declaration at all (caps
+// null) and a bare source (metrics null) both answer yes, because unknown must
+// not suppress: absent capability is a fact a driver states, and nobody having
+// stated one is not the same fact.
+function capHasMetric(caps, metric) {
+  if (!caps || !Array.isArray(caps.metrics)) return true;
+  return caps.metrics.includes(metric);
+}
+// <<< caps-logic
+
+// ---------------------------------------------------------------------------
 // Numbers on screen. Every one of these answers an absent reading with the
 // dash, which is the single rule this whole project exists to enforce: a
 // missing value and a value of nothing must never be drawn the same way.

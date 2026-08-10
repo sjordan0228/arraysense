@@ -408,33 +408,42 @@ const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
 // what the badge says.
 let calibration = null;
 
-// How this installation reaches the inverter, from /api/capabilities. Held
-// because two spots need it on every poll: the label over the release
-// controls, and the yield copy — which releases the dongle's TCP slot on one
-// installation and the serial port on the other. The words live in one map so
-// the two spots cannot disagree, and an unknown transport stays neutral: a
-// page that guessed "Dongle" over a serial link is the bug this exists to fix.
-let transport = null;
+// What the machine says it is: the whole device entry from /api/capabilities,
+// held because several renders read it on every poll — the transport label
+// over the release controls and in the yield copy, how many PV string rows the
+// detail draws, and which detail panels exist at all. null until the endpoint
+// answers, and null for good against a build without it; every reader treats
+// that as "unknown" and renders what this page always drew, because a missing
+// declaration must not erase hardware. The transport words live in one map so
+// the two spots that name the connection cannot disagree, and an unknown
+// transport stays neutral: a page that guessed "Dongle" over a serial link is
+// the bug that map exists to fix.
+let caps = null;
 const TRANSPORT_WORDS = {
   dongle: { label: 'Dongle', yielded: 'dongle yielded' },
   modbus_serial: { label: 'RS485', yielded: 'port yielded' },
 };
 const transportWords = () =>
-  TRANSPORT_WORDS[transport] || { label: 'Connection', yielded: 'yielded' };
+  TRANSPORT_WORDS[caps ? caps.transport : null] || { label: 'Connection', yielded: 'yielded' };
 
-// One fetch at boot: the transport is a property of the installation, not of
-// any reading, so it never changes while the page is open. A build whose
-// capabilities carry no transport, or a fetch that fails, leaves the neutral
-// words in place rather than a wrong guess.
-async function showTransport() {
+// The arguments of the last detail render, held for loadCaps below. The first
+// poll usually beats the capabilities fetch, so its detail render gates on
+// nothing; redrawing from the held payload once the declaration lands is how a
+// reduced device's absent panels leave the screen now rather than a refresh
+// interval later.
+let lastDetail = null;
+
+// One fetch at boot: capabilities are what the installation *is*, not a
+// reading, so they never change while the page is open. A fetch that fails
+// leaves caps null — neutral connection words, every panel rendered — rather
+// than a wrong guess.
+async function loadCaps() {
   try {
     const r = await fetch('/api/capabilities');
-    if (r.ok) {
-      const device = ((await r.json()).devices || [])[0];
-      transport = device ? device.transport : null;
-    }
-  } catch (e) { /* neutral words until the endpoint answers */ }
+    if (r.ok) caps = ((await r.json()).devices || [])[0] || null;
+  } catch (e) { /* unknown: the gates render everything until the endpoint answers */ }
   $('connLbl').textContent = transportWords().label;
+  if (lastDetail) renderDetail(lastDetail.i, lastDetail.mods);
 }
 
 const trim = (v) => v.toFixed(v % 1 === 0 ? 0 : 1);
@@ -986,7 +995,16 @@ function stringCaption(s) {
 }
 
 function detailStrings(i) {
-  const s = [1, 2, 3].map(k => ({
+  // As many rows as the device declares strings, so a one-string machine gets
+  // one row rather than one reading over two permanent dashes. Unknown falls
+  // back to the reference machine's three — what this panel drew before
+  // capabilities existed — so nothing changes before the declaration loads or
+  // on a bare source. Zero declared strings is a panel that does not exist,
+  // never an empty one.
+  const declared = capStrings(caps);
+  const count = declared === null ? 3 : declared;
+  if (count === 0) return '';
+  const s = Array.from({ length: count }, (_, n) => n + 1).map(k => ({
     k,
     p: numOrNull(i[`pv${k}_power_w`]),
     v: numOrNull(i[`pv${k}_voltage_v`]),
@@ -1271,10 +1289,33 @@ function detailStatus(i) {
       : `${uStr(b1, 1)} / ${uStr(b2, 1)} V`)}</div>`;
 }
 
+// Present or absent, from the declaration; the panels themselves stay
+// hand-authored, because the value here is the relationships and the captions
+// rather than a metric list. Each gate suppresses only on an explicit "no" —
+// with caps unknown everything renders, exactly as this page always did.
 function renderDetail(i, mods) {
+  lastDetail = { i, mods };
+  // Legs is a backup-panel diagnosis, so a device declaring no backup output
+  // (the EG4 3000 EHV) has no card rather than an all-dash one. null is a bare
+  // source that declared nothing, which keeps the card.
+  const legs = !caps || caps.backup_output !== false ? detailLegs(i) : '';
+  // Cable drop, the energy-and-capacity panel, and BMS are all battery
+  // diagnostics — cable drop reads the bank voltage against the inverter's
+  // sample of it, energy reads the pack capacities, BMS the charge permissions.
+  // A device with a battery is witnessed by battery_soc_pct: any battery reports
+  // its state of charge whatever else it relays, while per_module_battery only
+  // says how deep the relay goes — a bank-level-only battery still has all three
+  // worth reading, and gating on the relay depth would hide them. A device with
+  // no battery (the 3000 EHV shape) drops all three rather than showing three
+  // all-dash cards; capHasMetric answers yes on an unknown declaration, so a
+  // bare source keeps them.
+  const battery = capHasMetric(caps, 'battery_soc_pct');
+  const drop = battery ? detailDrop(i) : '';
+  const energy = battery ? detailEnergy(i, mods) : '';
+  const bms = battery ? detailBms(i) : '';
   $('dtl').innerHTML = '<div class="rel">'
-    + detailStrings(i) + detailLegs(i) + detailHeat(i) + detailDrop(i)
-    + detailEnergy(i, mods) + detailBms(i) + detailGrid(i) + detailStatus(i)
+    + detailStrings(i) + legs + detailHeat(i) + drop
+    + energy + bms + detailGrid(i) + detailStatus(i)
     + '</div>';
 }
 
@@ -1680,7 +1721,7 @@ async function boot() {
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
   showRanges();
-  showTransport();
+  loadCaps();
   loadLive();
   loadHistory();
   scheduleLive();
