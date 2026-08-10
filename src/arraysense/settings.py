@@ -29,7 +29,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
@@ -296,6 +296,12 @@ CURRENCY_SUGGESTIONS: tuple[str, ...] = (
     "ZAR",
 )
 
+# Timezone choices for the dropdown. The empty string is first and means
+# "follow the machine's own zone" — this is the default and must remain
+# valid for existing installations. The rest are sorted IANA zone names.
+_TIMEZONE_CHOICES: tuple[str, ...] = ("", *sorted(available_timezones()))
+
+
 SETTINGS: tuple[SettingSpec, ...] = (
     # --- Site ---------------------------------------------------------------
     # Where the installation is, as against who is looking at it. The inverter
@@ -304,7 +310,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
     # before they existed here.
     SettingSpec(
         key=SETTING_TIMEZONE,
-        kind="str",
+        kind="choice",
         default="",
         label="Timezone",
         help=(
@@ -314,10 +320,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "whoever is looking. Leave it empty to follow the machine's own "
             "zone, which is what happens today."
         ),
-        # Resolved against the tz database at save time. An unparseable zone
-        # stored here would surface as a history page that cannot answer, a
-        # long way from the box it was typed in.
-        check=check_timezone,
+        # The choices are the tz database itself, so membership is the check —
+        # a `check=` callback would never fire, because validate() returns
+        # inside the choice branch before reaching it.
+        choices=_TIMEZONE_CHOICES,
         max_length=64,
     ),
     SettingSpec(
