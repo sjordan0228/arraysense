@@ -909,6 +909,15 @@ async function checkStale() {
   let now = Date.now();
   try {
     const response = await fetch('/api/status' + zoneQuery());
+    if (response.status === 404) {
+      // No status endpoint here means the service is in first-run setup mode,
+      // which serves the wizard and /api/setup only. There is no collector to
+      // be stale about, so hide the banner rather than escalate a missing
+      // endpoint into "the service is not answering" over the setup form.
+      showStale(null);
+      staleMisses = 0;
+      return;
+    }
     if (response.ok) {
       const served = Date.parse(response.headers.get('date') || '');
       if (Number.isFinite(served)) now = served;
