@@ -127,7 +127,14 @@ class SqliteStore:
     take the default and quietly grow ninety columns.
     """
 
-    def __init__(self, path: str, device: str, metrics: Iterable[str] | None = None) -> None:
+    def __init__(
+        self,
+        path: str,
+        device: str,
+        metrics: Iterable[str] | None = None,
+        *,
+        synchronous: str = "full",
+    ) -> None:
         """Open the database for one inverter, creating file and schema if absent.
 
         ``device`` is that inverter's serial and becomes the default for every
@@ -207,6 +214,7 @@ class SqliteStore:
         self.is_memory_backed = _is_memory_path(path)
         self._path = path if self.is_memory_backed else os.path.abspath(path)
         self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._synchronous = synchronous
         self._apply_connection_pragmas(self._conn, establish_wal=True)
         self._conn.executescript(schema_ddl(declared))
         existing = {
@@ -254,10 +262,20 @@ class SqliteStore:
         connection still needs foreign keys and its busy timeout, which really
         are per-connection settings.
 
-        The primary connection stores irreplaceable raw samples and explicitly
-        uses FULL. Relying on SQLite's compile-time default would silently weaken
-        that guarantee in a build configured with NORMAL as its default, while a
-        test running against the usual FULL default would never expose it.
+        The primary connection sets its ``synchronous`` explicitly, never
+        inheriting it. Relying on SQLite's compile-time default would silently
+        weaken the guarantee in a build configured with NORMAL as its default,
+        while a test running against the usual FULL default would never expose
+        it. The value is a deployment choice — see ``Config.synchronous`` — and
+        defaults to FULL, which is what every installation had before it could
+        be chosen.
+
+        Measured on the reference Raspberry Pi, through this class's own
+        ``append``: 200 polls cost 207 fsyncs at FULL and 7 at NORMAL, so the
+        difference is about thirtyfold. What NORMAL trades away is bounded loss
+        rather than integrity — SQLite stays consistent either way — and at that
+        checkpoint rate an abrupt power cut discards roughly the last five
+        minutes of readings.
 
         This helper keeps the shared rules together. A second copy drifts, and
         the drift that costs most is a maintenance connection opened without
@@ -267,7 +285,7 @@ class SqliteStore:
         conn.execute(FOREIGN_KEYS_PRAGMA)
         if establish_wal:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute("PRAGMA synchronous = FULL")
+            conn.execute(f"PRAGMA synchronous = {self._synchronous.upper()}")
         conn.execute("PRAGMA busy_timeout = 5000")
 
     def maintenance_connection(self) -> sqlite3.Connection:

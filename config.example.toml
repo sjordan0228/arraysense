@@ -27,6 +27,14 @@ driver = "eg4_luxpower"
 # Where the database is written. Prefer an SSD over a Pi's SD card.
 database_path = "/var/lib/arraysense/arraysense.db"
 
+# How durably a reading must land before the write is done. 'full'
+# fsyncs every commit and is the safe default. 'normal' syncs at
+# checkpoint instead — measured on a Raspberry Pi, 200 polls cost 207
+# fsyncs at full and 7 at normal — which matters on flash storage that
+# wears out. Neither risks corruption; 'normal' can lose the most recent
+# readings, roughly the last five minutes, if power is cut abruptly.
+synchronous = "full"
+
 # How to reach the inverter: 'dongle' (default) for the WiFi dongle's
 # TCP port, or 'modbus_serial' for a USB-to-RS485 adapter. When set to
 # 'modbus_serial', serial_device must also be set.

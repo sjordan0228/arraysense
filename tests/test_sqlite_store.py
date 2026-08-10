@@ -1098,3 +1098,27 @@ def test_a_database_written_with_four_packs_accepts_a_fifth(tmp_path: Path) -> N
     serials = {m["serial"] for m in reopened.latest_modules(["soc_pct"])}
     reopened.close()
     assert serials == {f"CE0000000{i}" for i in range(1, 6)}
+
+
+def test_the_primary_connection_honours_the_configured_durability(tmp_path: Path) -> None:
+    # The setting is worth nothing if it does not reach the connection. Read the
+    # pragma back rather than trusting that it was passed: 2 is FULL, 1 NORMAL.
+    full = SqliteStore(str(tmp_path / "f.db"), device=TEST_DEVICE)
+    assert full._conn.execute("PRAGMA synchronous").fetchone() == (2,)
+    full.close()
+
+    relaxed = SqliteStore(str(tmp_path / "n.db"), device=TEST_DEVICE, synchronous="normal")
+    assert relaxed._conn.execute("PRAGMA synchronous").fetchone() == (1,)
+    relaxed.close()
+
+
+def test_relaxed_durability_still_stores_and_reads_back(tmp_path: Path) -> None:
+    # NORMAL trades a bounded amount of recent data on an abrupt power loss. It
+    # does not trade correctness, and a reading written under it must come back
+    # exactly as one written under FULL.
+    store = SqliteStore(str(tmp_path / "n.db"), device=TEST_DEVICE, synchronous="normal")
+    now = datetime.now(tz=UTC)
+    store.append(Sample(timestamp=now, readings={"battery_voltage_v": 55.9}))
+    rows = store.query(["battery_voltage_v"], now, now)
+    store.close()
+    assert rows[0]["battery_voltage_v"] == 55.9
