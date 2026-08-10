@@ -80,7 +80,13 @@ def fetch_radiation_forecast(
             "latitude": latitude,
             "longitude": longitude,
             "hourly": "shortwave_radiation",
-            "forecast_days": "1",
+            # Two days, not one: forecast_days counts UTC calendar days, and one
+            # UTC day ends at 6 PM in Chicago — which cut the owner's chart off
+            # mid-evening and left mornings without the day's tail. Two days
+            # always cover the whole local day whatever the zone; hours beyond
+            # today land in the table and simply become tomorrow's early
+            # "latest" curve until tomorrow's own dawn plan is made.
+            "forecast_days": "2",
             "timezone": "UTC",
         }
     )
