@@ -272,6 +272,85 @@ def run_migration(config: Config) -> int:
     return 0
 
 
+def _schedule_setup_restart() -> None:
+    """Exit cleanly in a moment, after the apply response has gone out.
+
+    Extracted so a test can stand in for it: the real thing SIGTERMs this
+    process, which under TestClient is the test runner itself — a test that
+    schedules it un-stubbed kills the whole suite half a second later.
+    """
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+
+
+def build_setup_app(config_path: Path | str) -> FastAPI:
+    """The app a brand-new installation serves: pages, setup, nothing else.
+
+    No store and no collector, because there is no inverter serial to open a
+    store under — a placeholder identity would attribute rows to a machine
+    that does not exist, which is the one sin the store's docstring forbids.
+    The wizard's apply writes the config file this path points at, then
+    restarts into the ordinary application. A file that exists but refuses to
+    parse never reaches here: that is a broken installation, and entering
+    setup mode over it would hide the breakage behind a welcome screen.
+    """
+    from fastapi import HTTPException
+
+    from arraysense.api.app import mount_pages
+    from arraysense.api.routes import DetectRequest, _probe_serial
+    from arraysense.config import DEFAULT_DATABASE_PATH
+    from arraysense.setup import describe_setup, render_config
+
+    app = FastAPI(title="Solar ArraySense setup", version=__version__)
+    mount_pages(app)
+
+    @app.get("/api/setup")
+    async def setup_describe() -> dict[str, object]:
+        # The placeholder exists only to satisfy describe_setup's signature;
+        # its values are TEST-NET noise, and the shell knows from first_run
+        # that "current" describes nothing real yet.
+        placeholder = Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA00000000",
+            inverter_serial="unconfigured",
+            database_path=str(DEFAULT_DATABASE_PATH),
+            transport="dongle",
+        )
+        payload = describe_setup(placeholder)
+        payload["first_run"] = True
+        return payload
+
+    @app.post("/api/setup/detect")
+    async def setup_detect(body: DetectRequest) -> dict[str, str]:
+        # No collector exists in setup mode, so there is nothing to borrow
+        # the wire from — probe directly, map failures to named causes.
+        try:
+            serial = await _probe_serial(body)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {"serial": serial}
+
+    @app.post("/api/setup/apply")
+    async def setup_apply_first_run(body: dict[str, object]) -> dict[str, object]:
+        body.setdefault("database_path", str(DEFAULT_DATABASE_PATH))
+        text = render_config(body)
+        target = Path(config_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        probe = target.with_suffix(".candidate")
+        probe.write_text(text)
+        try:
+            # Every boot-time rule refuses here, before the real file exists.
+            load(probe)
+        except (ValueError, FileNotFoundError) as exc:
+            probe.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        probe.replace(target)
+        _schedule_setup_restart()
+        return {"written": str(target), "restarting": True}
+
+    return app
+
+
 def main(argv: list[str] | None = None) -> int:
     """Load the configuration and serve until interrupted."""
     args = build_parser().parse_args(argv)
@@ -284,9 +363,21 @@ def main(argv: list[str] | None = None) -> int:
         # file — one line naming the drivers that exist, not a traceback out of
         # the middle of application assembly.
         drivers.get(config.driver)
-    except (FileNotFoundError, ValueError) as exc:
-        # A misconfigured service should say what is wrong and stop, not crash
-        # with a traceback that buries the one useful line.
+    except FileNotFoundError:
+        # A brand-new installation, not a broken one: serve setup mode, whose
+        # wizard writes the first config and restarts into normal life.
+        logger.info("no configuration at %s — serving first-run setup", args.config)
+        uvicorn.run(
+            build_setup_app(args.config),
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+        )
+        return 0
+    except ValueError as exc:
+        # A file that exists but refuses to parse is a broken installation.
+        # Say what is wrong and stop; entering setup mode over it would hide
+        # the breakage behind a welcome screen.
         logger.error("%s", exc)
         return 1
 

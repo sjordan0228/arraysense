@@ -41,6 +41,11 @@ DEFAULT_DONGLE_PORT = 8000
 # traceback.
 DEFAULT_DRIVER = "eg4_luxpower"
 
+# Where first-run setup puts the database when nobody says otherwise. load()
+# still requires the key — the file the wizard writes is always explicit — so
+# this is a suggestion for the writer, never a fallback for the reader.
+DEFAULT_DATABASE_PATH = Path("/var/lib/arraysense/arraysense.db")
+
 # Required whatever the transport: the identity rows are filed under, and
 # somewhere to file them.
 _REQUIRED = ("inverter_serial", "database_path")

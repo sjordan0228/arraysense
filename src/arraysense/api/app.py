@@ -109,6 +109,20 @@ def create_app(store: SqliteStore, service: CollectorService, config: Config) ->
     app.state.config = config
     app.include_router(router)
 
+    mount_pages(app)
+
+    logger.debug("application assembled")
+    return app
+
+
+def mount_pages(app: FastAPI) -> None:
+    """Attach the pages, shared script and vendored files to an app.
+
+    Split from create_app so first-run setup mode serves the same pages
+    byte-identically: a second page-mounting loop would drift from this one
+    the first time a page was added, and the wizard would 404 on exactly the
+    installation that needs it most.
+    """
     web = Path(__file__).parent.parent / "web"
 
     for route, filename in PAGES.items():
@@ -127,6 +141,3 @@ def create_app(store: SqliteStore, service: CollectorService, config: Config) ->
         if media is None:
             raise HTTPException(status_code=404, detail=f"no vendored file {name!r}")
         return FileResponse(web / name, media_type=media)
-
-    logger.debug("application assembled")
-    return app
