@@ -2290,3 +2290,459 @@ def test_every_connection_carries_the_configured_durability(tmp_path: Path) -> N
     assert kept.execute("PRAGMA synchronous").fetchone() == (2,)
     kept.close()
     unchanged.close()
+
+
+# --- the setup trio: describe, detect, apply (#setup slice A)
+
+
+def test_setup_describes_the_machine_and_redacts_secrets(client: Any) -> None:
+    r = client.get("/api/setup")
+    assert r.status_code == 200
+    body = r.json()
+    makers = [m["name"] for m in body["manufacturers"]]
+    assert "EG4" in makers and "Simulated" in makers
+    assert "dongle" in body["transports"]
+    # Masked with the settings module's own masker, so an echo of this value
+    # is recognisable to the apply endpoint's discard rule.
+    assert "•" in body["current"]["inverter_serial"]
+
+
+def test_detect_returns_the_serial_the_hardware_answered(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        return "3352000000"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"serial": "3352000000"}
+
+
+def test_detect_failure_is_a_message_with_a_cause_not_a_500(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        raise ConnectionError("could not open /dev/rs485: permission denied")
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 502
+    assert "permission denied" in r.json()["detail"]
+
+
+def test_detect_refuses_an_unknown_transport(client: Any) -> None:
+    r = client.post("/api/setup/detect", json={"transport": "carrier_pigeon"})
+    assert r.status_code == 400
+
+
+def test_detect_gives_the_wire_back_after_borrowing_it(client: Any, monkeypatch: Any) -> None:
+    # The probe borrows the single client slot through yield mode. Whatever
+    # happens on the wire, the collector must get it back — a detect that left
+    # the service yielded would silently stop collection.
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        raise ConnectionError("nothing answered")
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.9",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
+    assert r.status_code == 502
+    status = client.get("/api/status").json()
+    assert status["running"] is True, "the borrow must hand the collector back"
+    assert status["yielding"] is False
+
+
+def test_detect_fills_a_masked_connection_from_the_current_config(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The settings page prefills the connection redacted. A Detect that did not
+    # retype the secrets must probe the configured connection, not literally dial
+    # a bullet-filled host — so the server substitutes the real values from the
+    # config the collector runs on before the probe.
+    from arraysense.api import routes
+
+    seen: dict[str, str] = {}
+
+    async def fake_probe(body: Any) -> str:
+        seen["host"] = body.dongle_host
+        seen["serial"] = body.dongle_serial
+        seen["inverter"] = body.inverter_serial
+        return "CE12345678"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    cfg = client.app.state.config
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "1•••9",
+            "dongle_serial": "B•••s",
+            "inverter_serial": "C•••i",
+        },
+    )
+    assert r.status_code == 200
+    assert seen["host"] == cfg.dongle_host
+    assert seen["serial"] == cfg.dongle_serial
+    assert seen["inverter"] == cfg.inverter_serial
+    assert "•" not in seen["host"]
+
+
+def test_detect_uses_retyped_connection_values_as_given(client: Any, monkeypatch: Any) -> None:
+    # A value the person actually retyped carries no mask and is used verbatim,
+    # so a Detect against a new connection probes what was typed, not the old one.
+    from arraysense.api import routes
+
+    seen: dict[str, str] = {}
+
+    async def fake_probe(body: Any) -> str:
+        seen["host"] = body.dongle_host
+        return "CE12345678"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.50",
+            "dongle_serial": "BA99999999",
+            "inverter_serial": "CE99999999",
+        },
+    )
+    assert r.status_code == 200
+    assert seen["host"] == "192.0.2.50"
+
+
+def test_apply_refuses_an_invalid_combination_without_writing(
+    client: Any, monkeypatch: Any
+) -> None:
+    # Validation is by constructing a real Config from the merged result, so
+    # every rule the service enforces at boot refuses here first — one rule
+    # set, never two. The scheduler is stubbed so the exact regression this
+    # guards — a refusal that schedules anyway — fails as an assertion rather
+    # than SIGTERMing the test runner.
+    from arraysense.api import routes
+
+    fired: list[str] = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: fired.append("restart"))
+    r = client.post(
+        "/api/setup/apply",
+        json={"transport": "modbus_serial", "serial_device": ""},
+    )
+    assert r.status_code == 400
+    assert "serial_device" in r.json()["detail"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "a refused apply must write nothing"
+    assert fired == [], "a refused apply must not schedule a restart"
+
+
+def test_apply_writes_the_overlay_and_schedules_a_restart(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    fired: list[str] = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: fired.append("restart"))
+    r = client.post(
+        "/api/setup/apply",
+        json={"model": "18kPV", "battery_source": "relayed"},
+    )
+    assert r.status_code == 200
+    assert fired == ["restart"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.model"] == "18kPV"
+
+
+def test_apply_refuses_what_boot_would_refuse(client: Any, monkeypatch: Any) -> None:
+    # The review's sharpest finding: an overlay that apply accepts but boot
+    # rejects is a service systemd crash-loops with no page left to repair it.
+    # battery_source "direct" passes Config validation and fails the registry's
+    # rules — exactly the gap.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post("/api/setup/apply", json={"battery_source": "direct"})
+    assert r.status_code == 400
+    assert "not yet" in r.json()["detail"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.battery_source"] == ""
+
+
+def test_apply_is_all_or_nothing(client: Any, monkeypatch: Any) -> None:
+    # One act: a batch that stored its first key and refused its second would
+    # leave an overlay the next boot assembles from halves.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post(
+        "/api/setup/apply",
+        json={"transport": "dongle", "serial_device": "x" * 500},
+    )
+    assert r.status_code == 400
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "the batch partner must not have landed"
+
+
+def test_apply_discards_masked_echoes_rather_than_storing_dots(
+    client: Any, monkeypatch: Any
+) -> None:
+    # A full form submitted unchanged echoes the masks /api/setup showed it.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    masked = client.get("/api/setup").json()["current"]["inverter_serial"]
+    r = client.post("/api/setup/apply", json={"inverter_serial": masked, "model": "18kPV"})
+    assert r.status_code == 200
+    values = client.get("/api/settings").json()["values"]
+    assert "•" not in str(values["connection.inverter_serial"])
+
+
+def test_dongle_detect_without_the_serial_is_a_named_refusal(client: Any) -> None:
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "dongle", "dongle_host": "192.0.2.9", "dongle_serial": "BA0"},
+    )
+    assert r.status_code == 400
+    assert "authenticates" in r.json()["detail"]
+
+
+def test_apply_can_switch_the_driver_family(client: Any, monkeypatch: Any) -> None:
+    # The spec names driver switching for an existing installation; the first
+    # cut of apply forgot it.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.post("/api/setup/apply", json={"driver": "fake", "model": "Simulated"})
+    assert r.status_code == 200
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.driver"] == "fake"
+
+
+def test_the_settings_page_cannot_persist_an_unbootable_connection(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The settings PUT is a second write path to the connection group. An
+    # invalid combination through it would crash-loop the next boot exactly as
+    # one through /setup/apply would, so it runs the same registry validation.
+    r = client.put("/api/settings", json={"connection.transport": "carrier_pigeon"})
+    assert r.status_code == 400
+    r2 = client.put("/api/settings", json={"connection.battery_source": "direct"})
+    assert r2.status_code == 400
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "nothing unbootable should have landed"
+
+
+def test_detect_hands_back_an_already_yielded_collector(client: Any, monkeypatch: Any) -> None:
+    # The borrow stops the collector and starts it again. If stop() left the
+    # yield flag set, the restarted loop would return early forever — a detect
+    # that silently stopped collection. Yield first, then detect, then assert
+    # the collector is polling.
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        return "3352000000"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    client.post("/api/yield", json={"seconds": 60})
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.9",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
+    assert r.status_code == 200
+    status = client.get("/api/status").json()
+    assert status["yielding"] is False, "a stopped-then-started borrow must clear yield"
+    assert status["running"] is True
+
+
+def test_clearing_an_overlay_field_is_validated_against_the_file_not_the_overlay(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The subtle boot-safety hole: an install whose file names eg4/18kPV but
+    # whose stored overlay says fake/Simulated. Clearing connection.driver
+    # reverts the driver to the file's eg4 at next boot while the stored model
+    # override Simulated stays — eg4 has no model "Simulated", so the next boot
+    # would crash. The write path must model that revert and refuse the clear.
+    from arraysense.__main__ import build_app
+    from arraysense.config import load
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+
+    db = tmp_path / "clear.db"
+    seed = SqliteStore(str(db), device="CE00000000")
+    s = SettingsStore(seed)
+    s.set("connection.driver", "fake")
+    s.set("connection.model", "Simulated")
+    seed.close()
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'driver = "eg4_luxpower"\n'
+        'model = "18kPV"\n'
+        'dongle_host = "192.0.2.1"\n'
+        'dongle_serial = "BA00000000"\n'
+        'inverter_serial = "CE00000000"\n'
+        f'database_path = "{db}"\n'
+    )
+    app_obj, store, _service = build_app(load(path))
+    from fastapi.testclient import TestClient
+
+    with TestClient(app_obj) as client:
+        # Clearing the driver would revert to eg4 while model stays Simulated.
+        r = client.put("/api/settings", json={"connection.driver": ""})
+        assert r.status_code == 400, (
+            "the clear reverts to an eg4/Simulated boot and must be refused"
+        )
+    store.close()
+
+
+def test_a_malformed_connection_value_is_a_bad_request_not_a_500(
+    client: Any, monkeypatch: Any
+) -> None:
+    # Coercing a pending value can raise TypeError (a list where a number is
+    # wanted) or OverflowError (a number too large to become a float). Both are
+    # bad input, not a server fault, on either write path.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put("/api/settings", json={"connection.serial_baud": []})
+    assert r.status_code == 400
+    # Out of the field's bounds now, so pydantic refuses it at the door as a
+    # 422 — a cleaner refusal than the 400 the coercion path gave. Either is a
+    # bad request, never a 500.
+    r2 = client.post("/api/setup/apply", json={"serial_baud": 10**400})
+    assert r2.status_code in (400, 422)
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.serial_baud"] == 19200, "nothing malformed should have landed"
+
+
+def test_detect_rejects_a_device_path_with_a_null_byte_as_422(client: Any) -> None:
+    # A null byte in a device path makes pyserial raise on open — a 500 from a
+    # sink deep in the transport stack. The field validator refuses it at the
+    # door instead. No real device path holds a control character.
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/" + chr(0) + "rs485"},
+    )
+    assert r.status_code == 422
+
+
+def test_no_write_path_persists_an_unbootable_connection_value(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The class two review rounds kept turning up: a connection value some write
+    # path accepts and stores, which then crashes the collector on the next boot
+    # or 500s a probe. This pins the invariant across every field at once —
+    # every hostile-but-typed value is a 4xx on both persist paths and nothing
+    # lands — so a new field that forgets its validation fails here loudly rather
+    # than in production. Hosts are the one field that cannot be validated at the
+    # door (any string is a plausible name); they are caught at connect instead
+    # and covered by their own gap tests.
+    from arraysense.api import routes
+    from arraysense.settings import SettingsStore
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    # The overlay-settable connection fields, minus the two file-only ones:
+    # dongle_port and database_path are carried by neither ApplyRequest nor the
+    # settings registry, so the API cannot persist them (apply silently drops
+    # the unknown field). database_path IS written at first-run apply and is
+    # validated there — see test_main.py. Hosts are excluded per the docstring:
+    # any string is a plausible name, so they are caught at connect, not here.
+    cases: dict[str, object] = {
+        "model": "99kPV",
+        "driver": "no_such_driver",
+        "transport": "carrier_pigeon",
+        "battery_source": "quantum",
+        "serial_device": "loop://x",
+        "serial_baud": 10**9,
+        "serial_unit_id": 999,
+        "inverter_serial": "x" * 5000,
+        "dongle_serial": "x" * 5000,
+    }
+    for field, value in cases.items():
+        apply = client.post("/api/setup/apply", json={field: value})
+        assert apply.status_code >= 400, f"apply accepted a bad {field}"
+        put = client.put("/api/settings", json={f"connection.{field}": value})
+        assert put.status_code >= 400, f"settings PUT accepted a bad {field}"
+    # The invariant that matters, read from the raw overlay: nothing hostile
+    # landed. A 4xx that still wrote would be the actual bug.
+    overrides = SettingsStore(client.app.state.store).overrides()
+    for field in cases:
+        assert f"connection.{field}" not in overrides, f"a bad {field} was persisted"
+
+
+def test_a_url_serial_device_is_refused_at_the_door_not_stored(
+    client: Any, monkeypatch: Any
+) -> None:
+    # pyserial treats a device string with "://" as a URL and its handler raises
+    # an undeclared KeyError/re.error at connect — not (TransportError, OSError).
+    # Accepted and stored, it would kill the collector on the next boot and 500
+    # the detect probe. Every write path refuses it, and detect never reaches
+    # pyserial's URL dispatch: it is a 422 at the model, a device path is a
+    # filesystem path.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    bad = "loop://?foo=bar"
+
+    r = client.post("/api/setup/detect", json={"transport": "modbus_serial", "serial_device": bad})
+    assert r.status_code == 422
+
+    r = client.post("/api/setup/apply", json={"transport": "modbus_serial", "serial_device": bad})
+    assert r.status_code == 422
+
+    r = client.put("/api/settings", json={"connection.serial_device": bad})
+    assert r.status_code == 400
+
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.serial_device"] == "", "no URL device should have landed"
+
+
+def test_detect_survives_an_unresolvable_host_as_502(client: Any) -> None:
+    # A dongle host that resolves through IDNA to an over-long DNS label raises
+    # UnicodeError from connect, not OSError — an unhandled 500 on the
+    # unauthenticated setup surface unless the probe catches it. It is an
+    # unreachable endpoint like any other: a 502 with a cause, and the collector
+    # is handed back.
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "a" * 64 + ".invalid",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
+    assert r.status_code == 502
+    assert client.get("/api/status").json()["running"] is True
+
+
+def test_apply_rejects_control_text_in_a_serial_as_422(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    # A lone surrogate cannot be sent as a Python object — the client fails to
+    # encode it, just as a real HTTP client would. The attack is the JSON
+    # escape in the raw body, which the server decodes to a surrogate string.
+    r = client.post(
+        "/api/setup/apply",
+        content=b'{"inverter_serial": "\\ud800"}',
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 422

@@ -235,6 +235,12 @@ class CollectorService:
         finally:
             self._task = None
             self._yield_task = None
+            # A stopped collector is not yielding. Leaving the flag set would
+            # make the next start()'s poll loop return early forever, which is
+            # how a detect borrow against an already-yielded collector stranded
+            # it — running true, yielding true, no yield task to ever clear it.
+            self.status.yielding = False
+            self.status.yield_until = None
             with contextlib.suppress(*TRANSPORT_ERRORS):
                 await self._source.disconnect()
             self.status.running = False

@@ -7,6 +7,50 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.14 — 10 August 2026
+
+### Added
+
+- **The machine can now describe itself, which is what a setup wizard renders
+  from.** Drivers declare a manufacturer and their models, and every model
+  fact carries a citation — the 18kPV's three PV strings cite the reference
+  installation; the 6000XP and 12kPV inherit the family declaration until a
+  source exists, because a conservative default is honest and an invented
+  spec is not. Configuration gains `model` and `battery_source` (`relayed`,
+  the reality of every current installation, or `none`), the settings overlay
+  carries the connection group, and `/api/setup` serves the manufacturer
+  tree, each transport's required fields, the serial adapters the machine can
+  actually see, and the current values with secrets redacted.
+
+  Two endpoints act: **detect** stops the collector, reads the inverter's
+  serial off the candidate connection, and starts the collector again on the
+  way out whatever happened — it writes nothing, and on the dongle it needs
+  the inverter serial you typed, because that protocol authenticates with it.
+  **apply** validates the whole merged result with the registry's own boot
+  rules — an overlay it accepts is one the next boot accepts — discards any
+  masked value the form echoed back rather than storing dots over a real
+  serial, writes every setting in a single transaction or none at all, and
+  restarts the collector. Switching the driver family is part of it.
+
+  A brand-new installation — no config file at all — now serves **first-run
+  setup** instead of exiting with an error: pages and the setup endpoints,
+  no store and no collector, because there is no inverter serial to open a
+  store under until the wizard supplies one — typed, or read off a serial bus
+  by detection. The wizard's first apply writes the only config file software
+  will ever write, validated by the same loader that will read it at boot.
+
+  A **first-run wizard** renders all of it: pick who made the inverter, which
+  model, and how it is wired, read the serial off the wire with Detect or type
+  it, and one button writes the config and restarts into a live dashboard —
+  the page watches the restart come back rather than guessing at a delay, and a
+  refused apply keeps its reason on the form. The **settings page's connection
+  group is the same renderer**, one component in two shells so the wizard and
+  the settings form cannot drift, prefilled with the current values redacted and
+  saved through the same validated, restart-on-apply path. Detect on an
+  unchanged connection uses the configured secrets rather than the dots shown
+  for them. An existing installation changes nothing: every new field defaults
+  to exactly today's behaviour, and an already-configured box shows no wizard.
+
 ## 0.6.13 — 9 August 2026
 
 ### Changed

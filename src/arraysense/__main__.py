@@ -71,9 +71,17 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
     # The store lays its schema for what the configured driver declares it can
     # produce, so a fresh database has no column that can never be filled. The
-    # settings overlay below cannot change the driver — only the file names it
-    # — so the declaration is safe to resolve before the store exists to read
-    # settings from.
+    # settings overlay can now name a different driver than the file did, so
+    # this first open lays the schema and reads the settings table — its metric
+    # declaration is provisional and re-derived from the effective driver
+    # below, and the store is reopened if the overlay changed the driver. The
+    # settings table carries no driver-specific columns, so the provisional
+    # declaration only affects which tier columns are writable — the reopen
+    # sets the writable set for the effective driver and adds any missing
+    # columns; a column the provisional driver had and the effective one does
+    # not is left in place, unwritten, which is harmless.
+    file_config = config
+    opened_driver = config.driver
     declared = drivers.get(config.driver).capabilities.metrics
     store = SqliteStore(
         config.database_path,
@@ -86,6 +94,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # here rather than inside load() because the settings live in the database,
     # and the file is what says where the database is.
     config = effective(config, SettingsStore(store))
+    # The effective driver is what the collector will build, so the store's
+    # schema must be declared for it — not for whatever the file named. A
+    # first-run "fake" installation switched to eg4_luxpower through the
+    # overlay would otherwise write EG4 samples into a fake-declared store and
+    # KeyError on the first EG4-only metric, killing the poll loop.
+    declared = drivers.get(config.driver).capabilities.metrics
 
     # Which leaves an ordering problem now that the store is opened for a
     # device: the serial the settings page may override is the identity the
@@ -93,10 +107,16 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # read it. Reopening is the cheap and visible answer. Without it the API
     # would read one serial's rows while the collector wrote another's, and
     # every page would go blank with the collector apparently healthy.
-    if config.inverter_serial != store.device:
+    if config.inverter_serial != store.device or config.driver != opened_driver:
+        # Reopen whenever the identity or the driver the store was first built
+        # with no longer matches the effective configuration. The serial is the
+        # row identity; the driver decides the column set. Either one wrong
+        # means the collector and the store disagree about what they are
+        # writing, and the reopen is cheap and visible.
         logger.info(
-            "settings override the inverter serial; reopening the store as %s",
+            "settings override the connection; reopening the store as %s on the %s driver",
             config.inverter_serial,
+            config.driver,
         )
         store.close()
         store = SqliteStore(
@@ -132,7 +152,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         store=store,
         interval=config.poll_interval,
     )
-    app = create_app(store=store, service=service, config=config)
+    # The file config, not the effective one, is what a write path needs to
+    # predict the next boot: clearing an overlay field reverts to the file
+    # value, and only this base can see it.
+    app = create_app(store=store, service=service, config=config, file_config=file_config)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -272,6 +295,140 @@ def run_migration(config: Config) -> int:
     return 0
 
 
+def _schedule_setup_restart() -> None:
+    """Exit cleanly in a moment, after the apply response has gone out.
+
+    Extracted so a test can stand in for it: the real thing SIGTERMs this
+    process, which under TestClient is the test runner itself — a test that
+    schedules it un-stubbed kills the whole suite half a second later.
+    """
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+
+
+def build_setup_app(config_path: Path | str) -> FastAPI:
+    """The app a brand-new installation serves: pages, setup, nothing else.
+
+    No store and no collector, because there is no inverter serial to open a
+    store under — a placeholder identity would attribute rows to a machine
+    that does not exist, which is the one sin the store's docstring forbids.
+    The wizard's apply writes the config file this path points at, then
+    restarts into the ordinary application. A file that exists but refuses to
+    parse never reaches here: that is a broken installation, and entering
+    setup mode over it would hide the breakage behind a welcome screen.
+    """
+    from fastapi import HTTPException
+
+    from arraysense.api.app import install_text_guard, mount_pages
+    from arraysense.api.routes import DetectRequest, run_detect
+    from arraysense.config import DEFAULT_DATABASE_PATH
+    from arraysense.settings import check_serial_device
+    from arraysense.setup import describe_setup, render_config
+
+    app = FastAPI(title="Solar ArraySense setup", version=__version__)
+    mount_pages(app)
+    install_text_guard(app)
+
+    @app.get("/api/setup")
+    async def setup_describe() -> dict[str, object]:
+        # The placeholder exists only to satisfy describe_setup's signature;
+        # its values are TEST-NET noise, and the shell knows from first_run
+        # that "current" describes nothing real yet.
+        placeholder = Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA00000000",
+            inverter_serial="unconfigured",
+            database_path=str(DEFAULT_DATABASE_PATH),
+            transport="dongle",
+        )
+        payload = describe_setup(placeholder)
+        payload["first_run"] = True
+        return payload
+
+    @app.post("/api/setup/detect")
+    async def setup_detect(body: dict[str, object]) -> dict[str, str]:
+        # A plain dict rather than DetectRequest: a nested endpoint annotated
+        # with the imported class is an unresolved forward reference under this
+        # module's postponed annotations, which FastAPI turns into a 422 for a
+        # missing "body" parameter. Build the model here and hand it to the
+        # same run_detect the running-service route uses, so setup mode gets
+        # the unknown-transport and missing-serial checks rather than skipping
+        # them. No collector exists here, so nothing is borrowed.
+        from pydantic import ValidationError
+
+        try:
+            parsed = DetectRequest.model_validate(body)
+        except ValidationError as exc:
+            # A running-service route gets 422 from FastAPI for a malformed
+            # body; setup mode parses by hand, so it maps the same failure to
+            # the same status. Only the location and message are reported, never
+            # the raw input or the exception object — a lone surrogate input is
+            # not JSON-serializable and would turn the 422 into a 500.
+            detail = [
+                {"loc": [str(part) for part in err.get("loc", ())], "msg": str(err.get("msg", ""))}
+                for err in exc.errors()
+            ]
+            raise HTTPException(status_code=422, detail=detail) from exc
+        return await run_detect(parsed, service=None)
+
+    @app.post("/api/setup/apply")
+    async def setup_apply_first_run(body: dict[str, object]) -> dict[str, object]:
+        target = Path(config_path)
+        probe = target.with_suffix(".candidate")
+        try:
+            # Everything that can fault on a hostile body runs inside the guard:
+            # render_config and the write itself raise UnicodeEncodeError on a
+            # lone surrogate, so writing before the try would 500 and strand a
+            # candidate. Nothing outside the try touches the request.
+            body.setdefault("database_path", str(DEFAULT_DATABASE_PATH))
+            text = render_config(body)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            probe.write_text(text)
+            candidate = load(probe)
+            drivers.validate(candidate)
+            # A serial device pyserial would read as a URL parses fine here but
+            # raises an undeclared exception at connect. Reject it before it
+            # becomes the config file — the one write with no setup mode left to
+            # fall back to. Same rule the settings registry and request models
+            # enforce, so the wizard cannot write a floor the page would refuse.
+            check_serial_device(candidate.serial_device)
+            # database_path must not name the configuration file. The store the
+            # next line opens to prove the path is usable would then be the file
+            # replace() overwrites with TOML, and the boot after would read TOML
+            # as sqlite and crash — a persisted config that cannot start.
+            db = Path(candidate.database_path).resolve()
+            if db == target.resolve() or db == probe.resolve():
+                raise ValueError("database_path must not be the configuration file")
+            # Prove the candidate boots, not merely that it parses: open the
+            # store at the configured path, the one thing load() and the
+            # registry do not check. A path load() accepts but sqlite cannot
+            # open would otherwise become the real config and crash-loop every
+            # restart with no setup mode left to offer.
+            declared = drivers.get(candidate.driver).capabilities.metrics
+            SqliteStore(
+                candidate.database_path,
+                device=candidate.inverter_serial,
+                metrics=declared,
+                synchronous=candidate.synchronous,
+            ).close()
+        except (
+            ValueError,
+            FileNotFoundError,
+            OverflowError,
+            TypeError,
+            OSError,
+            UnicodeError,
+            sqlite3.Error,
+        ) as exc:
+            probe.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        probe.replace(target)
+        _schedule_setup_restart()
+        return {"written": str(target), "restarting": True}
+
+    return app
+
+
 def main(argv: list[str] | None = None) -> int:
     """Load the configuration and serve until interrupted."""
     args = build_parser().parse_args(argv)
@@ -284,9 +441,21 @@ def main(argv: list[str] | None = None) -> int:
         # file — one line naming the drivers that exist, not a traceback out of
         # the middle of application assembly.
         drivers.get(config.driver)
-    except (FileNotFoundError, ValueError) as exc:
-        # A misconfigured service should say what is wrong and stop, not crash
-        # with a traceback that buries the one useful line.
+    except FileNotFoundError:
+        # A brand-new installation, not a broken one: serve setup mode, whose
+        # wizard writes the first config and restarts into normal life.
+        logger.info("no configuration at %s — serving first-run setup", args.config)
+        uvicorn.run(
+            build_setup_app(args.config),
+            host=args.host,
+            port=args.port,
+            log_level=args.log_level,
+        )
+        return 0
+    except ValueError as exc:
+        # A file that exists but refuses to parse is a broken installation.
+        # Say what is wrong and stop; entering setup mode over it would hide
+        # the breakage behind a welcome screen.
         logger.error("%s", exc)
         return 1
 

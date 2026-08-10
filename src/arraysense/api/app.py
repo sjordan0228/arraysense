@@ -92,7 +92,12 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     return serve
 
 
-def create_app(store: SqliteStore, service: CollectorService, config: Config) -> FastAPI:
+def create_app(
+    store: SqliteStore,
+    service: CollectorService,
+    config: Config,
+    file_config: Config | None = None,
+) -> FastAPI:
     """Assemble the application from an open store, a collector and a config.
 
     Nothing is constructed here — the caller owns the lifecycle of all three,
@@ -107,8 +112,57 @@ def create_app(store: SqliteStore, service: CollectorService, config: Config) ->
     app.state.store = store
     app.state.service = service
     app.state.config = config
+    # The file config, before any settings overlay, is what a write path needs
+    # to predict the next boot: clearing an overlay field reverts to the file
+    # value. A direct caller that passes only the effective config would make
+    # the validation model the wrong base, so this is set here, always, and
+    # build_app passes the real file config through it.
+    app.state.file_config = file_config if file_config is not None else config
     app.include_router(router)
+    install_text_guard(app)
 
+    mount_pages(app)
+
+    logger.debug("application assembled")
+    return app
+
+
+def install_text_guard(app: FastAPI) -> None:
+    """Answer a malformed body as 422 without echoing the un-encodable input.
+
+    FastAPI's default validation-error response includes the offending input,
+    and a lone surrogate — valid JSON syntax through a uXXXX escape, but not
+    encodable text — makes rendering that response raise UnicodeError deep in
+    the framework, escaping as a 500. Field validators cannot help: the failure
+    is in serializing the error, after they have run. This handler reports only
+    each error's location and message, never the raw input, so the 422 renders
+    and the value that could not be encoded is dropped. Nothing is persisted on
+    this path, so the status is the whole of it.
+    """
+    from fastapi.exceptions import RequestValidationError
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import JSONResponse
+
+    async def on_validation_error(
+        request: StarletteRequest, exc: RequestValidationError
+    ) -> JSONResponse:
+        detail = [
+            {"loc": [str(part) for part in err.get("loc", ())], "msg": str(err.get("msg", ""))}
+            for err in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": detail})
+
+    app.add_exception_handler(RequestValidationError, on_validation_error)  # type: ignore[arg-type]
+
+
+def mount_pages(app: FastAPI) -> None:
+    """Attach the pages, shared script and vendored files to an app.
+
+    Split from create_app so first-run setup mode serves the same pages
+    byte-identically: a second page-mounting loop would drift from this one
+    the first time a page was added, and the wizard would 404 on exactly the
+    installation that needs it most.
+    """
     web = Path(__file__).parent.parent / "web"
 
     for route, filename in PAGES.items():
@@ -127,6 +181,3 @@ def create_app(store: SqliteStore, service: CollectorService, config: Config) ->
         if media is None:
             raise HTTPException(status_code=404, detail=f"no vendored file {name!r}")
         return FileResponse(web / name, media_type=media)
-
-    logger.debug("application assembled")
-    return app

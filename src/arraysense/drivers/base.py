@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -183,6 +183,16 @@ class Capabilities:
     # Whether the device reports each battery module separately, or only a
     # bank-level summary. Per-pack drift is invisible in the summary.
     per_module_battery: bool = False
+    # Whether this family relays BMS data through its own connection at all.
+    # per_module_battery says how deep the relay goes; this says whether it
+    # exists. A family that relays nothing can only offer battery_source
+    # "none", and the setup endpoint derives its choices from exactly this.
+    relays_battery: bool = False
+    # How many battery module slots the relay can carry. The registry expands
+    # per-module metric names to a fixed ceiling because it cannot import the
+    # drivers that import it; this is the per-family truth pages should render
+    # from. Must not exceed the registry's expansion — a test enforces it.
+    battery_module_slots: int = 0
     # How the driver reaches the inverter: "dongle" for the WiFi dongle's TCP
     # port, "modbus_serial" for a USB-to-RS485 adapter. This is a constant for
     # a given installation. The registry entry carries the family default; a
@@ -344,6 +354,57 @@ class InverterDriver(InverterSource, Protocol):
 
 
 @dataclass(frozen=True)
+class ModelSpec:
+    """One model within a driver family, and how it differs from the family.
+
+    Every delta field left None inherits the family declaration. A delta that
+    is set asserts a fact about a physical machine, so it must say where the
+    fact came from: a citation naming a measurement or a vendor document.
+    Without that rule the models table fills with plausible inventions, and a
+    page rendering pv_strings=2 for a 6000XP nobody ever checked is exactly
+    the kind of confident wrongness this project exists to refuse.
+    """
+
+    name: str
+    pv_strings: int | None = None
+    battery_module_slots: int | None = None
+    citation: str = ""
+
+    def __post_init__(self) -> None:
+        """Refuse a delta that cites nothing."""
+        has_delta = self.pv_strings is not None or self.battery_module_slots is not None
+        if has_delta and not self.citation.strip():
+            raise ValueError(
+                f"model {self.name!r} asserts a hardware fact without a citation; "
+                "name the measurement or document it came from"
+            )
+
+
+def resolve_model(family: Capabilities, model: ModelSpec) -> Capabilities:
+    """Return the family capabilities with one model's cited deltas applied.
+
+    The same shape as the transport resolution on a built source: the registry
+    entry carries the family default, and an installation that names a model
+    answers with this. Fields the model does not cite stay exactly the family's.
+    """
+    resolved = family
+    if model.pv_strings is not None:
+        resolved = replace(resolved, pv_strings=model.pv_strings)
+    if model.battery_module_slots is not None:
+        resolved = replace(resolved, battery_module_slots=model.battery_module_slots)
+    return resolved
+
+
+def find_model(entry: DriverEntry, name: str) -> ModelSpec:
+    """Return the named model from an entry, or refuse naming what does exist."""
+    for model in entry.models:
+        if model.name == name:
+            return model
+    known = ", ".join(m.name for m in entry.models) or "none"
+    raise ValueError(f"driver {entry.name!r} has no model {name!r}; models: {known}")
+
+
+@dataclass(frozen=True)
 class DriverEntry:
     """One registered driver: its name, what it covers, and how to build it.
 
@@ -354,11 +415,12 @@ class DriverEntry:
     itself, so what a source reports is the entry's declaration and not a second
     opinion about the hardware.
 
-    One field is necessarily an exception. ``transport`` is not a property of
-    the family — the same inverter is reached by a dongle at one installation
-    and a serial adapter at the next — so a built source answers with the one
-    its own configuration chose, and the entry can only carry the default. That
-    is the single field on which the two may differ, and they differ about the
+    Two resolutions are necessarily exceptions, both per installation rather
+    than per family: ``transport`` — the same inverter is reached by a dongle
+    at one installation and a serial adapter at the next — and the model's
+    cited capability deltas. A built source answers with what its own
+    configuration chose; the entry can only carry the family defaults. Those
+    are the fields on which the two may differ, and they differ about the
     installation rather than about the device.
 
     ``build`` takes the whole Config rather than a bag of connection settings.
@@ -371,6 +433,12 @@ class DriverEntry:
     description: str
     capabilities: Capabilities
     build: Callable[[Config], InverterDriver] = field(compare=False)
+    # Who makes the family, as a person would name it in a dropdown. The fake
+    # driver says "Simulated" — running the wizard with no hardware is a
+    # supported case, so it is a manufacturer as far as the picker cares.
+    manufacturer: str = ""
+    # The models this family covers, each carrying only cited deltas.
+    models: tuple[ModelSpec, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse an entry with no usable name, since the name is the lookup key."""

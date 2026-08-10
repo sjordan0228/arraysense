@@ -29,9 +29,12 @@ from arraysense.drivers.base import (
     EnergyReporting,
     InverterDriver,
     InverterSource,
+    ModelSpec,
     expand_module_metrics,
+    find_model,
+    resolve_model,
 )
-from arraysense.metrics import column_names
+from arraysense.metrics import _MODULE_SLOTS, column_names
 from arraysense.models import BatteryModuleSample
 
 
@@ -200,6 +203,32 @@ def test_a_negative_string_count_is_refused() -> None:
         Capabilities(pv_strings=-1, energy=EnergyReporting.COUNTED, metrics=frozenset())
 
 
+def test_capabilities_declare_the_battery_axis() -> None:
+    # The battery used to be one boolean on the inverter. The axis needs two
+    # more facts: whether this family relays BMS data at all, and how many
+    # module slots the relay can carry.
+    caps = Capabilities(
+        pv_strings=1,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset(),
+        relays_battery=False,
+        battery_module_slots=0,
+    )
+    assert caps.relays_battery is False
+    assert caps.battery_module_slots == 0
+
+
+def test_no_driver_declares_more_module_slots_than_the_registry_expands() -> None:
+    # The registry expands battery_module1..N names at import time and cannot
+    # ask the drivers (they import it). _MODULE_SLOTS is therefore a ceiling:
+    # raising a driver's declaration past it means raising the ceiling and the
+    # schema with it, deliberately, not silently.
+    for entry in drivers.entries():
+        assert entry.capabilities.battery_module_slots <= _MODULE_SLOTS, (
+            f"{entry.name} declares more module slots than the registry expands"
+        )
+
+
 # --- identity ---------------------------------------------------------------
 
 
@@ -216,6 +245,84 @@ def test_the_model_is_absent_rather_than_guessed() -> None:
     # collector reads no holding registers at all. Absent is the honest answer
     # until it does; "18kPV" would be a guess that happens to be right here.
     assert drivers.create(_config()).identity.model is None
+
+
+# --- connect: a bad connection is a gap, not a crash ------------------------
+
+
+async def test_an_unresolvable_host_becomes_a_connectionerror_not_a_crash() -> None:
+    # A dongle host the settings page accepted as a string but that resolves
+    # through IDNA to an over-long DNS label ("label empty or too long") raises
+    # UnicodeError from connect, not OSError. The collector's poll loop catches
+    # ConnectionError and records a gap; an escaped UnicodeError would kill the
+    # loop on every poll and every boot until someone SSHed in. connect must
+    # translate it like any other unreachable endpoint.
+    config = Config(
+        dongle_host="a" * 64 + ".invalid",
+        dongle_serial="BA12345678",
+        inverter_serial="CE12345678",
+        database_path="/tmp/arraysense-test.db",
+        driver="eg4_luxpower",
+    )
+    source = drivers.create(config)
+    with pytest.raises(ConnectionError):
+        await source.connect()
+
+
+# --- ModelSpec: cited capability deltas -------------------------------------
+
+
+def test_a_model_delta_without_a_citation_is_refused() -> None:
+    # The rule from the spec: no invented hardware facts. A delta asserts
+    # something about a physical machine, so it names where the fact came
+    # from or it does not exist.
+    with pytest.raises(ValueError, match="citation"):
+        ModelSpec(name="6000XP", pv_strings=2)
+
+
+def test_a_model_with_no_deltas_needs_no_citation() -> None:
+    spec = ModelSpec(name="12kPV")
+    assert spec.citation == ""
+
+
+def test_resolve_model_applies_deltas_and_inherits_the_rest() -> None:
+    family = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset(),
+        relays_battery=True,
+        battery_module_slots=4,
+    )
+    model = ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation")
+    resolved = resolve_model(family, model)
+    assert resolved.pv_strings == 3
+    assert resolved.relays_battery is True  # inherited untouched
+
+
+# --- Task 3: EG4 and fake families declare themselves -----------------------
+
+
+def test_every_registered_driver_names_a_manufacturer_and_models() -> None:
+    # The setup endpoint's manufacturer tree is built from these; an entry
+    # without them renders an unanswerable question.
+    for entry in drivers.entries():
+        assert entry.manufacturer, f"{entry.name} names no manufacturer"
+        assert entry.models, f"{entry.name} declares no models"
+
+
+def test_the_18kpv_cites_its_measured_string_count() -> None:
+    entry = drivers.get("eg4_luxpower")
+    model = find_model(entry, "18kPV")
+    assert model.pv_strings == 3
+    assert "reference" in model.citation
+
+
+def test_uncited_models_inherit_the_family_defaults() -> None:
+    entry = drivers.get("eg4_luxpower")
+    for name in ("6000XP", "12kPV"):
+        model = find_model(entry, name)
+        resolved = resolve_model(entry.capabilities, model)
+        assert resolved.pv_strings == entry.capabilities.pv_strings
 
 
 # --- what the reference driver declares -------------------------------------
@@ -361,3 +468,56 @@ def test_an_entry_must_name_itself() -> None:
             ),
             build=lambda _config: drivers.create(_config),
         )
+
+
+def _setup_config(**overrides: object) -> Config:
+    base: dict[str, object] = {
+        "dongle_host": "192.0.2.1",
+        "dongle_serial": "BA12345678",
+        "inverter_serial": "CE12345678",
+        "database_path": "/tmp/test.db",
+    }
+    base.update(overrides)
+    return Config(**base)  # type: ignore[arg-type]
+
+
+def test_create_refuses_an_unknown_model_naming_the_known_ones() -> None:
+    config = _setup_config(driver="eg4_luxpower", model="9000GT")
+    with pytest.raises(ValueError, match="18kPV"):
+        drivers.create(config)
+
+
+def test_create_refuses_direct_battery_source_for_now() -> None:
+    config = _setup_config(driver="eg4_luxpower", battery_source="direct")
+    with pytest.raises(ValueError, match="not yet"):
+        drivers.create(config)
+
+
+def test_create_refuses_relayed_when_the_family_relays_nothing() -> None:
+    # No current driver has relays_battery=False, so pin the rule with a
+    # temporary entry. Reaching into the registry dict for cleanup is uglier
+    # than an unregister function and better than shipping one nobody needs.
+    from dataclasses import replace as dc_replace
+
+    fake_entry = drivers.get("fake")
+    entry = DriverEntry(
+        name="norelay",
+        description="test-only",
+        capabilities=dc_replace(fake_entry.capabilities, relays_battery=False),
+        build=fake_entry.build,
+        manufacturer="Test",
+        models=(ModelSpec(name="One"),),
+    )
+    drivers.register(entry)
+    try:
+        config = _setup_config(driver="norelay", battery_source="relayed")
+        with pytest.raises(ValueError, match="does not relay"):
+            drivers.create(config)
+    finally:
+        drivers._REGISTRY.pop("norelay", None)
+
+
+def test_a_built_source_reports_the_models_cited_capabilities() -> None:
+    config = _setup_config(driver="eg4_luxpower", model="18kPV", transport="dongle")
+    source = drivers.create(config)
+    assert source.capabilities.pv_strings == 3

@@ -63,8 +63,10 @@ from arraysense.drivers.base import (
     DeviceIdentity,
     DeviceIdentityError,
     EnergyReporting,
+    ModelSpec,
     SampleBuildError,
     expand_module_metrics,
+    resolve_model,
 )
 from arraysense.models import BatteryModuleSample, Sample
 
@@ -428,8 +430,30 @@ CAPABILITIES = Capabilities(
     split_phase=True,
     parallel_capable=True,
     per_module_battery=True,
+    relays_battery=True,
+    battery_module_slots=4,
     transport="dongle",
 )
+
+
+# The models this family covers. Only the 18kPV carries deltas, because only
+# the 18kPV has been measured: it is the reference installation. The others
+# inherit the family declaration until a citation exists — a conservative
+# default is honest, an invented spec is not. When a 6000XP fact arrives
+# (vendor document or a user's measurement), it lands here with its source.
+MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation"),
+    ModelSpec(name="6000XP"),
+    ModelSpec(name="12kPV"),
+)
+
+
+def find_model_by_name(name: str) -> ModelSpec:
+    """The module's own model lookup, so the source needs no registry import."""
+    for model in MODELS:
+        if model.name == name:
+            return model
+    raise ValueError(f"no model {name!r} in this family")
 
 
 def _reading(source: object, attribute: str) -> float | None:
@@ -1091,7 +1115,10 @@ class Eg4LuxPowerSource:
         page telling somebody they are connected by dongle over a serial link
         would be worse than telling them nothing.
         """
-        return replace(CAPABILITIES, transport=self._config.transport)
+        declared = CAPABILITIES
+        if self._config.model:
+            declared = resolve_model(declared, find_model_by_name(self._config.model))
+        return replace(declared, transport=self._config.transport)
 
     async def connect(self) -> None:
         """Claim the inverter's single client slot, if it is not already held.
@@ -1118,7 +1145,15 @@ class Eg4LuxPowerSource:
         if self._serial is None or not self._serial.is_connected:
             try:
                 await self._transport.connect()
-            except (TransportError, OSError) as exc:
+            except (TransportError, OSError, UnicodeError) as exc:
+                # UnicodeError joins the two: a host the settings page accepted
+                # as a string but that resolves through IDNA to an over-long DNS
+                # label ("label empty or too long") raises it here, not OSError.
+                # That is a host that cannot be reached, which is exactly a gap
+                # to record and back off from — not a crash that kills every
+                # poll and every boot until someone SSHes in. Only the connect
+                # site catches it: a UnicodeDecodeError at a register read below
+                # is a decoding bug and must surface, not become a silent gap.
                 # Name the endpoint configured, not always the dongle.
                 if self._config.transport == "modbus_serial":
                     endpoint = self._config.serial_device

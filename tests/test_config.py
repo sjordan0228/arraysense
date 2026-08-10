@@ -195,6 +195,7 @@ def test_stored_settings_win_over_the_file(tmp_path: Path) -> None:
     from arraysense.config import effective
     from arraysense.settings import SettingsStore
     from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
 
     store = SqliteStore(str(tmp_path / "e.db"), device=TEST_DEVICE)
     settings = SettingsStore(store)
@@ -317,3 +318,71 @@ def test_an_unknown_durability_is_refused() -> None:
             database_path="/tmp/x.db",
             synchronous="off",
         )
+
+
+def test_model_and_battery_source_default_to_unset() -> None:
+    config = Config(
+        dongle_host="192.0.2.1",
+        dongle_serial="BA12345678",
+        inverter_serial="CE12345678",
+        database_path="/tmp/x.db",
+    )
+    assert config.model == ""
+    assert config.battery_source == ""
+
+
+def test_an_unknown_battery_source_is_refused_naming_the_choices() -> None:
+    with pytest.raises(ValueError, match="battery_source must be one of"):
+        Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            battery_source="telepathy",
+        )
+
+
+def test_model_and_battery_source_load_from_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'dongle_host = "192.0.2.1"\n'
+        'dongle_serial = "BA12345678"\n'
+        'inverter_serial = "CE12345678"\n'
+        f'database_path = "{tmp_path}/x.db"\n'
+        'model = "18kPV"\n'
+        'battery_source = "relayed"\n'
+    )
+    config = load(path)
+    assert config.model == "18kPV"
+    assert config.battery_source == "relayed"
+
+
+def test_effective_overlays_the_setup_settings(tmp_path: Path) -> None:
+    # The wizard writes these; the next boot must read them. Same merge the
+    # dongle fields already do, extended to everything setup lets a page change.
+    from arraysense.config import effective
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
+    store = SqliteStore(str(tmp_path / "e.db"), device=TEST_DEVICE)
+    settings = SettingsStore(store)
+    settings.set("connection.transport", "modbus_serial")
+    settings.set("connection.serial_device", "/dev/rs485")
+    settings.set("connection.serial_baud", 19200)
+    settings.set("connection.serial_unit_id", 1)
+    settings.set("connection.model", "18kPV")
+    settings.set("connection.battery_source", "relayed")
+    base = Config(
+        dongle_host="",
+        dongle_serial="",
+        inverter_serial="CE12345678",
+        database_path=str(tmp_path / "e.db"),
+        transport="modbus_serial",
+        serial_device="/dev/placeholder",
+    )
+    merged = effective(base, settings)
+    store.close()
+    assert merged.serial_device == "/dev/rs485"
+    assert merged.model == "18kPV"
+    assert merged.battery_source == "relayed"

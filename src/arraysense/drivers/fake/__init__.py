@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from arraysense.config import Config
 from arraysense.drivers.base import DriverEntry
-from arraysense.drivers.fake.source import CAPABILITIES, NAME, FakeSource
+from arraysense.drivers.fake.source import CAPABILITIES, MODELS, NAME, FakeSource
 
 
 def build(config: Config) -> FakeSource:
@@ -27,8 +27,10 @@ def build(config: Config) -> FakeSource:
 DRIVER = DriverEntry(
     name=NAME,
     description="A simulated inverter with no hardware behind it, for tests and demos",
+    manufacturer="Simulated",
+    models=MODELS,
     capabilities=CAPABILITIES,
     build=build,
 )
 
-__all__ = ["CAPABILITIES", "DRIVER", "NAME", "FakeSource", "build"]
+__all__ = ["CAPABILITIES", "DRIVER", "MODELS", "NAME", "FakeSource", "build"]
