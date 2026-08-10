@@ -290,3 +290,30 @@ def test_the_example_config_names_a_path_that_can_actually_be_opened() -> None:
     # Nothing here expands a glob, so a starred example is a path that fails to
     # open with a message about a missing file rather than about a wildcard.
     assert "usbserial-*" not in example_toml()
+
+
+def test_durability_defaults_to_what_every_installation_already_had() -> None:
+    # The choice is new; the behaviour must not be. An installation that says
+    # nothing keeps fsyncing every commit.
+    assert (
+        Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+        ).synchronous
+        == "full"
+    )
+
+
+def test_an_unknown_durability_is_refused() -> None:
+    # "off" is a real SQLite setting and would silently risk corruption rather
+    # than loss, which is a different bargain entirely and not one on offer.
+    with pytest.raises(ValueError, match="synchronous must be one of"):
+        Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path="/tmp/x.db",
+            synchronous="off",
+        )

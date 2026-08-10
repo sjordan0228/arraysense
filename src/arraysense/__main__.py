@@ -75,7 +75,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # — so the declaration is safe to resolve before the store exists to read
     # settings from.
     declared = drivers.get(config.driver).capabilities.metrics
-    store = SqliteStore(config.database_path, device=config.inverter_serial, metrics=declared)
+    store = SqliteStore(
+        config.database_path,
+        device=config.inverter_serial,
+        metrics=declared,
+        synchronous=config.synchronous,
+    )
 
     # Anything set from the settings page wins over the file. The merge happens
     # here rather than inside load() because the settings live in the database,
@@ -94,7 +99,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             config.inverter_serial,
         )
         store.close()
-        store = SqliteStore(config.database_path, device=config.inverter_serial, metrics=declared)
+        store = SqliteStore(
+            config.database_path,
+            device=config.inverter_serial,
+            metrics=declared,
+            synchronous=config.synchronous,
+        )
 
     # Logged here rather than in main() because this is the first point at
     # which the values are the ones the collector will actually use. Logging

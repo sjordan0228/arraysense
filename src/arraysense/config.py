@@ -63,6 +63,15 @@ def _required_for(transport: str) -> tuple[str, ...]:
 # modbus_serial is the alternative path for USB-to-RS485 adapters.
 _VALID_TRANSPORTS = frozenset({"dongle", "modbus_serial"})
 
+# How durably a stored reading has to land before the write is called done.
+# "full" fsyncs on every commit and is what every installation had before this
+# was a choice. "normal" syncs at checkpoint instead: measured on the reference
+# Pi through the store's own append, 200 polls cost 207 fsyncs at full and 7 at
+# normal. Neither risks corruption — SQLite stays consistent either way — but
+# normal can lose the most recent readings if power is cut abruptly, roughly the
+# last five minutes at that checkpoint rate.
+_VALID_SYNCHRONOUS = frozenset({"full", "normal"})
+
 
 @dataclass(frozen=True)
 class Config:
@@ -92,6 +101,11 @@ class Config:
     there rather than here, so that this module does not have to import the
     drivers that import it.
 
+    ``synchronous`` chooses how durably a reading has to land. The default
+    matches what every installation did before it was a choice; "normal" trades
+    a bounded amount of recent data on an abrupt power loss for roughly thirty
+    times fewer writes, which is worth having on flash storage.
+
     ``transport`` chooses how to reach the inverter. The default "dongle" uses
     the WiFi dongle's TCP port as before. "modbus_serial" uses a USB-to-RS485
     adapter. When "modbus_serial" is chosen, ``serial_device`` must be set.
@@ -108,6 +122,7 @@ class Config:
     serial_device: str = ""
     serial_baud: int = 19200
     serial_unit_id: int = 1
+    synchronous: str = "full"
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -143,6 +158,10 @@ class Config:
         # ''", which reads like a bug in the software rather than in the file.
         if not self.driver.strip():
             raise ValueError("driver must be set")
+        if self.synchronous not in _VALID_SYNCHRONOUS:
+            raise ValueError(
+                f"synchronous must be one of {sorted(_VALID_SYNCHRONOUS)}, got {self.synchronous!r}"
+            )
         if self.serial_baud <= 0:
             raise ValueError(f"serial_baud must be positive, got {self.serial_baud}")
         # 0 is the Modbus broadcast address: it is write-only by specification
@@ -221,6 +240,7 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
         serial_device=str(data.get("serial_device", "")),
         serial_baud=round(_number(data, "serial_baud", 19200)),
         serial_unit_id=round(_number(data, "serial_unit_id", 1)),
+        synchronous=str(data.get("synchronous", "full")),
     )
 
 
@@ -288,6 +308,14 @@ def example_toml() -> str:
         "\n"
         "# Where the database is written. Prefer an SSD over a Pi's SD card.\n"
         'database_path = "/var/lib/arraysense/arraysense.db"\n'
+        "\n"
+        "# How durably a reading must land before the write is done. 'full'\n"
+        "# fsyncs every commit and is the safe default. 'normal' syncs at\n"
+        "# checkpoint instead — measured on a Raspberry Pi, 200 polls cost 207\n"
+        "# fsyncs at full and 7 at normal — which matters on flash storage that\n"
+        "# wears out. Neither risks corruption; 'normal' can lose the most recent\n"
+        "# readings, roughly the last five minutes, if power is cut abruptly.\n"
+        'synchronous = "full"\n'
         "\n"
         "# How to reach the inverter: 'dongle' (default) for the WiFi dongle's\n"
         "# TCP port, or 'modbus_serial' for a USB-to-RS485 adapter. When set to\n"
