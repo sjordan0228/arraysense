@@ -63,6 +63,7 @@ from arraysense.drivers.base import (
     DeviceIdentity,
     DeviceIdentityError,
     EnergyReporting,
+    ModelSpec,
     SampleBuildError,
     expand_module_metrics,
 )
@@ -431,6 +432,18 @@ CAPABILITIES = Capabilities(
     relays_battery=True,
     battery_module_slots=4,
     transport="dongle",
+)
+
+
+# The models this family covers. Only the 18kPV carries deltas, because only
+# the 18kPV has been measured: it is the reference installation. The others
+# inherit the family declaration until a citation exists — a conservative
+# default is honest, an invented spec is not. When a 6000XP fact arrives
+# (vendor document or a user's measurement), it lands here with its source.
+MODELS: tuple[ModelSpec, ...] = (
+    ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation"),
+    ModelSpec(name="6000XP"),
+    ModelSpec(name="12kPV"),
 )
 
 

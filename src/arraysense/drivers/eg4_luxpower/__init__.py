@@ -15,6 +15,7 @@ from __future__ import annotations
 from arraysense.drivers.base import DriverEntry
 from arraysense.drivers.eg4_luxpower.source import (
     CAPABILITIES,
+    MODELS,
     NAME,
     Eg4LuxPowerSource,
     to_sample,
@@ -26,8 +27,10 @@ DRIVER = DriverEntry(
         "EG4 and LuxPower hybrid inverters over the WiFi dongle or a "
         "USB-to-RS485 adapter (18kPV, 6000XP, 12kPV)"
     ),
+    manufacturer="EG4",
+    models=MODELS,
     capabilities=CAPABILITIES,
     build=Eg4LuxPowerSource,
 )
 
-__all__ = ["CAPABILITIES", "DRIVER", "NAME", "Eg4LuxPowerSource", "to_sample"]
+__all__ = ["CAPABILITIES", "DRIVER", "MODELS", "NAME", "Eg4LuxPowerSource", "to_sample"]

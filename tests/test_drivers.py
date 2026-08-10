@@ -29,7 +29,10 @@ from arraysense.drivers.base import (
     EnergyReporting,
     InverterDriver,
     InverterSource,
+    ModelSpec,
     expand_module_metrics,
+    find_model,
+    resolve_model,
 )
 from arraysense.metrics import _MODULE_SLOTS, column_names
 from arraysense.models import BatteryModuleSample
@@ -242,6 +245,62 @@ def test_the_model_is_absent_rather_than_guessed() -> None:
     # collector reads no holding registers at all. Absent is the honest answer
     # until it does; "18kPV" would be a guess that happens to be right here.
     assert drivers.create(_config()).identity.model is None
+
+
+# --- ModelSpec: cited capability deltas -------------------------------------
+
+
+def test_a_model_delta_without_a_citation_is_refused() -> None:
+    # The rule from the spec: no invented hardware facts. A delta asserts
+    # something about a physical machine, so it names where the fact came
+    # from or it does not exist.
+    with pytest.raises(ValueError, match="citation"):
+        ModelSpec(name="6000XP", pv_strings=2)
+
+
+def test_a_model_with_no_deltas_needs_no_citation() -> None:
+    spec = ModelSpec(name="12kPV")
+    assert spec.citation == ""
+
+
+def test_resolve_model_applies_deltas_and_inherits_the_rest() -> None:
+    family = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset(),
+        relays_battery=True,
+        battery_module_slots=4,
+    )
+    model = ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation")
+    resolved = resolve_model(family, model)
+    assert resolved.pv_strings == 3
+    assert resolved.relays_battery is True  # inherited untouched
+
+
+# --- Task 3: EG4 and fake families declare themselves -----------------------
+
+
+def test_every_registered_driver_names_a_manufacturer_and_models() -> None:
+    # The setup endpoint's manufacturer tree is built from these; an entry
+    # without them renders an unanswerable question.
+    for entry in drivers.entries():
+        assert entry.manufacturer, f"{entry.name} names no manufacturer"
+        assert entry.models, f"{entry.name} declares no models"
+
+
+def test_the_18kpv_cites_its_measured_string_count() -> None:
+    entry = drivers.get("eg4_luxpower")
+    model = find_model(entry, "18kPV")
+    assert model.pv_strings == 3
+    assert "reference" in model.citation
+
+
+def test_uncited_models_inherit_the_family_defaults() -> None:
+    entry = drivers.get("eg4_luxpower")
+    for name in ("6000XP", "12kPV"):
+        model = find_model(entry, name)
+        resolved = resolve_model(entry.capabilities, model)
+        assert resolved.pv_strings == entry.capabilities.pv_strings
 
 
 # --- what the reference driver declares -------------------------------------
