@@ -566,7 +566,13 @@ class SqliteStore:
             for row in self._conn.execute(sql, params).fetchall()
         ]
 
-    def latest(self, metrics: Sequence[str], device: str | None = None) -> dict[str, object] | None:
+    def latest(
+        self,
+        metrics: Sequence[str],
+        device: str | None = None,
+        *,
+        include_gaps: bool = True,
+    ) -> dict[str, object] | None:
         """Return one inverter's most recent reading, or None if it has stored none.
 
         This is what a live view asks for on every refresh, so it rides the primary
@@ -601,7 +607,16 @@ class SqliteStore:
         # interpolating them into the predicate is safe.
         carries = ""
         if names:
-            terms = " OR ".join([*(f"{n} IS NOT NULL" for n in names), "error IS NOT NULL"])
+            # include_gaps=False asks for the newest actual reading of these
+            # metrics and nothing else. The default surfaces gap rows because
+            # for the dashboard recency is not health — but a reader of the
+            # site metrics (the sky readout) must not blank every time an
+            # inverter gap lands newer than the last weather tick, so it opts
+            # out and the walk continues past the gaps to the last real value.
+            witness = [f"{n} IS NOT NULL" for n in names]
+            if include_gaps:
+                witness.append("error IS NOT NULL")
+            terms = " OR ".join(witness)
             carries = f"AND ({terms}) "
         row = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM inverter_raw WHERE device = ? "

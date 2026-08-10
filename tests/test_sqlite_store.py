@@ -1185,3 +1185,34 @@ def test_latest_still_surfaces_a_gap_row(tmp_path: Path) -> None:
     assert row is not None
     assert row["error"] == "ConnectionError: nobody answered"
     assert row["timestamp"] == datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
+
+
+def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
+    # The sky readout asks for the newest actual weather reading. A recorded
+    # inverter gap lands newer than the last weather tick many times an hour on
+    # a lossy link, and surfacing it there would blank the readout while a
+    # five-minute-old reading exists. Opting out of gaps walks past them; the
+    # default still surfaces them, because for the dashboard recency is not
+    # health.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    with_gaps = store.latest(["outside_temperature_c"])
+    assert with_gaps is not None
+    assert with_gaps["error"] is not None, "the default keeps surfacing gaps"
+    reading = store.latest(["outside_temperature_c"], include_gaps=False)
+    store.close()
+    assert reading is not None
+    assert reading["outside_temperature_c"] == 37.4
+    assert reading["error"] is None
