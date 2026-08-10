@@ -596,7 +596,10 @@ class SqliteStore:
         mistake this project forbids. The mirror holds too: a request for the
         weather metrics walks past the inverter rows to the last sky reading.
         Gap rows still answer every request, because recency is not health and a
-        gap is information.
+        gap is information — unless the caller opts out with ``include_gaps=False``,
+        which asks for the newest actual reading of the named metrics and walks
+        past gaps. With no metrics named there is nothing to qualify a reading,
+        so ``include_gaps`` has no effect and the newest row of any kind answers.
         """
         names = self._check_inverter_names(metrics)
         columns = ["timestamp", *names, "error"]
