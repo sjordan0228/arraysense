@@ -136,6 +136,22 @@ On a Raspberry Pi, point `database_path` at a USB SSD rather than the SD card.
 Continuous writes wear cards out, and at the default poll interval this writes about
 9 MB a day.
 
+One catch, because it does not announce itself: the shipped unit's
+`ProtectSystem=strict` makes the whole filesystem read-only except the
+`StateDirectory` (`/var/lib/arraysense`), so a database *outside* it fails every
+write with `attempt to write a readonly database` — the SSD is visible but
+read-only to the service. Either mount the SSD at `/var/lib/arraysense` so the
+database stays inside the writable directory, or add a drop-in carving the SSD
+path back out:
+
+```
+# /etc/systemd/system/arraysense.service.d/ssd.conf
+[Service]
+ReadWritePaths=/mnt/ssd/arraysense
+```
+
+The rest of the sandbox is unaffected either way.
+
 ### Serving on port 80
 
 The default is 8080 because ports below 1024 are privileged and this service does not
