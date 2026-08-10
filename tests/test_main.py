@@ -518,3 +518,30 @@ def test_first_run_detect_refuses_a_url_serial_device(tmp_path: Path) -> None:
             json={"transport": "modbus_serial", "serial_device": "loop://?foo=bar"},
         )
         assert r.status_code == 422
+
+
+def test_the_weather_poller_starts_and_stops_with_the_service(tmp_path: Path) -> None:
+    """The weather poller lives and dies with the lifespan, exactly like the collector.
+
+    A service that stopped cleanly must leave no orphan task behind. With the
+    fake driver the collector won't dial anything, so entering the lifespan is
+    safe — and is the only way to exercise the weather poller's start and stop
+    through the same hook the production service uses.
+    """
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_app
+
+    config = _config(tmp_path)
+    config = replace(config, driver="fake")
+    app, store, _service = build_app(config)
+    try:
+        weather = app.state.weather
+        assert weather.running is False
+        with TestClient(app):
+            assert weather.running is True
+        assert weather.running is False
+    finally:
+        store.close()

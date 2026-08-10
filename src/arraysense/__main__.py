@@ -30,6 +30,7 @@ from fastapi import FastAPI
 from arraysense import __version__, drivers
 from arraysense.api.app import create_app
 from arraysense.collector.service import CollectorService
+from arraysense.collector.weather import WeatherPoller
 from arraysense.config import DEFAULT_PATH, Config, effective, load
 from arraysense.settings import SettingsStore
 from arraysense.store.migrate import migrate_devices, needs_device_migration
@@ -152,14 +153,17 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         store=store,
         interval=config.poll_interval,
     )
+    weather = WeatherPoller(store)
     # The file config, not the effective one, is what a write path needs to
     # predict the next boot: clearing an overlay field reverts to the file
     # value, and only this base can see it.
     app = create_app(store=store, service=service, config=config, file_config=file_config)
+    app.state.weather = weather
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await service.start()
+        await weather.start()
         watchdog = asyncio.create_task(_watch(service))
         try:
             yield
@@ -171,6 +175,7 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             # goes away, or the next start finds it occupied — the dongle's one
             # TCP slot, which the vendor's app also wants, or the serial port,
             # which is opened exclusively.
+            await weather.stop()
             await service.stop()
             store.close()
 
