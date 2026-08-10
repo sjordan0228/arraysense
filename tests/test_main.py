@@ -474,3 +474,47 @@ def test_first_run_apply_survives_a_lone_surrogate_in_the_body(
         )
         assert r.status_code == 400
     assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_refuses_a_url_serial_device(tmp_path: Path, monkeypatch: Any) -> None:
+    # First-run apply writes the config file directly from a raw body — it does
+    # not go through ApplyRequest, so it needs its own refusal. A device pyserial
+    # reads as a URL parses fine but crashes the collector at connect, and the
+    # file is the one write with no setup mode left to fall back to. Refused
+    # before anything is written.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "transport": "modbus_serial",
+                "serial_device": "loop://?foo=bar",
+                "inverter_serial": "CE00000000",
+                "database_path": str(tmp_path / "db.sqlite"),
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_detect_refuses_a_url_serial_device(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/detect",
+            json={"transport": "modbus_serial", "serial_device": "loop://?foo=bar"},
+        )
+        assert r.status_code == 422

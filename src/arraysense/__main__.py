@@ -322,6 +322,7 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
     from arraysense.api.app import install_text_guard, mount_pages
     from arraysense.api.routes import DetectRequest, run_detect
     from arraysense.config import DEFAULT_DATABASE_PATH
+    from arraysense.settings import check_serial_device
     from arraysense.setup import describe_setup, render_config
 
     app = FastAPI(title="Solar ArraySense setup", version=__version__)
@@ -385,6 +386,12 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
             probe.write_text(text)
             candidate = load(probe)
             drivers.validate(candidate)
+            # A serial device pyserial would read as a URL parses fine here but
+            # raises an undeclared exception at connect. Reject it before it
+            # becomes the config file — the one write with no setup mode left to
+            # fall back to. Same rule the settings registry and request models
+            # enforce, so the wizard cannot write a floor the page would refuse.
+            check_serial_device(candidate.serial_device)
             # database_path must not name the configuration file. The store the
             # next line opens to prove the path is usable would then be the file
             # replace() overwrites with TOML, and the boot after would read TOML

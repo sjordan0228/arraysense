@@ -54,7 +54,13 @@ from arraysense.costs import (
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
-from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
+from arraysense.settings import (
+    SETTING_TIMEZONE,
+    SettingsStore,
+    check_serial_device,
+    describe,
+    lookup_setting,
+)
 from arraysense.setup import describe_setup
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
@@ -1484,6 +1490,12 @@ class DetectRequest(BaseModel):
     def _clean(cls, value: str) -> str:
         return _reject_control_text(value)
 
+    @field_validator("serial_device")
+    @classmethod
+    def _device_is_a_path(cls, value: str) -> str:
+        check_serial_device(value)
+        return value
+
 
 async def _probe_serial(body: DetectRequest) -> str:
     """Open the candidate transport read-only and ask who is there.
@@ -1605,6 +1617,13 @@ class ApplyRequest(BaseModel):
     @classmethod
     def _clean(cls, value: str | None) -> str | None:
         return None if value is None else _reject_control_text(value)
+
+    @field_validator("serial_device")
+    @classmethod
+    def _device_is_a_path(cls, value: str | None) -> str | None:
+        if value is not None:
+            check_serial_device(value)
+        return value
 
 
 _SETTING_KEYS: dict[str, str] = {

@@ -2583,6 +2583,33 @@ def test_detect_rejects_a_device_path_with_a_null_byte_as_422(client: Any) -> No
     assert r.status_code == 422
 
 
+def test_a_url_serial_device_is_refused_at_the_door_not_stored(
+    client: Any, monkeypatch: Any
+) -> None:
+    # pyserial treats a device string with "://" as a URL and its handler raises
+    # an undeclared KeyError/re.error at connect — not (TransportError, OSError).
+    # Accepted and stored, it would kill the collector on the next boot and 500
+    # the detect probe. Every write path refuses it, and detect never reaches
+    # pyserial's URL dispatch: it is a 422 at the model, a device path is a
+    # filesystem path.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    bad = "loop://?foo=bar"
+
+    r = client.post("/api/setup/detect", json={"transport": "modbus_serial", "serial_device": bad})
+    assert r.status_code == 422
+
+    r = client.post("/api/setup/apply", json={"transport": "modbus_serial", "serial_device": bad})
+    assert r.status_code == 422
+
+    r = client.put("/api/settings", json={"connection.serial_device": bad})
+    assert r.status_code == 400
+
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.serial_device"] == "", "no URL device should have landed"
+
+
 def test_detect_survives_an_unresolvable_host_as_502(client: Any) -> None:
     # A dongle host that resolves through IDNA to an over-long DNS label raises
     # UnicodeError from connect, not OSError — an unhandled 500 on the

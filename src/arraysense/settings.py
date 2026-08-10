@@ -89,6 +89,24 @@ def check_email(value: str) -> str:
     return address
 
 
+def check_serial_device(value: str) -> None:
+    """Refuse a serial device that pyserial would treat as a URL.
+
+    pyserial dispatches any port string containing ``://`` to a URL handler —
+    ``loop://``, ``socket://``, ``rfc2217://``, ``hwgrep://`` and the rest —
+    each of which parses its own query string and raises undeclared exception
+    types (a bare ``KeyError``, an ``re.error``) that the connection layer
+    cannot catch by type. Such a value is accepted as a string, stored by both
+    write paths, and then kills the collector on the next boot or turns a detect
+    into a 500. A real RS485 adapter is a filesystem device path and never a
+    URL, so this is a crisp thing to refuse at the door rather than an exception
+    class to chase downstream. Enforced identically at the settings registry and
+    the request models, so no entry point disagrees.
+    """
+    if "://" in value:
+        raise ValueError("a serial device is a filesystem path, not a URL")
+
+
 @dataclass(frozen=True)
 class SettingSpec:
     """One settable value: its type, its bounds, and how to describe it to a person.
@@ -550,6 +568,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "Device path for the RS485 adapter — a udev symlink or a "
             "/dev/serial/by-id path survives replugging; /dev/ttyUSB0 may not."
         ),
+        check=check_serial_device,
     ),
     SettingSpec(
         key="connection.serial_baud",
