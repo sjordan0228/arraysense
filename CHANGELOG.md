@@ -7,6 +7,37 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.14 — 9 August 2026
+
+### Added
+
+- **The machine can now describe itself, which is what a setup wizard renders
+  from.** Drivers declare a manufacturer and their models, and every model
+  fact carries a citation — the 18kPV's three PV strings cite the reference
+  installation; the 6000XP and 12kPV inherit the family declaration until a
+  source exists, because a conservative default is honest and an invented
+  spec is not. Configuration gains `model` and `battery_source` (`relayed`,
+  the reality of every current installation, or `none`), the settings overlay
+  carries the whole connection, and `/api/setup` serves the manufacturer
+  tree, each transport's required fields, the serial adapters the machine can
+  actually see, and the current values with secrets redacted.
+
+  Two endpoints act: **detect** borrows the wire through yield mode, reads
+  the inverter's serial, and always gives the wire back — it writes nothing.
+  **apply** validates the whole merged result with the same rules the service
+  enforces at boot, writes the settings overlay, and restarts the collector.
+
+  A brand-new installation — no config file at all — now serves **first-run
+  setup** instead of exiting with an error: pages and the setup endpoints,
+  no store and no collector, because there is no inverter identity to open a
+  store under until detection has asked the hardware. The wizard's first
+  apply writes the only config file software will ever write, validated by
+  the same loader that will read it at boot.
+
+  No page renders any of this yet — that is the next slice — and an existing
+  installation changes nothing: every new field defaults to exactly today's
+  behaviour.
+
 ## 0.6.13 — 9 August 2026
 
 ### Changed

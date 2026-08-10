@@ -9,6 +9,7 @@ released on the way out.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from arraysense.__main__ import build_app, build_parser, main
 from arraysense.config import Config
@@ -35,10 +36,11 @@ def test_a_missing_config_serves_setup_mode(tmp_path: Path, monkeypatch: Any) ->
     # A missing file used to be an error, which was right for a broken
     # installation and wrong for a brand-new one. It now serves first-run
     # setup. uvicorn.run is stood in for because the real one serves forever.
-    from arraysense import __main__ as main_module
 
     served: list[Any] = []
-    monkeypatch.setattr(main_module.uvicorn, "run", lambda app, **kw: served.append(app))
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: served.append(app))
     code = main(["--config", str(tmp_path / "absent.toml")])
     assert code == 0
     assert len(served) == 1, "setup mode should have been served"
