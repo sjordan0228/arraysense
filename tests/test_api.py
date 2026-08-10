@@ -2758,3 +2758,24 @@ def test_apply_rejects_control_text_in_a_serial_as_422(client: Any, monkeypatch:
         headers={"content-type": "application/json"},
     )
     assert r.status_code == 422
+
+
+def test_a_fresh_weather_row_does_not_mask_a_quiet_inverter(empty_client: Any) -> None:
+    # The weather poller writes every fifteen minutes whatever the inverter is
+    # doing. If those rows aged the dashboard, the stale banner would stay
+    # quiet through a real outage — the sky is not the inverter answering.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=40), readings={"pv_total_power_w": 1000.0})
+    )
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=1), readings={"outside_temperature_c": 37.4})
+    )
+    service = empty_client.app.state.service
+    service.status.running = True
+    service.status.started_at = now
+    service.status.last_success = None
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True, "a sky reading must not count as the inverter reporting"
+    assert body["reading_at"] == (now - timedelta(minutes=40)).replace(microsecond=0).isoformat()

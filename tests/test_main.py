@@ -545,3 +545,34 @@ def test_the_weather_poller_starts_and_stops_with_the_service(tmp_path: Path) ->
         assert weather.running is False
     finally:
         store.close()
+
+
+def test_the_production_store_accepts_a_weather_append(tmp_path: Path) -> None:
+    """build_app's store must take the poller's writes, not only the driver's.
+
+    The store is opened with a whitelist of writable metrics, and the driver's
+    declaration does not include the sky: opened for the driver alone, every
+    weather append raised KeyError — not a sqlite error, so it escaped the
+    poller's store guard and weather was silently never recorded in
+    production while every unit test (full-registry stores) stayed green.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from arraysense.models import Sample
+
+    config = replace(_config(tmp_path), driver="fake")
+    _app, store, _service = build_app(config)
+    try:
+        store.append(
+            Sample(
+                timestamp=datetime.now(UTC),
+                readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+            )
+        )
+        row = store.latest(["outside_temperature_c", "cloud_cover_pct"])
+        assert row is not None
+        assert row["outside_temperature_c"] == 37.4
+        assert row["cloud_cover_pct"] == 0.0
+    finally:
+        store.close()

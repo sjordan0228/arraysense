@@ -65,6 +65,13 @@ from arraysense.store.schema import inverter_metric_columns, module_metric_colum
 
 # A failed poll is stored with its reason and no readings (see models.Sample).
 # Excluding it from the aggregate stops it being counted as a reading of zero.
+#
+# Weather rows pass this filter — they carry no error — so sample_count counts
+# them alongside inverter readings: a minute holding five polls and one weather
+# tick records six. Known and accepted: the values themselves aggregate
+# correctly (AVG/MAX/MIN skip the nulls, and the energy openers filter to real
+# counter values), the skew is one row in ~82 at the fifteen-minute cadence,
+# and a per-metric count would cost a column per metric to be exact.
 _ERROR_FILTER = "error IS NULL"
 
 

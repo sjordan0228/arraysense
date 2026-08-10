@@ -36,6 +36,13 @@ _FIELDS: dict[str, str] = {
     "cloud_cover": "cloud_cover_pct",
 }
 
+# The metric names this source writes, for whoever opens the store. A store is
+# opened with a whitelist of writable metrics, and the driver's declaration
+# does not include the sky — a store opened for the driver alone refuses every
+# weather append with a KeyError. Exported here, beside the mapping it is
+# derived from, so the set cannot drift from what fetch_current produces.
+METRICS: frozenset[str] = frozenset(_FIELDS.values())
+
 _SPECS = {spec.name: spec for spec in INVERTER_METRICS}
 
 # The exact ways a stdlib HTTP GET plus JSON parse can fail, and nothing wider:

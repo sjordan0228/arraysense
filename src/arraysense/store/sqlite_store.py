@@ -581,12 +581,31 @@ class SqliteStore:
 
         The row it returns may be a recorded gap, carrying ``error`` and no readings;
         recency is not health.
+
+        A row that carries *none* of the requested metrics and no error is not a
+        reading of them and is skipped, because two writers share this tier: the
+        weather poller lands a row every fifteen minutes whose inverter columns
+        are all null, and returning it here blanked the live dashboard until the
+        next inverter poll — an absence drawn where data exists, the exact
+        mistake this project forbids. The mirror holds too: a request for the
+        weather metrics walks past the inverter rows to the last sky reading.
+        Gap rows still answer every request, because recency is not health and a
+        gap is information.
         """
         names = self._check_inverter_names(metrics)
         columns = ["timestamp", *names, "error"]
         selected = ["timestamp", *(self._selected("inverter_raw", n) for n in names), "error"]
+        # Asked for no metrics, the question is "when did any row land" and the
+        # newest row of any kind is the answer — the row-based contract callers
+        # like the gap search rely on. Names are whitelist-checked above, so
+        # interpolating them into the predicate is safe.
+        carries = ""
+        if names:
+            terms = " OR ".join([*(f"{n} IS NOT NULL" for n in names), "error IS NOT NULL"])
+            carries = f"AND ({terms}) "
         row = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM inverter_raw WHERE device = ? "
+            f"{carries}"
             "ORDER BY timestamp DESC LIMIT 1",
             (self._device(device),),
         ).fetchone()

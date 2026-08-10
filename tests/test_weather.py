@@ -72,3 +72,15 @@ def test_a_non_numeric_value_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None
     sample = open_meteo.fetch_current(35.2, -97.4)
     assert sample is not None
     assert sample.readings == {"cloud_cover_pct": 60.0}
+
+
+def test_the_client_writes_exactly_the_site_metrics() -> None:
+    # Two truths, one fact: the registry classifies which metrics are the
+    # site's (SITE_METRICS gates staleness and widens the store's writable
+    # set), and the client maps API fields to the metrics it writes. If they
+    # drift, either the store refuses a weather append or the staleness
+    # witness starts counting sky rows as the inverter answering.
+    from arraysense.metrics import SITE_METRICS
+    from arraysense.weather import METRICS
+
+    assert METRICS == SITE_METRICS

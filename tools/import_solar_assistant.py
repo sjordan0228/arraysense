@@ -135,6 +135,14 @@ SOURCES: tuple[Source, ...] = (
     # the export, Celsius in the registry — same correction as the inverter
     # temperature above. Recoverable at all because #5 gave them a metric.
     #
+    # DO NOT RUN THE WEATHER BACK-FILL YET. These rows would land under the
+    # inverter's serial, and at SolarAssistant's cadence that roughly doubles
+    # every historical bucket's sample_count — the coverage figure money
+    # depends on (#23). Whether weather history belongs under a site identity
+    # of its own is the plotting sub-feature's design question; import the sky
+    # after it is settled. The mappings stay here so the answer is one decision
+    # away rather than re-derived.
+    #
     # FIELD KEY "combined" IS UNVERIFIED: no SA export file was reachable in
     # this environment. The key follows the convention for aggregate
     # (non-inverter-specific) series. If a real export carries a different

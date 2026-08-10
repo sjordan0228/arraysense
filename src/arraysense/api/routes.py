@@ -53,7 +53,7 @@ from arraysense.costs import (
     unpriced_minutes,
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
-from arraysense.metrics import INVERTER_METRICS
+from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.settings import (
     SETTING_TIMEZONE,
     SettingsStore,
@@ -253,8 +253,19 @@ def _row_time(row: Mapping[str, Any] | None) -> datetime | None:
     return stamp if isinstance(stamp, datetime) else None
 
 
+# What witnesses "the inverter reported": every inverter metric that is not the
+# site's. Two writers share the raw tier, and the sky landing a row every
+# fifteen minutes must not read as the inverter answering — a stale banner the
+# weather keeps quiet would hide exactly the outage it exists to announce.
+# Computed lazily because the registry is read at call time everywhere else,
+# and a test that extends the registry must see the new column here too.
+def _inverter_witness() -> list[str]:
+    """The metric columns whose presence means the inverter itself reported."""
+    return [name for name in inverter_metric_columns() if name not in SITE_METRICS]
+
+
 def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None, bool]:
-    """When the newest stored reading was taken, and whether the store holds anything.
+    """When the newest stored inverter reading was taken, and whether rows exist.
 
     The store's clock, deliberately, and not the collector's. ``last_success``
     lives in the process and comes back None the moment it restarts, so a
@@ -264,8 +275,11 @@ def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None,
 
     A recorded gap is not a reading. It carries a reason and no values, so a
     page drawing it shows dashes, and counting one as data reports a screen
-    full of nothing as up to date. No metric columns are asked for: only the
-    timestamp and the gap marker decide this.
+    full of nothing as up to date. Nor is a weather row: the sky poller writes
+    on its own clock, and its rows carry no inverter column at all — aging the
+    dashboard by them would keep the banner quiet through an inverter outage.
+    So the question is asked with the inverter's own columns as the witness,
+    and ``latest`` answers with the newest row carrying any of them or a gap.
 
     Returns no timestamp when every row inside the search window is a gap,
     which is a longer outage rather than a fresh install — the second half of
@@ -273,13 +287,17 @@ def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None,
     warn about an install that has simply not polled yet or stay quiet through
     an outage that has run all day.
     """
-    newest = store.latest([])
+    witness = _inverter_witness()
+    newest = store.latest(witness)
     if newest is None:
-        return None, False
+        # No inverter reading and no gap ever — but the tier may still hold
+        # weather rows, and "holds anything" keeps its row-based meaning so a
+        # sky-only database reads as an install that has not polled yet.
+        return None, store.latest([]) is not None
     if not newest.get("error"):
         return _row_time(newest), True
-    for row in reversed(store.query([], now - READING_SEARCH, now)):
-        if not row.get("error"):
+    for row in reversed(store.query(witness, now - READING_SEARCH, now)):
+        if not row.get("error") and any(row.get(name) is not None for name in witness):
             return _row_time(row), True
     return None, True
 
