@@ -51,6 +51,24 @@ migration says so at the top of its entry.
   for them. An existing installation changes nothing: every new field defaults
   to exactly today's behaviour, and an already-configured box shows no wizard.
 
+### Changed
+
+- **The battery topologies have names.** The wizard's Battery choice read
+  "Through the inverter" and "No battery data"; it now reads "Closed loop
+  (through the inverter)" and "None", with the reserved direct mode shown beside
+  them as a disabled "Open loop — coming soon" so it reads as planned rather than
+  missing. The server's choices are unchanged and still refuse it.
+- **The timezone is chosen from a list** rather than typed — a menu over the tz
+  database, so it cannot be mistyped. The empty default still means "follow the
+  machine's own zone", which every existing installation has stored. The orphaned
+  `check_timezone` validator went with the change, since a choice field validates
+  by membership before any callback runs.
+- **The settings page says less.** Group introductions that re-explained the
+  controls beside them are trimmed or dropped, "This installation" becomes
+  "General", and Collection now states what each transport wants — 11 seconds or
+  more over the dongle, ten over RS485. Numeric help no longer reprints the
+  bounds the number box already enforces.
+
 ## 0.6.13 — 9 August 2026
 
 ### Changed
