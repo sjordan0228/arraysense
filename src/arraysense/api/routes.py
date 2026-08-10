@@ -472,6 +472,10 @@ async def capabilities(request: Request) -> dict[str, Any]:
     ``energy`` says whether kWh figures are counters the inverter keeps itself
     or an estimate integrated from power — a page must be able to tell a meter
     reading from a guess.
+    ``transport`` is how this installation reaches the inverter — the built
+    source reports what its configuration chose, not the family default — so a
+    page labels the connection it actually has instead of hard-coding the
+    dongle's.
 
     ``devices`` is a list because a parallel stack is several inverters behind
     one service, even though today's collector polls one. Three states, kept
@@ -501,6 +505,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "three_phase": None,
             "parallel_capable": None,
             "per_module_battery": None,
+            "transport": None,
             "metrics": None,
             "battery_module_metrics": None,
         }
@@ -515,6 +520,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                     "three_phase": declared.three_phase,
                     "parallel_capable": declared.parallel_capable,
                     "per_module_battery": declared.per_module_battery,
+                    "transport": declared.transport,
                     "metrics": list(inverter_metric_columns(declared.metrics)),
                     "battery_module_metrics": list(module_metric_columns(declared.metrics)),
                 }

@@ -256,7 +256,9 @@
         </select>
       </label>
       <div class="set">
-        <span class="lbl">Dongle</span>
+        <!-- Named from /api/capabilities once boot() learns the transport:
+             "Dongle" here was simply wrong on an RS485 installation. -->
+        <span class="lbl" id="connLbl">Connection</span>
         <div style="display:flex;gap:6px;margin-top:5px">
           <button class="iconbtn wide" id="yieldBtn">Release 5 min</button>
           <button class="iconbtn wide" id="resumeBtn">Take back</button>
@@ -405,6 +407,35 @@ const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
 // Held between polls because it changes how the per-module cards draw, not just
 // what the badge says.
 let calibration = null;
+
+// How this installation reaches the inverter, from /api/capabilities. Held
+// because two spots need it on every poll: the label over the release
+// controls, and the yield copy — which releases the dongle's TCP slot on one
+// installation and the serial port on the other. The words live in one map so
+// the two spots cannot disagree, and an unknown transport stays neutral: a
+// page that guessed "Dongle" over a serial link is the bug this exists to fix.
+let transport = null;
+const TRANSPORT_WORDS = {
+  dongle: { label: 'Dongle', yielded: 'dongle yielded' },
+  modbus_serial: { label: 'RS485', yielded: 'port yielded' },
+};
+const transportWords = () =>
+  TRANSPORT_WORDS[transport] || { label: 'Connection', yielded: 'yielded' };
+
+// One fetch at boot: the transport is a property of the installation, not of
+// any reading, so it never changes while the page is open. A build whose
+// capabilities carry no transport, or a fetch that fails, leaves the neutral
+// words in place rather than a wrong guess.
+async function showTransport() {
+  try {
+    const r = await fetch('/api/capabilities');
+    if (r.ok) {
+      const device = ((await r.json()).devices || [])[0];
+      transport = device ? device.transport : null;
+    }
+  } catch (e) { /* neutral words until the endpoint answers */ }
+  $('connLbl').textContent = transportWords().label;
+}
 
 const trim = (v) => v.toFixed(v % 1 === 0 ? 0 : 1);
 
@@ -587,7 +618,7 @@ async function loadLive() {
 
     const ok = status.connected && status.running;
     const colour = status.yielding ? 'var(--warn)' : ok ? 'var(--good)' : 'var(--bad)';
-    const text = status.yielding ? 'dongle yielded' : ok ? 'collecting' : 'not collecting';
+    const text = status.yielding ? transportWords().yielded : ok ? 'collecting' : 'not collecting';
     const when = i.timestamp ? new Date(i.timestamp).toLocaleTimeString() : '—';
     $('conn').innerHTML = `<span class="dot" style="background:${colour}"></span>${text} · last reading ${when}`;
 
@@ -1649,6 +1680,7 @@ async function boot() {
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
   showRanges();
+  showTransport();
   loadLive();
   loadHistory();
   scheduleLive();
