@@ -389,11 +389,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         upper=300,
         unit="seconds",
         label="Dashboard refresh",
-        help=(
-            "How often the page asks for new readings. It does not affect how "
-            "often the inverter is polled, so setting it faster than the poll "
-            "interval only redraws the same numbers."
-        ),
+        help="How often the page asks for new readings.",
     ),
     # --- Collector ----------------------------------------------------------
     SettingSpec(

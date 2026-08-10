@@ -167,9 +167,7 @@ const GROUPS = [
   {
     prefix: 'tariff',
     title: 'What electricity costs',
-    intro: 'The Costs page prices nothing until these are entered — a rate nobody supplied is '
-      + 'a rate the page would be inventing, and an invented rate produces a savings figure '
-      + 'that reads as though it had been measured.',
+    intro: 'The Costs page prices nothing until these are entered.',
   },
   {
     prefix: 'connection',
@@ -180,21 +178,19 @@ const GROUPS = [
   {
     prefix: 'collector',
     title: 'Collection',
-    intro: 'How often the inverter is read. The dongle accepts one connection at a time, so '
-      + 'this is the whole of what the installation asks of it.',
+    intro: 'How often the inverter is read. Over the dongle, keep this at 11 seconds or more: '
+      + 'it accepts one connection at a time and answers at its own pace, so asking faster '
+      + 'mostly produces reads that overlap the previous one. RS485 can be read faster, and 10 '
+      + 'seconds is the recommendation there. Every poll is a row written — around 8,600 a day '
+      + 'at 10 seconds — so the database grows in proportion to how often you ask.',
   },
   {
     prefix: 'site',
-    title: 'This installation',
-    intro: 'Where the system is, and who looks after it. What each of these is used for is '
-      + 'described beside it.',
+    title: 'General',
   },
   {
     prefix: 'display',
     title: 'Display',
-    intro: 'Defaults for every browser that opens this installation. A device that has picked '
-      + 'its own units on the dashboard keeps them; anything that has not follows what is set '
-      + 'here.',
   },
 ];
 
