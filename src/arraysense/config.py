@@ -48,7 +48,7 @@ _REQUIRED = ("inverter_serial", "database_path")
 # Required only by the transport that uses them. A serial installation has no
 # dongle to name, and demanding a placeholder host from it would make the
 # transport choice a fiction.
-_REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
+REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
     "dongle": ("dongle_host", "dongle_serial"),
     "modbus_serial": ("serial_device",),
 }
@@ -56,7 +56,7 @@ _REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
 
 def _required_for(transport: str) -> tuple[str, ...]:
     """Return the settings an installation on ``transport`` cannot start without."""
-    return _REQUIRED + _REQUIRED_BY_TRANSPORT.get(transport, ())
+    return _REQUIRED + REQUIRED_BY_TRANSPORT.get(transport, ())
 
 
 # Valid transport types. The default preserves the existing dongle behaviour;
@@ -155,7 +155,7 @@ class Config:
                 # Name the transport when the field is only required because of
                 # it. "serial_device must be set" alone sends someone hunting
                 # through a file where that setting may not even appear.
-                if field in _REQUIRED_BY_TRANSPORT.get(self.transport, ()):
+                if field in REQUIRED_BY_TRANSPORT.get(self.transport, ()):
                     raise ValueError(f"{field} must be set when transport is {self.transport!r}")
                 raise ValueError(f"{field} must be set")
         if self.poll_interval <= 0:
