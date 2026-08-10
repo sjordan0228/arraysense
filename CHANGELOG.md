@@ -7,6 +7,15 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.13 — 9 August 2026
+
+### Changed
+
+- The History page's footer says "days in America/Chicago time" instead of
+  "days as reckoned in America/Chicago". The zone still matters — a total
+  labelled August 5 depends entirely on where midnight was put — it just no
+  longer sounds like a treaty.
+
 ## 0.6.12 — 9 August 2026
 
 ### Fixed
