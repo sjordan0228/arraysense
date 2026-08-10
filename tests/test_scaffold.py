@@ -114,9 +114,17 @@ def test_the_power_flow_chart_fills_only_the_grid_series() -> None:
     # house runs on the grid, import equals house load to the watt, so a grid
     # *line* lies exactly under the home line and vanishes beneath it. Solar has
     # no such coincidence, so as a line it stays legible.
+    # Scoped to the power-flow chart's own builder rather than the whole page:
+    # the rule protects the tariff shading drawn behind THIS chart, and the
+    # forecast chart fills its actual series legitimately — nothing is shaded
+    # beneath it, and its solid-against-hatch mass is the owner's chosen way to
+    # tell a measurement from a prediction.
     page = _web("index.html")
-    assert "gridFill" in page, "grid lost the fill that stops it vanishing under home"
-    assert "pvFill" not in page, "solar is still filled, so shading cannot be read beneath it"
+    start = page.index("function drawPower(")
+    end = page.index("function drawBatt", start)
+    flow = page[start:end]
+    assert "gridFill" in flow, "grid lost the fill that stops it vanishing under home"
+    assert "pvFill" not in flow, "solar is still filled, so shading cannot be read beneath it"
 
 
 def test_pv_fill_is_kept_available_even_though_unused() -> None:

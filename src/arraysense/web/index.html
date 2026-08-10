@@ -356,6 +356,21 @@
     </details>
   </section>
 
+  <!-- The forecast panel. A prediction is never drawn as a measurement — the
+       texture IS the label — so the dawn plan is hatched fill behind a dashed
+       revision line, while actual production is a solid line with a gradient
+       fill on top. The dawn band stays visible behind the actual so a day
+       running below plan shows as a gap between solid and hatch by lunchtime,
+       which is the money signal: the eye reads the space between what was
+       expected and what arrived. -->
+  <section class="p" id="forecastPanel" hidden>
+    <div class="chead"><h2>Today</h2>
+      <span class="legend"><span class="muted" id="forecastFigures"></span></span>
+    </div>
+    <div class="chart" id="forecastWrap" role="img"
+         aria-label="Today's solar forecast versus actual production"></div>
+  </section>
+
   <section class="p">
     <div class="chead"><h2>Battery power</h2>
       <div class="legend">
@@ -407,6 +422,9 @@ const CAL_SEVERITIES = ['info', 'warning', 'elevated', 'alert'];
 // Held between polls because it changes how the per-module cards draw, not just
 // what the badge says.
 let calibration = null;
+// Held between polls so a failed fetch keeps the last drawn forecast rather
+// than tearing the panel down. null until the first successful response.
+let forecastData = null;
 
 // What the machine says it is: the whole device entry from /api/capabilities,
 // held because several renders read it on every poll — the transport label
@@ -1603,6 +1621,207 @@ function drawSoc(points) {
   }, [f.xs, soc, batt]);
 }
 
+// ---------------------------------------------------------------------------
+// Forecast chart — the day's predicted solar production against what actually
+// arrived. The whole point of Option B (the owner's chosen design) is that
+// the dawn plan stays visible BEHIND the actual, so a day running below plan
+// shows as a gap between solid and hatch by lunchtime.
+//
+// All three series share --pv as their hue. The distinction between forecast
+// and measurement is carried by texture — hatch, dash, solid — which is how
+// the chart reads under every form of colour vision deficiency. The foresight
+// of using texture over colour only helps the colour-blind reader; it does
+// not rely on them to see anything differently.
+// ---------------------------------------------------------------------------
+
+// The figures line in the panel header, from the response only. The page
+// computes nothing: expected_today_kwh formatted like the other kWh figures,
+// tracking_pct rendered as "behind" (negative) or "ahead" (positive). Each
+// part is absent when its value is null — never a dash.
+function forecastFigures(fc) {
+  const parts = [];
+  if (fc.expected_today_kwh !== null && fc.expected_today_kwh !== undefined) {
+    parts.push(`expected ${fc.expected_today_kwh.toFixed(1)} kWh`);
+  }
+  if (fc.tracking_pct !== null && fc.tracking_pct !== undefined) {
+    const abs = Math.abs(fc.tracking_pct);
+    const dir = fc.tracking_pct < 0 ? 'behind' : 'ahead';
+    const cls = fc.tracking_pct < 0 ? 'bad' : 'good';
+    parts.push(`making <span style="color:var(--${cls})">${abs}% ${dir}</span> so far`);
+  }
+  return parts.join(' · ');
+}
+
+// Canvas pattern: diagonal lines in --pv at low alpha over a transparent
+// background. Built fresh on every call so theme changes re-resolve — ink()
+// returns the current theme's colour, and a pattern cached from the last draw
+// would carry the old one into the new surface. uPlot's series.fill accepts a
+// function returning a fillStyle, which is how this reaches the canvas.
+function dawnFill(u, seriesIdx) {
+  const pat = document.createElement('canvas');
+  pat.width = 10;
+  pat.height = 10;
+  const ctx = pat.getContext('2d');
+  ctx.strokeStyle = ink('--pv');
+  ctx.globalAlpha = 0.35;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(0, 10);
+  ctx.lineTo(10, 0);
+  ctx.stroke();
+  return ctx.createPattern(pat, 'repeat');
+}
+
+// A vertical line at the response's `now` instant across the plot, with a
+// small "now" label above it. Implemented as a uPlot plugin so it redraws
+// with the chart — mirroring zeroRule and bandShade's structure. Reads the
+// now value through a function rather than closing over an array, per the
+// documented re-draw trap: paint() builds a chart once and afterwards only
+// calls setData, so a plugin rebuilt on a later poll is silently discarded
+// and the chart keeps the one it was constructed with.
+function nowMarker(getNowFn) {
+  return {
+    hooks: {
+      draw: (u) => {
+        const nowIso = getNowFn();
+        if (!nowIso) return;
+        const nowSec = new Date(nowIso).getTime() / 1000;
+        if (nowSec < u.scales.x.min || nowSec > u.scales.x.max) return;
+        const x = Math.round(u.valToPos(nowSec, 'x', true)) + 0.5;
+        const { top, height } = u.bbox;
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.strokeStyle = ink('--zero-rule');
+        ctx.lineWidth = uPlot.pxRatio || 1;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(x, top);
+        ctx.lineTo(x, top + height);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = ink('--ink2');
+        ctx.font = '10px system-ui,sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('now', x, top - 4);
+        ctx.restore();
+      },
+    },
+  };
+}
+
+// Build aligned x/y arrays over the day's hours. Each hour boundary becomes
+// one position in the x array; hours absent from a curve are nulls (uPlot
+// gaps), never zeros. The three series may have different hour coverage —
+// dawn and latest cover the full day, actual only has measurements for hours
+// that have already passed.
+function buildForecastSeries(fc) {
+  const dayStart = new Date(fc.day.start);
+  const dayEnd = new Date(fc.day.end);
+
+  const hours = [];
+  let h = new Date(dayStart);
+  while (h < dayEnd) {
+    hours.push(new Date(h));
+    h = new Date(h.getTime() + 3600000);
+  }
+
+  const xs = hours.map((t) => t.getTime() / 1000);
+
+  // Keyed on the epoch, never the ISO text: the service writes
+  // "...T05:00:00+00:00" while toISOString() spells the same instant
+  // "...T05:00:00.000Z", and matching strings across the two spellings made
+  // every lookup miss — a chart that said "no forecast data" over a day the
+  // API was serving in full.
+  const dawnMap = {};
+  for (const d of fc.dawn) dawnMap[Date.parse(d.hour)] = d.expected_w;
+  const latestMap = {};
+  for (const l of fc.latest) latestMap[Date.parse(l.hour)] = l.expected_w;
+  const actualMap = {};
+  for (const a of fc.actual) actualMap[Date.parse(a.hour)] = a.mean_w;
+
+  const lookup = (map) => hours.map((t) => {
+    const v = map[t.getTime()];
+    return v !== undefined ? v : null;
+  });
+
+  return { xs, dawn: lookup(dawnMap), latest: lookup(latestMap), actual: lookup(actualMap) };
+}
+
+// Draw (or update) the forecast chart. Called on every successful fetch; on
+// failure the caller keeps the last drawn state and does not tear down.
+function drawForecast(fc) {
+  const data = buildForecastSeries(fc);
+  if (!anyReading(data.dawn, data.latest, data.actual)) {
+    chartMessage('forecast', 'no forecast data for today');
+    return;
+  }
+
+  const dayStartSec = new Date(fc.day.start).getTime() / 1000;
+  const dayEndSec = new Date(fc.day.end).getTime() / 1000;
+
+  paint('forecast', {
+    height: 180,
+    unit: 'kW',
+    opts: chartBase({
+      scales: {
+        x: { time: true, min: dayStartSec, max: dayEndSec },
+        y: { range: powerRange },
+      },
+      axes: [timeAxis(), kwAxis()],
+      // Back to front: the dawn plan (hatched), the latest revision (dashed),
+      // and the actual production (solid with gradient fill). All three share
+      // --pv; the distinction is carried by texture and position alone.
+      series: [
+        {},
+        trace('Dawn plan', '--pv', 1.0, {
+          fill: dawnFill,
+          fillTo: () => 0,
+          stroke: () => fade('--pv', 0.25),
+          dash: [6, 4],
+        }),
+        trace('Latest', '--pv', 1.2, {
+          dash: [8, 4],
+        }),
+        trace('Actual', '--pv', 1.8, {
+          fill: pvFill,
+          fillTo: () => 0,
+        }),
+      ],
+      plugins: [
+        nowMarker(() => (forecastData ? forecastData.now : null)),
+        readout('forecast', [
+          ['Dawn plan', 1, kw],
+          ['Latest', 2, kw],
+          ['Actual', 3, kw],
+        ]),
+      ],
+    }),
+  }, [data.xs, data.dawn, data.latest, data.actual]);
+
+  $('forecastFigures').innerHTML = forecastFigures(fc);
+}
+
+async function loadForecast() {
+  try {
+    const url = '/api/forecast' + zoneQuery();
+    const r = await fetch(url);
+    if (!r.ok) return;           // keep the last drawn state
+    const fc = await r.json();
+    if (!fc.configured) {
+      $('forecastPanel').hidden = true;
+      forecastData = null;
+      return;
+    }
+    forecastData = fc;
+    drawForecast(fc);
+    $('forecastPanel').hidden = false;
+  } catch (e) {
+    // Transient failure — keep whatever is already on screen. Tearing the
+    // chart down would throw away the zoom and the last good readings over a
+    // hiccup that usually lasts one poll.
+  }
+}
+
 async function loadHistory() {
   const end = new Date();
   const start = new Date(end.getTime() - range.seconds*1000);
@@ -1740,8 +1959,10 @@ async function boot() {
   loadCaps();
   loadLive();
   loadHistory();
+  loadForecast();
   scheduleLive();
   setInterval(loadHistory, 60000);
+  setInterval(loadForecast, 60000);
 }
 
 boot();
