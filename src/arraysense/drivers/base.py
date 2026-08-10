@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -354,6 +354,57 @@ class InverterDriver(InverterSource, Protocol):
 
 
 @dataclass(frozen=True)
+class ModelSpec:
+    """One model within a driver family, and how it differs from the family.
+
+    Every delta field left None inherits the family declaration. A delta that
+    is set asserts a fact about a physical machine, so it must say where the
+    fact came from: a citation naming a measurement or a vendor document.
+    Without that rule the models table fills with plausible inventions, and a
+    page rendering pv_strings=2 for a 6000XP nobody ever checked is exactly
+    the kind of confident wrongness this project exists to refuse.
+    """
+
+    name: str
+    pv_strings: int | None = None
+    battery_module_slots: int | None = None
+    citation: str = ""
+
+    def __post_init__(self) -> None:
+        """Refuse a delta that cites nothing."""
+        has_delta = self.pv_strings is not None or self.battery_module_slots is not None
+        if has_delta and not self.citation.strip():
+            raise ValueError(
+                f"model {self.name!r} asserts a hardware fact without a citation; "
+                "name the measurement or document it came from"
+            )
+
+
+def resolve_model(family: Capabilities, model: ModelSpec) -> Capabilities:
+    """Return the family capabilities with one model's cited deltas applied.
+
+    The same shape as the transport resolution on a built source: the registry
+    entry carries the family default, and an installation that names a model
+    answers with this. Fields the model does not cite stay exactly the family's.
+    """
+    resolved = family
+    if model.pv_strings is not None:
+        resolved = replace(resolved, pv_strings=model.pv_strings)
+    if model.battery_module_slots is not None:
+        resolved = replace(resolved, battery_module_slots=model.battery_module_slots)
+    return resolved
+
+
+def find_model(entry: DriverEntry, name: str) -> ModelSpec:
+    """Return the named model from an entry, or refuse naming what does exist."""
+    for model in entry.models:
+        if model.name == name:
+            return model
+    known = ", ".join(m.name for m in entry.models) or "none"
+    raise ValueError(f"driver {entry.name!r} has no model {name!r}; models: {known}")
+
+
+@dataclass(frozen=True)
 class DriverEntry:
     """One registered driver: its name, what it covers, and how to build it.
 
@@ -381,6 +432,12 @@ class DriverEntry:
     description: str
     capabilities: Capabilities
     build: Callable[[Config], InverterDriver] = field(compare=False)
+    # Who makes the family, as a person would name it in a dropdown. The fake
+    # driver says "Simulated" — running the wizard with no hardware is a
+    # supported case, so it is a manufacturer as far as the picker cares.
+    manufacturer: str = ""
+    # The models this family covers, each carrying only cited deltas.
+    models: tuple[ModelSpec, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse an entry with no usable name, since the name is the lookup key."""
