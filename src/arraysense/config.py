@@ -72,6 +72,14 @@ _VALID_TRANSPORTS = frozenset({"dongle", "modbus_serial"})
 # last five minutes at that checkpoint rate.
 _VALID_SYNCHRONOUS = frozenset({"full", "normal"})
 
+# Where battery truth comes from. Empty means "derive from the driver": relayed
+# when the family relays BMS data, none otherwise — which is every existing
+# installation's behaviour, so nobody migrates anything. "direct" is reserved
+# by the setup design and refused at driver construction until a battery
+# driver exists to honour it; refusing it here would hard-code driver
+# knowledge into a module the drivers import.
+_VALID_BATTERY_SOURCES = frozenset({"", "relayed", "none", "direct"})
+
 
 @dataclass(frozen=True)
 class Config:
@@ -123,6 +131,8 @@ class Config:
     serial_baud: int = 19200
     serial_unit_id: int = 1
     synchronous: str = "full"
+    model: str = ""
+    battery_source: str = ""
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -161,6 +171,11 @@ class Config:
         if self.synchronous not in _VALID_SYNCHRONOUS:
             raise ValueError(
                 f"synchronous must be one of {sorted(_VALID_SYNCHRONOUS)}, got {self.synchronous!r}"
+            )
+        if self.battery_source not in _VALID_BATTERY_SOURCES:
+            raise ValueError(
+                f"battery_source must be one of {sorted(s for s in _VALID_BATTERY_SOURCES if s)}"
+                f" or unset, got {self.battery_source!r}"
             )
         if self.serial_baud <= 0:
             raise ValueError(f"serial_baud must be positive, got {self.serial_baud}")
@@ -241,6 +256,8 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
         serial_baud=round(_number(data, "serial_baud", 19200)),
         serial_unit_id=round(_number(data, "serial_unit_id", 1)),
         synchronous=str(data.get("synchronous", "full")),
+        model=str(data.get("model", "")),
+        battery_source=str(data.get("battery_source", "")),
     )
 
 
@@ -270,6 +287,14 @@ def effective(config: Config, settings: SettingsStore) -> Config:
         dongle_serial=str(pick("connection.dongle_serial", config.dongle_serial)),
         inverter_serial=str(pick("connection.inverter_serial", config.inverter_serial)),
         poll_interval=float(pick("collector.poll_interval", config.poll_interval)),  # type: ignore[arg-type]
+        # Registered in settings.py — an unregistered overlay here is dead
+        # code, which is exactly how the first attempt at these failed review.
+        transport=str(pick("connection.transport", config.transport)),
+        serial_device=str(pick("connection.serial_device", config.serial_device)),
+        serial_baud=round(float(pick("connection.serial_baud", config.serial_baud))),  # type: ignore[arg-type]
+        serial_unit_id=round(float(pick("connection.serial_unit_id", config.serial_unit_id))),  # type: ignore[arg-type]
+        model=str(pick("connection.model", config.model)),
+        battery_source=str(pick("connection.battery_source", config.battery_source)),
     )
 
 
