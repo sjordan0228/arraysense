@@ -57,6 +57,65 @@ def _http_get(url: str, timeout: float) -> bytes:
         return bytes(response.read())
 
 
+def fetch_radiation_forecast(
+    latitude: float,
+    longitude: float,
+    timeout: float = 10.0,
+) -> list[tuple[datetime, float]] | None:
+    """Fetch the day's hourly shortwave radiation forecast, or nothing.
+
+    The same free endpoint that serves current conditions also serves the
+    day's cloud-adjusted radiation forecast. That forecast is what the
+    prediction engine scales into expected production — a watt-hour figure per
+    hour, from the cloud cover the model already knows and the sun angle at
+    this latitude. A prediction is fetched, never measured, and the caller
+    stores it in the forecast table, never a metric column.
+
+    Returns a list of (aware UTC datetime, W/m²) pairs for every hour whose
+    value is a real non-negative number. None means nothing to record: the
+    fetch failed, the reply had no hourly block, or no pair survived filtering.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "hourly": "shortwave_radiation",
+            "forecast_days": "1",
+            "timezone": "UTC",
+        }
+    )
+    try:
+        raw = _http_get(f"{_BASE}?{query}", timeout)
+        hourly = json.loads(raw)["hourly"]
+    except _FETCH_ERRORS as exc:
+        logger.debug("radiation forecast fetch failed, recording nothing: %s", exc)
+        return None
+    except (KeyError, TypeError):
+        logger.debug("radiation forecast reply carried no hourly block; recording nothing")
+        return None
+
+    times = hourly.get("time") if isinstance(hourly, dict) else None
+    values = hourly.get("shortwave_radiation") if isinstance(hourly, dict) else None
+    if not isinstance(times, list) or not isinstance(values, list):
+        return None
+
+    pairs: list[tuple[datetime, float]] = []
+    # strict=False by intent: a reply whose two lists disagree in length is
+    # malformed at the tail, and pairing what aligns while dropping the rest
+    # is the same degrade-to-absent rule as every other failure here.
+    for time_str, value in zip(times, values, strict=False):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            continue
+        if float(value) < 0:
+            continue
+        try:
+            ts = datetime.fromisoformat(time_str).replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            continue
+        pairs.append((ts, float(value)))
+    return pairs or None
+
+
 def fetch_current(latitude: float, longitude: float, timeout: float = 10.0) -> Sample | None:
     """Read the current outside temperature and cloud cover, or nothing.
 

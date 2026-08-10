@@ -74,6 +74,119 @@ def test_a_non_numeric_value_is_dropped(monkeypatch: pytest.MonkeyPatch) -> None
     assert sample.readings == {"cloud_cover_pct": 60.0}
 
 
+# -- fetch_radiation_forecast -------------------------------------------------
+# The same Open-Meteo endpoint that serves current conditions also serves an
+# hourly shortwave-radiation forecast. The function pairs each timestamp
+# with its non-null, non-negative W/m² value and drops everything else.
+
+
+def _forecast_payload(
+    times: object | None = None,
+    values: object | None = None,
+) -> bytes:
+    if times is None:
+        times = [
+            "2026-08-10T06:00",
+            "2026-08-10T07:00",
+            "2026-08-10T08:00",
+            "2026-08-10T09:00",
+        ]
+    if values is None:
+        values = [0.0, 150.3, 420.7, 680.1]
+    return json.dumps({"hourly": {"time": times, "shortwave_radiation": values}}).encode()
+
+
+def test_good_forecast_becomes_timed_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthy reply returns (aware UTC datetime, W/m²) pairs for every hour."""
+    seen: dict[str, str] = {}
+
+    def fake_get(url: str, timeout: float) -> bytes:
+        seen["url"] = url
+        return _forecast_payload()
+
+    monkeypatch.setattr(open_meteo, "_http_get", fake_get)
+    pairs = open_meteo.fetch_radiation_forecast(35.2, -97.4)
+    assert pairs is not None
+    assert len(pairs) == 4
+    from datetime import UTC
+
+    assert pairs[0][1] == 0.0
+    assert pairs[1][1] == 150.3
+    assert pairs[2][1] == 420.7
+    assert pairs[3][1] == 680.1
+    for ts, _ in pairs:
+        assert ts.tzinfo is UTC
+    assert "hourly=shortwave_radiation" in seen["url"]
+    assert "forecast_days=1" in seen["url"]
+
+
+def test_null_forecast_values_are_dropped_not_zeroed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A null in the radiation column is absent, not a cloudy hour at 0 W/m²."""
+    monkeypatch.setattr(
+        open_meteo,
+        "_http_get",
+        lambda url, timeout: _forecast_payload(values=[0.0, None, 420.7, None]),
+    )
+    pairs = open_meteo.fetch_radiation_forecast(35.2, -97.4)
+    assert pairs is not None
+    assert len(pairs) == 2
+    assert [v for _, v in pairs] == [0.0, 420.7]
+
+
+def test_forecast_network_failure_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(url: str, timeout: float) -> bytes:
+        raise URLError("no route to host")
+
+    monkeypatch.setattr(open_meteo, "_http_get", fake_get)
+    assert open_meteo.fetch_radiation_forecast(35.2, -97.4) is None
+
+
+def test_malformed_forecast_json_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b"<html>oops</html>")
+    assert open_meteo.fetch_radiation_forecast(35.2, -97.4) is None
+
+
+def test_forecast_missing_hourly_block_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b'{"elevation": 350}')
+    assert open_meteo.fetch_radiation_forecast(35.2, -97.4) is None
+
+
+def test_forecast_with_no_surviving_pairs_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every value is null — nothing to return."""
+    monkeypatch.setattr(
+        open_meteo,
+        "_http_get",
+        lambda url, timeout: _forecast_payload(values=[None, None]),
+    )
+    assert open_meteo.fetch_radiation_forecast(35.2, -97.4) is None
+
+
+def test_forecast_url_carries_required_params(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, str] = {}
+
+    def fake_get(url: str, timeout: float) -> bytes:
+        seen["url"] = url
+        return _forecast_payload()
+
+    monkeypatch.setattr(open_meteo, "_http_get", fake_get)
+    open_meteo.fetch_radiation_forecast(35.2, -97.4)
+    assert "hourly=shortwave_radiation" in seen["url"]
+    assert "forecast_days=1" in seen["url"]
+    assert "timezone=UTC" in seen["url"]
+
+
 def test_the_client_writes_exactly_the_site_metrics() -> None:
     # Two truths, one fact: the registry classifies which metrics are the
     # site's (SITE_METRICS gates staleness and widens the store's writable

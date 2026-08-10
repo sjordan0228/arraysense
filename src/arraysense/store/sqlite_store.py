@@ -663,6 +663,98 @@ class SqliteStore:
         columns = ["timestamp", "serial", *names]
         return [self._decode_row(columns, row, names, module=True) for row in rows]
 
+    def append_forecast(self, made_at: datetime, points: Sequence[tuple[datetime, float]]) -> None:
+        """Record one prediction of the day's production, keeping when it was made.
+
+        Append-only on (target_hour, made_at): a revision never overwrites the
+        plan it revises, because the page tracks the day against the dawn plan
+        while drawing the latest expectation ahead of now — two truths from one
+        table, and erasing the older would fake the tracking. A prediction is
+        not a measurement and never touches a metric column.
+        """
+        rows = [
+            (int(hour.timestamp()), int(made_at.timestamp()), round(watts))
+            for hour, watts in points
+        ]
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO forecast (target_hour, made_at, expected_w) "
+                "VALUES (?, ?, ?)",
+                rows,
+            )
+
+    def forecast_day(self, start: datetime, end: datetime) -> dict[str, list[dict[str, object]]]:
+        """The day's dawn plan and its latest revision, hour by hour.
+
+        ``first`` is the earliest prediction made on the day itself for each
+        hour — the plan the day is tracked against; a forecast made yesterday
+        does not count as the dawn plan. ``latest`` is the newest prediction
+        for each hour whenever it was made. Hours nobody predicted are absent,
+        not zero.
+        """
+        lo, hi = int(start.timestamp()), int(end.timestamp())
+
+        def curve(order: str, floor: int | None) -> list[dict[str, object]]:
+            made_filter = "AND made_at >= ?" if floor is not None else ""
+            params: tuple[int, ...] = (lo, hi, floor) if floor is not None else (lo, hi)
+            rows = self._conn.execute(
+                "SELECT target_hour, expected_w, made_at FROM forecast f "
+                f"WHERE target_hour >= ? AND target_hour < ? {made_filter} "
+                "AND made_at = (SELECT "
+                f"{order}(made_at) FROM forecast WHERE target_hour = f.target_hour"
+                + (" AND made_at >= ?" if floor is not None else "")
+                + ") ORDER BY target_hour",
+                params + ((floor,) if floor is not None else ()),
+            ).fetchall()
+            return [
+                {
+                    "hour": datetime.fromtimestamp(hour, tz=UTC),
+                    "expected_w": float(watts),
+                    "made_at": datetime.fromtimestamp(made, tz=UTC),
+                }
+                for hour, watts, made in rows
+            ]
+
+        return {"first": curve("MIN", lo), "latest": curve("MAX", None)}
+
+    def prune_forecast(self, before: datetime) -> int:
+        """Drop predictions for hours older than ``before``; returns rows removed.
+
+        Ninety days of revisions is enough to score the forecast against what
+        the day actually did; unbounded, a fifteen-minute refresh writes nine
+        hundred rows a day forever on a machine whose database already outgrew
+        one SD card.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM forecast WHERE target_hour < ?", (int(before.timestamp()),)
+            )
+        return cur.rowcount
+
+    def peak(
+        self,
+        metric: str,
+        start: datetime,
+        end: datetime,
+        device: str | None = None,
+    ) -> float | None:
+        """The highest raw reading of one metric in a window, or None if nothing.
+
+        This is what calibrates the forecast: the system's own observed peak is
+        the honest measure of what the array can do, where a nameplate rating
+        would be an assumption. Reads the raw tier because a coarser tier's
+        mean flattens exactly the peak this is for.
+        """
+        (name,) = self._check_inverter_names([metric])
+        row = self._conn.execute(
+            f"SELECT MAX({name}) FROM inverter_raw "
+            "WHERE device = ? AND timestamp >= ? AND timestamp < ?",
+            (self._device(device), int(start.timestamp()), int(end.timestamp())),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return lookup(name).decode(row[0])
+
     def _check_inverter_names(self, metrics: Sequence[str]) -> list[str]:
         """Return ``metrics`` unchanged, raising if any is not an inverter metric.
 
