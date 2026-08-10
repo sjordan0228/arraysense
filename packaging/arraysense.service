@@ -18,6 +18,10 @@ Wants=network-online.target
 Type=exec
 User=arraysense
 Group=arraysense
+# A serial installation's USB-to-RS485 adapter is owned by the dialout group and
+# is unreadable without it, even once it is visible. Harmless on a dongle
+# installation, which opens no port and reaches the inverter over TCP.
+SupplementaryGroups=dialout
 
 WorkingDirectory=/opt/arraysense
 ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --config /etc/arraysense/config.toml
@@ -47,7 +51,15 @@ StateDirectory=arraysense
 ConfigurationDirectory=arraysense
 NoNewPrivileges=true
 PrivateTmp=true
-PrivateDevices=true
+# false, not true, so a serial installation's USB-to-RS485 adapter — /dev/ttyUSB0
+# or a udev symlink to it such as /dev/rs485 — is visible to the service. A
+# private /dev holds only pseudo-devices (/dev/null, /dev/zero and the like), and
+# the adapter is not among them: with PrivateDevices=true every serial poll failed
+# with "could not open port ... No such file or directory" while the device
+# plainly existed on the host, an error that points nowhere near the sandbox. A
+# dongle-only installation opens no device and may set this back to true with a
+# drop-in for the extra hardening; everything else in this sandbox is unaffected.
+PrivateDevices=false
 ProtectSystem=strict
 ProtectHome=true
 ProtectKernelTunables=true
