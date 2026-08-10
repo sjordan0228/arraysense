@@ -7,6 +7,30 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.10 — 9 August 2026
+
+### Added
+
+- **An installation can choose how durably a reading has to land.**
+  `synchronous = "normal"` in the configuration syncs at checkpoint rather than
+  on every commit. The default is `"full"`, which is what every installation did
+  before this was a choice, so nothing changes for anyone who does not ask.
+
+  This exists for flash storage. Measured on a Raspberry Pi through the store's
+  own `append`, 200 polls cost **207 fsyncs at full and 7 at normal** — about
+  thirtyfold fewer, or roughly 2.8 million fewer flash program cycles a year at
+  an eleven-second cadence. On the same hardware the write itself went from
+  7.5 ms to 0.6 ms.
+
+  What it trades is bounded loss, not integrity: SQLite stays consistent either
+  way, and an abrupt power cut discards the readings written since the last
+  checkpoint — roughly the last five minutes at that rate. `"off"` is rejected
+  rather than offered, because that one risks corruption instead of loss and is
+  a different bargain altogether.
+
+  A reading written under `normal` reads back identically; the setting changes
+  when the write is durable, never what it contains.
+
 ## 0.6.9 — 9 August 2026
 
 ### Added
