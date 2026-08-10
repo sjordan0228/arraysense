@@ -30,7 +30,9 @@ from fastapi import FastAPI
 from arraysense import __version__, drivers
 from arraysense.api.app import create_app
 from arraysense.collector.service import CollectorService
+from arraysense.collector.weather import WeatherPoller
 from arraysense.config import DEFAULT_PATH, Config, effective, load
+from arraysense.metrics import SITE_METRICS
 from arraysense.settings import SettingsStore
 from arraysense.store.migrate import migrate_devices, needs_device_migration
 from arraysense.store.sqlite_store import SqliteStore
@@ -82,7 +84,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # not is left in place, unwritten, which is harmless.
     file_config = config
     opened_driver = config.driver
-    declared = drivers.get(config.driver).capabilities.metrics
+    # The store's writable set is what the SITE records, not the driver alone:
+    # the driver's declaration plus the weather metrics the poller writes. A
+    # store opened for the driver's metrics only refused every weather append
+    # with a KeyError — which is not a sqlite error, so it escaped the poller's
+    # store guard and the sky was silently never recorded.
+    declared = drivers.get(config.driver).capabilities.metrics | SITE_METRICS
     store = SqliteStore(
         config.database_path,
         device=config.inverter_serial,
@@ -98,8 +105,9 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # schema must be declared for it — not for whatever the file named. A
     # first-run "fake" installation switched to eg4_luxpower through the
     # overlay would otherwise write EG4 samples into a fake-declared store and
-    # KeyError on the first EG4-only metric, killing the poll loop.
-    declared = drivers.get(config.driver).capabilities.metrics
+    # KeyError on the first EG4-only metric, killing the poll loop. The weather
+    # metrics ride along for the same reason they did at the first open.
+    declared = drivers.get(config.driver).capabilities.metrics | SITE_METRICS
 
     # Which leaves an ordering problem now that the store is opened for a
     # device: the serial the settings page may override is the identity the
@@ -152,14 +160,17 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         store=store,
         interval=config.poll_interval,
     )
+    weather = WeatherPoller(store)
     # The file config, not the effective one, is what a write path needs to
     # predict the next boot: clearing an overlay field reverts to the file
     # value, and only this base can see it.
     app = create_app(store=store, service=service, config=config, file_config=file_config)
+    app.state.weather = weather
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await service.start()
+        await weather.start()
         watchdog = asyncio.create_task(_watch(service))
         try:
             yield
@@ -171,6 +182,7 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             # goes away, or the next start finds it occupied — the dongle's one
             # TCP slot, which the vendor's app also wants, or the serial port,
             # which is opened exclusively.
+            await weather.stop()
             await service.stop()
             store.close()
 

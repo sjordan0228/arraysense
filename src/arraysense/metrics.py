@@ -295,6 +295,14 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("grid_export_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("ac_charge_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("inverter_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
+    # --- Weather -------------------------------------------------------------
+    # Site readings, not inverter registers: written by the weather poller on
+    # its own clock. They live in this registry so schema, storage, rollup and
+    # the API treat them like any reading — issue #5. SITE_METRICS below is the
+    # classification: everything that asks "did the inverter report" must
+    # exclude these, or a fresh sky reading masks a quiet inverter.
+    MetricSpec("outside_temperature_c", "\N{DEGREE SIGN}C", 10, -60.0, 60.0),
+    MetricSpec("cloud_cover_pct", "%", 1, 0.0, 100.0),
     # --- Status and diagnostics ---------------------------------------------
     # Bitfields, not measurements. They aggregate with max rather than mean
     # because the average of two bitfields is not a bitfield, and because a
@@ -316,6 +324,14 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # leaves this climbing across the hole, the inverter's resets it.
     MetricSpec("inverter_run_time_s", "s", 1, 0.0, 4294967295.0, "max"),
 )
+
+# The metrics above that are the site's, not the inverter's. Two writers share
+# the raw tier, and every question of the form "did the inverter report" — the
+# staleness verdict most of all — must exclude these, or a sky reading landing
+# every fifteen minutes reads as the inverter answering while it is dark. The
+# registry owns this classification because it owns what each metric is; the
+# weather client's own export is tested equal to it, so the two cannot drift.
+SITE_METRICS: frozenset[str] = frozenset({"outside_temperature_c", "cloud_cover_pct"})
 
 # This is a ceiling, not a per-device fact: Capabilities.battery_module_slots
 # carries what each family actually has, and a test in test_drivers.py refuses

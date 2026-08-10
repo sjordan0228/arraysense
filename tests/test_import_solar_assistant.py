@@ -24,6 +24,7 @@ from arraysense.store.schema import FOREIGN_KEYS_PRAGMA, INVERTER_TIERS, schema_
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 from import_solar_assistant import (
+    DROPPED,
     HOURLY_ENERGY,
     SOURCES,
     Accumulator,
@@ -114,6 +115,34 @@ def test_the_battery_temperature_is_not_imported() -> None:
     # from cutover onwards, so importing the other sensor into the same column
     # would put a seventeen degree step in the chart at the seam.
     assert not any(s.measurement == "Battery temperature" for s in SOURCES)
+
+
+def test_the_weather_series_are_imported_not_dropped() -> None:
+    # 22 months of sky data came over in the export and was parked in DROPPED
+    # until these metrics existed (#5). Fahrenheit converts on the way in,
+    # exactly as the inverter temperature does; cloud cover is already a
+    # percentage.
+    #
+    # FIELD KEY "combined" IS UNVERIFIED: no SolarAssistant export file was
+    # reachable in this environment. The key follows the convention for
+    # aggregate (non-inverter-specific) series in the export. Verify on the
+    # first real import run — if "Outside temperature" lines carry a different
+    # field key, adjust the two Source lines above.
+    #
+    # THE FAHRENHEIT ASSUMPTION IS ALSO UNVERIFIED: "Inverter temperature" was
+    # confirmed to be Fahrenheit by comparing a live reading, but "Outside
+    # temperature" has no such confirmation. If a Texas summer day imports as a
+    # few degrees Celsius, the export was already Celsius and the conversion
+    # must be removed.
+    mapping = {(s.measurement, s.field): s for s in SOURCES}
+    temp = mapping[("Outside temperature", "combined")]
+    assert temp.metric == "outside_temperature_c"
+    assert temp.convert(77.0) == pytest.approx(25.0)
+    cloud = mapping[("Cloud cover", "combined")]
+    assert cloud.metric == "cloud_cover_pct"
+    assert cloud.convert(60.0) == 60.0
+    assert "Outside temperature" not in DROPPED
+    assert "Cloud cover" not in DROPPED
 
 
 def _buckets(energy: dict[int, float], metric: str) -> Buckets:

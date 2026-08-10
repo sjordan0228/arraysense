@@ -469,6 +469,17 @@ def test_the_setup_connection_keys_are_registered_with_bounds() -> None:
     assert lookup_setting("connection.battery_source").choices == ("", "relayed", "none")
 
 
+def test_the_weather_interval_is_registered_with_bounds() -> None:
+    # The weather poller reads this every tick, so an install tunes cadence
+    # without a code change. 900 s is Open-Meteo's own refresh rate for
+    # current conditions; polling faster stores near-identical points.
+    spec = lookup_setting("collector.weather_interval")
+    assert spec.kind == "float"
+    assert spec.default == 900.0
+    assert (spec.lower, spec.upper) == (300.0, 86400.0)
+    assert spec.unit == "seconds"
+
+
 def test_a_serial_device_that_is_a_url_is_refused() -> None:
     # pyserial reads any device string with "://" as a URL and dispatches to a
     # handler that raises an undeclared exception at connect. The registry

@@ -1122,3 +1122,66 @@ def test_relaxed_durability_still_stores_and_reads_back(tmp_path: Path) -> None:
     rows = store.query(["battery_voltage_v"], now, now)
     store.close()
     assert rows[0]["battery_voltage_v"] == 55.9
+
+
+def test_latest_skips_a_newer_row_that_carries_none_of_the_asked_metrics(
+    tmp_path: Path,
+) -> None:
+    # Two writers share this tier: the weather poller lands a row whose
+    # inverter columns are all null. Row-based recency returned that row and
+    # blanked the live dashboard for a poll cycle after every weather tick —
+    # an absence drawn where data exists. The most recent READING of the asked
+    # metrics is the answer, in both directions.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0, "battery_soc_pct": 64.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, 30, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    live = store.latest(["pv_total_power_w", "battery_soc_pct"])
+    assert live is not None
+    assert live["pv_total_power_w"] == 5000.0, "a weather row must not blank the live view"
+    assert live["timestamp"] == datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    # The mirror: the sky is readable under newer inverter rows.
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={"pv_total_power_w": 5100.0},
+        )
+    )
+    sky = store.latest(["outside_temperature_c"])
+    store.close()
+    assert sky is not None
+    assert sky["outside_temperature_c"] == 37.4
+
+
+def test_latest_still_surfaces_a_gap_row(tmp_path: Path) -> None:
+    # Recency is not health: a recorded gap answers every request, whatever
+    # metrics it was asked for, because a gap is information and hiding it
+    # would dress an outage as the last good reading with no timestamp shift.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    row = store.latest(["pv_total_power_w"])
+    store.close()
+    assert row is not None
+    assert row["error"] == "ConnectionError: nobody answered"
+    assert row["timestamp"] == datetime(2026, 8, 6, 12, 1, tzinfo=UTC)

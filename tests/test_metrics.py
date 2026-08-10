@@ -139,6 +139,22 @@ def test_module_expansion_preserves_aggregation() -> None:
         assert lookup(f"battery_module{slot}_cell_min_voltage_v").aggregation == "min"
 
 
+def test_weather_metrics_are_registered_with_their_bounds() -> None:
+    # Site-level readings, not inverter registers: recorded by the weather
+    # poller, tiered and rolled up like any reading. Bounds are generous but
+    # real — a cloud percentage past 100 or a temperature past the records is
+    # an API glitch to drop, not a reading.
+    by_name = {spec.name: spec for spec in INVERTER_METRICS}
+    temp = by_name["outside_temperature_c"]
+    assert temp.unit == "\N{DEGREE SIGN}C"
+    assert temp.scale == 10
+    assert (temp.lower, temp.upper) == (-60.0, 60.0)
+    cloud = by_name["cloud_cover_pct"]
+    assert cloud.unit == "%"
+    assert cloud.scale == 1
+    assert (cloud.lower, cloud.upper) == (0.0, 100.0)
+
+
 def test_adding_an_inverter_metric_to_the_registry_is_one_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
