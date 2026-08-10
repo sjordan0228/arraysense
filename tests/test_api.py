@@ -2468,3 +2468,44 @@ def test_apply_can_switch_the_driver_family(client: Any, monkeypatch: Any) -> No
     assert r.status_code == 200
     values = client.get("/api/settings").json()["values"]
     assert values["connection.driver"] == "fake"
+
+
+def test_the_settings_page_cannot_persist_an_unbootable_connection(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The settings PUT is a second write path to the connection group. An
+    # invalid combination through it would crash-loop the next boot exactly as
+    # one through /setup/apply would, so it runs the same registry validation.
+    r = client.put("/api/settings", json={"connection.transport": "carrier_pigeon"})
+    assert r.status_code == 400
+    r2 = client.put("/api/settings", json={"connection.battery_source": "direct"})
+    assert r2.status_code == 400
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "nothing unbootable should have landed"
+
+
+def test_detect_hands_back_an_already_yielded_collector(client: Any, monkeypatch: Any) -> None:
+    # The borrow stops the collector and starts it again. If stop() left the
+    # yield flag set, the restarted loop would return early forever — a detect
+    # that silently stopped collection. Yield first, then detect, then assert
+    # the collector is polling.
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        return "3352000000"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    client.post("/api/yield", json={"seconds": 60})
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.9",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
+    assert r.status_code == 200
+    status = client.get("/api/status").json()
+    assert status["yielding"] is False, "a stopped-then-started borrow must clear yield"
+    assert status["running"] is True

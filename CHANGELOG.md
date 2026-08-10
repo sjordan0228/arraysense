@@ -39,9 +39,13 @@ migration says so at the top of its entry.
   apply writes the only config file software will ever write, validated by
   the same loader that will read it at boot.
 
-  No page renders any of this yet — that is the next slice — and an existing
-  installation changes nothing: every new field defaults to exactly today's
-  behaviour.
+  No dedicated wizard renders this yet — that is the next slice. The existing
+  settings page, which builds itself from the registry, does now show the new
+  connection fields as ordinary controls, and a change to any of them is
+  validated against the same boot rules before it is stored, so that path
+  cannot persist a configuration the next start would refuse either. An
+  existing installation changes nothing: every new field defaults to exactly
+  today's behaviour.
 
 ## 0.6.13 — 9 August 2026
 

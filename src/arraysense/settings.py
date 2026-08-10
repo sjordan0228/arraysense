@@ -4,9 +4,11 @@ Editing a TOML file over SSH is a reasonable thing to ask of someone who already
 has a terminal open, and an unreasonable thing to ask of someone whose solar
 monitor is a tablet on a wall. Everything here is settable from the running
 service and is one value for the whole installation rather than per browser.
-Most settings take effect on the next request; the connection group is the
-exception, merged over the config file once at startup, which is why the setup
-flow's apply ends in a restart rather than a promise — a temperature unit stored in local
+Most settings take effect on the next request. The two exceptions are read
+once at startup and so wait for a restart: the connection group, merged over
+the config file, which is why the setup flow's apply ends in a restart rather
+than a promise; and the poll interval, which the collector reads when it
+begins its loop — a temperature unit stored in local
 storage means the tablet and the phone disagree about what 39 means.
 
 Defaults live in this registry, never in the database. A fresh install with an

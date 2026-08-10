@@ -71,9 +71,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
     # The store lays its schema for what the configured driver declares it can
     # produce, so a fresh database has no column that can never be filled. The
-    # settings overlay below cannot change the driver — only the file names it
-    # — so the declaration is safe to resolve before the store exists to read
-    # settings from.
+    # settings overlay can now name a different driver than the file did, so
+    # this first open is only to read the settings table — its metric
+    # declaration is provisional and re-derived from the effective driver
+    # below. The settings table itself carries no driver-specific columns, so
+    # reading it through a provisionally-declared store is safe.
+    opened_driver = config.driver
     declared = drivers.get(config.driver).capabilities.metrics
     store = SqliteStore(
         config.database_path,
@@ -86,6 +89,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # here rather than inside load() because the settings live in the database,
     # and the file is what says where the database is.
     config = effective(config, SettingsStore(store))
+    # The effective driver is what the collector will build, so the store's
+    # schema must be declared for it — not for whatever the file named. A
+    # first-run "fake" installation switched to eg4_luxpower through the
+    # overlay would otherwise write EG4 samples into a fake-declared store and
+    # KeyError on the first EG4-only metric, killing the poll loop.
+    declared = drivers.get(config.driver).capabilities.metrics
 
     # Which leaves an ordering problem now that the store is opened for a
     # device: the serial the settings page may override is the identity the
@@ -93,10 +102,16 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # read it. Reopening is the cheap and visible answer. Without it the API
     # would read one serial's rows while the collector wrote another's, and
     # every page would go blank with the collector apparently healthy.
-    if config.inverter_serial != store.device:
+    if config.inverter_serial != store.device or config.driver != opened_driver:
+        # Reopen whenever the identity or the driver the store was first built
+        # with no longer matches the effective configuration. The serial is the
+        # row identity; the driver decides the column set. Either one wrong
+        # means the collector and the store disagree about what they are
+        # writing, and the reopen is cheap and visible.
         logger.info(
-            "settings override the inverter serial; reopening the store as %s",
+            "settings override the connection; reopening the store as %s on the %s driver",
             config.inverter_serial,
+            config.driver,
         )
         store.close()
         store = SqliteStore(
@@ -297,7 +312,7 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
     from fastapi import HTTPException
 
     from arraysense.api.app import mount_pages
-    from arraysense.api.routes import DetectRequest, _probe_serial
+    from arraysense.api.routes import DetectRequest, run_detect
     from arraysense.config import DEFAULT_DATABASE_PATH
     from arraysense.setup import describe_setup, render_config
 
@@ -321,14 +336,15 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         return payload
 
     @app.post("/api/setup/detect")
-    async def setup_detect(body: DetectRequest) -> dict[str, str]:
-        # No collector exists in setup mode, so there is nothing to borrow
-        # the wire from — probe directly, map failures to named causes.
-        try:
-            serial = await _probe_serial(body)
-        except (ConnectionError, OSError, TimeoutError) as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"serial": serial}
+    async def setup_detect(body: dict[str, object]) -> dict[str, str]:
+        # A plain dict rather than DetectRequest: a nested endpoint annotated
+        # with the imported class is an unresolved forward reference under this
+        # module's postponed annotations, which FastAPI turns into a 422 for a
+        # missing "body" parameter. Build the model here and hand it to the
+        # same run_detect the running-service route uses, so setup mode gets
+        # the unknown-transport and missing-serial checks rather than skipping
+        # them. No collector exists here, so nothing is borrowed.
+        return await run_detect(DetectRequest.model_validate(body), service=None)
 
     @app.post("/api/setup/apply")
     async def setup_apply_first_run(body: dict[str, object]) -> dict[str, object]:

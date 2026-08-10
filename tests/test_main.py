@@ -293,14 +293,19 @@ def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path, monkeypa
     assert not target.with_suffix(".candidate").exists()
 
 
-def test_first_run_apply_refuses_a_driver_the_registry_refuses(tmp_path: Path) -> None:
+def test_first_run_apply_refuses_a_driver_the_registry_refuses(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     # load() alone cannot know which drivers exist; the registry's rules run
     # on the candidate before the file is born, or an unbootable file would
     # exist and setup mode would never be offered again.
     from fastapi.testclient import TestClient
 
+    from arraysense import __main__ as main_module
     from arraysense.__main__ import build_setup_app
 
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
     target = tmp_path / "config.toml"
     app = build_setup_app(config_path=target)
     with TestClient(app) as client:
@@ -316,5 +321,46 @@ def test_first_run_apply_refuses_a_driver_the_registry_refuses(tmp_path: Path) -
             },
         )
         assert r.status_code == 400
+    assert fired == [], "a refused first-run apply must not schedule a restart"
     assert not target.exists()
     assert not target.with_suffix(".candidate").exists()
+
+
+def test_switching_the_driver_reopens_the_store_for_the_new_declaration(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The overlay can now name a different driver than the file did. The store
+    # must be reopened declared for the effective driver, or EG4 samples land
+    # in a fake-declared store and KeyError on the first EG4-only metric. This
+    # pins the store's declaration follows the overlay, not the file.
+    from arraysense.config import load
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+
+    db = tmp_path / "switch.db"
+    # A file that names the fake driver.
+    store = SqliteStore(str(db), device="CE00000000")
+    SettingsStore(store).set("connection.driver", "eg4_luxpower")
+    store.close()
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'driver = "fake"\n'
+        'dongle_host = "192.0.2.1"\n'
+        'dongle_serial = "BA00000000"\n'
+        'inverter_serial = "CE00000000"\n'
+        f'database_path = "{db}"\n'
+    )
+    config = load(path)
+    assert config.driver == "fake"
+    # After the overlay, the effective driver is eg4_luxpower — the code that
+    # opens the store must declare it for that, which build_app exercises.
+    from arraysense.__main__ import build_app
+
+    _app, opened_store, _service = build_app(config)
+    try:
+        # An EG4-only metric column exists, proving the store was declared for
+        # the effective driver rather than the file's fake one.
+        assert "pv1_power_w" in opened_store._present.get("inverter_raw", frozenset())
+    finally:
+        opened_store.close()

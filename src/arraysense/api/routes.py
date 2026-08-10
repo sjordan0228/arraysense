@@ -634,6 +634,53 @@ async def read_settings(request: Request) -> dict[str, Any]:
     return {"fields": describe(), "values": settings.public()}
 
 
+def _reject_unbootable_connection(config: Config, wanted: dict[str, Any]) -> None:
+    """Refuse a settings write whose connection group would not boot.
+
+    The overlay merges over the file at startup and is then handed to the same
+    driver validation the collector runs. Mirroring that here — building the
+    candidate config from the current one plus the connection keys being
+    written, and validating it — is what stops the settings page persisting a
+    transport with no device path, or a driver nobody has, or battery_source
+    "direct". Empty strings are skipped exactly as the startup merge skips
+    them, so clearing a field on the page keeps the file's value rather than
+    blanking it.
+    """
+    overlay: dict[str, object] = {}
+    field_for_setting = {setting: f for f, setting in _SETTING_KEYS.items()}
+    for key, raw in wanted.items():
+        field = field_for_setting.get(key)
+        if field is None:
+            continue
+        value = lookup_setting(key).validate(raw)
+        if value == "":
+            continue
+        overlay[field] = value
+    if not overlay:
+        return
+    merged: dict[str, Any] = {
+        "dongle_host": config.dongle_host,
+        "dongle_serial": config.dongle_serial,
+        "inverter_serial": config.inverter_serial,
+        "database_path": config.database_path,
+        "poll_interval": config.poll_interval,
+        "dongle_port": config.dongle_port,
+        "driver": config.driver,
+        "transport": config.transport,
+        "serial_device": config.serial_device,
+        "serial_baud": config.serial_baud,
+        "serial_unit_id": config.serial_unit_id,
+        "synchronous": config.synchronous,
+        "model": config.model,
+        "battery_source": config.battery_source,
+    }
+    merged.update(overlay)
+    try:
+        drivers.validate(Config(**merged))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -648,6 +695,12 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
     """
     settings = SettingsStore(request.app.state.store)
     wanted = {k: v for k, v in values.items() if not _is_mask(k, v)}
+    # The connection group is a second write path to the same fields /setup
+    # writes, and an invalid combination here would boot-crash exactly as one
+    # there would. Validate the merged result against the registry's own boot
+    # rules before writing a single row, so this path cannot store what the
+    # next start refuses.
+    _reject_unbootable_connection(request.app.state.config, wanted)
     try:
         changed = settings.update(wanted)
     except KeyError as exc:
@@ -1477,15 +1530,23 @@ async def _probe_serial(body: DetectRequest) -> str:
         await transport.disconnect()
 
 
-@router.post("/setup/detect")
-async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
+# One detect at a time across the process. Two concurrent probes would both
+# find the collector already stopped by the first and probe the wire together,
+# and the first's restart could begin polling while the second still holds it.
+_DETECT_LOCK = asyncio.Lock()
+
+
+async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, str]:
     """Read the inverter's serial off a candidate connection. Writes nothing.
 
-    If a collector is running it holds the single client slot — the serial
-    port is exclusive and the dongle takes one TCP client — so the probe
-    borrows the wire through yield mode and always gives it back. The
-    mismatch decision belongs to the page: this returns what answered, and
-    what was expected is whatever the form currently holds.
+    Shared by the running-service route and first-run setup so the two cannot
+    validate differently. A running collector holds the single client slot —
+    the serial port is exclusive, the dongle takes one TCP client — so the
+    probe borrows the wire by stopping the collector outright, which cancels
+    the poll task and waits out an in-flight write where yield mode would race
+    it, and starts it again on the way out whatever happened. In setup mode
+    there is no collector, so nothing is borrowed. The mismatch decision
+    belongs to the page: this returns what answered.
     """
     if body.transport not in ("dongle", "modbus_serial"):
         raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
@@ -1499,23 +1560,25 @@ async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
             detail="dongle detection needs the inverter serial; the dongle "
             "protocol authenticates with it",
         )
-    service = getattr(request.app.state, "service", None)
-    borrowed = False
-    if service is not None and service.status.running:
-        # stop() is the exclusive borrow: it cancels the poll task, waits out
-        # an in-flight write, and disconnects — yield mode does none of the
-        # waiting, so a poll already on the wire could fight the probe.
-        await service.stop()
-        borrowed = True
-    try:
+    async with _DETECT_LOCK:
+        borrowed = False
+        if service is not None and service.status.running:
+            await service.stop()
+            borrowed = True
         try:
             serial = await _probe_serial(body)
         except (ConnectionError, OSError, TimeoutError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-    finally:
-        if borrowed and service is not None:
-            await service.start()
+        finally:
+            if borrowed and service is not None:
+                await service.start()
     return {"serial": serial}
+
+
+@router.post("/setup/detect")
+async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
+    """Read the inverter's serial off a candidate connection. Writes nothing."""
+    return await run_detect(body, getattr(request.app.state, "service", None))
 
 
 class ApplyRequest(BaseModel):
@@ -1536,7 +1599,7 @@ class ApplyRequest(BaseModel):
     battery_source: str | None = None
 
 
-_SETTING_KEYS = {
+_SETTING_KEYS: dict[str, str] = {
     "driver": "connection.driver",
     "transport": "connection.transport",
     "serial_device": "connection.serial_device",
