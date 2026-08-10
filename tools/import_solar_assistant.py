@@ -131,6 +131,20 @@ SOURCES: tuple[Source, ...] = (
     # step at the seam and present it as the inverter warming up.
     Source("Inverter temperature", "inverter_0", "radiator1_temperature_c", convert=_fahrenheit),
     Source("Generator power", "inverter_0", "generator_power_w"),
+    # Weather, recorded by SolarAssistant from its own provider. Fahrenheit in
+    # the export, Celsius in the registry — same correction as the inverter
+    # temperature above. Recoverable at all because #5 gave them a metric.
+    #
+    # FIELD KEY "combined" IS UNVERIFIED: no SA export file was reachable in
+    # this environment. The key follows the convention for aggregate
+    # (non-inverter-specific) series. If a real export carries a different
+    # field key (e.g. the measurement name alone), adjust both Source lines.
+    # THE FAHRENHEIT ASSUMPTION IS ALSO UNVERIFIED: "Inverter temperature" was
+    # confirmed in Fahrenheit, but "Outside temperature" has no such check. If
+    # a Texas summer day imports near freezing, the export is already Celsius
+    # and the convert=_fahrenheit must be removed.
+    Source("Outside temperature", "combined", "outside_temperature_c", convert=_fahrenheit),
+    Source("Cloud cover", "combined", "cloud_cover_pct"),
 )
 
 # SolarAssistant's hourly means, in watts. Divided by a thousand each is that
@@ -150,8 +164,6 @@ DROPPED: dict[str, str] = {
     "Load power non-essential": "no metric for it; load_power_w already holds the whole house",
     "Load power|inverter_0": "duplicate of the combined field",
     "PV power|inverter_0": "duplicate of the combined field",
-    "Outside temperature": "weather, not the inverter; no metric until a weather source exists",
-    "Cloud cover": "weather, as above",
     "PV power predicted": "a forecast, not a measurement; it must never sit in the same column",
     "PV power predicted hourly": "as above",
     "Grid power hourly": "unsigned; the in/out pair carries the direction",
