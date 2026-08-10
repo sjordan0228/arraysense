@@ -442,6 +442,13 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
 
     ``device`` names an inverter and defaults to the configured one, so a page
     that sends nothing gets exactly what it always got.
+
+    The ``sky`` block carries the site's own weather readings — outside
+    temperature and cloud cover — written by a second poller on its own clock.
+    It rides the live response as its own object so the dashboard needs no
+    second request, but it never mixes into the inverter block: a weather row
+    must not blank the inverter read, and an inverter gap must not blank the
+    sky.
     """
     device = _device(device)
     inverter = store.latest(list(_LIVE_INVERTER), device=device)
@@ -458,6 +465,23 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
     # whose capacity or power nobody reported carries null for the rate; zero
     # is a real reading (an idle bank) and stays zero.
     battery_block = _battery_block(inverter)
+    # Weather: the site metrics the sky poller writes on its own clock.
+    # include_gaps=False so an inverter gap newer than the last weather tick
+    # does not blank the sky — the walk continues past gaps to the last real
+    # reading. None when no weather row exists or when the row has no values
+    # at all, never an object of two nulls.
+    sky: dict[str, Any] | None = None
+    sky_row = store.latest(sorted(SITE_METRICS), device=device, include_gaps=False)
+    if sky_row is not None:
+        formatted = _isoformat_row(sky_row)
+        temp = formatted.get("outside_temperature_c")
+        cover = formatted.get("cloud_cover_pct")
+        if temp is not None or cover is not None:
+            sky = {
+                "timestamp": formatted["timestamp"],
+                "outside_temperature_c": temp,
+                "cloud_cover_pct": cover,
+            }
     return {
         "inverter": _isoformat_row(inverter) if inverter else None,
         "modules": [_isoformat_row(m) for m in modules],
@@ -468,6 +492,7 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
             "known": status.known,
         },
         "battery": battery_block,
+        "sky": sky,
     }
 
 
