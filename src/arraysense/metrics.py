@@ -295,6 +295,12 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("grid_export_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("ac_charge_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("inverter_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
+    # --- Weather -------------------------------------------------------------
+    # Site readings, not inverter registers: written by the weather poller on
+    # its own clock. They live in this registry so schema, storage, rollup and
+    # the API treat them like any reading — issue #5.
+    MetricSpec("outside_temperature_c", "\N{DEGREE SIGN}C", 10, -60.0, 60.0),
+    MetricSpec("cloud_cover_pct", "%", 1, 0.0, 100.0),
     # --- Status and diagnostics ---------------------------------------------
     # Bitfields, not measurements. They aggregate with max rather than mean
     # because the average of two bitfields is not a bitfield, and because a

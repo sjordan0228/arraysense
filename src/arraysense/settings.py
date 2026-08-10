@@ -387,6 +387,21 @@ SETTINGS: tuple[SettingSpec, ...] = (
         # the box is the same sentence twice.
         help="",
     ),
+    SettingSpec(
+        key="collector.weather_interval",
+        kind="float",
+        default=900.0,
+        lower=300.0,
+        upper=86400.0,
+        unit="seconds",
+        label="Weather interval",
+        help=(
+            "Seconds between weather fetches. Open-Meteo refreshes its current "
+            "conditions about every fifteen minutes, so asking faster stores "
+            "near-identical points. Weather is fetched only while a location "
+            "is set under This installation."
+        ),
+    ),
     # --- Tariff -------------------------------------------------------------
     # What the owner pays. Nothing here has a default that prices anything: an
     # install that has entered no tariff shows energy and no money at all,
