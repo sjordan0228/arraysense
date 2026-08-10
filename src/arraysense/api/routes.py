@@ -1517,7 +1517,11 @@ async def _probe_serial(body: DetectRequest) -> str:
         )
     try:
         await transport.connect()
-    except (TransportError, OSError) as exc:
+    except (TransportError, OSError, UnicodeError) as exc:
+        # A host that resolves through IDNA to an over-long DNS label raises
+        # UnicodeError, not OSError, from connect. run_detect turns a
+        # ConnectionError into a 502; without this it would surface as an
+        # unhandled 500 on the unauthenticated setup surface.
         raise ConnectionError(str(exc)) from exc
     try:
         return str(await transport.read_serial_number())

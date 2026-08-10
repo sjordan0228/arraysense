@@ -2583,6 +2583,25 @@ def test_detect_rejects_a_device_path_with_a_null_byte_as_422(client: Any) -> No
     assert r.status_code == 422
 
 
+def test_detect_survives_an_unresolvable_host_as_502(client: Any) -> None:
+    # A dongle host that resolves through IDNA to an over-long DNS label raises
+    # UnicodeError from connect, not OSError — an unhandled 500 on the
+    # unauthenticated setup surface unless the probe catches it. It is an
+    # unreachable endpoint like any other: a 502 with a cause, and the collector
+    # is handed back.
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "a" * 64 + ".invalid",
+            "dongle_serial": "BA00000000",
+            "inverter_serial": "CE00000000",
+        },
+    )
+    assert r.status_code == 502
+    assert client.get("/api/status").json()["running"] is True
+
+
 def test_apply_rejects_control_text_in_a_serial_as_422(client: Any, monkeypatch: Any) -> None:
     from arraysense.api import routes
 

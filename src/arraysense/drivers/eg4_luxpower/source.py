@@ -1145,7 +1145,15 @@ class Eg4LuxPowerSource:
         if self._serial is None or not self._serial.is_connected:
             try:
                 await self._transport.connect()
-            except (TransportError, OSError) as exc:
+            except (TransportError, OSError, UnicodeError) as exc:
+                # UnicodeError joins the two: a host the settings page accepted
+                # as a string but that resolves through IDNA to an over-long DNS
+                # label ("label empty or too long") raises it here, not OSError.
+                # That is a host that cannot be reached, which is exactly a gap
+                # to record and back off from — not a crash that kills every
+                # poll and every boot until someone SSHes in. Only the connect
+                # site catches it: a UnicodeDecodeError at a register read below
+                # is a decoding bug and must surface, not become a silent gap.
                 # Name the endpoint configured, not always the dongle.
                 if self._config.transport == "modbus_serial":
                     endpoint = self._config.serial_device

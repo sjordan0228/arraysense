@@ -247,6 +247,28 @@ def test_the_model_is_absent_rather_than_guessed() -> None:
     assert drivers.create(_config()).identity.model is None
 
 
+# --- connect: a bad connection is a gap, not a crash ------------------------
+
+
+async def test_an_unresolvable_host_becomes_a_connectionerror_not_a_crash() -> None:
+    # A dongle host the settings page accepted as a string but that resolves
+    # through IDNA to an over-long DNS label ("label empty or too long") raises
+    # UnicodeError from connect, not OSError. The collector's poll loop catches
+    # ConnectionError and records a gap; an escaped UnicodeError would kill the
+    # loop on every poll and every boot until someone SSHed in. connect must
+    # translate it like any other unreachable endpoint.
+    config = Config(
+        dongle_host="a" * 64 + ".invalid",
+        dongle_serial="BA12345678",
+        inverter_serial="CE12345678",
+        database_path="/tmp/arraysense-test.db",
+        driver="eg4_luxpower",
+    )
+    source = drivers.create(config)
+    with pytest.raises(ConnectionError):
+        await source.connect()
+
+
 # --- ModelSpec: cited capability deltas -------------------------------------
 
 
