@@ -34,10 +34,10 @@ migration says so at the top of its entry.
 
   A brand-new installation — no config file at all — now serves **first-run
   setup** instead of exiting with an error: pages and the setup endpoints,
-  no store and no collector, because there is no inverter identity to open a
-  store under until detection has asked the hardware. The wizard's first
-  apply writes the only config file software will ever write, validated by
-  the same loader that will read it at boot.
+  no store and no collector, because there is no inverter serial to open a
+  store under until the wizard supplies one — typed, or read off a serial bus
+  by detection. The wizard's first apply writes the only config file software
+  will ever write, validated by the same loader that will read it at boot.
 
   No dedicated wizard renders this yet — that is the next slice. The existing
   settings page, which builds itself from the registry, does now show the new

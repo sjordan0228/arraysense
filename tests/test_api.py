@@ -2550,3 +2550,20 @@ def test_clearing_an_overlay_field_is_validated_against_the_file_not_the_overlay
             "the clear reverts to an eg4/Simulated boot and must be refused"
         )
     store.close()
+
+
+def test_a_malformed_connection_value_is_a_bad_request_not_a_500(
+    client: Any, monkeypatch: Any
+) -> None:
+    # Coercing a pending value can raise TypeError (a list where a number is
+    # wanted) or OverflowError (a number too large to become a float). Both are
+    # bad input, not a server fault, on either write path.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put("/api/settings", json={"connection.serial_baud": []})
+    assert r.status_code == 400
+    r2 = client.post("/api/setup/apply", json={"serial_baud": 10**400})
+    assert r2.status_code == 400
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.serial_baud"] == 19200, "nothing malformed should have landed"

@@ -76,7 +76,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # declaration is provisional and re-derived from the effective driver
     # below, and the store is reopened if the overlay changed the driver. The
     # settings table carries no driver-specific columns, so the provisional
-    # declaration only affects tier columns the reopen then corrects.
+    # declaration only affects which tier columns are writable — the reopen
+    # sets the writable set for the effective driver and adds any missing
+    # columns; a column the provisional driver had and the effective one does
+    # not is left in place, unwritten, which is harmless.
     file_config = config
     opened_driver = config.driver
     declared = drivers.get(config.driver).capabilities.metrics
@@ -149,11 +152,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         store=store,
         interval=config.poll_interval,
     )
-    app = create_app(store=store, service=service, config=config)
     # The file config, not the effective one, is what a write path needs to
     # predict the next boot: clearing an overlay field reverts to the file
     # value, and only this base can see it.
-    app.state.file_config = file_config
+    app = create_app(store=store, service=service, config=config, file_config=file_config)
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:

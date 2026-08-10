@@ -678,7 +678,7 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (ValueError, OverflowError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         # OverflowError rather than ValueError comes back from converting a
         # number too large for its type, and it was escaping as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1606,11 +1606,12 @@ def _schedule_restart() -> None:
 async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     """Validate the merged result, write the overlay, restart the collector.
 
-    Validation is by building a real Config over the currently effective one:
-    the file stays the floor, the overlay is values not structure, and every
-    rule the service enforces at boot refuses here first with the same words.
-    Only after the whole merged picture validates does anything get written —
-    a partial write of a bad combination would be a page-made outage.
+    Validation is against the exact config the next start will assemble — the
+    file config, the stored settings, and this change layered on with the real
+    merge semantics — so every rule the service enforces at boot refuses here
+    first with the same words. Only after the whole merged picture validates
+    does anything get written; a partial write of a bad combination would be a
+    page-made outage.
     """
     provided = {k: v for k, v in body.model_dump().items() if v is not None}
     # A masked value posted back unchanged is the page echoing what /api/setup
@@ -1631,7 +1632,9 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
         # All-or-nothing: every value validates against its spec before any
         # row is written, in one transaction.
         settings.set_many(pending)
-    except ValueError as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
+        # A malformed value — wrong type, or a number too large to coerce —
+        # is a bad request, not a server fault.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _schedule_restart()
     return {"applied": sorted(provided), "restarting": True}

@@ -92,7 +92,12 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     return serve
 
 
-def create_app(store: SqliteStore, service: CollectorService, config: Config) -> FastAPI:
+def create_app(
+    store: SqliteStore,
+    service: CollectorService,
+    config: Config,
+    file_config: Config | None = None,
+) -> FastAPI:
     """Assemble the application from an open store, a collector and a config.
 
     Nothing is constructed here — the caller owns the lifecycle of all three,
@@ -107,6 +112,12 @@ def create_app(store: SqliteStore, service: CollectorService, config: Config) ->
     app.state.store = store
     app.state.service = service
     app.state.config = config
+    # The file config, before any settings overlay, is what a write path needs
+    # to predict the next boot: clearing an overlay field reverts to the file
+    # value. A direct caller that passes only the effective config would make
+    # the validation model the wrong base, so this is set here, always, and
+    # build_app passes the real file config through it.
+    app.state.file_config = file_config if file_config is not None else config
     app.include_router(router)
 
     mount_pages(app)
