@@ -339,12 +339,11 @@ function render() {
       continue;
     }
     const controls = mine.map((spec) => {
+      // The bounds are not written out. A number box already carries min and
+      // max, so the browser refuses an out-of-range value and the spinner
+      // stops at the ends — printing the same range as prose says it twice,
+      // in the place where it reads least like an instruction.
       const help = [spec.help];
-      if (spec.kind === 'int' || spec.kind === 'float') {
-        if (spec.lower !== null && spec.upper !== null) {
-          help.push(`${spec.lower} to ${spec.upper}.`);
-        }
-      }
       // The unit is the registry's word for what the number means, and it goes
       // beside the box — except on a paragraph field, where "beside" is half a
       // screen away from anything, so it joins the help line instead.
