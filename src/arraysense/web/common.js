@@ -244,6 +244,76 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
 const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 
 // ---------------------------------------------------------------------------
+// The setup wizard's decisions. One renderer serves both the first-run wizard
+// and the settings Connection group, and these are the choices it makes from
+// the /api/setup payload — which models a driver has, which fields a transport
+// needs, which battery sources a driver supports, and what to actually send.
+// They are pure and DOM-free so node can check them against describe_setup's
+// shape (tests/test_wizard_js.py): a field shown that a transport does not
+// need, or a value sent that apply would refuse, is the same drift from the
+// single source of truth this project forbids everywhere else.
+// ---------------------------------------------------------------------------
+
+// >>> setup-logic
+function setupModelsFor(payload, driver) {
+  for (const maker of payload.manufacturers || []) {
+    for (const fam of maker.families || []) {
+      if (fam.driver === driver) return fam.models || [];
+    }
+  }
+  return [];
+}
+
+function setupMakerOf(payload, driver) {
+  for (const maker of payload.manufacturers || []) {
+    for (const fam of maker.families || []) {
+      if (fam.driver === driver) return maker.name;
+    }
+  }
+  return '';
+}
+
+function setupFieldsFor(payload, transport) {
+  const map = (payload && payload.transports) || {};
+  return Array.isArray(map[transport]) ? map[transport] : [];
+}
+
+function setupBatterySourcesFor(payload, driver) {
+  const map = (payload && payload.battery_sources) || {};
+  return Array.isArray(map[driver]) ? map[driver] : ['none'];
+}
+
+// The apply body: only the connection keys, only the ones with a real value.
+// serial_* and dongle_* ride only when their transport needs them, so a dongle
+// install never sends a serial_device the server would ignore and a serial
+// install never sends a dongle_host. An empty string is dropped — it means
+// "leave the file or overlay as it is", never "set this to blank", which is the
+// same rule the settings overlay follows when it merges over the file.
+function buildSetupBody(s) {
+  const body = {};
+  const put = (k, v) => {
+    if (v === undefined || v === null || v === '') return;
+    body[k] = v;
+  };
+  put('driver', s.driver);
+  put('model', s.model);
+  put('transport', s.transport);
+  put('battery_source', s.battery_source);
+  put('inverter_serial', s.inverter_serial);
+  if (s.transport === 'modbus_serial') {
+    put('serial_device', s.serial_device);
+    put('serial_baud', s.serial_baud);
+    put('serial_unit_id', s.serial_unit_id);
+  } else if (s.transport === 'dongle') {
+    put('dongle_host', s.dongle_host);
+    put('dongle_serial', s.dongle_serial);
+    put('dongle_port', s.dongle_port);
+  }
+  return body;
+}
+// <<< setup-logic
+
+// ---------------------------------------------------------------------------
 // Numbers on screen. Every one of these answers an absent reading with the
 // dash, which is the single rule this whole project exists to enforce: a
 // missing value and a value of nothing must never be drawn the same way.
