@@ -2583,6 +2583,50 @@ def test_detect_rejects_a_device_path_with_a_null_byte_as_422(client: Any) -> No
     assert r.status_code == 422
 
 
+def test_no_write_path_persists_an_unbootable_connection_value(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The class two review rounds kept turning up: a connection value some write
+    # path accepts and stores, which then crashes the collector on the next boot
+    # or 500s a probe. This pins the invariant across every field at once —
+    # every hostile-but-typed value is a 4xx on both persist paths and nothing
+    # lands — so a new field that forgets its validation fails here loudly rather
+    # than in production. Hosts are the one field that cannot be validated at the
+    # door (any string is a plausible name); they are caught at connect instead
+    # and covered by their own gap tests.
+    from arraysense.api import routes
+    from arraysense.settings import SettingsStore
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    # The overlay-settable connection fields, minus the two file-only ones:
+    # dongle_port and database_path are carried by neither ApplyRequest nor the
+    # settings registry, so the API cannot persist them (apply silently drops
+    # the unknown field). database_path IS written at first-run apply and is
+    # validated there — see test_main.py. Hosts are excluded per the docstring:
+    # any string is a plausible name, so they are caught at connect, not here.
+    cases: dict[str, object] = {
+        "model": "99kPV",
+        "driver": "no_such_driver",
+        "transport": "carrier_pigeon",
+        "battery_source": "quantum",
+        "serial_device": "loop://x",
+        "serial_baud": 10**9,
+        "serial_unit_id": 999,
+        "inverter_serial": "x" * 5000,
+        "dongle_serial": "x" * 5000,
+    }
+    for field, value in cases.items():
+        apply = client.post("/api/setup/apply", json={field: value})
+        assert apply.status_code >= 400, f"apply accepted a bad {field}"
+        put = client.put("/api/settings", json={f"connection.{field}": value})
+        assert put.status_code >= 400, f"settings PUT accepted a bad {field}"
+    # The invariant that matters, read from the raw overlay: nothing hostile
+    # landed. A 4xx that still wrote would be the actual bug.
+    overrides = SettingsStore(client.app.state.store).overrides()
+    for field in cases:
+        assert f"connection.{field}" not in overrides, f"a bad {field} was persisted"
+
+
 def test_a_url_serial_device_is_refused_at_the_door_not_stored(
     client: Any, monkeypatch: Any
 ) -> None:
