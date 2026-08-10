@@ -2563,7 +2563,10 @@ def test_a_malformed_connection_value_is_a_bad_request_not_a_500(
     monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
     r = client.put("/api/settings", json={"connection.serial_baud": []})
     assert r.status_code == 400
+    # Out of the field's bounds now, so pydantic refuses it at the door as a
+    # 422 — a cleaner refusal than the 400 the coercion path gave. Either is a
+    # bad request, never a 500.
     r2 = client.post("/api/setup/apply", json={"serial_baud": 10**400})
-    assert r2.status_code == 400
+    assert r2.status_code in (400, 422)
     values = client.get("/api/settings").json()["values"]
     assert values["connection.serial_baud"] == 19200, "nothing malformed should have landed"

@@ -364,3 +364,51 @@ def test_switching_the_driver_reopens_the_store_for_the_new_declaration(
         assert "pv1_power_w" in opened_store._present.get("inverter_raw", frozenset())
     finally:
         opened_store.close()
+
+
+def test_first_run_apply_refuses_a_database_path_that_cannot_open(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # load() accepts any non-empty database_path string, and the registry does
+    # not look at it — but the next boot opens a store there, and "/" cannot be
+    # opened. Validating only the file would let that become the real config
+    # and crash-loop every restart with no setup mode left to offer. First-run
+    # apply proves the store opens before it writes the file.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": "/",
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_detect_bounds_reject_a_bad_port_as_422(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/detect",
+            json={"transport": "dongle", "dongle_host": "192.0.2.1", "dongle_port": -1},
+        )
+        assert r.status_code == 422

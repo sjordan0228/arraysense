@@ -1454,10 +1454,10 @@ class DetectRequest(BaseModel):
     inverter_serial: str = ""
     transport: str
     serial_device: str = ""
-    serial_baud: int = 19200
+    serial_baud: int = Field(default=19200, ge=1, le=4000000)
     serial_unit_id: int = Field(default=1, ge=1, le=247)
     dongle_host: str = ""
-    dongle_port: int = 8000
+    dongle_port: int = Field(default=8000, ge=1, le=65535)
     dongle_serial: str = ""
 
 
@@ -1563,8 +1563,8 @@ class ApplyRequest(BaseModel):
     driver: str | None = None
     transport: str | None = None
     serial_device: str | None = None
-    serial_baud: int | None = None
-    serial_unit_id: int | None = None
+    serial_baud: int | None = Field(default=None, ge=1, le=4000000)
+    serial_unit_id: int | None = Field(default=None, ge=1, le=247)
     dongle_host: str | None = None
     dongle_serial: str | None = None
     inverter_serial: str | None = None

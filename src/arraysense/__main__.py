@@ -372,13 +372,31 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         probe = target.with_suffix(".candidate")
         probe.write_text(text)
         try:
-            # Every boot-time rule refuses here, before the real file exists:
-            # the loader's own checks, then the registry's — driver existence,
-            # model membership, the battery rules. A file that passed only the
-            # loader could name a driver nobody has, and the next boot would
-            # crash-loop on a file setup mode no longer offers to replace.
-            drivers.validate(load(probe))
-        except (ValueError, FileNotFoundError) as exc:
+            # Prove the candidate boots, not merely that it parses. The loader's
+            # own checks and the registry's — driver existence, model
+            # membership, battery rules — then the one boot() itself does that
+            # neither covers: opening the store at the configured path. A
+            # database_path that load() accepts but sqlite cannot open ("/",
+            # say) would otherwise become the real file, and every restart
+            # after it would crash on the store open with no setup mode left to
+            # offer, because the file now exists.
+            candidate = load(probe)
+            drivers.validate(candidate)
+            declared = drivers.get(candidate.driver).capabilities.metrics
+            SqliteStore(
+                candidate.database_path,
+                device=candidate.inverter_serial,
+                metrics=declared,
+                synchronous=candidate.synchronous,
+            ).close()
+        except (
+            ValueError,
+            FileNotFoundError,
+            OverflowError,
+            TypeError,
+            OSError,
+            sqlite3.Error,
+        ) as exc:
             probe.unlink(missing_ok=True)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         probe.replace(target)
