@@ -7,7 +7,7 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 0.6.14 — 9 August 2026
+## 0.6.14 — 10 August 2026
 
 ### Added
 
@@ -39,13 +39,17 @@ migration says so at the top of its entry.
   by detection. The wizard's first apply writes the only config file software
   will ever write, validated by the same loader that will read it at boot.
 
-  No dedicated wizard renders this yet — that is the next slice. The existing
-  settings page, which builds itself from the registry, does now show the new
-  connection fields as ordinary controls, and a change to any of them is
-  validated against the same boot rules before it is stored, so that path
-  cannot persist a configuration the next start would refuse either. An
-  existing installation changes nothing: every new field defaults to exactly
-  today's behaviour.
+  A **first-run wizard** renders all of it: pick who made the inverter, which
+  model, and how it is wired, read the serial off the wire with Detect or type
+  it, and one button writes the config and restarts into a live dashboard —
+  the page watches the restart come back rather than guessing at a delay, and a
+  refused apply keeps its reason on the form. The **settings page's connection
+  group is the same renderer**, one component in two shells so the wizard and
+  the settings form cannot drift, prefilled with the current values redacted and
+  saved through the same validated, restart-on-apply path. Detect on an
+  unchanged connection uses the configured secrets rather than the dots shown
+  for them. An existing installation changes nothing: every new field defaults
+  to exactly today's behaviour, and an already-configured box shows no wizard.
 
 ## 0.6.13 — 9 August 2026
 
