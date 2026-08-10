@@ -2570,3 +2570,29 @@ def test_a_malformed_connection_value_is_a_bad_request_not_a_500(
     assert r2.status_code in (400, 422)
     values = client.get("/api/settings").json()["values"]
     assert values["connection.serial_baud"] == 19200, "nothing malformed should have landed"
+
+
+def test_detect_rejects_a_device_path_with_a_null_byte_as_422(client: Any) -> None:
+    # A null byte in a device path makes pyserial raise on open — a 500 from a
+    # sink deep in the transport stack. The field validator refuses it at the
+    # door instead. No real device path holds a control character.
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/" + chr(0) + "rs485"},
+    )
+    assert r.status_code == 422
+
+
+def test_apply_rejects_control_text_in_a_serial_as_422(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    # A lone surrogate cannot be sent as a Python object — the client fails to
+    # encode it, just as a real HTTP client would. The attack is the JSON
+    # escape in the raw body, which the server decodes to a surrogate string.
+    r = client.post(
+        "/api/setup/apply",
+        content=b'{"inverter_serial": "\\ud800"}',
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 422

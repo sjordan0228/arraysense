@@ -412,3 +412,65 @@ def test_first_run_detect_bounds_reject_a_bad_port_as_422(tmp_path: Path) -> Non
             json={"transport": "dongle", "dongle_host": "192.0.2.1", "dongle_port": -1},
         )
         assert r.status_code == 422
+
+
+def test_first_run_refuses_a_database_path_that_is_the_config_file(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # database_path aliasing the config file: the store opened to validate the
+    # path is the file replace() overwrites with TOML, and the next boot reads
+    # TOML as sqlite and crashes. Refused before anything is written.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(target),
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_survives_a_lone_surrogate_in_the_body(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A lone surrogate makes render_config's write raise UnicodeEncodeError.
+    # It must be a 400 with no stray candidate, not a 500 — the write is inside
+    # the guard for exactly this.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        body = (
+            '{"driver": "fake", "transport": "dongle", '
+            '"dongle_host": "192.0.2.1", "dongle_serial": "BA00000000", '
+            '"inverter_serial": "\\ud800", '
+            f'"database_path": "{tmp_path / "db.sqlite"}"}}'
+        )
+        r = client.post(
+            "/api/setup/apply",
+            content=body.encode("ascii"),
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400
+    assert not target.with_suffix(".candidate").exists()

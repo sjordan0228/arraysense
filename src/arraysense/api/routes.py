@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
@@ -1448,6 +1448,25 @@ async def setup(request: Request) -> dict[str, Any]:
     return describe_setup(request.app.state.config)
 
 
+def _reject_control_text(value: str) -> str:
+    """Refuse text a device path, host or serial can never hold.
+
+    Such a value would turn into a 500 at a raising sink downstream: a null
+    byte makes pyserial raise on open; a lone surrogate makes any UTF-8
+    encoding raise, including writing the config file and storing a setting.
+    None of the fields this guards — a device path, a host, a serial — can
+    contain a control character or unencodable text in any real installation,
+    so rejecting them here is a clean 422 rather than a fault later.
+    """
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("control characters are not allowed")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("value must be valid text") from exc
+    return value
+
+
 class DetectRequest(BaseModel):
     """Candidate connection parameters to probe. Nothing here is saved."""
 
@@ -1459,6 +1478,11 @@ class DetectRequest(BaseModel):
     dongle_host: str = ""
     dongle_port: int = Field(default=8000, ge=1, le=65535)
     dongle_serial: str = ""
+
+    @field_validator("serial_device", "dongle_host", "dongle_serial", "inverter_serial")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return _reject_control_text(value)
 
 
 async def _probe_serial(body: DetectRequest) -> str:
@@ -1570,6 +1594,13 @@ class ApplyRequest(BaseModel):
     inverter_serial: str | None = None
     model: str | None = None
     battery_source: str | None = None
+
+    @field_validator(
+        "serial_device", "dongle_host", "dongle_serial", "inverter_serial", "model", "driver"
+    )
+    @classmethod
+    def _clean(cls, value: str | None) -> str | None:
+        return None if value is None else _reject_control_text(value)
 
 
 _SETTING_KEYS: dict[str, str] = {

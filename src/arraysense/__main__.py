@@ -319,13 +319,14 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
     """
     from fastapi import HTTPException
 
-    from arraysense.api.app import mount_pages
+    from arraysense.api.app import install_text_guard, mount_pages
     from arraysense.api.routes import DetectRequest, run_detect
     from arraysense.config import DEFAULT_DATABASE_PATH
     from arraysense.setup import describe_setup, render_config
 
     app = FastAPI(title="Solar ArraySense setup", version=__version__)
     mount_pages(app)
+    install_text_guard(app)
 
     @app.get("/api/setup")
     async def setup_describe() -> dict[str, object]:
@@ -359,29 +360,43 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         except ValidationError as exc:
             # A running-service route gets 422 from FastAPI for a malformed
             # body; setup mode parses by hand, so it maps the same failure to
-            # the same status rather than letting it escape as a 500.
-            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+            # the same status. Only the location and message are reported, never
+            # the raw input or the exception object — a lone surrogate input is
+            # not JSON-serializable and would turn the 422 into a 500.
+            detail = [
+                {"loc": [str(part) for part in err.get("loc", ())], "msg": str(err.get("msg", ""))}
+                for err in exc.errors()
+            ]
+            raise HTTPException(status_code=422, detail=detail) from exc
         return await run_detect(parsed, service=None)
 
     @app.post("/api/setup/apply")
     async def setup_apply_first_run(body: dict[str, object]) -> dict[str, object]:
-        body.setdefault("database_path", str(DEFAULT_DATABASE_PATH))
-        text = render_config(body)
         target = Path(config_path)
-        target.parent.mkdir(parents=True, exist_ok=True)
         probe = target.with_suffix(".candidate")
-        probe.write_text(text)
         try:
-            # Prove the candidate boots, not merely that it parses. The loader's
-            # own checks and the registry's — driver existence, model
-            # membership, battery rules — then the one boot() itself does that
-            # neither covers: opening the store at the configured path. A
-            # database_path that load() accepts but sqlite cannot open ("/",
-            # say) would otherwise become the real file, and every restart
-            # after it would crash on the store open with no setup mode left to
-            # offer, because the file now exists.
+            # Everything that can fault on a hostile body runs inside the guard:
+            # render_config and the write itself raise UnicodeEncodeError on a
+            # lone surrogate, so writing before the try would 500 and strand a
+            # candidate. Nothing outside the try touches the request.
+            body.setdefault("database_path", str(DEFAULT_DATABASE_PATH))
+            text = render_config(body)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            probe.write_text(text)
             candidate = load(probe)
             drivers.validate(candidate)
+            # database_path must not name the configuration file. The store the
+            # next line opens to prove the path is usable would then be the file
+            # replace() overwrites with TOML, and the boot after would read TOML
+            # as sqlite and crash — a persisted config that cannot start.
+            db = Path(candidate.database_path).resolve()
+            if db == target.resolve() or db == probe.resolve():
+                raise ValueError("database_path must not be the configuration file")
+            # Prove the candidate boots, not merely that it parses: open the
+            # store at the configured path, the one thing load() and the
+            # registry do not check. A path load() accepts but sqlite cannot
+            # open would otherwise become the real config and crash-loop every
+            # restart with no setup mode left to offer.
             declared = drivers.get(candidate.driver).capabilities.metrics
             SqliteStore(
                 candidate.database_path,
@@ -395,6 +410,7 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
             OverflowError,
             TypeError,
             OSError,
+            UnicodeError,
             sqlite3.Error,
         ) as exc:
             probe.unlink(missing_ok=True)
