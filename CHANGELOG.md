@@ -18,7 +18,7 @@ migration says so at the top of its entry.
   source exists, because a conservative default is honest and an invented
   spec is not. Configuration gains `model` and `battery_source` (`relayed`,
   the reality of every current installation, or `none`), the settings overlay
-  carries the whole connection, and `/api/setup` serves the manufacturer
+  carries the connection group, and `/api/setup` serves the manufacturer
   tree, each transport's required fields, the serial adapters the machine can
   actually see, and the current values with secrets redacted.
 

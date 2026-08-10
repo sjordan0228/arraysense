@@ -266,19 +266,29 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
     )
 
 
-def effective(config: Config, settings: SettingsStore) -> Config:
-    """Merge the stored settings over the file configuration.
+def effective(
+    config: Config,
+    settings: SettingsStore,
+    pending: dict[str, object] | None = None,
+) -> Config:
+    """Merge the stored settings, and any pending change, over the file config.
 
     The settings page is the newer authority. Someone who changes a value there
     has to see it take effect rather than be silently overruled by a file they
     cannot reach from a tablet on a wall.
 
     Only settings actually stored take part, and a stored empty string is
-    ignored. Every connection setting defaults to empty, so an untouched one
+    ignored — every connection setting defaults to empty, so an untouched one
     would otherwise blank a working serial and break every poll from the next
-    restart onward.
+    restart onward. ``pending`` layers a not-yet-written change on top of what
+    is stored, so a write path can compute exactly the config the next start
+    will assemble and validate that rather than a near-miss. It must be given
+    the FILE config, not an already-merged one: clearing a field reverts it to
+    the file's value, which only this base can see.
     """
-    stored = settings.overrides()
+    stored = dict(settings.overrides())
+    if pending:
+        stored.update(pending)
 
     def pick(key: str, fallback: object) -> object:
         value = stored.get(key)

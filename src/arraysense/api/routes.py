@@ -44,7 +44,7 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
-from arraysense.config import Config
+from arraysense.config import effective
 from arraysense.costs import (
     band_intervals,
     bucket_energy,
@@ -634,51 +634,25 @@ async def read_settings(request: Request) -> dict[str, Any]:
     return {"fields": describe(), "values": settings.public()}
 
 
-def _reject_unbootable_connection(config: Config, wanted: dict[str, Any]) -> None:
+def _reject_unbootable_connection(request: Request, wanted: dict[str, Any]) -> None:
     """Refuse a settings write whose connection group would not boot.
 
-    The overlay merges over the file at startup and is then handed to the same
-    driver validation the collector runs. Mirroring that here — building the
-    candidate config from the current one plus the connection keys being
-    written, and validating it — is what stops the settings page persisting a
-    transport with no device path, or a driver nobody has, or battery_source
-    "direct". Empty strings are skipped exactly as the startup merge skips
-    them, so clearing a field on the page keeps the file's value rather than
-    blanking it.
+    Only fires when the write touches connection keys. It computes the exact
+    config the next start will assemble — the FILE config, the stored settings,
+    and this pending change layered on with the real merge semantics — and
+    hands it to the same registry validation the collector runs. Reusing
+    ``effective`` rather than re-deriving the merge is the whole point: an
+    earlier version validated against the already-merged config and skipped
+    empty values by hand, which modelled a cleared field as "keep the current
+    value" when the next boot reverts it to the file's, and let an unbootable
+    combination through. Raises ValueError, which the settings route maps to
+    400 alongside every other validation failure.
     """
-    overlay: dict[str, object] = {}
-    field_for_setting = {setting: f for f, setting in _SETTING_KEYS.items()}
-    for key, raw in wanted.items():
-        field = field_for_setting.get(key)
-        if field is None:
-            continue
-        value = lookup_setting(key).validate(raw)
-        if value == "":
-            continue
-        overlay[field] = value
-    if not overlay:
+    if not any(key in _SETTING_KEYS.values() for key in wanted):
         return
-    merged: dict[str, Any] = {
-        "dongle_host": config.dongle_host,
-        "dongle_serial": config.dongle_serial,
-        "inverter_serial": config.inverter_serial,
-        "database_path": config.database_path,
-        "poll_interval": config.poll_interval,
-        "dongle_port": config.dongle_port,
-        "driver": config.driver,
-        "transport": config.transport,
-        "serial_device": config.serial_device,
-        "serial_baud": config.serial_baud,
-        "serial_unit_id": config.serial_unit_id,
-        "synchronous": config.synchronous,
-        "model": config.model,
-        "battery_source": config.battery_source,
-    }
-    merged.update(overlay)
-    try:
-        drivers.validate(Config(**merged))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    file_config = getattr(request.app.state, "file_config", request.app.state.config)
+    settings = SettingsStore(request.app.state.store)
+    drivers.validate(effective(file_config, settings, pending=wanted))
 
 
 @router.put("/settings")
@@ -695,13 +669,12 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
     """
     settings = SettingsStore(request.app.state.store)
     wanted = {k: v for k, v in values.items() if not _is_mask(k, v)}
-    # The connection group is a second write path to the same fields /setup
-    # writes, and an invalid combination here would boot-crash exactly as one
-    # there would. Validate the merged result against the registry's own boot
-    # rules before writing a single row, so this path cannot store what the
-    # next start refuses.
-    _reject_unbootable_connection(request.app.state.config, wanted)
     try:
+        # A second write path to the same connection fields /setup writes; an
+        # invalid combination here would boot-crash exactly as one there would,
+        # so it is validated against the true next-boot merge before any row is
+        # written. Inside the try so its ValueError maps to 400 like the rest.
+        _reject_unbootable_connection(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1639,44 +1612,25 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     Only after the whole merged picture validates does anything get written —
     a partial write of a bad combination would be a page-made outage.
     """
-    config = request.app.state.config
     provided = {k: v for k, v in body.model_dump().items() if v is not None}
     # A masked value posted back unchanged is the page echoing what /api/setup
     # showed it, not a choice. Discarded exactly as the settings endpoint
     # discards them, or an untouched full-form submit would write dots over
     # real serials.
     provided = {k: v for k, v in provided.items() if not _is_mask(_SETTING_KEYS[k], v)}
-    merged: dict[str, Any] = {
-        "dongle_host": config.dongle_host,
-        "dongle_serial": config.dongle_serial,
-        "inverter_serial": config.inverter_serial,
-        "database_path": config.database_path,
-        "poll_interval": config.poll_interval,
-        "dongle_port": config.dongle_port,
-        "driver": config.driver,
-        "transport": config.transport,
-        "serial_device": config.serial_device,
-        "serial_baud": config.serial_baud,
-        "serial_unit_id": config.serial_unit_id,
-        "synchronous": config.synchronous,
-        "model": config.model,
-        "battery_source": config.battery_source,
-    }
-    merged.update(provided)
-    try:
-        candidate = Config(**merged)
-        # The registry's boot rules, not a subset: an overlay that passes here
-        # is one the next boot accepts, and one that fails here stored anyway
-        # would be a service systemd crash-loops with no page left to fix it.
-        drivers.validate(candidate)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
+    pending = {_SETTING_KEYS[k]: v for k, v in provided.items()}
+    file_config = getattr(request.app.state, "file_config", request.app.state.config)
     settings = SettingsStore(request.app.state.store)
     try:
+        # The exact config the next start will assemble — file, stored
+        # settings, this change layered on with the real merge — validated
+        # against the registry's boot rules. Reusing effective() is why a
+        # cleared field is modelled as reverting to the file value rather than
+        # keeping the current one, which an earlier hand-rolled merge got wrong.
+        drivers.validate(effective(file_config, settings, pending=pending))
         # All-or-nothing: every value validates against its spec before any
         # row is written, in one transaction.
-        settings.set_many({_SETTING_KEYS[k]: v for k, v in provided.items()})
+        settings.set_many(pending)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     _schedule_restart()

@@ -72,10 +72,12 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # The store lays its schema for what the configured driver declares it can
     # produce, so a fresh database has no column that can never be filled. The
     # settings overlay can now name a different driver than the file did, so
-    # this first open is only to read the settings table — its metric
+    # this first open lays the schema and reads the settings table — its metric
     # declaration is provisional and re-derived from the effective driver
-    # below. The settings table itself carries no driver-specific columns, so
-    # reading it through a provisionally-declared store is safe.
+    # below, and the store is reopened if the overlay changed the driver. The
+    # settings table carries no driver-specific columns, so the provisional
+    # declaration only affects tier columns the reopen then corrects.
+    file_config = config
     opened_driver = config.driver
     declared = drivers.get(config.driver).capabilities.metrics
     store = SqliteStore(
@@ -148,6 +150,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         interval=config.poll_interval,
     )
     app = create_app(store=store, service=service, config=config)
+    # The file config, not the effective one, is what a write path needs to
+    # predict the next boot: clearing an overlay field reverts to the file
+    # value, and only this base can see it.
+    app.state.file_config = file_config
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -344,7 +350,16 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         # same run_detect the running-service route uses, so setup mode gets
         # the unknown-transport and missing-serial checks rather than skipping
         # them. No collector exists here, so nothing is borrowed.
-        return await run_detect(DetectRequest.model_validate(body), service=None)
+        from pydantic import ValidationError
+
+        try:
+            parsed = DetectRequest.model_validate(body)
+        except ValidationError as exc:
+            # A running-service route gets 422 from FastAPI for a malformed
+            # body; setup mode parses by hand, so it maps the same failure to
+            # the same status rather than letting it escape as a 500.
+            raise HTTPException(status_code=422, detail=exc.errors()) from exc
+        return await run_detect(parsed, service=None)
 
     @app.post("/api/setup/apply")
     async def setup_apply_first_run(body: dict[str, object]) -> dict[str, object]:

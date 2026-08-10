@@ -2509,3 +2509,44 @@ def test_detect_hands_back_an_already_yielded_collector(client: Any, monkeypatch
     status = client.get("/api/status").json()
     assert status["yielding"] is False, "a stopped-then-started borrow must clear yield"
     assert status["running"] is True
+
+
+def test_clearing_an_overlay_field_is_validated_against_the_file_not_the_overlay(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The subtle boot-safety hole: an install whose file names eg4/18kPV but
+    # whose stored overlay says fake/Simulated. Clearing connection.driver
+    # reverts the driver to the file's eg4 at next boot while the stored model
+    # override Simulated stays — eg4 has no model "Simulated", so the next boot
+    # would crash. The write path must model that revert and refuse the clear.
+    from arraysense.__main__ import build_app
+    from arraysense.config import load
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+
+    db = tmp_path / "clear.db"
+    seed = SqliteStore(str(db), device="CE00000000")
+    s = SettingsStore(seed)
+    s.set("connection.driver", "fake")
+    s.set("connection.model", "Simulated")
+    seed.close()
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'driver = "eg4_luxpower"\n'
+        'model = "18kPV"\n'
+        'dongle_host = "192.0.2.1"\n'
+        'dongle_serial = "BA00000000"\n'
+        'inverter_serial = "CE00000000"\n'
+        f'database_path = "{db}"\n'
+    )
+    app_obj, store, _service = build_app(load(path))
+    from fastapi.testclient import TestClient
+
+    with TestClient(app_obj) as client:
+        # Clearing the driver would revert to eg4 while model stays Simulated.
+        r = client.put("/api/settings", json={"connection.driver": ""})
+        assert r.status_code == 400, (
+            "the clear reverts to an eg4/Simulated boot and must be refused"
+        )
+    store.close()
