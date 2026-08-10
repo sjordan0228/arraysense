@@ -382,11 +382,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
         upper=3600.0,
         unit="seconds",
         label="Poll interval",
-        help=(
-            "Seconds between reads of the inverter. The dongle answers at its "
-            "own pace, so asking faster than about ten seconds mostly produces "
-            "reads that overlap the previous one."
-        ),
+        # What to ask for is explained once, for both transports, in the
+        # Collection introduction on the settings page. Saying it again beside
+        # the box is the same sentence twice.
+        help="",
     ),
     # --- Tariff -------------------------------------------------------------
     # What the owner pays. Nothing here has a default that prices anything: an
