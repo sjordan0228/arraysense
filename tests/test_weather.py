@@ -117,7 +117,7 @@ def test_good_forecast_becomes_timed_pairs(monkeypatch: pytest.MonkeyPatch) -> N
     for ts, _ in pairs:
         assert ts.tzinfo is UTC
     assert "hourly=shortwave_radiation" in seen["url"]
-    assert "forecast_days=1" in seen["url"]
+    assert "forecast_days=2" in seen["url"]
 
 
 def test_null_forecast_values_are_dropped_not_zeroed(
@@ -183,7 +183,7 @@ def test_forecast_url_carries_required_params(
     monkeypatch.setattr(open_meteo, "_http_get", fake_get)
     open_meteo.fetch_radiation_forecast(35.2, -97.4)
     assert "hourly=shortwave_radiation" in seen["url"]
-    assert "forecast_days=1" in seen["url"]
+    assert "forecast_days=2" in seen["url"]
     assert "timezone=UTC" in seen["url"]
 
 
