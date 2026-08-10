@@ -7,6 +7,38 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.12 — 9 August 2026
+
+### Fixed
+
+- **The dashboard can no longer freeze the service it is watching**
+  ([#63](https://github.com/sjordan0228/arraysense/issues/63)). The
+  once-a-minute stall this project chased through the rollup pass for three
+  releases was never the rollup pass. The dashboard reloads its history on a
+  sixty-second timer and fetches the calibration advisory alongside — and that
+  endpoint, like every tier-scanning read, ran synchronous SQLite on the event
+  loop. Measured on the reference Pi it held the loop for 1.6 to 3.2 seconds,
+  and for that whole time every other response waited: status polls, pages,
+  everything, which is exactly the both-at-the-same-instant freeze the issue
+  documents. The evidence trail — including why the rollup timer cannot even
+  fire at the observed sixty-second spacing — is on the issue.
+
+  The tier-scanning endpoints (`live`, `calibration`, `costs`, `history`,
+  `battery/history`, `energy`, `bands`) now run in the server's threadpool,
+  each on its own short-lived database connection (a memory-backed store — the
+  test configuration — cannot be reopened, so it serves reads from its one
+  connection as before). Both halves are measured:
+  under WAL a reader on its own connection saw zero interference from writers
+  on either reference filesystem, and opening a configured connection costs
+  0.07 ms. Endpoints answering from memory or single rows stay on the loop.
+
+- **A deployment's durability choice now reaches every connection**. 0.6.10's
+  `synchronous = "normal"` was applied only to the primary connection, so the
+  maintenance pass — the bulk of the writing, once a minute — kept fsyncing at
+  FULL from the SQLite build's own default. Proved by execution on the
+  production Pi: primary NORMAL, maintenance FULL. Every connection the store
+  opens now carries the configured value.
+
 ## 0.6.11 — 9 August 2026
 
 ### Fixed

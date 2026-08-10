@@ -547,8 +547,10 @@ class SettingsStore:
 
         ``SqliteStore`` creates the settings table with the rest of the schema
         before request handling begins. This constructor must stay read-only:
-        API routes construct it on the event-loop thread, and even idempotent
-        schema DDL is a lock-taking operation that does not belong in a read.
+        API routes construct it per request — cheap ones on the event-loop
+        thread, tier-scanning ones on threadpool workers over a read view — and
+        even idempotent schema DDL is a lock-taking operation that does not
+        belong in a read on any of those paths.
 
         Takes the store rather than a raw connection so settings share its
         transaction and its lifetime: a settings write and a reading write in

@@ -23,13 +23,13 @@ parameter to mean anything across two. No page sends the parameter.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from arraysense import __version__
@@ -75,6 +75,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
+
+
+def _read_store(request: Request) -> Iterator[SqliteStore]:
+    """Yield a per-request read view of the store, for handlers that scan tiers.
+
+    The handlers this feeds are deliberately plain ``def``: FastAPI runs them in
+    its threadpool, and the view gives each one its own connection — except a
+    memory-backed store, which cannot be reopened and serves reads from its one
+    connection; that is the test configuration, never a deployment. Both halves
+    are load-bearing and both are measured. As ``async def`` running synchronous
+    SQLite on the event loop, ``/api/calibration`` held every response on the
+    installation for 1.6 to 3.2 seconds each time the dashboard's sixty-second
+    timer fired — the once-a-minute freeze issue #63 chased through the rollup
+    pass for days. And on its own connection a reader sees zero interference
+    from writers under WAL, where a thread sharing the primary connection would
+    serialise against the collector's writes and hand the stall back.
+    """
+    with request.app.state.store.read_view() as view:
+        yield view
+
+
+_ReadStore = Annotated[SqliteStore, Depends(_read_store)]
 
 _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 
@@ -378,7 +400,7 @@ async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
 
 
 @router.get("/live")
-async def live(request: Request, device: str | None = None) -> dict[str, Any]:
+def live(request: Request, store: _ReadStore, device: str | None = None) -> dict[str, Any]:
     """The most recent inverter reading and every battery module's latest.
 
     What a wall display polls. Absent values stay null — a battery block empty
@@ -387,7 +409,6 @@ async def live(request: Request, device: str | None = None) -> dict[str, Any]:
     ``device`` names an inverter and defaults to the configured one, so a page
     that sends nothing gets exactly what it always got.
     """
-    store = request.app.state.store
     device = _device(device)
     inverter = store.latest(list(_LIVE_INVERTER), device=device)
     modules = store.latest_modules(list(module_metric_columns()), device=device)
@@ -521,7 +542,7 @@ def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[di
 
 
 @router.get("/calibration")
-async def calibration(request: Request) -> dict[str, Any]:
+def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
     """How far the per-pack state-of-charge estimates have drifted from the truth.
 
     Each pack counts amp-hours to estimate its charge and cannot correct itself
@@ -534,7 +555,6 @@ async def calibration(request: Request) -> dict[str, Any]:
     on voltage have a hardware fault, because parallel packs are physically
     forced to the same voltage.
     """
-    store = request.app.state.store
     now = datetime.now(tz=UTC)
     start = now - timedelta(days=CALIBRATION_SEARCH_DAYS)
 
@@ -657,8 +677,9 @@ def _is_mask(key: str, value: object) -> bool:
 
 
 @router.get("/costs")
-async def costs(
+def costs(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     tz: str | None = None,
@@ -673,7 +694,6 @@ async def costs(
     Money is absent, not zero, when no tariff is configured. An install that
     has never entered one shows its energy and says so.
     """
-    store = request.app.state.store
     settings = SettingsStore(store)
     tariff = load_tariff(settings.all())
     # The installation's zone decides which wall-clock hours a band covers, and
@@ -875,8 +895,9 @@ def _band_rows(
 
 
 @router.get("/history")
-async def history(
+def history(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     metrics: str,
@@ -891,13 +912,14 @@ async def history(
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
-    rows = request.app.state.store.query(names, start, end, tier=tier, device=_device(device))
+    rows = store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
 @router.get("/battery/history")
-async def battery_history(
+def battery_history(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     metrics: str = "soc_pct",
@@ -917,15 +939,14 @@ async def battery_history(
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
-    rows = request.app.state.store.query_modules(
-        names, start, end, tier=tier, serial=serial, device=_device(device)
-    )
+    rows = store.query_modules(names, start, end, tier=tier, serial=serial, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
 @router.get("/energy")
-async def energy(
+def energy(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     period: Period = "day",
@@ -971,7 +992,6 @@ async def energy(
     cost on any bucket, no totals, and ``configured`` false. Not zero — an
     install that has never entered a tariff shows its energy and says so.
     """
-    store = request.app.state.store
     try:
         zone = _request_zone(store, tz)
     except KeyError as exc:
@@ -1315,8 +1335,9 @@ def _bucket_money(
 
 
 @router.get("/bands")
-async def bands(
+def bands(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     tz: str | None = None,
@@ -1333,7 +1354,6 @@ async def bands(
     Absent data is not zero: with no tariff configured the windows are absent,
     not one window covering everything.
     """
-    store = request.app.state.store
     settings = SettingsStore(store)
     tariff = load_tariff(settings.all())
     # A zone this tz database does not know is refused, as ``/api/energy``
