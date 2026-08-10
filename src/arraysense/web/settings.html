@@ -154,6 +154,11 @@
 
 let fields = [];
 let saved = {};
+// The /api/setup payload the Connection group's picker renders from. It is the
+// same renderer the first-run wizard uses — one component, two shells — so the
+// two can never drift. Null until load() reads it; a build whose /api/setup
+// cannot be read falls back to the loose registry controls for connection.
+let setupPayload = null;
 
 // The groups, in the order they are shown, keyed by the prefix of the settings
 // that belong to each. A prefix with no entry here still renders — under its
@@ -162,9 +167,7 @@ const GROUPS = [
   {
     prefix: 'tariff',
     title: 'What electricity costs',
-    intro: 'The Costs page prices nothing until these are entered — a rate nobody supplied is '
-      + 'a rate the page would be inventing, and an invented rate produces a savings figure '
-      + 'that reads as though it had been measured.',
+    intro: 'The Costs page prices nothing until these are entered.',
   },
   {
     prefix: 'connection',
@@ -175,21 +178,19 @@ const GROUPS = [
   {
     prefix: 'collector',
     title: 'Collection',
-    intro: 'How often the inverter is read. The dongle accepts one connection at a time, so '
-      + 'this is the whole of what the installation asks of it.',
+    intro: 'How often the inverter is read. Over the dongle, keep this at 11 seconds or more: '
+      + 'it accepts one connection at a time and answers at its own pace, so asking faster '
+      + 'mostly produces reads that overlap the previous one. RS485 can be read faster, and 10 '
+      + 'seconds is the recommendation there. Every poll is a row written — around 8,600 a day '
+      + 'at 10 seconds — so the database grows in proportion to how often you ask.',
   },
   {
     prefix: 'site',
-    title: 'This installation',
-    intro: 'Where the system is, and who looks after it. What each of these is used for is '
-      + 'described beside it.',
+    title: 'General',
   },
   {
     prefix: 'display',
     title: 'Display',
-    intro: 'Defaults for every browser that opens this installation. A device that has picked '
-      + 'its own units on the dashboard keeps them; anything that has not follows what is set '
-      + 'here.',
   },
 ];
 
@@ -324,13 +325,25 @@ function render() {
   for (const group of order) {
     const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
     if (!mine.length) continue;
+    // The connection group is the wizard's other shell: the same Manufacturer →
+    // Model → Connection picker the first-run wizard shows, mounted from
+    // /api/setup so the two cannot drift. It replaces the loose registry
+    // controls entirely, and only when the payload is in hand — a build whose
+    // /api/setup could not be read falls through to the controls below.
+    if (group.prefix === 'connection' && setupPayload) {
+      blocks.push(`<section class="p grp">
+          <div class="chead"><h2>${esc(group.title)}</h2></div>
+          ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
+          <div id="connHost"></div>
+        </section>`);
+      continue;
+    }
     const controls = mine.map((spec) => {
+      // The bounds are not written out. A number box already carries min and
+      // max, so the browser refuses an out-of-range value and the spinner
+      // stops at the ends — printing the same range as prose says it twice,
+      // in the place where it reads least like an instruction.
       const help = [spec.help];
-      if (spec.kind === 'int' || spec.kind === 'float') {
-        if (spec.lower !== null && spec.upper !== null) {
-          help.push(`${spec.lower} to ${spec.upper}.`);
-        }
-      }
       // The unit is the registry's word for what the number means, and it goes
       // beside the box — except on a paragraph field, where "beside" is half a
       // screen away from anything, so it joins the help line instead.
@@ -361,6 +374,13 @@ function render() {
   // already rendered rather than instead of them: each keeps the registry's
   // own field in the DOM and only writes into it.
   mountExtras();
+  // The connection picker mounts after the form's own controls, into the host
+  // the group left for it. Its Save is its own — a connection change only takes
+  // effect on restart — so it is separate from the page's Save, which never
+  // touches these fields (the picker's controls carry no data-key for pending).
+  if (setupPayload && $('connHost')) {
+    mountSetup($('connHost'), setupPayload, { mode: 'settings', onApply: applyConnection });
+  }
   dirtyCheck();
 
   const secret = fields.filter((f) => f.secret).map((f) => f.label);
@@ -1340,6 +1360,35 @@ function applyDisplay(values) {
   }
 }
 
+// The connection picker's Save. Unlike the page's own Save, which PUTs the
+// changed settings and leaves the collector running, a connection change is only
+// read at startup — so this writes the overlay through /api/setup/apply, which
+// restarts the collector, and reflects that honestly. A rejected apply keeps its
+// reason on the form; a successful one refreshes the page once the service is
+// back, so the redacted current values show what was just set.
+async function applyConnection(body, ui) {
+  ui.status('Saving and restarting the collector…', 'busy');
+  try {
+    const r = await fetchTimeout('/api/setup/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 20000);
+    const reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(problemText(reply.detail) || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+  } catch (e) {
+    ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
+  }
+  // The collector restarts, so /api/status goes quiet and comes back; refresh
+  // only once it has, rather than after a blind delay that could land on the
+  // outage. If it never reports ready, the form comes back rather than a reload
+  // onto a connection-error page.
+  ui.status('Saved. The collector is restarting; the page refreshes when it is back.', 'ok');
+  watchRestart(
+    () => location.reload(),
+    () => { ui.status('Saved, but the collector did not report ready. Reload to check its state.', 'warn'); ui.reenable(); },
+  );
+}
+
 async function load() {
   try {
     const response = await fetch('/api/settings');
@@ -1351,6 +1400,15 @@ async function load() {
     pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
       + 'service answers.');
     return;
+  }
+  // Best-effort: the Connection group renders through the wizard picker when the
+  // payload is in hand, and falls back to loose controls when it is not, so a
+  // failure here degrades the group rather than the whole page.
+  try {
+    const r = await fetch('/api/setup');
+    setupPayload = r.ok ? await r.json() : null;
+  } catch (e) {
+    setupPayload = null;
   }
   pageNote('');
   render();

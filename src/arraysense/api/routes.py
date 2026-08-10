@@ -1,8 +1,10 @@
 """routes.py — the HTTP surface: live values, history, status, and yielding.
 
-Everything here reads from the store and never touches the inverter. The
-collector owns the one connection the dongle allows, so an API that reached for
-it directly would fight the poll loop for the single TCP slot.
+Everything here reads from the store and stays off the inverter's wire, with
+one deliberate exception: setup detection, which stops the collector, probes,
+and hands the wire straight back. The collector owns the one connection the
+hardware allows, so any other route that reached for it would fight the poll
+loop for the single slot.
 
 History reads pick their resolution from the requested span and the caller's
 pixel width rather than always serving the finest tier. A month at one-minute
@@ -22,17 +24,18 @@ parameter to mean anything across two. No page sends the parameter.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, Field, field_validator
 
-from arraysense import __version__
+from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
 from arraysense.calibration import (
     CORROBORATING_ABSORB,
@@ -41,6 +44,7 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
+from arraysense.config import Config, effective
 from arraysense.costs import (
     band_intervals,
     bucket_energy,
@@ -50,7 +54,14 @@ from arraysense.costs import (
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
-from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
+from arraysense.settings import (
+    SETTING_TIMEZONE,
+    SettingsStore,
+    check_serial_device,
+    describe,
+    lookup_setting,
+)
+from arraysense.setup import describe_setup
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -75,6 +86,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api")
+
+
+def _read_store(request: Request) -> Iterator[SqliteStore]:
+    """Yield a per-request read view of the store, for handlers that scan tiers.
+
+    The handlers this feeds are deliberately plain ``def``: FastAPI runs them in
+    its threadpool, and the view gives each one its own connection — except a
+    memory-backed store, which cannot be reopened and serves reads from its one
+    connection; that is the test configuration, never a deployment. Both halves
+    are load-bearing and both are measured. As ``async def`` running synchronous
+    SQLite on the event loop, ``/api/calibration`` held every response on the
+    installation for 1.6 to 3.2 seconds each time the dashboard's sixty-second
+    timer fired — the once-a-minute freeze issue #63 chased through the rollup
+    pass for days. And on its own connection a reader sees zero interference
+    from writers under WAL, where a thread sharing the primary connection would
+    serialise against the collector's writes and hand the stall back.
+    """
+    with request.app.state.store.read_view() as view:
+        yield view
+
+
+_ReadStore = Annotated[SqliteStore, Depends(_read_store)]
 
 _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 
@@ -378,7 +411,7 @@ async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
 
 
 @router.get("/live")
-async def live(request: Request, device: str | None = None) -> dict[str, Any]:
+def live(request: Request, store: _ReadStore, device: str | None = None) -> dict[str, Any]:
     """The most recent inverter reading and every battery module's latest.
 
     What a wall display polls. Absent values stay null — a battery block empty
@@ -387,7 +420,6 @@ async def live(request: Request, device: str | None = None) -> dict[str, Any]:
     ``device`` names an inverter and defaults to the configured one, so a page
     that sends nothing gets exactly what it always got.
     """
-    store = request.app.state.store
     device = _device(device)
     inverter = store.latest(list(_LIVE_INVERTER), device=device)
     modules = store.latest_modules(list(module_metric_columns()), device=device)
@@ -521,7 +553,7 @@ def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[di
 
 
 @router.get("/calibration")
-async def calibration(request: Request) -> dict[str, Any]:
+def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
     """How far the per-pack state-of-charge estimates have drifted from the truth.
 
     Each pack counts amp-hours to estimate its charge and cannot correct itself
@@ -534,7 +566,6 @@ async def calibration(request: Request) -> dict[str, Any]:
     on voltage have a hardware fault, because parallel packs are physically
     forced to the same voltage.
     """
-    store = request.app.state.store
     now = datetime.now(tz=UTC)
     start = now - timedelta(days=CALIBRATION_SEARCH_DAYS)
 
@@ -609,6 +640,27 @@ async def read_settings(request: Request) -> dict[str, Any]:
     return {"fields": describe(), "values": settings.public()}
 
 
+def _reject_unbootable_connection(request: Request, wanted: dict[str, Any]) -> None:
+    """Refuse a settings write whose connection group would not boot.
+
+    Only fires when the write touches connection keys. It computes the exact
+    config the next start will assemble — the FILE config, the stored settings,
+    and this pending change layered on with the real merge semantics — and
+    hands it to the same registry validation the collector runs. Reusing
+    ``effective`` rather than re-deriving the merge is the whole point: an
+    earlier version validated against the already-merged config and skipped
+    empty values by hand, which modelled a cleared field as "keep the current
+    value" when the next boot reverts it to the file's, and let an unbootable
+    combination through. Raises ValueError, which the settings route maps to
+    400 alongside every other validation failure.
+    """
+    if not any(key in _SETTING_KEYS.values() for key in wanted):
+        return
+    file_config = getattr(request.app.state, "file_config", request.app.state.config)
+    settings = SettingsStore(request.app.state.store)
+    drivers.validate(effective(file_config, settings, pending=wanted))
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -624,10 +676,15 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
     settings = SettingsStore(request.app.state.store)
     wanted = {k: v for k, v in values.items() if not _is_mask(k, v)}
     try:
+        # A second write path to the same connection fields /setup writes; an
+        # invalid combination here would boot-crash exactly as one there would,
+        # so it is validated against the true next-boot merge before any row is
+        # written. Inside the try so its ValueError maps to 400 like the rest.
+        _reject_unbootable_connection(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except (ValueError, OverflowError) as exc:
+    except (ValueError, TypeError, OverflowError) as exc:
         # OverflowError rather than ValueError comes back from converting a
         # number too large for its type, and it was escaping as a 500.
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -657,8 +714,9 @@ def _is_mask(key: str, value: object) -> bool:
 
 
 @router.get("/costs")
-async def costs(
+def costs(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     tz: str | None = None,
@@ -673,7 +731,6 @@ async def costs(
     Money is absent, not zero, when no tariff is configured. An install that
     has never entered one shows its energy and says so.
     """
-    store = request.app.state.store
     settings = SettingsStore(store)
     tariff = load_tariff(settings.all())
     # The installation's zone decides which wall-clock hours a band covers, and
@@ -875,8 +932,9 @@ def _band_rows(
 
 
 @router.get("/history")
-async def history(
+def history(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     metrics: str,
@@ -891,13 +949,14 @@ async def history(
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
-    rows = request.app.state.store.query(names, start, end, tier=tier, device=_device(device))
+    rows = store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
 @router.get("/battery/history")
-async def battery_history(
+def battery_history(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     metrics: str = "soc_pct",
@@ -917,15 +976,14 @@ async def battery_history(
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
     cadence = int(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
-    rows = request.app.state.store.query_modules(
-        names, start, end, tier=tier, serial=serial, device=_device(device)
-    )
+    rows = store.query_modules(names, start, end, tier=tier, serial=serial, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
 @router.get("/energy")
-async def energy(
+def energy(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     period: Period = "day",
@@ -971,7 +1029,6 @@ async def energy(
     cost on any bucket, no totals, and ``configured`` false. Not zero — an
     install that has never entered a tariff shows its energy and says so.
     """
-    store = request.app.state.store
     try:
         zone = _request_zone(store, tz)
     except KeyError as exc:
@@ -1315,8 +1372,9 @@ def _bucket_money(
 
 
 @router.get("/bands")
-async def bands(
+def bands(
     request: Request,
+    store: _ReadStore,
     start: datetime,
     end: datetime,
     tz: str | None = None,
@@ -1333,7 +1391,6 @@ async def bands(
     Absent data is not zero: with no tariff configured the windows are absent,
     not one window covering everything.
     """
-    store = request.app.state.store
     settings = SettingsStore(store)
     tariff = load_tariff(settings.all())
     # A zone this tz database does not know is refused, as ``/api/energy``
@@ -1382,6 +1439,285 @@ async def bands(
         "timezone": str(zone),
         "windows": windows,
     }
+
+
+@router.get("/setup")
+async def setup(request: Request) -> dict[str, Any]:
+    """Everything the setup wizard renders, from one place.
+
+    Served on the loop rather than the threadpool: the payload is registry
+    metadata, a directory listing and the already-loaded config — no tier
+    scan anywhere near it. The connection values it echoes are redacted the
+    same way the settings API redacts them, because this page has no auth
+    (#34) and a serial number is an installation secret.
+    """
+    return describe_setup(request.app.state.config)
+
+
+def _reject_control_text(value: str) -> str:
+    """Refuse text a device path, host or serial can never hold.
+
+    Such a value would turn into a 500 at a raising sink downstream: a null
+    byte makes pyserial raise on open; a lone surrogate makes any UTF-8
+    encoding raise, including writing the config file and storing a setting.
+    None of the fields this guards — a device path, a host, a serial — can
+    contain a control character or unencodable text in any real installation,
+    so rejecting them here is a clean 422 rather than a fault later.
+    """
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        raise ValueError("control characters are not allowed")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("value must be valid text") from exc
+    return value
+
+
+class DetectRequest(BaseModel):
+    """Candidate connection parameters to probe. Nothing here is saved."""
+
+    inverter_serial: str = ""
+    transport: str
+    serial_device: str = ""
+    serial_baud: int = Field(default=19200, ge=1, le=4000000)
+    serial_unit_id: int = Field(default=1, ge=1, le=247)
+    dongle_host: str = ""
+    dongle_port: int = Field(default=8000, ge=1, le=65535)
+    dongle_serial: str = ""
+
+    @field_validator("serial_device", "dongle_host", "dongle_serial", "inverter_serial")
+    @classmethod
+    def _clean(cls, value: str) -> str:
+        return _reject_control_text(value)
+
+    @field_validator("serial_device")
+    @classmethod
+    def _device_is_a_path(cls, value: str) -> str:
+        check_serial_device(value)
+        return value
+
+
+async def _probe_serial(body: DetectRequest) -> str:
+    """Open the candidate transport read-only and ask who is there.
+
+    Split from the route so tests can stand in for the hardware: the route's
+    job is borrowing, error mapping and never writing; this function's job is
+    the wire. The library imports live inside so the module keeps no
+    top-level dependency on the transport stack.
+    """
+    from pylxpweb.transports.dongle import DongleTransport
+    from pylxpweb.transports.exceptions import TransportError
+    from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
+    from pylxpweb.transports.modbus_serial import ModbusSerialTransport
+
+    transport: ModbusSerialTransport | DongleTransport
+    if body.transport == "modbus_serial":
+        transport = create_serial_transport(
+            port=body.serial_device,
+            serial="detect",
+            baudrate=body.serial_baud,
+            unit_id=body.serial_unit_id,
+            timeout=10.0,
+        )
+    else:
+        transport = create_dongle_transport(
+            host=body.dongle_host,
+            dongle_serial=body.dongle_serial,
+            inverter_serial=body.inverter_serial,
+            port=body.dongle_port,
+            timeout=10.0,
+        )
+    try:
+        await transport.connect()
+    except (TransportError, OSError, UnicodeError) as exc:
+        # A host that resolves through IDNA to an over-long DNS label raises
+        # UnicodeError, not OSError, from connect. run_detect turns a
+        # ConnectionError into a 502; without this it would surface as an
+        # unhandled 500 on the unauthenticated setup surface.
+        raise ConnectionError(str(exc)) from exc
+    try:
+        return str(await transport.read_serial_number())
+    except (TransportError, OSError) as exc:
+        raise ConnectionError(str(exc)) from exc
+    finally:
+        await transport.disconnect()
+
+
+# One detect at a time across the process. Two concurrent probes would both
+# find the collector already stopped by the first and probe the wire together,
+# and the first's restart could begin polling while the second still holds it.
+_DETECT_LOCK = asyncio.Lock()
+
+
+async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, str]:
+    """Read the inverter's serial off a candidate connection. Writes nothing.
+
+    Shared by the running-service route and first-run setup so the two cannot
+    validate differently. A running collector holds the single client slot —
+    the serial port is exclusive, the dongle takes one TCP client — so the
+    probe borrows the wire by stopping the collector outright, which cancels
+    the poll task and waits out an in-flight write where yield mode would race
+    it, and starts it again on the way out whatever happened. In setup mode
+    there is no collector, so nothing is borrowed. The mismatch decision
+    belongs to the page: this returns what answered.
+    """
+    if body.transport not in ("dongle", "modbus_serial"):
+        raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
+    if body.transport == "dongle" and not body.inverter_serial:
+        # The dongle protocol authenticates every request with the inverter
+        # serial, so a probe with a blank one can never receive an answer.
+        # Serial-bus detection discovers the serial; dongle detection can only
+        # confirm one the form already holds.
+        raise HTTPException(
+            status_code=400,
+            detail="dongle detection needs the inverter serial; the dongle "
+            "protocol authenticates with it",
+        )
+    async with _DETECT_LOCK:
+        borrowed = False
+        if service is not None and service.status.running:
+            await service.stop()
+            borrowed = True
+        try:
+            serial = await _probe_serial(body)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            if borrowed and service is not None:
+                await service.start()
+    return {"serial": serial}
+
+
+def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
+    """Probe the configured connection when its secrets were not retyped.
+
+    The settings page prefills the connection with redacted values, so a Detect
+    on an unchanged connection would otherwise carry bullet-filled host and
+    serials and always fail to connect or authenticate. A masked field means
+    "use what is already configured", so the real value from the effective config
+    the collector runs on is substituted before the probe. First-run never
+    reaches here with a mask — its form starts empty — so this only ever fills
+    from a real configuration.
+    """
+    updates: dict[str, str] = {}
+    for field, current in (
+        ("dongle_host", config.dongle_host),
+        ("dongle_serial", config.dongle_serial),
+        ("inverter_serial", config.inverter_serial),
+    ):
+        value = getattr(body, field)
+        if isinstance(value, str) and "\N{BULLET}" in value:
+            updates[field] = current
+    return body.model_copy(update=updates) if updates else body
+
+
+@router.post("/setup/detect")
+async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
+    """Read the inverter's serial off a candidate connection. Writes nothing."""
+    file_config = getattr(request.app.state, "file_config", None) or request.app.state.config
+    settings = SettingsStore(request.app.state.store)
+    body = _fill_masked_detect(body, effective(file_config, settings))
+    return await run_detect(body, getattr(request.app.state, "service", None))
+
+
+class ApplyRequest(BaseModel):
+    """The setup fields a page may change.
+
+    Everything optional; only provided fields are validated and written.
+    """
+
+    driver: str | None = None
+    transport: str | None = None
+    serial_device: str | None = None
+    serial_baud: int | None = Field(default=None, ge=1, le=4000000)
+    serial_unit_id: int | None = Field(default=None, ge=1, le=247)
+    dongle_host: str | None = None
+    dongle_serial: str | None = None
+    inverter_serial: str | None = None
+    model: str | None = None
+    battery_source: str | None = None
+
+    @field_validator(
+        "serial_device", "dongle_host", "dongle_serial", "inverter_serial", "model", "driver"
+    )
+    @classmethod
+    def _clean(cls, value: str | None) -> str | None:
+        return None if value is None else _reject_control_text(value)
+
+    @field_validator("serial_device")
+    @classmethod
+    def _device_is_a_path(cls, value: str | None) -> str | None:
+        if value is not None:
+            check_serial_device(value)
+        return value
+
+
+_SETTING_KEYS: dict[str, str] = {
+    "driver": "connection.driver",
+    "transport": "connection.transport",
+    "serial_device": "connection.serial_device",
+    "serial_baud": "connection.serial_baud",
+    "serial_unit_id": "connection.serial_unit_id",
+    "dongle_host": "connection.dongle_host",
+    "dongle_serial": "connection.dongle_serial",
+    "inverter_serial": "connection.inverter_serial",
+    "model": "connection.model",
+    "battery_source": "connection.battery_source",
+}
+
+
+def _schedule_restart() -> None:
+    """Exit cleanly in a moment, after the response has gone out.
+
+    systemd's Restart policy brings the service back, and the next boot reads
+    the overlay this request just wrote. SIGTERM rather than sys.exit because
+    the shutdown path — releasing the inverter's single client slot — already
+    hangs off it, and a restart that skipped disconnect would leave the next
+    start finding the slot occupied.
+    """
+    import os
+    import signal
+
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+
+
+@router.post("/setup/apply")
+async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
+    """Validate the merged result, write the overlay, restart the collector.
+
+    Validation is against the exact config the next start will assemble — the
+    file config, the stored settings, and this change layered on with the real
+    merge semantics — so every rule the service enforces at boot refuses here
+    first with the same words. Only after the whole merged picture validates
+    does anything get written; a partial write of a bad combination would be a
+    page-made outage.
+    """
+    provided = {k: v for k, v in body.model_dump().items() if v is not None}
+    # A masked value posted back unchanged is the page echoing what /api/setup
+    # showed it, not a choice. Discarded exactly as the settings endpoint
+    # discards them, or an untouched full-form submit would write dots over
+    # real serials.
+    provided = {k: v for k, v in provided.items() if not _is_mask(_SETTING_KEYS[k], v)}
+    pending = {_SETTING_KEYS[k]: v for k, v in provided.items()}
+    file_config = getattr(request.app.state, "file_config", request.app.state.config)
+    settings = SettingsStore(request.app.state.store)
+    try:
+        # The exact config the next start will assemble — file, stored
+        # settings, this change layered on with the real merge — validated
+        # against the registry's boot rules. Reusing effective() is why a
+        # cleared field is modelled as reverting to the file value rather than
+        # keeping the current one, which an earlier hand-rolled merge got wrong.
+        drivers.validate(effective(file_config, settings, pending=pending))
+        # All-or-nothing: every value validates against its spec before any
+        # row is written, in one transaction.
+        settings.set_many(pending)
+    except (ValueError, TypeError, OverflowError) as exc:
+        # A malformed value — wrong type, or a number too large to coerce —
+        # is a bad request, not a server fault.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _schedule_restart()
+    return {"applied": sorted(provided), "restarting": True}
 
 
 @router.post("/yield")

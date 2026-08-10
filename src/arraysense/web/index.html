@@ -1580,10 +1580,68 @@ async function loadHistory() {
   }
 }
 
+// The first-run wizard, full-screen. Shown only when the service is running in
+// setup mode — no config file yet — which /api/setup announces with first_run.
+// It replaces the dashboard entirely: there is no data to show and nowhere else
+// to go until the inverter is named. The same renderer serves the settings
+// page's Connection group; only the surrounding chrome and the after-apply
+// behaviour differ, which is the whole reason apply is handed out here.
+function showWizard(payload) {
+  const main = document.querySelector('main');
+  main.innerHTML = `
+    <header><h1>Solar ArraySense</h1></header>
+    <section class="p wizard">
+      <div class="chead"><h2>Set up your inverter</h2></div>
+      <p class="welcome">Welcome. Tell ArraySense what it is talking to — who made the
+        inverter, which model, and how it is wired — and it will start collecting.
+        Everything here can be changed later on the settings page.</p>
+      <div id="wizardHost"></div>
+    </section>`;
+  mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: applyAndWatch });
+}
+
+// Apply, then watch the restart. The service writes the config and restarts
+// itself under systemd, so /api/status goes quiet for a few seconds and then
+// answers from normal mode. Poll until it does, then open the live dashboard.
+// No spinner that hides a failure: a rejected apply stays on the form with the
+// reason, and a restart that never reports ready hands the form back rather than
+// spinning forever.
+async function applyAndWatch(body, ui) {
+  ui.status('Writing the configuration and restarting the collector…', 'busy');
+  try {
+    const r = await fetchTimeout('/api/setup/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 20000);
+    const reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(problemText(reply.detail) || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+  } catch (e) {
+    ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
+  }
+  ui.status('Restarting… the dashboard opens as soon as the collector is up.', 'busy');
+  // watchRestart waits for the service to go quiet and answer again — in setup
+  // mode /api/status starts absent, so the first ok answer is the restarted,
+  // now-configured service. A timeout hands the form back rather than spinning.
+  watchRestart(
+    () => location.assign('/'),
+    () => { ui.status('The collector did not report ready. Check the connection and try again.', 'warn'); ui.reenable(); },
+  );
+}
+
 // Boot. Everything above is definitions; nothing runs until here. The display
 // defaults are adopted before the first render rather than after it, so a
 // dashboard configured in Celsius does not flash Fahrenheit on the way in.
 async function boot() {
+  // Ask the machine to describe itself first. In setup mode this is the only
+  // data endpoint that exists, and its first_run flag is what routes an
+  // unconfigured install to the wizard instead of a dashboard with no data.
+  let setup = null;
+  try {
+    const r = await fetch('/api/setup');
+    if (r.ok) setup = await r.json();
+  } catch (e) { /* an older build without /api/setup: fall through to the dashboard */ }
+  if (setup && setup.first_run) { showWizard(setup); return; }
+
   await syncDisplayDefaults();
   wireSettings();
   wireDetail();

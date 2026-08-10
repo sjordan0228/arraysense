@@ -29,6 +29,7 @@ from arraysense.drivers.base import (
     EnergyReporting,
     InverterDriver,
     InverterSource,
+    find_model,
 )
 
 if TYPE_CHECKING:
@@ -95,14 +96,41 @@ def get(name: str) -> DriverEntry:
         raise ValueError(f"no such driver: {name!r}. Available drivers: {known}") from None
 
 
+def validate(config: Config) -> DriverEntry:
+    """Check a configuration against the registry without building anything.
+
+    The same rules create() enforces, callable where building would be wrong:
+    the apply endpoint and first-run setup validate a candidate before writing
+    it, because an overlay or file that passes here is one the next boot will
+    accept — and one that fails here stored anyway is a service systemd
+    crash-loops with no page left to repair it.
+    """
+    entry = get(config.driver)
+    if config.model:
+        find_model(entry, config.model)
+    if config.battery_source == "direct":
+        raise ValueError(
+            "battery_source 'direct' is not yet available; the battery axis "
+            "design reserves it for a dedicated battery driver"
+        )
+    if config.battery_source == "relayed" and not entry.capabilities.relays_battery:
+        raise ValueError(
+            f"driver {entry.name!r} does not relay battery data; battery_source must be 'none'"
+        )
+    return entry
+
+
 def create(config: Config) -> InverterDriver:
     """Build the source for the driver this configuration names.
 
-    The one call the entry point makes, and the reason nothing above the driver
-    layer imports a driver: which family is being read is a string in a file,
-    resolved here.
+    The one call the entry point makes, and the reason nothing above the
+    driver layer imports a driver: which family is being read is a string in a
+    file, resolved here. Model and battery source are validated here too,
+    beside the driver lookup, because the registry is the only layer that
+    knows what each family offers — config cannot import it, and a page must
+    never learn these rules a second way.
     """
-    return get(config.driver).build(config)
+    return validate(config).build(config)
 
 
 # Explicit registration. One line per driver, and a driver that is not on this

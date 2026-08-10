@@ -317,6 +317,9 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("inverter_run_time_s", "s", 1, 0.0, 4294967295.0, "max"),
 )
 
+# This is a ceiling, not a per-device fact: Capabilities.battery_module_slots
+# carries what each family actually has, and a test in test_drivers.py refuses
+# any declaration above this.
 _MODULE_SLOTS = 4
 
 # Per-module metrics share one template each; the registry expands each across

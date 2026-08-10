@@ -9,6 +9,7 @@ released on the way out.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from arraysense.__main__ import build_app, build_parser, main
 from arraysense.config import Config
@@ -31,11 +32,18 @@ def test_parser_accepts_overrides() -> None:
     assert args.port == 9000
 
 
-def test_a_missing_config_reports_itself_and_exits(tmp_path: Path, caplog: object) -> None:
-    # A misconfigured service should say what is wrong, not bury it in a
-    # traceback.
+def test_a_missing_config_serves_setup_mode(tmp_path: Path, monkeypatch: Any) -> None:
+    # A missing file used to be an error, which was right for a broken
+    # installation and wrong for a brand-new one. It now serves first-run
+    # setup. uvicorn.run is stood in for because the real one serves forever.
+
+    served: list[Any] = []
+    import uvicorn
+
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: served.append(app))
     code = main(["--config", str(tmp_path / "absent.toml")])
-    assert code == 1
+    assert code == 0
+    assert len(served) == 1, "setup mode should have been served"
 
 
 def test_an_invalid_config_exits_cleanly(tmp_path: Path) -> None:
@@ -205,3 +213,308 @@ def test_the_file_serial_is_used_when_nothing_overrides_it(tmp_path: Path) -> No
         database_path=str(tmp_path / "missing.db"),
     )
     assert _configured_serial(config) == "CE12345678"
+
+
+def test_a_missing_config_starts_setup_mode_not_an_error(tmp_path: Path) -> None:
+    # Today a missing file is a logged error and exit 1 — correct for a broken
+    # installation, wrong for a brand new one. Setup mode serves the wizard's
+    # endpoints with no store and no collector, because there is no identity
+    # to open a store under until Detect has asked the hardware.
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.get("/api/setup")
+        assert r.status_code == 200
+        body = r.json()
+        assert "manufacturers" in body
+        assert body["first_run"] is True
+        assert client.get("/api/status").status_code == 404
+
+
+def test_first_run_apply_writes_a_config_load_accepts_and_restarts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The restart is stubbed because the real one SIGTERMs this process —
+    # which under TestClient is the test runner itself.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+    from arraysense.config import load
+
+    target = tmp_path / "config.toml"
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(tmp_path / "db.sqlite"),
+            },
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["restarting"] is True
+    assert fired == ["restart"]
+    config = load(target)
+    assert config.driver == "fake"
+    assert config.inverter_serial == "CE00000000"
+
+
+def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path, monkeypatch: Any) -> None:
+    # The candidate file is validated by load() itself before it replaces
+    # anything — one rule set. A refused apply must leave no file behind.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={"driver": "fake", "transport": "modbus_serial", "inverter_serial": "CE0"},
+        )
+        assert r.status_code == 400
+    assert fired == [], "a refused first-run apply must not schedule a restart"
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_refuses_a_driver_the_registry_refuses(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # load() alone cannot know which drivers exist; the registry's rules run
+    # on the candidate before the file is born, or an unbootable file would
+    # exist and setup mode would never be offered again.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "no_such_family",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(tmp_path / "db.sqlite"),
+            },
+        )
+        assert r.status_code == 400
+    assert fired == [], "a refused first-run apply must not schedule a restart"
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_switching_the_driver_reopens_the_store_for_the_new_declaration(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The overlay can now name a different driver than the file did. The store
+    # must be reopened declared for the effective driver, or EG4 samples land
+    # in a fake-declared store and KeyError on the first EG4-only metric. This
+    # pins the store's declaration follows the overlay, not the file.
+    from arraysense.config import load
+    from arraysense.settings import SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+
+    db = tmp_path / "switch.db"
+    # A file that names the fake driver.
+    store = SqliteStore(str(db), device="CE00000000")
+    SettingsStore(store).set("connection.driver", "eg4_luxpower")
+    store.close()
+
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'driver = "fake"\n'
+        'dongle_host = "192.0.2.1"\n'
+        'dongle_serial = "BA00000000"\n'
+        'inverter_serial = "CE00000000"\n'
+        f'database_path = "{db}"\n'
+    )
+    config = load(path)
+    assert config.driver == "fake"
+    # After the overlay, the effective driver is eg4_luxpower — the code that
+    # opens the store must declare it for that, which build_app exercises.
+    from arraysense.__main__ import build_app
+
+    _app, opened_store, _service = build_app(config)
+    try:
+        # An EG4-only metric column exists, proving the store was declared for
+        # the effective driver rather than the file's fake one.
+        assert "pv1_power_w" in opened_store._present.get("inverter_raw", frozenset())
+    finally:
+        opened_store.close()
+
+
+def test_first_run_apply_refuses_a_database_path_that_cannot_open(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # load() accepts any non-empty database_path string, and the registry does
+    # not look at it — but the next boot opens a store there, and "/" cannot be
+    # opened. Validating only the file would let that become the real config
+    # and crash-loop every restart with no setup mode left to offer. First-run
+    # apply proves the store opens before it writes the file.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": "/",
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_detect_bounds_reject_a_bad_port_as_422(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/detect",
+            json={"transport": "dongle", "dongle_host": "192.0.2.1", "dongle_port": -1},
+        )
+        assert r.status_code == 422
+
+
+def test_first_run_refuses_a_database_path_that_is_the_config_file(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # database_path aliasing the config file: the store opened to validate the
+    # path is the file replace() overwrites with TOML, and the next boot reads
+    # TOML as sqlite and crashes. Refused before anything is written.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(target),
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_survives_a_lone_surrogate_in_the_body(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A lone surrogate makes render_config's write raise UnicodeEncodeError.
+    # It must be a 400 with no stray candidate, not a 500 — the write is inside
+    # the guard for exactly this.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        body = (
+            '{"driver": "fake", "transport": "dongle", '
+            '"dongle_host": "192.0.2.1", "dongle_serial": "BA00000000", '
+            '"inverter_serial": "\\ud800", '
+            f'"database_path": "{tmp_path / "db.sqlite"}"}}'
+        )
+        r = client.post(
+            "/api/setup/apply",
+            content=body.encode("ascii"),
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_apply_refuses_a_url_serial_device(tmp_path: Path, monkeypatch: Any) -> None:
+    # First-run apply writes the config file directly from a raw body — it does
+    # not go through ApplyRequest, so it needs its own refusal. A device pyserial
+    # reads as a URL parses fine but crashes the collector at connect, and the
+    # file is the one write with no setup mode left to fall back to. Refused
+    # before anything is written.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: None)
+    target = tmp_path / "config.toml"
+    app = build_setup_app(config_path=target)
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "transport": "modbus_serial",
+                "serial_device": "loop://?foo=bar",
+                "inverter_serial": "CE00000000",
+                "database_path": str(tmp_path / "db.sqlite"),
+            },
+        )
+        assert r.status_code == 400
+    assert not target.exists()
+    assert not target.with_suffix(".candidate").exists()
+
+
+def test_first_run_detect_refuses_a_url_serial_device(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/detect",
+            json={"transport": "modbus_serial", "serial_device": "loop://?foo=bar"},
+        )
+        assert r.status_code == 422

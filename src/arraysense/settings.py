@@ -3,8 +3,12 @@
 Editing a TOML file over SSH is a reasonable thing to ask of someone who already
 has a terminal open, and an unreasonable thing to ask of someone whose solar
 monitor is a tablet on a wall. Everything here is settable from the running
-service, takes effect without a restart, and is one value for the whole
-installation rather than per browser — a temperature unit stored in local
+service and is one value for the whole installation rather than per browser.
+Most settings take effect on the next request. The two exceptions are read
+once at startup and so wait for a restart: the connection group, merged over
+the config file, which is why the setup flow's apply ends in a restart rather
+than a promise; and the poll interval, which the collector reads when it
+begins its loop — a temperature unit stored in local
 storage means the tablet and the phone disagree about what 39 means.
 
 Defaults live in this registry, never in the database. A fresh install with an
@@ -25,7 +29,7 @@ import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import available_timezones
 
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
@@ -44,24 +48,6 @@ SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
-
-
-def check_timezone(name: str) -> ZoneInfo:
-    """Resolve an IANA zone name, raising ValueError if the tz database has no such zone.
-
-    Refused where it is typed rather than discovered later by an endpoint that
-    then has to decide what to do about it. Every daily and monthly total in
-    this project is cut at a midnight, and which midnight is exactly what this
-    value chooses; an unusable one stored here would surface as a page that
-    cannot answer at all, far from the box it was typed in.
-    """
-    try:
-        return ZoneInfo(name.strip())
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(
-            f"{name.strip()!r} is not a zone in the tz database — "
-            "use a name like America/New_York, or leave it empty to follow the machine"
-        ) from exc
 
 
 # Deliberately loose. The full grammar of an address admits quoted local parts
@@ -83,6 +69,24 @@ def check_email(value: str) -> str:
     if not _EMAIL.match(address):
         raise ValueError(f"{address!r} does not look like an email address")
     return address
+
+
+def check_serial_device(value: str) -> None:
+    """Refuse a serial device that pyserial would treat as a URL.
+
+    pyserial dispatches any port string containing ``://`` to a URL handler —
+    ``loop://``, ``socket://``, ``rfc2217://``, ``hwgrep://`` and the rest —
+    each of which parses its own query string and raises undeclared exception
+    types (a bare ``KeyError``, an ``re.error``) that the connection layer
+    cannot catch by type. Such a value is accepted as a string, stored by both
+    write paths, and then kills the collector on the next boot or turns a detect
+    into a 500. A real RS485 adapter is a filesystem device path and never a
+    URL, so this is a crisp thing to refuse at the door rather than an exception
+    class to chase downstream. Enforced identically at the settings registry and
+    the request models, so no entry point disagrees.
+    """
+    if "://" in value:
+        raise ValueError("a serial device is a filesystem path, not a URL")
 
 
 @dataclass(frozen=True)
@@ -274,6 +278,12 @@ CURRENCY_SUGGESTIONS: tuple[str, ...] = (
     "ZAR",
 )
 
+# Timezone choices for the dropdown. The empty string is first and means
+# "follow the machine's own zone" — this is the default and must remain
+# valid for existing installations. The rest are sorted IANA zone names.
+_TIMEZONE_CHOICES: tuple[str, ...] = ("", *sorted(available_timezones()))
+
+
 SETTINGS: tuple[SettingSpec, ...] = (
     # --- Site ---------------------------------------------------------------
     # Where the installation is, as against who is looking at it. The inverter
@@ -282,7 +292,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
     # before they existed here.
     SettingSpec(
         key=SETTING_TIMEZONE,
-        kind="str",
+        kind="choice",
         default="",
         label="Timezone",
         help=(
@@ -292,10 +302,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "whoever is looking. Leave it empty to follow the machine's own "
             "zone, which is what happens today."
         ),
-        # Resolved against the tz database at save time. An unparseable zone
-        # stored here would surface as a history page that cannot answer, a
-        # long way from the box it was typed in.
-        check=check_timezone,
+        # The choices are the tz database itself, so membership is the check —
+        # a `check=` callback would never fire, because validate() returns
+        # inside the choice branch before reaching it.
+        choices=_TIMEZONE_CHOICES,
         max_length=64,
     ),
     SettingSpec(
@@ -361,11 +371,7 @@ SETTINGS: tuple[SettingSpec, ...] = (
         upper=300,
         unit="seconds",
         label="Dashboard refresh",
-        help=(
-            "How often the page asks for new readings. It does not affect how "
-            "often the inverter is polled, so setting it faster than the poll "
-            "interval only redraws the same numbers."
-        ),
+        help="How often the page asks for new readings.",
     ),
     # --- Collector ----------------------------------------------------------
     SettingSpec(
@@ -376,11 +382,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
         upper=3600.0,
         unit="seconds",
         label="Poll interval",
-        help=(
-            "Seconds between reads of the inverter. The dongle answers at its "
-            "own pace, so asking faster than about ten seconds mostly produces "
-            "reads that overlap the previous one."
-        ),
+        # What to ask for is explained once, for both transports, in the
+        # Collection introduction on the settings page. Saying it again beside
+        # the box is the same sentence twice.
+        help="",
     ),
     # --- Tariff -------------------------------------------------------------
     # What the owner pays. Nothing here has a default that prices anything: an
@@ -516,6 +521,74 @@ SETTINGS: tuple[SettingSpec, ...] = (
         ),
         secret=True,
     ),
+    SettingSpec(
+        key="connection.driver",
+        kind="str",
+        default="",
+        label="Inverter family",
+        help=(
+            "Which driver family reads this inverter. Empty keeps the config "
+            "file's choice. Applies at the next collector restart."
+        ),
+    ),
+    SettingSpec(
+        key="connection.transport",
+        kind="str",
+        default="",
+        choices=("dongle", "modbus_serial"),
+        label="Connection type",
+        help=(
+            "How the inverter is reached. Empty keeps the config file's "
+            "choice. Applies at the next collector restart."
+        ),
+    ),
+    SettingSpec(
+        key="connection.serial_device",
+        kind="str",
+        default="",
+        label="Serial device",
+        help=(
+            "Device path for the RS485 adapter — a udev symlink or a "
+            "/dev/serial/by-id path survives replugging; /dev/ttyUSB0 may not."
+        ),
+        check=check_serial_device,
+    ),
+    SettingSpec(
+        key="connection.serial_baud",
+        kind="int",
+        default=19200,
+        lower=1,
+        upper=1000000,
+        label="Serial baud rate",
+        help="19200 is the LuxPower convention; change it only if yours differs.",
+    ),
+    SettingSpec(
+        key="connection.serial_unit_id",
+        kind="int",
+        default=1,
+        lower=1,
+        upper=247,
+        label="Modbus unit id",
+        help="Which unit answers on the bus. 0 is broadcast and never answers reads.",
+    ),
+    SettingSpec(
+        key="connection.model",
+        kind="str",
+        default="",
+        label="Inverter model",
+        help="Which model of the chosen family this installation is.",
+    ),
+    SettingSpec(
+        key="connection.battery_source",
+        kind="str",
+        default="",
+        choices=("", "relayed", "none"),
+        label="Battery source",
+        help=(
+            "Where battery data comes from: relayed through the inverter, or "
+            "no communicating battery. Empty derives it from the driver."
+        ),
+    ),
 )
 
 _BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTINGS}
@@ -547,8 +620,10 @@ class SettingsStore:
 
         ``SqliteStore`` creates the settings table with the rest of the schema
         before request handling begins. This constructor must stay read-only:
-        API routes construct it on the event-loop thread, and even idempotent
-        schema DDL is a lock-taking operation that does not belong in a read.
+        API routes construct it per request — cheap ones on the event-loop
+        thread, tier-scanning ones on threadpool workers over a read view — and
+        even idempotent schema DDL is a lock-taking operation that does not
+        belong in a read on any of those paths.
 
         Takes the store rather than a raw connection so settings share its
         transaction and its lifetime: a settings write and a reading write in
@@ -575,6 +650,32 @@ class SettingsStore:
             # working answer; refusing to start is not.
             logger.warning("setting %s holds undecodable %r; using the default", key, row[0])
             return spec.default
+
+    def set_many(self, values: dict[str, object]) -> None:
+        """Validate every value, then store all of them in one transaction.
+
+        The apply endpoint writes several connection settings as one act, and
+        one act is what it has to be: a batch that validated four keys, wrote
+        two and refused the third leaves an overlay the next boot assembles
+        from halves — a stored transport with no device path is a page-made
+        crash loop. Nothing is written until every value has passed its spec.
+        """
+        checked: list[tuple[str, str]] = []
+        for key, value in values.items():
+            spec = lookup_setting(key)
+            valid = spec.validate(value)
+            if valid is None:
+                stored = ""
+            else:
+                stored = "1" if valid is True else "0" if valid is False else str(valid)
+            checked.append((key, stored))
+        with self._conn:
+            for key, stored in checked:
+                self._conn.execute(
+                    "INSERT INTO settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, stored),
+                )
 
     def set(self, key: str, value: object) -> None:
         """Validate ``value`` against its spec and store it.

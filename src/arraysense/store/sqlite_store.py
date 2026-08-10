@@ -41,10 +41,12 @@ the caller both are the same fact: nothing was measured here.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 from arraysense.metrics import lookup
 from arraysense.models import BatteryModuleSample, Sample
@@ -107,10 +109,14 @@ def _module_table(tier: str) -> str:
 class SqliteStore:
     """Persist inverter samples to a SQLite database, and read them back out.
 
-    One instance owns one connection, shared between the collector writing from
-    the event loop and the API reading on a threadpool. Writes go to the
-    full-cadence tiers and commit per sample; the coarse tiers are filled later by
-    ``arraysense.store.rollup`` and read back through the same query methods.
+    One instance owns one primary connection, which belongs to the collector's
+    writes and to the cheap single-row reads that stay on the event loop. Reads
+    that scan tiers go through ``read_view`` instead — the store bound to its
+    own short-lived connection — and maintenance gets ``maintenance_connection``,
+    so neither can hold the primary while the collector needs it. Writes go to
+    the full-cadence tiers and commit per sample; the coarse tiers are filled
+    later by ``arraysense.store.rollup`` and read back through the same query
+    methods.
 
     Every metric name a caller passes is checked against the registry before any
     SQL is built. A typo therefore raises KeyError instead of returning a column
@@ -227,10 +233,12 @@ class SqliteStore:
         # column just added is counted. Reads answer from this rather than from
         # the declaration: an older database carries columns this driver never
         # declared, and the history in them belongs to whoever asks.
-        self._present: dict[str, frozenset[str]] = {
-            table: frozenset(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
-            for table in expected_columns()
-        }
+        self._present: Mapping[str, frozenset[str]] = MappingProxyType(
+            {
+                table: frozenset(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
+                for table in expected_columns()
+            }
+        )
 
     def close(self) -> None:
         """Release the database connection.
@@ -245,7 +253,7 @@ class SqliteStore:
         self._conn.close()
 
     def _apply_connection_pragmas(self, conn: sqlite3.Connection, *, establish_wal: bool) -> None:
-        """Apply shared safety settings and establish primary durability.
+        """Apply the safety settings and durability every connection here gets.
 
         Foreign keys because the module tables' serial reference is decorative
         until they are on; WAL because it is what makes a commit per sample cheap
@@ -262,13 +270,16 @@ class SqliteStore:
         connection still needs foreign keys and its busy timeout, which really
         are per-connection settings.
 
-        The primary connection sets its ``synchronous`` explicitly, never
-        inheriting it. Relying on SQLite's compile-time default would silently
-        weaken the guarantee in a build configured with NORMAL as its default,
-        while a test running against the usual FULL default would never expose
-        it. The value is a deployment choice — see ``Config.synchronous`` — and
-        defaults to FULL, which is what every installation had before it could
-        be chosen.
+        Every connection sets its ``synchronous`` explicitly, never inheriting
+        it. Relying on SQLite's compile-time default would silently weaken the
+        guarantee in a build configured with NORMAL as its default, while a test
+        running against the usual FULL default would never expose it — and when
+        only the primary set it, a deployment's choice never reached the
+        maintenance connection at all: measured on the production Pi, a store
+        configured "normal" ran its once-a-minute passes at the distro default
+        of FULL. The value is a deployment choice — see ``Config.synchronous`` —
+        and defaults to FULL, which is what every installation had before it
+        could be chosen.
 
         Measured on the reference Raspberry Pi, through this class's own
         ``append``: 200 polls cost 207 fsyncs at FULL and 7 at NORMAL, so the
@@ -285,8 +296,60 @@ class SqliteStore:
         conn.execute(FOREIGN_KEYS_PRAGMA)
         if establish_wal:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.execute(f"PRAGMA synchronous = {self._synchronous.upper()}")
+        # Durability is per-connection state, and every connection this store
+        # opens carries the configured value. It used to be set only on the
+        # primary, which silently ignored a deployment's choice on the one
+        # connection doing the bulk of the writing: measured on the production
+        # Pi, a store configured "normal" ran its maintenance passes at the
+        # distro default of FULL, fsyncing the SD card once a minute for a
+        # setting the owner had traded away.
+        conn.execute(f"PRAGMA synchronous = {self._synchronous.upper()}")
         conn.execute("PRAGMA busy_timeout = 5000")
+
+    @contextlib.contextmanager
+    def read_view(self) -> Iterator[SqliteStore]:
+        """A store bound to its own connection, for reads that must not share.
+
+        The HTTP handlers that scan tiers used to run their queries on the
+        primary connection, from ``async def`` handlers — synchronous SQLite on
+        the event loop. Measured on the production Pi, ``/api/calibration``
+        held the loop for 1.6 to 3.2 seconds, and every concurrent response
+        waited for it: the once-a-minute freeze issue #63 chased through the
+        rollup pass was the dashboard's own refresh timers all along.
+
+        A view is the measured way out. A reader on its own connection sees
+        zero interference from writers under WAL — probed at 50 ms intervals
+        through full maintenance passes on both reference filesystems without a
+        single stall — and opening a configured connection costs 0.07 ms, so a
+        view per request is cheap. The view shares every piece of the store's
+        derived state except the connection, which it opens on entry and closes
+        on exit.
+
+        A memory-backed store cannot be reopened — every connect() makes a new
+        empty database — so it yields the store itself, and the caller must not
+        assume the view outlives the block either way. Views are for reading;
+        nothing stops a write technically, but a writer on a view forfeits the
+        one-writer reasoning the primary connection's callers rely on.
+        """
+        if self.is_memory_backed:
+            yield self
+            return
+        # The fresh connection is created and closed here, never through the
+        # view, so a failure partway can never close the primary by mistake.
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        try:
+            self._apply_connection_pragmas(conn, establish_wal=False)
+            view = object.__new__(SqliteStore)
+            # Wholesale, not attribute by attribute: a hand-picked copy is an
+            # invariant nobody maintains, and an attribute added to __init__
+            # later would be silently absent from every view until some read
+            # path raised AttributeError in production. Everything shared this
+            # way is immutable after __init__; only the connection is replaced.
+            view.__dict__.update(self.__dict__)
+            view._conn = conn
+            yield view
+        finally:
+            conn.close()
 
     def maintenance_connection(self) -> sqlite3.Connection:
         """Open a second connection to this database, for work done off the loop.

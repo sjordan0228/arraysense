@@ -41,6 +41,11 @@ DEFAULT_DONGLE_PORT = 8000
 # traceback.
 DEFAULT_DRIVER = "eg4_luxpower"
 
+# Where first-run setup puts the database when nobody says otherwise. load()
+# still requires the key — the file the wizard writes is always explicit — so
+# this is a suggestion for the writer, never a fallback for the reader.
+DEFAULT_DATABASE_PATH = Path("/var/lib/arraysense/arraysense.db")
+
 # Required whatever the transport: the identity rows are filed under, and
 # somewhere to file them.
 _REQUIRED = ("inverter_serial", "database_path")
@@ -48,7 +53,7 @@ _REQUIRED = ("inverter_serial", "database_path")
 # Required only by the transport that uses them. A serial installation has no
 # dongle to name, and demanding a placeholder host from it would make the
 # transport choice a fiction.
-_REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
+REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
     "dongle": ("dongle_host", "dongle_serial"),
     "modbus_serial": ("serial_device",),
 }
@@ -56,7 +61,7 @@ _REQUIRED_BY_TRANSPORT: dict[str, tuple[str, ...]] = {
 
 def _required_for(transport: str) -> tuple[str, ...]:
     """Return the settings an installation on ``transport`` cannot start without."""
-    return _REQUIRED + _REQUIRED_BY_TRANSPORT.get(transport, ())
+    return _REQUIRED + REQUIRED_BY_TRANSPORT.get(transport, ())
 
 
 # Valid transport types. The default preserves the existing dongle behaviour;
@@ -71,6 +76,14 @@ _VALID_TRANSPORTS = frozenset({"dongle", "modbus_serial"})
 # normal can lose the most recent readings if power is cut abruptly, roughly the
 # last five minutes at that checkpoint rate.
 _VALID_SYNCHRONOUS = frozenset({"full", "normal"})
+
+# Where battery truth comes from. Empty means "derive from the driver": relayed
+# when the family relays BMS data, none otherwise — which is every existing
+# installation's behaviour, so nobody migrates anything. "direct" is reserved
+# by the setup design and refused at driver construction until a battery
+# driver exists to honour it; refusing it here would hard-code driver
+# knowledge into a module the drivers import.
+_VALID_BATTERY_SOURCES = frozenset({"", "relayed", "none", "direct"})
 
 
 @dataclass(frozen=True)
@@ -123,6 +136,8 @@ class Config:
     serial_baud: int = 19200
     serial_unit_id: int = 1
     synchronous: str = "full"
+    model: str = ""
+    battery_source: str = ""
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -145,7 +160,7 @@ class Config:
                 # Name the transport when the field is only required because of
                 # it. "serial_device must be set" alone sends someone hunting
                 # through a file where that setting may not even appear.
-                if field in _REQUIRED_BY_TRANSPORT.get(self.transport, ()):
+                if field in REQUIRED_BY_TRANSPORT.get(self.transport, ()):
                     raise ValueError(f"{field} must be set when transport is {self.transport!r}")
                 raise ValueError(f"{field} must be set")
         if self.poll_interval <= 0:
@@ -161,6 +176,11 @@ class Config:
         if self.synchronous not in _VALID_SYNCHRONOUS:
             raise ValueError(
                 f"synchronous must be one of {sorted(_VALID_SYNCHRONOUS)}, got {self.synchronous!r}"
+            )
+        if self.battery_source not in _VALID_BATTERY_SOURCES:
+            raise ValueError(
+                f"battery_source must be one of {sorted(s for s in _VALID_BATTERY_SOURCES if s)}"
+                f" or unset, got {self.battery_source!r}"
             )
         if self.serial_baud <= 0:
             raise ValueError(f"serial_baud must be positive, got {self.serial_baud}")
@@ -241,22 +261,34 @@ def load(path: Path | str = DEFAULT_PATH) -> Config:
         serial_baud=round(_number(data, "serial_baud", 19200)),
         serial_unit_id=round(_number(data, "serial_unit_id", 1)),
         synchronous=str(data.get("synchronous", "full")),
+        model=str(data.get("model", "")),
+        battery_source=str(data.get("battery_source", "")),
     )
 
 
-def effective(config: Config, settings: SettingsStore) -> Config:
-    """Merge the stored settings over the file configuration.
+def effective(
+    config: Config,
+    settings: SettingsStore,
+    pending: dict[str, object] | None = None,
+) -> Config:
+    """Merge the stored settings, and any pending change, over the file config.
 
     The settings page is the newer authority. Someone who changes a value there
     has to see it take effect rather than be silently overruled by a file they
     cannot reach from a tablet on a wall.
 
     Only settings actually stored take part, and a stored empty string is
-    ignored. Every connection setting defaults to empty, so an untouched one
+    ignored — every connection setting defaults to empty, so an untouched one
     would otherwise blank a working serial and break every poll from the next
-    restart onward.
+    restart onward. ``pending`` layers a not-yet-written change on top of what
+    is stored, so a write path can compute exactly the config the next start
+    will assemble and validate that rather than a near-miss. It must be given
+    the FILE config, not an already-merged one: clearing a field reverts it to
+    the file's value, which only this base can see.
     """
-    stored = settings.overrides()
+    stored = dict(settings.overrides())
+    if pending:
+        stored.update(pending)
 
     def pick(key: str, fallback: object) -> object:
         value = stored.get(key)
@@ -270,6 +302,15 @@ def effective(config: Config, settings: SettingsStore) -> Config:
         dongle_serial=str(pick("connection.dongle_serial", config.dongle_serial)),
         inverter_serial=str(pick("connection.inverter_serial", config.inverter_serial)),
         poll_interval=float(pick("collector.poll_interval", config.poll_interval)),  # type: ignore[arg-type]
+        # Registered in settings.py — an unregistered overlay here is dead
+        # code, which is exactly how the first attempt at these failed review.
+        driver=str(pick("connection.driver", config.driver)),
+        transport=str(pick("connection.transport", config.transport)),
+        serial_device=str(pick("connection.serial_device", config.serial_device)),
+        serial_baud=round(float(pick("connection.serial_baud", config.serial_baud))),  # type: ignore[arg-type]
+        serial_unit_id=round(float(pick("connection.serial_unit_id", config.serial_unit_id))),  # type: ignore[arg-type]
+        model=str(pick("connection.model", config.model)),
+        battery_source=str(pick("connection.battery_source", config.battery_source)),
     )
 
 

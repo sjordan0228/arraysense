@@ -453,3 +453,29 @@ def test_an_empty_contact_email_is_allowed(settings: SettingsStore) -> None:
     settings.set(SETTING_CONTACT_EMAIL, "")
     assert settings.get(SETTING_CONTACT_EMAIL) == ""
     assert settings.public()[SETTING_CONTACT_EMAIL] == ""
+
+
+def test_the_setup_connection_keys_are_registered_with_bounds() -> None:
+    # effective() only overlays registered keys, and the apply endpoint can
+    # only write registered keys — an unregistered key silently vanishes,
+    # which is how the first attempt at these settings failed review.
+    assert lookup_setting("connection.transport").choices == ("dongle", "modbus_serial")
+    assert lookup_setting("connection.serial_device").kind == "str"
+    baud = lookup_setting("connection.serial_baud")
+    assert baud.kind == "int"
+    unit = lookup_setting("connection.serial_unit_id")
+    assert (unit.lower, unit.upper) == (1, 247)
+    assert lookup_setting("connection.model").kind == "str"
+    assert lookup_setting("connection.battery_source").choices == ("", "relayed", "none")
+
+
+def test_a_serial_device_that_is_a_url_is_refused() -> None:
+    # pyserial reads any device string with "://" as a URL and dispatches to a
+    # handler that raises an undeclared exception at connect. The registry
+    # refuses it so it never persists — the same rule the request models and the
+    # first-run wizard enforce, so no write path can store a bricking device.
+    spec = lookup_setting("connection.serial_device")
+    with pytest.raises(ValueError, match="filesystem path, not a URL"):
+        spec.validate("loop://?foo=bar")
+    # A real device path is still accepted.
+    assert spec.validate("/dev/serial/by-id/usb-1a86") == "/dev/serial/by-id/usb-1a86"

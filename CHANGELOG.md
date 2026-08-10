@@ -7,6 +7,127 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.6.14 — 10 August 2026
+
+### Added
+
+- **The machine can now describe itself, which is what a setup wizard renders
+  from.** Drivers declare a manufacturer and their models, and every model
+  fact carries a citation — the 18kPV's three PV strings cite the reference
+  installation; the 6000XP and 12kPV inherit the family declaration until a
+  source exists, because a conservative default is honest and an invented
+  spec is not. Configuration gains `model` and `battery_source` (`relayed`,
+  the reality of every current installation, or `none`), the settings overlay
+  carries the connection group, and `/api/setup` serves the manufacturer
+  tree, each transport's required fields, the serial adapters the machine can
+  actually see, and the current values with secrets redacted.
+
+  Two endpoints act: **detect** stops the collector, reads the inverter's
+  serial off the candidate connection, and starts the collector again on the
+  way out whatever happened — it writes nothing, and on the dongle it needs
+  the inverter serial you typed, because that protocol authenticates with it.
+  **apply** validates the whole merged result with the registry's own boot
+  rules — an overlay it accepts is one the next boot accepts — discards any
+  masked value the form echoed back rather than storing dots over a real
+  serial, writes every setting in a single transaction or none at all, and
+  restarts the collector. Switching the driver family is part of it.
+
+  A brand-new installation — no config file at all — now serves **first-run
+  setup** instead of exiting with an error: pages and the setup endpoints,
+  no store and no collector, because there is no inverter serial to open a
+  store under until the wizard supplies one — typed, or read off a serial bus
+  by detection. The wizard's first apply writes the only config file software
+  will ever write, validated by the same loader that will read it at boot.
+
+  A **first-run wizard** renders all of it: pick who made the inverter, which
+  model, and how it is wired, read the serial off the wire with Detect or type
+  it, and one button writes the config and restarts into a live dashboard —
+  the page watches the restart come back rather than guessing at a delay, and a
+  refused apply keeps its reason on the form. The **settings page's connection
+  group is the same renderer**, one component in two shells so the wizard and
+  the settings form cannot drift, prefilled with the current values redacted and
+  saved through the same validated, restart-on-apply path. Detect on an
+  unchanged connection uses the configured secrets rather than the dots shown
+  for them. An existing installation changes nothing: every new field defaults
+  to exactly today's behaviour, and an already-configured box shows no wizard.
+
+### Changed
+
+- **The battery topologies have names.** The wizard's Battery choice read
+  "Through the inverter" and "No battery data"; it now reads "Closed loop
+  (through the inverter)" and "None", with the reserved direct mode shown beside
+  them as a disabled "Open loop — coming soon" so it reads as planned rather than
+  missing. The server's choices are unchanged and still refuse it.
+- **The timezone is chosen from a list** rather than typed — a menu over the tz
+  database, so it cannot be mistyped. The empty default still means "follow the
+  machine's own zone", which every existing installation has stored. The orphaned
+  `check_timezone` validator went with the change, since a choice field validates
+  by membership before any callback runs.
+- **The settings page says less.** Group introductions that re-explained the
+  controls beside them are trimmed or dropped, "This installation" becomes
+  "General", and Collection now states what each transport wants — 11 seconds or
+  more over the dongle, ten over RS485. Numeric help no longer reprints the
+  bounds the number box already enforces.
+
+## 0.6.13 — 9 August 2026
+
+### Changed
+
+- The History page's footer says "days in America/Chicago time" instead of
+  "days as reckoned in America/Chicago". The zone still matters — a total
+  labelled August 5 depends entirely on where midnight was put — it just no
+  longer sounds like a treaty.
+
+## 0.6.12 — 9 August 2026
+
+### Fixed
+
+- **The dashboard can no longer freeze the service it is watching**
+  ([#63](https://github.com/sjordan0228/arraysense/issues/63)). The
+  once-a-minute stall this project chased through the rollup pass for three
+  releases was never the rollup pass. The dashboard reloads its history on a
+  sixty-second timer and fetches the calibration advisory alongside — and that
+  endpoint, like every tier-scanning read, ran synchronous SQLite on the event
+  loop. Measured on the reference Pi it held the loop for 1.6 to 3.2 seconds,
+  and for that whole time every other response waited: status polls, pages,
+  everything, which is exactly the both-at-the-same-instant freeze the issue
+  documents. The evidence trail — including why the rollup timer cannot even
+  fire at the observed sixty-second spacing — is on the issue.
+
+  The tier-scanning endpoints (`live`, `calibration`, `costs`, `history`,
+  `battery/history`, `energy`, `bands`) now run in the server's threadpool,
+  each on its own short-lived database connection (a memory-backed store — the
+  test configuration — cannot be reopened, so it serves reads from its one
+  connection as before). Both halves are measured:
+  under WAL a reader on its own connection saw zero interference from writers
+  on either reference filesystem, and opening a configured connection costs
+  0.07 ms. Endpoints answering from memory or single rows stay on the loop.
+
+- **A deployment's durability choice now reaches every connection**. 0.6.10's
+  `synchronous = "normal"` was applied only to the primary connection, so the
+  maintenance pass — the bulk of the writing, once a minute — kept fsyncing at
+  FULL from the SQLite build's own default. Proved by execution on the
+  production Pi: primary NORMAL, maintenance FULL. Every connection the store
+  opens now carries the configured value.
+
+## 0.6.11 — 9 August 2026
+
+### Fixed
+
+- **A bug in the battery mapper can no longer be filed as an inverter gap**
+  ([#66](https://github.com/sjordan0228/arraysense/issues/66)). The wrap that
+  converts a model's refusal into `SampleBuildError` enclosed the whole
+  constructor expression, so a `ValueError` raised while *evaluating* an
+  argument — a defect in this driver's own reading helpers, demonstrated with a
+  NaN cycle count reaching `round()` — was converted too, and would have been
+  recorded as an inverter outage and retried forever. The arguments are now
+  evaluated before the wrap, so it covers construction alone, and a mapper bug
+  surfaces loudly the way #42 established one layer up.
+
+  No real reply reaches either path today — the guards drop malformed records
+  earlier — so this closes a latent hole rather than a live one. Nothing about
+  an installation's data changes.
+
 ## 0.6.10 — 9 August 2026
 
 ### Added

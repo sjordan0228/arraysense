@@ -21,6 +21,7 @@ from arraysense.drivers.base import (
     Capabilities,
     DeviceIdentity,
     EnergyReporting,
+    ModelSpec,
     expand_module_metrics,
 )
 from arraysense.models import BatteryModuleSample, Sample
@@ -75,7 +76,15 @@ CAPABILITIES = Capabilities(
     metrics=frozenset(_READINGS) | expand_module_metrics(_MODULE_TEMPLATES),
     split_phase=True,
     per_module_battery=True,
+    relays_battery=True,
+    battery_module_slots=4,
 )
+
+
+# The models this family covers. The fake has only one, and it carries no
+# deltas because it is the baseline for testing. A citation is not required
+# when there are no deltas to cite.
+MODELS: tuple[ModelSpec, ...] = (ModelSpec(name="Simulated"),)
 
 
 class FakeSource:
