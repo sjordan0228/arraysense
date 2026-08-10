@@ -2290,3 +2290,96 @@ def test_every_connection_carries_the_configured_durability(tmp_path: Path) -> N
     assert kept.execute("PRAGMA synchronous").fetchone() == (2,)
     kept.close()
     unchanged.close()
+
+
+# --- the setup trio: describe, detect, apply (#setup slice A)
+
+
+def test_setup_describes_the_machine_and_redacts_secrets(client: Any) -> None:
+    r = client.get("/api/setup")
+    assert r.status_code == 200
+    body = r.json()
+    makers = [m["name"] for m in body["manufacturers"]]
+    assert "EG4" in makers and "Simulated" in makers
+    assert "dongle" in body["transports"]
+    assert "*" in body["current"]["inverter_serial"] or body["current"]["inverter_serial"] == "*"
+
+
+def test_detect_returns_the_serial_the_hardware_answered(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        return "3352000000"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"serial": "3352000000"}
+
+
+def test_detect_failure_is_a_message_with_a_cause_not_a_500(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        raise ConnectionError("could not open /dev/rs485: permission denied")
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 502
+    assert "permission denied" in r.json()["detail"]
+
+
+def test_detect_refuses_an_unknown_transport(client: Any) -> None:
+    r = client.post("/api/setup/detect", json={"transport": "carrier_pigeon"})
+    assert r.status_code == 400
+
+
+def test_detect_gives_the_wire_back_after_borrowing_it(client: Any, monkeypatch: Any) -> None:
+    # The probe borrows the single client slot through yield mode. Whatever
+    # happens on the wire, the collector must get it back — a detect that left
+    # the service yielded would silently stop collection.
+    from arraysense.api import routes
+
+    async def fake_probe(body: Any) -> str:
+        raise ConnectionError("nothing answered")
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post("/api/setup/detect", json={"transport": "dongle", "dongle_host": "192.0.2.9"})
+    assert r.status_code == 502
+    status = client.get("/api/status").json()
+    assert status["yielding"] is False
+
+
+def test_apply_refuses_an_invalid_combination_without_writing(client: Any) -> None:
+    # Validation is by constructing a real Config from the merged result, so
+    # every rule the service enforces at boot refuses here first — one rule
+    # set, never two.
+    r = client.post(
+        "/api/setup/apply",
+        json={"transport": "modbus_serial", "serial_device": ""},
+    )
+    assert r.status_code == 400
+    assert "serial_device" in r.json()["detail"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.transport"] == "", "a refused apply must write nothing"
+
+
+def test_apply_writes_the_overlay_and_schedules_a_restart(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    fired: list[str] = []
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: fired.append("restart"))
+    r = client.post(
+        "/api/setup/apply",
+        json={"model": "18kPV", "battery_source": "relayed"},
+    )
+    assert r.status_code == 200
+    assert fired == ["restart"]
+    values = client.get("/api/settings").json()["values"]
+    assert values["connection.model"] == "18kPV"

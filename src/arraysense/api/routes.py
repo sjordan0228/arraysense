@@ -22,6 +22,7 @@ parameter to mean anything across two. No page sends the parameter.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
@@ -32,7 +33,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
-from arraysense import __version__
+from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
 from arraysense.calibration import (
     CORROBORATING_ABSORB,
@@ -41,6 +42,7 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
+from arraysense.config import Config
 from arraysense.costs import (
     band_intervals,
     bucket_energy,
@@ -48,9 +50,11 @@ from arraysense.costs import (
     price_period,
     unpriced_minutes,
 )
+from arraysense.drivers.base import find_model
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.settings import SETTING_TIMEZONE, SettingsStore, describe, lookup_setting
+from arraysense.setup import describe_setup
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -1402,6 +1406,191 @@ def bands(
         "timezone": str(zone),
         "windows": windows,
     }
+
+
+@router.get("/setup")
+async def setup(request: Request) -> dict[str, Any]:
+    """Everything the setup wizard renders, from one place.
+
+    Served on the loop rather than the threadpool: the payload is registry
+    metadata, a directory listing and the already-loaded config — no tier
+    scan anywhere near it. The connection values it echoes are redacted the
+    same way the settings API redacts them, because this page has no auth
+    (#34) and a serial number is an installation secret.
+    """
+    return describe_setup(request.app.state.config)
+
+
+class DetectRequest(BaseModel):
+    """Candidate connection parameters to probe. Nothing here is saved."""
+
+    transport: str
+    serial_device: str = ""
+    serial_baud: int = 19200
+    serial_unit_id: int = Field(default=1, ge=1, le=247)
+    dongle_host: str = ""
+    dongle_port: int = 8000
+    dongle_serial: str = ""
+
+
+async def _probe_serial(body: DetectRequest) -> str:
+    """Open the candidate transport read-only and ask who is there.
+
+    Split from the route so tests can stand in for the hardware: the route's
+    job is borrowing, error mapping and never writing; this function's job is
+    the wire. The library imports live inside so the module keeps no
+    top-level dependency on the transport stack.
+    """
+    from pylxpweb.transports.dongle import DongleTransport
+    from pylxpweb.transports.exceptions import TransportError
+    from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
+    from pylxpweb.transports.modbus_serial import ModbusSerialTransport
+
+    transport: ModbusSerialTransport | DongleTransport
+    if body.transport == "modbus_serial":
+        transport = create_serial_transport(
+            port=body.serial_device,
+            serial="detect",
+            baudrate=body.serial_baud,
+            unit_id=body.serial_unit_id,
+            timeout=10.0,
+        )
+    else:
+        transport = create_dongle_transport(
+            host=body.dongle_host,
+            dongle_serial=body.dongle_serial,
+            inverter_serial="",
+            port=body.dongle_port,
+            timeout=10.0,
+        )
+    try:
+        await transport.connect()
+    except (TransportError, OSError) as exc:
+        raise ConnectionError(str(exc)) from exc
+    try:
+        return str(await transport.read_serial_number())
+    except (TransportError, OSError) as exc:
+        raise ConnectionError(str(exc)) from exc
+    finally:
+        await transport.disconnect()
+
+
+@router.post("/setup/detect")
+async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
+    """Read the inverter's serial off a candidate connection. Writes nothing.
+
+    If a collector is running it holds the single client slot — the serial
+    port is exclusive and the dongle takes one TCP client — so the probe
+    borrows the wire through yield mode and always gives it back. The
+    mismatch decision belongs to the page: this returns what answered, and
+    what was expected is whatever the form currently holds.
+    """
+    if body.transport not in ("dongle", "modbus_serial"):
+        raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
+    service = getattr(request.app.state, "service", None)
+    borrowed = False
+    if service is not None and service.status.running and not service.is_yielding:
+        await service.yield_for(30)
+        borrowed = True
+    try:
+        try:
+            serial = await _probe_serial(body)
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        if borrowed and service is not None:
+            await service.resume()
+    return {"serial": serial}
+
+
+class ApplyRequest(BaseModel):
+    """The setup fields a page may change.
+
+    Everything optional; only provided fields are validated and written.
+    """
+
+    transport: str | None = None
+    serial_device: str | None = None
+    serial_baud: int | None = None
+    serial_unit_id: int | None = None
+    dongle_host: str | None = None
+    dongle_serial: str | None = None
+    inverter_serial: str | None = None
+    model: str | None = None
+    battery_source: str | None = None
+
+
+_SETTING_KEYS = {
+    "transport": "connection.transport",
+    "serial_device": "connection.serial_device",
+    "serial_baud": "connection.serial_baud",
+    "serial_unit_id": "connection.serial_unit_id",
+    "dongle_host": "connection.dongle_host",
+    "dongle_serial": "connection.dongle_serial",
+    "inverter_serial": "connection.inverter_serial",
+    "model": "connection.model",
+    "battery_source": "connection.battery_source",
+}
+
+
+def _schedule_restart() -> None:
+    """Exit cleanly in a moment, after the response has gone out.
+
+    systemd's Restart policy brings the service back, and the next boot reads
+    the overlay this request just wrote. SIGTERM rather than sys.exit because
+    the shutdown path — releasing the inverter's single client slot — already
+    hangs off it, and a restart that skipped disconnect would leave the next
+    start finding the slot occupied.
+    """
+    import os
+    import signal
+
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+
+
+@router.post("/setup/apply")
+async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
+    """Validate the merged result, write the overlay, restart the collector.
+
+    Validation is by building a real Config over the currently effective one:
+    the file stays the floor, the overlay is values not structure, and every
+    rule the service enforces at boot refuses here first with the same words.
+    Only after the whole merged picture validates does anything get written —
+    a partial write of a bad combination would be a page-made outage.
+    """
+    config = request.app.state.config
+    provided = {k: v for k, v in body.model_dump().items() if v is not None}
+    merged: dict[str, Any] = {
+        "dongle_host": config.dongle_host,
+        "dongle_serial": config.dongle_serial,
+        "inverter_serial": config.inverter_serial,
+        "database_path": config.database_path,
+        "poll_interval": config.poll_interval,
+        "dongle_port": config.dongle_port,
+        "driver": config.driver,
+        "transport": config.transport,
+        "serial_device": config.serial_device,
+        "serial_baud": config.serial_baud,
+        "serial_unit_id": config.serial_unit_id,
+        "synchronous": config.synchronous,
+        "model": config.model,
+        "battery_source": config.battery_source,
+    }
+    merged.update(provided)
+    try:
+        candidate = Config(**merged)
+        entry = drivers.get(candidate.driver)
+        if candidate.model:
+            find_model(entry, candidate.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    settings = SettingsStore(request.app.state.store)
+    for field_name, value in provided.items():
+        settings.set(_SETTING_KEYS[field_name], value)
+    _schedule_restart()
+    return {"applied": sorted(provided), "restarting": True}
 
 
 @router.post("/yield")
