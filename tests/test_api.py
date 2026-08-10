@@ -2799,3 +2799,60 @@ def test_live_survives_a_weather_row_landing_between_polls(empty_client: Any) ->
     assert body["inverter"]["pv_total_power_w"] == 5000.0, (
         "a weather row must not blank the live view"
     )
+
+
+# --- the sky block in /api/live ------------------------------------------------
+
+
+def test_live_sky_returns_weather_when_stored(empty_client: Any) -> None:
+    """A weather row stored -> sky carries the values, inverter unaffected."""
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(
+        Sample(timestamp=now - timedelta(minutes=1), readings={"pv_total_power_w": 5000.0})
+    )
+    store.append(
+        Sample(
+            timestamp=now,
+            readings={"outside_temperature_c": 22.5, "cloud_cover_pct": 65.0},
+        )
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0
+    assert body["sky"] is not None
+    assert body["sky"]["outside_temperature_c"] == 22.5
+    assert body["sky"]["cloud_cover_pct"] == 65.0
+    assert "timestamp" in body["sky"]
+
+
+def test_live_sky_is_none_with_no_weather(empty_client: Any) -> None:
+    """No weather ever stored -> sky is None."""
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now, readings={"pv_total_power_w": 5000.0})
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0
+    assert body["sky"] is None
+
+
+def test_live_sky_survives_a_newer_gap(empty_client: Any) -> None:
+    """Weather row followed by a newer gap -> sky still carries the weather values.
+
+    include_gaps=False makes the store walk past the gap row to the last real
+    reading, so an inverter gap that lands newer than the last weather tick
+    does not blank the sky.
+    """
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(
+        Sample(
+            timestamp=now - timedelta(minutes=30),
+            readings={"outside_temperature_c": 18.2, "cloud_cover_pct": 90.0},
+        )
+    )
+    store.append(Sample.failed(now - timedelta(seconds=5), "TimeoutError: read timed out"))
+    body = empty_client.get("/api/live").json()
+    assert body["sky"] is not None
+    assert body["sky"]["outside_temperature_c"] == 18.2
+    assert body["sky"]["cloud_cover_pct"] == 90.0

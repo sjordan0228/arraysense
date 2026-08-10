@@ -105,9 +105,13 @@
       <span class="legend muted">grid, backup panel and the inverter itself</span>
     </div>
     <div id="acBands"></div>
-    <!-- Outside temperature and cloud cover belong beside the solar bands once
-         a weather source exists. Tracked as issue #5; the note that used to
-         stand here explaining their absence was longer than the absence. -->
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Weather</h2>
+      <span class="legend muted">the sky over the site</span>
+    </div>
+    <div id="weatherBands"></div>
   </section>
 </main>
 
@@ -391,6 +395,23 @@ const BANDS = [
     kind: 'freq', ink: '--grid' },
   { sec: 'ac', id: 'invTemp', metric: 'inverter_temperature_c', label: 'Inverter temperature',
     kind: 'temp', ink: '--load' },
+
+  // --- Weather (site metrics, not inverter registers) -----------------------
+  // These are written by the weather poller on its own clock, not by the
+  // inverter. site:true exempts them from the capability filter: no driver
+  // declares these, and a band whose presence is not a driver capability must
+  // not be filtered as one.
+  { sec: 'weather', id: 'outsideTemp', metric: 'outside_temperature_c',
+    label: 'Outside temperature', kind: 'temp', ink: '--batt', site: true,
+    // All temperature traces share one hue so the page does not invent a new
+    // colour for every thermometer; --batt is already used by bank and pack
+    // temperature bands and the weather section is not adjacent to either.
+  },
+  { sec: 'weather', id: 'cloudCover', metric: 'cloud_cover_pct',
+    label: 'Cloud cover', kind: 'percent', ink: '--pv', site: true,
+    // Cloud cover modulates PV output; sharing --pv with the solar bands ties
+    // cause to effect without introducing a hue nobody measured.
+  },
 ];
 
 const SECTIONS = [
@@ -398,12 +419,17 @@ const SECTIONS = [
   { key: 'battery', host: 'batteryBands' },
   { key: 'packs', host: 'packBands' },
   { key: 'ac', host: 'acBands' },
+  { key: 'weather', host: 'weatherBands' },
 ];
 
 // The inverter metrics one band reads: its own, or the operands a computed
 // band names in `needs`. Both the fetch list and the capability filter below
 // are built from this, so a band cannot be drawn without its inputs being
 // asked for, nor a metric fetched for a band that is not drawn.
+//
+// Site bands carry `site: true` and bypass the capability filter (see
+// loadCaps): their presence is not a driver capability, so they must never be
+// dropped on the say-so of a device that has never heard of weather.
 const neededBy = (b) => b.needs || (b.metric ? [b.metric] : []);
 
 // The bands this device can fill, from /api/capabilities. A band is kept only
@@ -423,11 +449,17 @@ async function loadCaps() {
     const r = await fetch('/api/capabilities');
     if (r.ok) device = ((await r.json()).devices || [])[0] || null;
   } catch (err) { /* unknown: every band stays */ }
-  bands = BANDS.filter((b) => neededBy(b).every((m) => capHasMetric(device, m)));
+  bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)));
 }
 
 // Every inverter metric the kept bands read, asked for in one request. Built
 // from what is plotted rather than kept beside it and allowed to drift.
+//
+// Site metrics (weather) are always present here because the caps filter never
+// drops site bands — they are exempt. The weather section hides when the
+// fetched window carries no data rather than the bands being removed, so the
+// metrics must still be fetched: without the fetch the page cannot tell that
+// data has appeared and the section would stay hidden forever.
 const metricsAsk = () => [...new Set(bands.flatMap(neededBy))].join(',');
 
 // What a pack band holds, in the order the columns are stacked into the data.
@@ -777,6 +809,20 @@ async function load() {
   packResolution(packs);
   drawInverter(inv);
   drawPacks(packs);
+  // The data-in-window rule for site metrics: hide the weather section when the
+  // fetched window carries no non-null value for either site metric. An install
+  // that has never recorded weather must not show two permanently empty charts
+  // — an empty chart reads as a fault — and an install where the weather poller
+  // stopped a month ago degrades right when the owner scrolls to a window
+  // before it stopped. Only on a successful fetch: a failed poll must not tear
+  // the section down over a problem that usually lasts one request.
+  if (inv) {
+    const hasWeather = (inv.points || []).some(
+      (p) => numOrNull(p.outside_temperature_c) !== null
+          || numOrNull(p.cloud_cover_pct) !== null,
+    );
+    $('weatherBands').parentElement.hidden = !hasWeather;
+  }
   rangeChanged = false;
   refreshZoomState();
 }

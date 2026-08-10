@@ -566,7 +566,13 @@ class SqliteStore:
             for row in self._conn.execute(sql, params).fetchall()
         ]
 
-    def latest(self, metrics: Sequence[str], device: str | None = None) -> dict[str, object] | None:
+    def latest(
+        self,
+        metrics: Sequence[str],
+        device: str | None = None,
+        *,
+        include_gaps: bool = True,
+    ) -> dict[str, object] | None:
         """Return one inverter's most recent reading, or None if it has stored none.
 
         This is what a live view asks for on every refresh, so it rides the primary
@@ -590,7 +596,10 @@ class SqliteStore:
         mistake this project forbids. The mirror holds too: a request for the
         weather metrics walks past the inverter rows to the last sky reading.
         Gap rows still answer every request, because recency is not health and a
-        gap is information.
+        gap is information — unless the caller opts out with ``include_gaps=False``,
+        which asks for the newest actual reading of the named metrics and walks
+        past gaps. With no metrics named there is nothing to qualify a reading,
+        so ``include_gaps`` has no effect and the newest row of any kind answers.
         """
         names = self._check_inverter_names(metrics)
         columns = ["timestamp", *names, "error"]
@@ -601,7 +610,16 @@ class SqliteStore:
         # interpolating them into the predicate is safe.
         carries = ""
         if names:
-            terms = " OR ".join([*(f"{n} IS NOT NULL" for n in names), "error IS NOT NULL"])
+            # include_gaps=False asks for the newest actual reading of these
+            # metrics and nothing else. The default surfaces gap rows because
+            # for the dashboard recency is not health — but a reader of the
+            # site metrics (the sky readout) must not blank every time an
+            # inverter gap lands newer than the last weather tick, so it opts
+            # out and the walk continues past the gaps to the last real value.
+            witness = [f"{n} IS NOT NULL" for n in names]
+            if include_gaps:
+                witness.append("error IS NOT NULL")
+            terms = " OR ".join(witness)
             carries = f"AND ({terms}) "
         row = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM inverter_raw WHERE device = ? "
