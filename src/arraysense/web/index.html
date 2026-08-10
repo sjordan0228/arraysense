@@ -293,7 +293,7 @@
        judgement is made once in arraysense.mode and arrives with /api/live;
        the title carries the readings it turned on, because a mode a reader
        cannot check is one they have to take on trust. -->
-  <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span></div>
+  <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span><span id="skyReadout" class="muted"></span></div>
   <div class="toprow">
     <div class="p hero">
       <div class="lbl">Producing now</div>
@@ -624,6 +624,22 @@ async function loadLive() {
     showToday('loadToday', i.load_energy_today_kwh);
     showToday('gridToday', i.grid_import_energy_today_kwh);
     showMode(live.mode, i);
+
+    // The sky is site context from a second poller; absence means weather is not
+    // configured or not reachable, and the dashboard says nothing rather than
+    // something wrong.
+    const sky = live.sky;
+    const skyEl = $('skyReadout');
+    if (sky && skyEl) {
+      const parts = [];
+      const t = tempOf(sky.outside_temperature_c);
+      if (t !== null) parts.push(`${Math.round(t)}° outside`);
+      const cover = numOrNull(sky.cloud_cover_pct);
+      if (cover !== null) parts.push(`${Math.round(cover)}% cloud`);
+      skyEl.textContent = parts.length ? ' · ' + parts.join(' · ') : '';
+    } else if (skyEl) {
+      skyEl.textContent = '';
+    }
 
     const ok = status.connected && status.running;
     const colour = status.yielding ? 'var(--warn)' : ok ? 'var(--good)' : 'var(--bad)';
