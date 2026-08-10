@@ -29,6 +29,7 @@ from arraysense.drivers.base import (
     EnergyReporting,
     InverterDriver,
     InverterSource,
+    find_model,
 )
 
 if TYPE_CHECKING:
@@ -98,11 +99,26 @@ def get(name: str) -> DriverEntry:
 def create(config: Config) -> InverterDriver:
     """Build the source for the driver this configuration names.
 
-    The one call the entry point makes, and the reason nothing above the driver
-    layer imports a driver: which family is being read is a string in a file,
-    resolved here.
+    The one call the entry point makes, and the reason nothing above the
+    driver layer imports a driver: which family is being read is a string in a
+    file, resolved here. Model and battery source are validated here too,
+    beside the driver lookup, because the registry is the only layer that
+    knows what each family offers — config cannot import it, and a page must
+    never learn these rules a second way.
     """
-    return get(config.driver).build(config)
+    entry = get(config.driver)
+    if config.model:
+        find_model(entry, config.model)
+    if config.battery_source == "direct":
+        raise ValueError(
+            "battery_source 'direct' is not yet available; the battery axis "
+            "design reserves it for a dedicated battery driver"
+        )
+    if config.battery_source == "relayed" and not entry.capabilities.relays_battery:
+        raise ValueError(
+            f"driver {entry.name!r} does not relay battery data; battery_source must be 'none'"
+        )
+    return entry.build(config)
 
 
 # Explicit registration. One line per driver, and a driver that is not on this

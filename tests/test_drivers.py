@@ -446,3 +446,56 @@ def test_an_entry_must_name_itself() -> None:
             ),
             build=lambda _config: drivers.create(_config),
         )
+
+
+def _setup_config(**overrides: object) -> Config:
+    base: dict[str, object] = {
+        "dongle_host": "192.0.2.1",
+        "dongle_serial": "BA12345678",
+        "inverter_serial": "CE12345678",
+        "database_path": "/tmp/test.db",
+    }
+    base.update(overrides)
+    return Config(**base)  # type: ignore[arg-type]
+
+
+def test_create_refuses_an_unknown_model_naming_the_known_ones() -> None:
+    config = _setup_config(driver="eg4_luxpower", model="9000GT")
+    with pytest.raises(ValueError, match="18kPV"):
+        drivers.create(config)
+
+
+def test_create_refuses_direct_battery_source_for_now() -> None:
+    config = _setup_config(driver="eg4_luxpower", battery_source="direct")
+    with pytest.raises(ValueError, match="not yet"):
+        drivers.create(config)
+
+
+def test_create_refuses_relayed_when_the_family_relays_nothing() -> None:
+    # No current driver has relays_battery=False, so pin the rule with a
+    # temporary entry. Reaching into the registry dict for cleanup is uglier
+    # than an unregister function and better than shipping one nobody needs.
+    from dataclasses import replace as dc_replace
+
+    fake_entry = drivers.get("fake")
+    entry = DriverEntry(
+        name="norelay",
+        description="test-only",
+        capabilities=dc_replace(fake_entry.capabilities, relays_battery=False),
+        build=fake_entry.build,
+        manufacturer="Test",
+        models=(ModelSpec(name="One"),),
+    )
+    drivers.register(entry)
+    try:
+        config = _setup_config(driver="norelay", battery_source="relayed")
+        with pytest.raises(ValueError, match="does not relay"):
+            drivers.create(config)
+    finally:
+        drivers._REGISTRY.pop("norelay", None)
+
+
+def test_a_built_source_reports_the_models_cited_capabilities() -> None:
+    config = _setup_config(driver="eg4_luxpower", model="18kPV", transport="dongle")
+    source = drivers.create(config)
+    assert source.capabilities.pv_strings == 3

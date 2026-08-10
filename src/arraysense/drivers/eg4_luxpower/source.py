@@ -66,6 +66,7 @@ from arraysense.drivers.base import (
     ModelSpec,
     SampleBuildError,
     expand_module_metrics,
+    resolve_model,
 )
 from arraysense.models import BatteryModuleSample, Sample
 
@@ -445,6 +446,14 @@ MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(name="6000XP"),
     ModelSpec(name="12kPV"),
 )
+
+
+def find_model_by_name(name: str) -> ModelSpec:
+    """The module's own model lookup, so the source needs no registry import."""
+    for model in MODELS:
+        if model.name == name:
+            return model
+    raise ValueError(f"no model {name!r} in this family")
 
 
 def _reading(source: object, attribute: str) -> float | None:
@@ -1106,7 +1115,10 @@ class Eg4LuxPowerSource:
         page telling somebody they are connected by dongle over a serial link
         would be worse than telling them nothing.
         """
-        return replace(CAPABILITIES, transport=self._config.transport)
+        declared = CAPABILITIES
+        if self._config.model:
+            declared = resolve_model(declared, find_model_by_name(self._config.model))
+        return replace(declared, transport=self._config.transport)
 
     async def connect(self) -> None:
         """Claim the inverter's single client slot, if it is not already held.
