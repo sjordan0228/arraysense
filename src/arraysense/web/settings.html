@@ -1373,19 +1373,25 @@ function applyDisplay(values) {
 // back, so the redacted current values show what was just set.
 async function applyConnection(body, ui) {
   ui.status('Saving and restarting the collector…', 'busy');
-  let reply;
   try {
-    const r = await fetch('/api/setup/apply', {
+    const r = await fetchTimeout('/api/setup/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
-    reply = await r.json().catch(() => ({}));
-    if (!r.ok) { ui.status(reply.detail || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+    }, 20000);
+    const reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(problemText(reply.detail) || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
   } catch (e) {
     ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
   }
-  ui.status('Saved. The collector is restarting to apply the change; the page will refresh.', 'ok');
-  setTimeout(() => location.reload(), 5000);
+  // The collector restarts, so /api/status goes quiet and comes back; refresh
+  // only once it has, rather than after a blind delay that could land on the
+  // outage. If it never reports ready, the form comes back rather than a reload
+  // onto a connection-error page.
+  ui.status('Saved. The collector is restarting; the page refreshes when it is back.', 'ok');
+  watchRestart(
+    () => location.reload(),
+    () => { ui.status('Saved, but the collector did not report ready. Reload to check its state.', 'warn'); ui.reenable(); },
+  );
 }
 
 async function load() {

@@ -2367,6 +2367,66 @@ def test_detect_gives_the_wire_back_after_borrowing_it(client: Any, monkeypatch:
     assert status["yielding"] is False
 
 
+def test_detect_fills_a_masked_connection_from_the_current_config(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The settings page prefills the connection redacted. A Detect that did not
+    # retype the secrets must probe the configured connection, not literally dial
+    # a bullet-filled host — so the server substitutes the real values from the
+    # config the collector runs on before the probe.
+    from arraysense.api import routes
+
+    seen: dict[str, str] = {}
+
+    async def fake_probe(body: Any) -> str:
+        seen["host"] = body.dongle_host
+        seen["serial"] = body.dongle_serial
+        seen["inverter"] = body.inverter_serial
+        return "CE12345678"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    cfg = client.app.state.config
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "1•••9",
+            "dongle_serial": "B•••s",
+            "inverter_serial": "C•••i",
+        },
+    )
+    assert r.status_code == 200
+    assert seen["host"] == cfg.dongle_host
+    assert seen["serial"] == cfg.dongle_serial
+    assert seen["inverter"] == cfg.inverter_serial
+    assert "•" not in seen["host"]
+
+
+def test_detect_uses_retyped_connection_values_as_given(client: Any, monkeypatch: Any) -> None:
+    # A value the person actually retyped carries no mask and is used verbatim,
+    # so a Detect against a new connection probes what was typed, not the old one.
+    from arraysense.api import routes
+
+    seen: dict[str, str] = {}
+
+    async def fake_probe(body: Any) -> str:
+        seen["host"] = body.dongle_host
+        return "CE12345678"
+
+    monkeypatch.setattr(routes, "_probe_serial", fake_probe)
+    r = client.post(
+        "/api/setup/detect",
+        json={
+            "transport": "dongle",
+            "dongle_host": "192.0.2.50",
+            "dongle_serial": "BA99999999",
+            "inverter_serial": "CE99999999",
+        },
+    )
+    assert r.status_code == 200
+    assert seen["host"] == "192.0.2.50"
+
+
 def test_apply_refuses_an_invalid_combination_without_writing(
     client: Any, monkeypatch: Any
 ) -> None:

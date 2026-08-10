@@ -44,7 +44,7 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
-from arraysense.config import effective
+from arraysense.config import Config, effective
 from arraysense.costs import (
     band_intervals,
     bucket_energy,
@@ -1588,9 +1588,35 @@ async def run_detect(body: DetectRequest, service: CollectorService | None) -> d
     return {"serial": serial}
 
 
+def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
+    """Probe the configured connection when its secrets were not retyped.
+
+    The settings page prefills the connection with redacted values, so a Detect
+    on an unchanged connection would otherwise carry bullet-filled host and
+    serials and always fail to connect or authenticate. A masked field means
+    "use what is already configured", so the real value from the effective config
+    the collector runs on is substituted before the probe. First-run never
+    reaches here with a mask — its form starts empty — so this only ever fills
+    from a real configuration.
+    """
+    updates: dict[str, str] = {}
+    for field, current in (
+        ("dongle_host", config.dongle_host),
+        ("dongle_serial", config.dongle_serial),
+        ("inverter_serial", config.inverter_serial),
+    ):
+        value = getattr(body, field)
+        if isinstance(value, str) and "\N{BULLET}" in value:
+            updates[field] = current
+    return body.model_copy(update=updates) if updates else body
+
+
 @router.post("/setup/detect")
 async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
     """Read the inverter's serial off a candidate connection. Writes nothing."""
+    file_config = getattr(request.app.state, "file_config", None) or request.app.state.config
+    settings = SettingsStore(request.app.state.store)
+    body = _fill_masked_detect(body, effective(file_config, settings))
     return await run_detect(body, getattr(request.app.state, "service", None))
 
 

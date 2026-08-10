@@ -1608,30 +1608,24 @@ function showWizard(payload) {
 // spinning forever.
 async function applyAndWatch(body, ui) {
   ui.status('Writing the configuration and restarting the collector…', 'busy');
-  let reply;
   try {
-    const r = await fetch('/api/setup/apply', {
+    const r = await fetchTimeout('/api/setup/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
-    reply = await r.json().catch(() => ({}));
-    if (!r.ok) { ui.status(reply.detail || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+    }, 20000);
+    const reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(problemText(reply.detail) || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
   } catch (e) {
     ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
   }
   ui.status('Restarting… the dashboard opens as soon as the collector is up.', 'busy');
-  const deadline = Date.now() + 60000;
-  const poll = async () => {
-    try {
-      const s = await fetch('/api/status');
-      // /api/status does not exist in setup mode, so an ok answer means the
-      // service has come back in normal mode with the config just written.
-      if (s.ok) { location.assign('/'); return; }
-    } catch (e) { /* mid-restart; keep waiting */ }
-    if (Date.now() < deadline) setTimeout(poll, 2000);
-    else { ui.status('The collector did not report ready. Check the connection and try again.', 'warn'); ui.reenable(); }
-  };
-  setTimeout(poll, 2500);
+  // watchRestart waits for the service to go quiet and answer again — in setup
+  // mode /api/status starts absent, so the first ok answer is the restarted,
+  // now-configured service. A timeout hands the form back rather than spinning.
+  watchRestart(
+    () => location.assign('/'),
+    () => { ui.status('The collector did not report ready. Check the connection and try again.', 'warn'); ui.reenable(); },
+  );
 }
 
 // Boot. Everything above is definitions; nothing runs until here. The display

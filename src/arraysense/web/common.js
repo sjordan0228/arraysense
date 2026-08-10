@@ -1576,6 +1576,61 @@ function paint(id, spec, data) {
   fit(wrap, held.u, spec.height);
 }
 
+// A fetch that cannot hang forever. A dongle behind a dead proxy can accept a
+// connection and never answer, and a restart watch or an apply that awaits such
+// a fetch would leave the button disabled with no way back. The abort turns a
+// silent hang into a caught error the caller can report.
+function fetchTimeout(url, options, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms || 8000);
+  return fetch(url, { ...(options || {}), signal: controller.signal })
+    .finally(() => clearTimeout(timer));
+}
+
+// The message under a rejection, whatever shape it came in. A validation error
+// from the framework is a list of {loc, msg}, and printing that list as-is put
+// "[object Object]" on the form where the reason should be. A plain string is
+// the service's own worded refusal and passes straight through.
+function problemText(detail) {
+  if (typeof detail === 'string') return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((d) => (d && d.msg) ? d.msg : String(d)).join('; ') || 'the value was refused';
+  }
+  return 'the value was refused';
+}
+
+// Watch the collector come back after a save-and-restart, for both shells. The
+// service SIGTERMs itself and systemd restarts it, so /api/status goes away and
+// then answers again — and in first-run setup mode it did not exist to begin
+// with, which is the same "not up yet" as a process mid-restart. Ready is
+// therefore "reachable again after having been unreachable", never the first
+// reachable poll (on the settings page the old process is still answering for
+// the moment before it exits). A deadline hands the form back rather than
+// spinning forever, and each poll is time-boxed so one hung request cannot stall
+// the whole watch.
+function watchRestart(onReady, onGiveUp) {
+  const deadline = Date.now() + 90000;
+  let sawDown = false;
+  const poll = async () => {
+    let up = false;
+    try {
+      const r = await fetchTimeout('/api/status', { cache: 'no-store' }, 4000);
+      up = r.ok;
+    } catch (e) {
+      up = false;
+    }
+    if (!up) {
+      sawDown = true;
+    } else if (sawDown) {
+      onReady();
+      return;
+    }
+    if (Date.now() < deadline) setTimeout(poll, 1500);
+    else onGiveUp();
+  };
+  setTimeout(poll, 800);
+}
+
 // ---------------------------------------------------------------------------
 // The setup renderer. One component, two shells: the first-run wizard mounts it
 // full-screen, the settings page mounts it as the Connection group. It draws the
@@ -1619,7 +1674,6 @@ function mountSetup(host, payload, opts) {
     serial_baud: !firstRun && cur.serial_baud ? cur.serial_baud : 19200,
     serial_unit_id: !firstRun && cur.serial_unit_id ? cur.serial_unit_id : 1,
     dongle_host: !firstRun ? (cur.dongle_host || '') : '',
-    dongle_port: !firstRun && cur.dongle_port ? cur.dongle_port : 8000,
     dongle_serial: !firstRun ? (cur.dongle_serial || '') : '',
     inverter_serial: !firstRun ? (cur.inverter_serial || '') : '',
     battery_source: !firstRun && cur.battery_source ? cur.battery_source : '',
@@ -1641,9 +1695,11 @@ function mountSetup(host, payload, opts) {
   };
   const ports = (payload && payload.ports) || [];
 
-  function numRow(key, label, hint) {
+  function numRow(key, label, hint, min, max) {
+    const lo = min === undefined ? '' : ` min="${esc(String(min))}"`;
+    const hi = max === undefined ? '' : ` max="${esc(String(max))}"`;
     return `<div class="row"><label for="su_${key}">${esc(label)}</label>
-      <input id="su_${key}" data-k="${key}" type="number" inputmode="numeric"
+      <input id="su_${key}" data-k="${key}" type="number" inputmode="numeric" step="1"${lo}${hi}
         value="${esc(String(state[key]))}">
       <span class="hint">${esc(hint)}</span></div>`;
   }
@@ -1666,15 +1722,16 @@ function mountSetup(host, payload, opts) {
         ports.length ? 'Pick a detected adapter or type a path. A /dev/serial/by-id path survives replugging.'
           : 'The device path for the RS485 adapter, e.g. /dev/ttyUSB0.', list) + datalist
         + `<details class="adv"><summary>Advanced serial settings</summary><div class="fields">`
-        + numRow('serial_baud', 'Baud rate', '19200 is the LuxPower default.')
-        + numRow('serial_unit_id', 'Modbus unit id', 'Which unit answers on the bus. Usually 1.')
+        + numRow('serial_baud', 'Baud rate', '19200 is the LuxPower default.', 1, 1000000)
+        + numRow('serial_unit_id', 'Modbus unit id', 'Which unit answers on the bus. Usually 1.', 1, 247)
         + `</div></details>`;
     }
+    // The dongle port is deliberately not offered: it is 8000 on current
+    // firmware, is not among the fields the settings overlay accepts, and a box
+    // that silently discarded its edits would be worse than its absence. A
+    // non-standard port is set in the config file, the one place it takes.
     return textRow('dongle_host', 'Dongle address', 'The IP address or hostname of the WiFi dongle.')
-      + textRow('dongle_serial', 'Dongle serial', 'Printed on the dongle, e.g. BA12345678.')
-      + `<details class="adv"><summary>Advanced dongle settings</summary><div class="fields">`
-      + numRow('dongle_port', 'Port', '8000 on current firmware.')
-      + `</div></details>`;
+      + textRow('dongle_serial', 'Dongle serial', 'Printed on the dongle, e.g. BA12345678.');
   }
 
   function render() {
@@ -1763,12 +1820,12 @@ function mountSetup(host, payload, opts) {
     btn.disabled = true;
     status('Reading the inverter’s serial…', 'busy');
     try {
-      const r = await fetch('/api/setup/detect', {
+      const r = await fetchTimeout('/api/setup/detect', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildSetupBody(state)),
-      });
+      }, 20000);
       const body = await r.json().catch(() => ({}));
-      if (!r.ok) { status(body.detail || `The probe failed (${r.status}).`, 'bad'); return; }
+      if (!r.ok) { status(problemText(body.detail) || `The probe failed (${r.status}).`, 'bad'); return; }
       if (body.serial) {
         state.inverter_serial = body.serial;
         const input = host.querySelector('[data-k="inverter_serial"]');
