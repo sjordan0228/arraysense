@@ -2209,3 +2209,84 @@ def test_the_battery_block_is_present_even_with_nothing_to_report(empty_client: 
     body = empty_client.get("/api/live").json()
     assert "battery" in body
     assert body["battery"]["rate_pct_per_hour"] is None
+
+
+# --- tier-scanning reads run off the event loop, on their own connections (#63)
+
+
+def test_tier_scanning_endpoints_are_not_coroutines() -> None:
+    # The whole fix. As async def, these ran synchronous SQLite on the event
+    # loop: /api/calibration measured 1.6 to 3.2 seconds on the production Pi,
+    # and every concurrent response — status, static pages, everything — waited
+    # for it, on the dashboard's own sixty-second refresh timer. A plain def is
+    # what makes FastAPI run the handler in its threadpool, so this pins the
+    # property the stall fix depends on. If one of these needs to become async
+    # again, its queries must move off the loop some other way first.
+    import asyncio
+
+    from arraysense.api import routes
+
+    for handler in (
+        routes.live,
+        routes.calibration,
+        routes.costs,
+        routes.history,
+        routes.battery_history,
+        routes.energy,
+        routes.bands,
+    ):
+        assert not asyncio.iscoroutinefunction(handler), (
+            f"{handler.__name__} is async again: its synchronous queries would "
+            "run on the event loop and block every concurrent response"
+        )
+
+
+def test_a_read_view_gets_its_own_connection_and_closing_it_spares_the_store(
+    tmp_path: Path,
+) -> None:
+    # A reader on its own connection sees zero interference from writers under
+    # WAL — measured on both reference filesystems — and that only holds if the
+    # view really is its own connection, and its cleanup really does leave the
+    # store's primary alone.
+    store = SqliteStore(str(tmp_path / "view.db"), device=TEST_DEVICE)
+    now = datetime.now(tz=UTC)
+    store.append(Sample(timestamp=now, readings={"battery_voltage_v": 55.9}))
+    with store.read_view() as view:
+        assert view._conn is not store._conn
+        rows = view.query(["battery_voltage_v"], now, now)
+        assert rows[0]["battery_voltage_v"] == 55.9
+    # the view is closed; the store must still work
+    store.append(Sample(timestamp=now + timedelta(seconds=11), readings={}))
+    store.close()
+
+
+def test_a_memory_backed_store_serves_reads_from_itself(tmp_path: Path) -> None:
+    # ":memory:" cannot be reopened — every connect() makes a new empty
+    # database — so the view is the store, and leaving the block must not
+    # close the one connection everything shares.
+    store = SqliteStore(":memory:", device=TEST_DEVICE)
+    with store.read_view() as view:
+        assert view is store
+    store.append(Sample(timestamp=datetime.now(tz=UTC), readings={}))
+    store.close()
+
+
+def test_every_connection_carries_the_configured_durability(tmp_path: Path) -> None:
+    # 0.6.10 made durability a deployment choice, and the choice used to reach
+    # only the primary connection: a store configured "normal" ran its
+    # maintenance passes at the distro default of FULL, fsyncing flash once a
+    # minute for a guarantee the owner had traded away. 1 is NORMAL, 2 is FULL.
+    store = SqliteStore(str(tmp_path / "sync.db"), device=TEST_DEVICE, synchronous="normal")
+    maintenance = store.maintenance_connection()
+    with store.read_view() as view:
+        assert view._conn.execute("PRAGMA synchronous").fetchone() == (1,)
+    assert store._conn.execute("PRAGMA synchronous").fetchone() == (1,)
+    assert maintenance.execute("PRAGMA synchronous").fetchone() == (1,)
+    maintenance.close()
+    store.close()
+
+    unchanged = SqliteStore(str(tmp_path / "full.db"), device=TEST_DEVICE)
+    kept = unchanged.maintenance_connection()
+    assert kept.execute("PRAGMA synchronous").fetchone() == (2,)
+    kept.close()
+    unchanged.close()
