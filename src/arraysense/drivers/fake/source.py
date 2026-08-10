@@ -75,6 +75,8 @@ CAPABILITIES = Capabilities(
     metrics=frozenset(_READINGS) | expand_module_metrics(_MODULE_TEMPLATES),
     split_phase=True,
     per_module_battery=True,
+    relays_battery=True,
+    battery_module_slots=4,
 )
 
 

@@ -183,6 +183,16 @@ class Capabilities:
     # Whether the device reports each battery module separately, or only a
     # bank-level summary. Per-pack drift is invisible in the summary.
     per_module_battery: bool = False
+    # Whether this family relays BMS data through its own connection at all.
+    # per_module_battery says how deep the relay goes; this says whether it
+    # exists. A family that relays nothing can only offer battery_source
+    # "none", and the setup endpoint derives its choices from exactly this.
+    relays_battery: bool = False
+    # How many battery module slots the relay can carry. The registry expands
+    # per-module metric names to a fixed ceiling because it cannot import the
+    # drivers that import it; this is the per-family truth pages should render
+    # from. Must not exceed the registry's expansion — a test enforces it.
+    battery_module_slots: int = 0
     # How the driver reaches the inverter: "dongle" for the WiFi dongle's TCP
     # port, "modbus_serial" for a USB-to-RS485 adapter. This is a constant for
     # a given installation. The registry entry carries the family default; a

@@ -428,6 +428,8 @@ CAPABILITIES = Capabilities(
     split_phase=True,
     parallel_capable=True,
     per_module_battery=True,
+    relays_battery=True,
+    battery_module_slots=4,
     transport="dongle",
 )
 

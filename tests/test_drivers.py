@@ -31,7 +31,7 @@ from arraysense.drivers.base import (
     InverterSource,
     expand_module_metrics,
 )
-from arraysense.metrics import column_names
+from arraysense.metrics import _MODULE_SLOTS, column_names
 from arraysense.models import BatteryModuleSample
 
 
@@ -198,6 +198,32 @@ def test_declaring_no_module_templates_is_not_an_error() -> None:
 def test_a_negative_string_count_is_refused() -> None:
     with pytest.raises(ValueError, match="pv_strings"):
         Capabilities(pv_strings=-1, energy=EnergyReporting.COUNTED, metrics=frozenset())
+
+
+def test_capabilities_declare_the_battery_axis() -> None:
+    # The battery used to be one boolean on the inverter. The axis needs two
+    # more facts: whether this family relays BMS data at all, and how many
+    # module slots the relay can carry.
+    caps = Capabilities(
+        pv_strings=1,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset(),
+        relays_battery=False,
+        battery_module_slots=0,
+    )
+    assert caps.relays_battery is False
+    assert caps.battery_module_slots == 0
+
+
+def test_no_driver_declares_more_module_slots_than_the_registry_expands() -> None:
+    # The registry expands battery_module1..N names at import time and cannot
+    # ask the drivers (they import it). _MODULE_SLOTS is therefore a ceiling:
+    # raising a driver's declaration past it means raising the ceiling and the
+    # schema with it, deliberately, not silently.
+    for entry in drivers.entries():
+        assert entry.capabilities.battery_module_slots <= _MODULE_SLOTS, (
+            f"{entry.name} declares more module slots than the registry expands"
+        )
 
 
 # --- identity ---------------------------------------------------------------
