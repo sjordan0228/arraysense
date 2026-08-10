@@ -316,11 +316,13 @@ function setupBatterySourcesFor(payload, driver) {
 }
 
 // The apply body: only the connection keys, only the ones with a real value.
-// serial_* and dongle_* ride only when their transport needs them, so a dongle
-// install never sends a serial_device the server would ignore and a serial
-// install never sends a dongle_host. An empty string is dropped — it means
-// "leave the file or overlay as it is", never "set this to blank", which is the
-// same rule the settings overlay follows when it merges over the file.
+// The transport-specific fields ride only when their transport needs them, so a
+// dongle install never sends a serial_device the server would ignore and a
+// serial install never sends a dongle_host. The dongle port is deliberately not
+// among them — it is not offered on the form (8000 by default, set in the config
+// file when it differs), so it never reaches here. An empty string is dropped:
+// it means "leave the file or overlay as it is", never "set this to blank",
+// which is the same rule the settings overlay follows when it merges the file.
 function buildSetupBody(s) {
   const body = {};
   const put = (k, v) => {
@@ -339,7 +341,6 @@ function buildSetupBody(s) {
   } else if (s.transport === 'dongle') {
     put('dongle_host', s.dongle_host);
     put('dongle_serial', s.dongle_serial);
-    put('dongle_port', s.dongle_port);
   }
   return body;
 }

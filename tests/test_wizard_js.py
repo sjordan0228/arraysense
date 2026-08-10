@@ -121,6 +121,8 @@ def test_body_sends_only_the_transport_it_uses() -> None:
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_body_sends_the_dongle_fields_on_a_dongle() -> None:
+    # The dongle port is not a form field, so it never appears in the body even
+    # when the state carries a stray one — 8000 is the server's default.
     state = (
         'const s = {driver:"eg4_luxpower", model:"18kPV", transport:"dongle", '
         'dongle_host:"192.0.2.1", dongle_serial:"BA00000000", dongle_port:8000, '
@@ -128,5 +130,5 @@ def test_body_sends_the_dongle_fields_on_a_dongle() -> None:
     )
     out = _run(PAYLOAD + state + "console.log(Object.keys(buildSetupBody(s)).sort().join(','));")
     assert out == (
-        "battery_source,dongle_host,dongle_port,dongle_serial,driver,inverter_serial,model,transport"
+        "battery_source,dongle_host,dongle_serial,driver,inverter_serial,model,transport"
     )
