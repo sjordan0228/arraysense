@@ -42,7 +42,7 @@ def test_the_payload_carries_the_tree_requirements_and_choices() -> None:
     payload = describe_setup(_config(model="18kPV"))
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     names = [model["name"] for model in eg4["models"]]
-    assert names == ["18kPV", "6000XP", "12kPV"]
+    assert names == ["18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18", "6000XP"]
     assert payload["transports"]["modbus_serial"] == ["serial_device"]
     assert payload["transports"]["dongle"] == ["dongle_host", "dongle_serial"]
     assert payload["current"]["model"] == "18kPV"
@@ -53,9 +53,39 @@ def test_model_deltas_declare_their_citation_status() -> None:
     payload = describe_setup(_config())
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     cited = next(m for m in eg4["models"] if m["name"] == "18kPV")
-    inherited = next(m for m in eg4["models"] if m["name"] == "6000XP")
+    uncited = next(m for m in eg4["models"] if m["name"] == "6000XP")
     assert cited["citation"]
-    assert inherited["citation"] == ""
+    assert cited["cited_fields"] == ["pv_strings"]
+    # The off-grid machine asserts nothing about itself: its string count is an
+    # open question upstream, so it inherits rather than claiming.
+    assert uncited["citation"] == ""
+    assert uncited["cited_fields"] == []
+
+
+def test_a_model_whose_readings_are_unproven_says_so() -> None:
+    """A caveat travels to the page, or the page presents a guess as support.
+
+    The EG4 off-grid machines answer at the same register addresses as the
+    hybrids and disagree about what several of them hold, so offering one
+    silently would put a wrong reading on a chart rather than a gap. Offering it
+    labelled is a decision the owner gets to make.
+    """
+    payload = describe_setup(_config())
+    eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
+    offgrid = next(m for m in eg4["models"] if m["name"] == "6000XP")
+    assert offgrid["caveat"], "an unproven model must carry its caveat to the page"
+
+    # Every model the payload offers has the key, so a page reads it
+    # unconditionally rather than branching on whether it happens to be there.
+    assert all("caveat" in model for model in eg4["models"])
+
+    # And a model that has been confirmed carries no caveat, or the label means
+    # nothing: FlexBOSS shares the hybrids' device type code and their
+    # live-confirmed string count.
+    for name in ("18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18"):
+        model = next(m for m in eg4["models"] if m["name"] == name)
+        assert model["caveat"] == "", f"{name} is confirmed and must carry no caveat"
+        assert model["pv_strings"] == 3
 
 
 def test_render_config_writes_a_file_load_accepts(tmp_path: Path) -> None:

@@ -81,6 +81,11 @@ def describe_setup(config: Config, dev_root: Path | str = "/dev") -> dict[str, A
                     # be able to label the difference — a cited fact and a
                     # conservative default are different claims.
                     "cited_fields": cited,
+                    # Empty for a model with nothing known against it. A page
+                    # that shows a model without showing this presents an
+                    # unproven decode as a supported one, which is the whole
+                    # reason the field exists.
+                    "caveat": model.caveat,
                     "pv_strings": resolved.pv_strings,
                     "battery_module_slots": resolved.battery_module_slots,
                 }
