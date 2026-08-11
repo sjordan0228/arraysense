@@ -167,3 +167,25 @@ def test_every_chart_container_carries_the_shared_chart_class() -> None:
             if not classes or "chart" not in classes.group(1).split():
                 offenders.append(f"{page.name}: {name}Wrap")
     assert not offenders, f"chart wrappers missing the 'chart' class: {offenders}"
+
+
+def test_every_charting_page_loads_the_uplot_stylesheet() -> None:
+    """The library draws; its stylesheet is what lays the canvas out.
+
+    uPlot sizes its canvas to logical pixels times the device pixel ratio and
+    relies on its own CSS to position it inside `.u-wrap`. Load the script
+    without the stylesheet and the canvas keeps its raw size -- twice the
+    container on a retina screen -- flows in normal document flow, and paints
+    itself across the page behind everything else. The Efficiency page shipped
+    exactly that way: the script tag was there, the link was not, so the chart
+    rendered and every gate passed while the plot sat on top of the document.
+    """
+    offenders: list[str] = []
+    for page in (Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web").glob(
+        "*.html"
+    ):
+        html = page.read_text()
+        draws = "paint(" in html or "uPlot.iife" in html
+        if draws and "uPlot.min.css" not in html:
+            offenders.append(page.name)
+    assert not offenders, f"pages drawing uPlot without its stylesheet: {offenders}"
