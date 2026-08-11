@@ -1070,6 +1070,10 @@ function detailLegs(i) {
   const l1 = numOrNull(i.eps_l1_power_w), l2 = numOrNull(i.eps_l2_power_w);
   const a1 = numOrNull(i.eps_l1_apparent_power_va), a2 = numOrNull(i.eps_l2_apparent_power_va);
   const v1 = numOrNull(i.eps_l1_voltage_v), v2 = numOrNull(i.eps_l2_voltage_v);
+  // The legs are a pair with each half meaningful on its own — a single-phase
+  // backup still has a leg — so the block and its rows survive on either
+  // power register; the captions below are stricter about what they read.
+  const powersDeclared = capHasMetric(caps, 'eps_l1_power_w') || capHasMetric(caps, 'eps_l2_power_w');
   let cap = '';
   if (l1 !== null && l2 !== null) {
     const sum = l1 + l2, imb = Math.abs(l1 - l2);
@@ -1104,21 +1108,35 @@ function detailLegs(i) {
     const lag = f1 < f2 ? { k:'L1', w:l1, va:a1 } : { k:'L2', w:l2, va:a2 };
     pfCap += ` — ${lag.k} draws ${uStr(lag.va, 0, 'VA')} to deliver ${wStr(lag.w)}`;
   }
-  return `<div class="p"><h3>Backup legs</h3>
-    <div class="legs">
+  const legsBlock = powersDeclared ? `<div class="legs">
       <div class="leg legL">${wStr(l1)}</div>
       <div class="split">L1 · L2</div>
       <div class="leg legR">${wStr(l2)}</div>
-    </div>
-    ${capOf(cap)}
-    ${kvRow('Total', wStr(numOrNull(i.eps_power_w)))}
-    ${kvRow('Apparent total', uStr(numOrNull(i.eps_apparent_power_va), 0, 'VA'))}
-    ${kvRow('Apparent L1 · L2', a1 === null && a2 === null ? DASH
-      : `${uStr(a1, 0)} · ${uStr(a2, 0)} VA`)}
-    ${kvRow('Voltage L1 · L2', v1 === null && v2 === null ? DASH
-      : `${uStr(v1, 1)} · ${uStr(v2, 1)} V`)}
-    ${kvRow('Frequency', uStr(numOrNull(i.eps_frequency_hz), 2, 'Hz'))}
-    ${capOf(pfCap)}</div>`;
+    </div>` : '';
+  // The imbalance caption needs both legs, and the power-factor caption the
+  // apparent pair as well; a caption explaining figures that are not on
+  // screen is the empty card this gating exists to remove.
+  const rows =
+    capRow(caps, 'eps_power_w', 'Total', wStr(numOrNull(i.eps_power_w)))
+    + capRow(caps, 'eps_apparent_power_va', 'Apparent total',
+        uStr(numOrNull(i.eps_apparent_power_va), 0, 'VA'))
+    + pairRow(capParts(caps, [
+        { metric: 'eps_l1_apparent_power_va', label: 'L1', v: a1 },
+        { metric: 'eps_l2_apparent_power_va', label: 'L2', v: a2 },
+      ]), 'Apparent', (v) => uStr(v, 0), 'VA')
+    + pairRow(capParts(caps, [
+        { metric: 'eps_l1_voltage_v', label: 'L1', v: v1 },
+        { metric: 'eps_l2_voltage_v', label: 'L2', v: v2 },
+      ]), 'Voltage', (v) => uStr(v, 1), 'V')
+    + capRow(caps, 'eps_frequency_hz', 'Frequency',
+        uStr(numOrNull(i.eps_frequency_hz), 2, 'Hz'));
+  const body = `${legsBlock}
+    ${capHasMetric(caps, 'eps_l1_power_w') && capHasMetric(caps, 'eps_l2_power_w') ? capOf(cap) : ''}
+    ${rows}
+    ${capHasMetric(caps, 'eps_l1_power_w') && capHasMetric(caps, 'eps_l2_power_w')
+        && capHasMetric(caps, 'eps_l1_apparent_power_va') && capHasMetric(caps, 'eps_l2_apparent_power_va')
+        ? capOf(pfCap) : ''}`;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Backup legs</h3>${body}</div>`;
 }
 
 // Full scale for the heatsink bars, in Celsius. The conversion for display
@@ -1147,16 +1165,30 @@ function detailHeat(i) {
   // The rows label the bars in the order they are drawn — the two radiators,
   // then the two readings taken inside the case — so a pair with nothing in it
   // collapses to a single dash rather than to a unit with no number under it.
-  const pair = (a, b) => a === null && b === null ? DASH
-    : `${one(a)} · ${one(b)} °${settings.tempUnit}`;
   const spread = r1 !== null && r2 !== null
     ? `Heatsinks ${tempDeltaStr(Math.abs(r1 - r2))} apart. ` : '';
-  return `<div class="p"><h3>Inverter Temp</h3>
-    <div class="pairbar">${bar(r1, hot)}${bar(r2, hot)}${bar(inner, cool)}${bar(board, cool)}</div>
-    ${kvRow('H1 · H2', pair(r1, r2))}
-    ${kvRow('Internal · board', pair(inner, board))}
-    ${capOf(spread)}
-    </div>`;
+  // Each bar survives only when its own sensor exists; the pairbar wrapper
+  // only when at least one does, so a device with no declared sensors cannot
+  // leave an empty bar area under the heading.
+  const bars =
+    (capHasMetric(caps, 'radiator1_temperature_c') ? bar(r1, hot) : '')
+    + (capHasMetric(caps, 'radiator2_temperature_c') ? bar(r2, hot) : '')
+    + (capHasMetric(caps, 'inverter_temperature_c') ? bar(inner, cool) : '')
+    + (capHasMetric(caps, 'board_temperature_c') ? bar(board, cool) : '');
+  const body = `
+    ${bars ? `<div class="pairbar">${bars}</div>` : ''}
+    ${pairRow(capParts(caps, [
+        { metric: 'radiator1_temperature_c', label: 'H1', v: r1 },
+        { metric: 'radiator2_temperature_c', label: 'H2', v: r2 },
+      ]), '', one, `°${settings.tempUnit}`)}
+    ${pairRow(capParts(caps, [
+        { metric: 'inverter_temperature_c', label: 'Internal', v: inner },
+        { metric: 'board_temperature_c', label: 'board', v: board },
+      ]), '', one, `°${settings.tempUnit}`)}
+    ${capHasMetric(caps, 'radiator1_temperature_c') && capHasMetric(caps, 'radiator2_temperature_c')
+        ? capOf(spread) : ''}
+    `;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Inverter Temp</h3>${body}</div>`;
 }
 
 // The BMS measures at the cells and the inverter at its own terminals, so the
@@ -1168,10 +1200,16 @@ function detailDrop(i) {
   const d = bms !== null && inv !== null ? Math.abs(inv - bms) : null;
   const head = d === null ? '' : `<div class="delta"><em>${uStr(d, 1, 'V')}</em>
     <span class="lbl">between BMS and inverter</span></div>`;
-  return `<div class="p"><h3>Cable drop</h3>${head}
-    ${kvRow('At the cells', uStr(bms, 1, 'V'))}
-    ${kvRow('At the terminals', uStr(inv, 1, 'V'))}
-    ${d === null ? '' : capOf('Watch this widen under load — that points at a lug or a busbar')}</div>`;
+  // The headline delta and the closing caption are both the difference
+  // between the two readings, so they disappear unless both ends exist.
+  const both = capHasMetric(caps, 'battery_voltage_v') && capHasMetric(caps, 'battery_voltage_inv_sample_v');
+  const body = `
+    ${both ? head : ''}
+    ${capRow(caps, 'battery_voltage_v', 'At the cells', uStr(bms, 1, 'V'))}
+    ${capRow(caps, 'battery_voltage_inv_sample_v', 'At the terminals', uStr(inv, 1, 'V'))}
+    ${both && d !== null ? capOf('Watch this widen under load — that points at a lug or a busbar') : ''}
+    `;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Cable drop</h3>${body}</div>`;
 }
 
 // State of charge as a percentage hides how much energy that is, and hides
@@ -1245,26 +1283,41 @@ function detailEnergy(i, mods) {
       + `${gnum(mods.length, 0)} packs are listed — `
       + `${gone === 1 ? 'one pack is not answering' : `${gnum(gone, 0)} packs are not answering`}`
     : '';
-  const health = soh === null && cycles === null ? DASH
-    : `${soh === null ? DASH : gnum(Math.round(soh), 0) + '%'} / ${
-        cycles === null ? DASH : gnum(Math.round(cycles), 0)}`;
-  return `<div class="p"><h3>Energy</h3>
-    <div class="delta"><em>${qty(rem)}</em>
+  // The headline and the bar are the same pair of readings — what is left and
+  // what the bank holds — so both ends must exist before either is drawn.
+  const head = capHasMetric(caps, 'battery_remaining_capacity_ah') && capHasMetric(caps, 'battery_full_capacity_ah')
+    ? `<div class="delta"><em>${qty(rem)}</em>
       <span class="lbl">${full === null ? 'Ah in the bank' : `of ${qty(full)} Ah`}</span></div>
-    <div class="bar${pct === null ? ' none' : ''}" style="margin-top:8px">${fill}</div>
-    <div style="margin-top:7px">
-      ${kvRow('Per pack', perPack)}
-      ${kvRow('Current', uStr(cur, 1, 'A'))}
-      ${kvRow('Health / cycles', health)}
-      ${kvRow('Modules', n === null ? DASH : gnum(n, 0), short ? 'warn' : '')}
-      ${kvRow('Cell high', uStr(cellHi, 3, 'V'))}
-      ${kvRow('Cell low', uStr(cellLo, 3, 'V'))}
-      ${kvRow('Cell spread', mv === null ? DASH : `${gnum(mv, 0)} mV`, wide ? 'warn' : '')}
-      ${kvRow('Cell hottest', tempStr(cellHot))}
-      ${kvRow('Cell coldest', tempStr(cellCold))}
-      ${kvRow('Temperature spread', dt === null ? DASH : tempDeltaStr(dt))}
-    </div>
-    ${capOf(cap)}${capOf(cellCap)}${capOf(countCap)}</div>`;
+    <div class="bar${pct === null ? ' none' : ''}" style="margin-top:8px">${fill}</div>`
+    : '';
+  // The spreads are differences and need both ends; the pairs whose halves are
+  // each meaningful on their own — health / cycles — survive on either one,
+  // the missing half drawn as the dash the value logic already produces.
+  const rows =
+    (capHasModuleMetric(caps, 'remaining_capacity_ah') ? kvRow('Per pack', perPack) : '')
+    + capRow(caps, 'battery_current_a', 'Current', uStr(cur, 1, 'A'))
+    + pairRow(capParts(caps, [
+        { metric: 'battery_soh_pct', label: 'Health', v: soh,
+          fmt: (v) => gnum(Math.round(v), 0) + '%' },
+        { metric: 'battery_cycle_count', label: 'cycles', v: cycles,
+          fmt: (v) => gnum(Math.round(v), 0) },
+      ]), '', null, '', ' / ')
+    + capRow(caps, 'battery_module_count', 'Modules', n === null ? DASH : gnum(n, 0), short ? 'warn' : '')
+    + capRow(caps, 'battery_max_cell_voltage_v', 'Cell high', uStr(cellHi, 3, 'V'))
+    + capRow(caps, 'battery_min_cell_voltage_v', 'Cell low', uStr(cellLo, 3, 'V'))
+    + capRow(caps, ['battery_max_cell_voltage_v', 'battery_min_cell_voltage_v'],
+        'Cell spread', mv === null ? DASH : `${gnum(mv, 0)} mV`, wide ? 'warn' : '')
+    + capRow(caps, 'battery_temperature_c', 'Cell hottest', tempStr(cellHot))
+    + capRow(caps, 'battery_min_cell_temperature_c', 'Cell coldest', tempStr(cellCold))
+    + capRow(caps, ['battery_temperature_c', 'battery_min_cell_temperature_c'],
+        'Temperature spread', dt === null ? DASH : tempDeltaStr(dt));
+  const body = `
+    ${head}
+    ${rows ? `<div style="margin-top:7px">${rows}</div>` : ''}
+    ${capHasModuleMetric(caps, 'remaining_capacity_ah') ? capOf(cap) : ''}
+    ${capHasMetric(caps, 'battery_max_cell_voltage_v') && capHasMetric(caps, 'battery_min_cell_voltage_v') ? capOf(cellCap) : ''}
+    ${capHasMetric(caps, 'battery_module_count') ? capOf(countCap) : ''}`;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Energy</h3>${body}</div>`;
 }
 
 function detailBms(i) {
@@ -1278,49 +1331,60 @@ function detailBms(i) {
   const force = flagOf(i.bms_force_charge);
   const forcePill = force === null ? '<span class="pill q">Unknown</span>'
     : force ? '<span class="pill w">Requested</span>' : '<span class="pill q">Off</span>';
-  return `<div class="p"><h3>BMS</h3>
-    ${permit('Charge', i.bms_allow_charge, numOrNull(i.bms_charge_current_limit_a))}
-    ${permit('Discharge', i.bms_allow_discharge, numOrNull(i.bms_discharge_current_limit_a))}
-    <div class="kv"><u>Force charge</u>${forcePill}</div>
-    ${kvRow('Charge reference', uStr(numOrNull(i.bms_charge_voltage_ref_v), 1, 'V'))}
-    ${kvRow('Discharge cutoff', uStr(numOrNull(i.bms_discharge_cutoff_v), 1, 'V'))}
+  const body = `
+    ${capHasMetric(caps, 'bms_allow_charge')
+        ? permit('Charge', i.bms_allow_charge, numOrNull(i.bms_charge_current_limit_a)) : ''}
+    ${capHasMetric(caps, 'bms_allow_discharge')
+        ? permit('Discharge', i.bms_allow_discharge, numOrNull(i.bms_discharge_current_limit_a)) : ''}
+    ${capHasMetric(caps, 'bms_force_charge') ? `<div class="kv"><u>Force charge</u>${forcePill}</div>` : ''}
+    ${capRow(caps, 'bms_charge_voltage_ref_v', 'Charge reference', uStr(numOrNull(i.bms_charge_voltage_ref_v), 1, 'V'))}
+    ${capRow(caps, 'bms_discharge_cutoff_v', 'Discharge cutoff', uStr(numOrNull(i.bms_discharge_cutoff_v), 1, 'V'))}
     ${numOrNull(i.bms_charge_current_limit_a) === null
         && numOrNull(i.bms_discharge_current_limit_a) === null ? ''
         : capOf('Limits fall when the pack is cold or near full — that is what stalls a charge')
-      }</div>`;
+      }`;
+  return body.trim() === '' ? '' : `<div class="p"><h3>BMS</h3>${body}</div>`;
 }
 
 // Grid, AC and status hold no two numbers that mean something together, so
 // they are plain rows. A relationship panel here would be decoration.
 function detailGrid(i) {
   const l1 = numOrNull(i.grid_power_l1_w), l2 = numOrNull(i.grid_power_l2_w);
-  return `<div class="p"><h3>Grid &amp; AC</h3>
-    ${kvRow('Leg 1 / Leg 2', l1 === null && l2 === null ? DASH : `${wStr(l1)} · ${wStr(l2)}`)}
-    ${kvRow('Voltage', uStr(numOrNull(i.grid_voltage_v), 1, 'V'))}
-    ${kvRow('Frequency', uStr(numOrNull(i.grid_frequency_hz), 2, 'Hz'))}
-    ${kvRow('Power factor', uStr(numOrNull(i.power_factor), 2))}
-    ${kvRow('Inverter current', uStr(numOrNull(i.inverter_current_a), 2, 'A'))}
-    ${kvRow('Exporting to grid', wStr(numOrNull(i.inverter_power_w)))}
-    ${kvRow('Grid charging bank', wStr(numOrNull(i.rectifier_power_w)))}
-    ${kvRow('AC couple power', wStr(numOrNull(i.ac_couple_power_w)))}
-    ${capOf('Both of those are grid-direction figures and read zero on this '
-      + 'installation: nothing is sold back, and the bank charges from the array '
-      + 'rather than from the mains. Neither is the inverter idling.')}</div>`;
+  const body = `
+    ${pairRow(capParts(caps, [
+        { metric: 'grid_power_l1_w', label: 'Leg 1', v: l1 },
+        { metric: 'grid_power_l2_w', label: 'Leg 2', v: l2 },
+      ]), '', wStr, '', ' / ', ' · ')}
+    ${capRow(caps, 'grid_voltage_v', 'Voltage', uStr(numOrNull(i.grid_voltage_v), 1, 'V'))}
+    ${capRow(caps, 'grid_frequency_hz', 'Frequency', uStr(numOrNull(i.grid_frequency_hz), 2, 'Hz'))}
+    ${capRow(caps, 'power_factor', 'Power factor', uStr(numOrNull(i.power_factor), 2))}
+    ${capRow(caps, 'inverter_current_a', 'Inverter current', uStr(numOrNull(i.inverter_current_a), 2, 'A'))}
+    ${capRow(caps, 'inverter_power_w', 'Exporting to grid', wStr(numOrNull(i.inverter_power_w)))}
+    ${capRow(caps, 'rectifier_power_w', 'Grid charging bank', wStr(numOrNull(i.rectifier_power_w)))}
+    ${capRow(caps, 'ac_couple_power_w', 'AC couple power', wStr(numOrNull(i.ac_couple_power_w)))}
+    ${capHasMetric(caps, 'inverter_power_w') || capHasMetric(caps, 'rectifier_power_w')
+        ? capOf('Both of those are grid-direction figures and read zero on this '
+          + 'installation: nothing is sold back, and the bank charges from the array '
+          + 'rather than from the mains. Neither is the inverter idling.') : ''}`;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Grid &amp; AC</h3>${body}</div>`;
 }
 
 function detailStatus(i) {
   const dev = numOrNull(i.device_status);
   const run = numOrNull(i.inverter_run_time_s);
   const b1 = numOrNull(i.bus_voltage_1_v), b2 = numOrNull(i.bus_voltage_2_v);
-  return `<div class="p"><h3>Status</h3>
-    ${kvRow('Doing now', deviceStatus(dev))}
-    ${codeRow('Inverter fault', numOrNull(i.inverter_fault_code))}
-    ${codeRow('Inverter warning', numOrNull(i.inverter_warning_code))}
-    ${codeRow('Battery fault', numOrNull(i.battery_fault_code))}
-    ${codeRow('Battery warning', numOrNull(i.battery_warning_code))}
-    ${kvRow('Run time', run === null ? DASH : runtimeStr(run))}
-    ${kvRow('DC bus 1 / 2', b1 === null && b2 === null ? DASH
-      : `${uStr(b1, 1)} / ${uStr(b2, 1)} V`)}</div>`;
+  const body = `
+    ${capRow(caps, 'device_status', 'Doing now', deviceStatus(dev))}
+    ${capHasMetric(caps, 'inverter_fault_code') ? codeRow('Inverter fault', numOrNull(i.inverter_fault_code)) : ''}
+    ${capHasMetric(caps, 'inverter_warning_code') ? codeRow('Inverter warning', numOrNull(i.inverter_warning_code)) : ''}
+    ${capHasMetric(caps, 'battery_fault_code') ? codeRow('Battery fault', numOrNull(i.battery_fault_code)) : ''}
+    ${capHasMetric(caps, 'battery_warning_code') ? codeRow('Battery warning', numOrNull(i.battery_warning_code)) : ''}
+    ${capRow(caps, 'inverter_run_time_s', 'Run time', run === null ? DASH : runtimeStr(run))}
+    ${pairRow(capParts(caps, [
+        { metric: 'bus_voltage_1_v', label: '1', v: b1 },
+        { metric: 'bus_voltage_2_v', label: '2', v: b2 },
+      ]), 'DC bus', (v) => uStr(v, 1), 'V', ' / ')}`;
+  return body.trim() === '' ? '' : `<div class="p"><h3>Status</h3>${body}</div>`;
 }
 
 // Present or absent, from the declaration; the panels themselves stay
