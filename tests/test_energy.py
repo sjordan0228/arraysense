@@ -24,6 +24,8 @@ from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.energy import (
+    ENERGY_FIELDS,
+    MAX_EDGE_GAP,
     EnergyBucket,
     attribute_energy,
     bucket_edges,
@@ -903,3 +905,72 @@ def test_energy_endpoint_rejects_a_backwards_range(client: Any) -> None:
         params={"start": "2026-07-03T00:00:00Z", "end": "2026-07-01T00:00:00Z"},
     )
     assert response.status_code == 400
+
+
+# --- tier equivalence -----------------------------------------------------------
+#
+# A day's kWh telescopes — the counter at the end minus the counter at the
+# start — so the daily totals from the hourly tier must be identical to the
+# same totals from the minute tier. This test pins that property against a
+# future change that silently trades accuracy for speed.
+
+
+def test_daily_totals_are_identical_from_hourly_and_minute_tiers(
+    tmp_path: Path,
+) -> None:
+    """Daily totals from the hourly tier match those from the minute tier.
+
+    Covers normal days and the 23-hour day the US spring-forward makes, so the
+    assertion holds across the calendar shapes that matter. A single day broken
+    here would put the lie to the claim that the tier does not affect the
+    answer.
+    """
+    from arraysense.store.rollup import rebuild_inverter_hourly, rebuild_inverter_minute
+
+    zone = ZoneInfo("America/New_York")
+    # Straddling the spring-forward, which is the second Sunday of March in the
+    # US: 14 Mar 2027, a day 23 hours long.
+    start = datetime(2027, 3, 12, tzinfo=zone)
+    end = datetime(2027, 3, 16, tzinfo=zone)
+    edges = bucket_edges(start, end, "day", zone)
+
+    # Write a counter climbing 1 kWh an hour for 10 days so both tiers see the
+    # same underlying measurements.
+    samples = _counters(datetime(2027, 3, 10, tzinfo=zone), hours=24 * 10)
+    store = _store(tmp_path, samples)
+
+    # Roll up to both coarse tiers.
+    db_path = str(tmp_path / "energy.db")
+    conn = sqlite3.connect(db_path)
+    data_start = int(samples[0].timestamp.timestamp())
+    data_end = int(samples[-1].timestamp.timestamp())
+    rebuild_inverter_minute(conn, data_start, data_end)
+    rebuild_inverter_hourly(conn, data_start, data_end)
+    conn.commit()
+    conn.close()
+
+    # Read from each tier directly, widened as _counter_rows does.
+    query_start = edges[0] - MAX_EDGE_GAP
+    query_end = edges[-1] + MAX_EDGE_GAP
+    hourly_rows = store.query(list(ENERGY_FIELDS.values()), query_start, query_end, tier="hourly")
+    minute_rows = store.query(list(ENERGY_FIELDS.values()), query_start, query_end, tier="minute")
+
+    store.close()
+
+    hourly_buckets = bucket_totals(hourly_rows, edges)
+    minute_buckets = bucket_totals(minute_rows, edges)
+
+    # Same number of buckets.
+    assert len(hourly_buckets) == len(minute_buckets)
+
+    for hb, mb in zip(hourly_buckets, minute_buckets, strict=True):
+        assert hb.start == mb.start
+        assert hb.end == mb.end
+        assert hb.complete == mb.complete
+        for field in ENERGY_FIELDS:
+            hv = hb.totals.get(field)
+            mv = mb.totals.get(field)
+            if hv is None or mv is None:
+                assert hv is mv, f"{field} at {hb.start}: hourly={hv} minute={mv}"
+            else:
+                assert hv == pytest.approx(mv), f"{field} at {hb.start}: hourly={hv} minute={mv}"

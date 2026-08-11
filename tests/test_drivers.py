@@ -152,6 +152,19 @@ def test_a_string_metric_beyond_the_declared_count_is_refused() -> None:
         )
 
 
+def test_a_declared_string_with_partial_metrics_is_refused() -> None:
+    # The converse of the check above: declaring N strings but producing metrics
+    # for only some of 1..N is an error. A page rendering from /api/capabilities
+    # draws a card per declared string, so the unreported ones sit permanently
+    # blank — which is what #90 was on the fake.
+    with pytest.raises(ValueError, match="string\\(s\\) 2, 3"):
+        Capabilities(
+            pv_strings=3,
+            energy=EnergyReporting.ESTIMATED,
+            metrics=frozenset({"pv1_power_w"}),
+        )
+
+
 # --- per-module metric expansion --------------------------------------------
 
 
@@ -208,7 +221,7 @@ def test_capabilities_declare_the_battery_axis() -> None:
     # more facts: whether this family relays BMS data at all, and how many
     # module slots the relay can carry.
     caps = Capabilities(
-        pv_strings=1,
+        pv_strings=0,
         energy=EnergyReporting.COUNTED,
         metrics=frozenset(),
         relays_battery=False,
@@ -289,7 +302,7 @@ def test_resolve_model_applies_deltas_and_inherits_the_rest() -> None:
     family = Capabilities(
         pv_strings=3,
         energy=EnergyReporting.COUNTED,
-        metrics=frozenset(),
+        metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w"}),
         relays_battery=True,
         battery_module_slots=4,
     )
@@ -405,6 +418,20 @@ async def test_the_fake_returns_only_metrics_it_declared() -> None:
     assert set(sample.readings) <= caps.metrics
 
 
+async def test_the_fake_per_string_powers_sum_to_the_total() -> None:
+    # The fake's per-string powers must add up to pv_total_power_w, not
+    # contradict it. A fake that declares 3 strings and returns pv1/2/3_power_w
+    # but has them sum to something other than pv_total_power_w would render
+    # a dashboard with internally inconsistent numbers.
+    from arraysense.drivers.fake.source import _READINGS
+
+    total = _READINGS["pv_total_power_w"]
+    pv1 = _READINGS["pv1_power_w"]
+    pv2 = _READINGS["pv2_power_w"]
+    pv3 = _READINGS["pv3_power_w"]
+    assert pv1 + pv2 + pv3 == total
+
+
 # --- the configuration reaches the registry ---------------------------------
 
 
@@ -464,7 +491,7 @@ def test_an_entry_must_name_itself() -> None:
             name="  ",
             description="nothing",
             capabilities=Capabilities(
-                pv_strings=1, energy=EnergyReporting.ESTIMATED, metrics=frozenset()
+                pv_strings=0, energy=EnergyReporting.ESTIMATED, metrics=frozenset()
             ),
             build=lambda _config: drivers.create(_config),
         )
@@ -521,3 +548,16 @@ def test_a_built_source_reports_the_models_cited_capabilities() -> None:
     config = _setup_config(driver="eg4_luxpower", model="18kPV", transport="dongle")
     source = drivers.create(config)
     assert source.capabilities.pv_strings == 3
+
+
+def test_a_double_digit_string_is_still_a_string_metric() -> None:
+    # Nothing supported has ten strings, so this pins the pattern rather than a
+    # device: a single-digit match would read pv10_power_w as not-a-string,
+    # which fails open — the count check would call string 10 missing while the
+    # beyond-the-count check let it through.
+    with pytest.raises(ValueError, match="pv10_power_w"):
+        Capabilities(
+            pv_strings=3,
+            energy=EnergyReporting.ESTIMATED,
+            metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w", "pv10_power_w"}),
+        )

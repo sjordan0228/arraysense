@@ -104,26 +104,21 @@ _KWH_PLACES = 1
 _LOCALTIME = Path("/etc/localtime")
 _ZONEINFO_DIR = "/zoneinfo/"
 
-# Which tier answers which period. Both are chosen for the cost of the read
-# rather than for accuracy — the totals telescope, so a coarser tier moves at
-# most one bucket-edge's worth of energy between neighbours and never loses
-# any. Thirty days of raw is a quarter of a million rows to produce thirty
-# numbers; the minute tier is a fifth of that and is retained for a year, and
-# the hourly tier is the only one that outlives a year at all.
-_PERIOD_TIER: Mapping[Period, str] = {"day": "minute", "month": "hourly"}
+# Which tier answers which period. Both are chosen for the cost of the read.
+# A day's kWh telescopes — the counter at the end minus the counter at the
+# start — so a coarser tier moves at most one bucket-edge's worth of energy
+# between neighbours and never loses any. The minute tier read 43,000 rows to
+# produce thirty one-day numbers; the hourly tier reads roughly 720 for the
+# same answer. Both periods now prefer hourly.
+_PERIOD_TIER: Mapping[Period, str] = {"day": "hourly", "month": "hourly"}
 
-# Where to look when the preferred tier has nothing, in order. The coarse tiers
-# are rollup destinations, so a database whose rollup has not run yet has empty
-# ones, and answering "no energy" from an empty tier while the readings sit in
-# the raw table would be the worst of both.
-#
-# A daily view tries hourly before raw, which matters for history older than the
-# minute tier's year: imported history and any install past its first birthday
-# keep only the hourly tier back there, and falling straight to raw finds
-# nothing because raw is thirty days. The answer was a blank chart over data
-# that existed.
+# Where to look when the preferred tier has nothing, in order. Both fall
+# straight to raw. A database whose hourly tier is empty also has an empty
+# minute tier — both rollups run in the same maintenance pass — so skipping
+# minute costs nothing and gets the query answered from the only tier that
+# could actually have rows behind a stalled rollup.
 _FALLBACK_TIERS: Mapping[Period, tuple[str, ...]] = {
-    "day": ("hourly", "full"),
+    "day": ("full",),
     "month": ("full",),
 }
 

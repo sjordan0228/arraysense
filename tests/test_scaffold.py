@@ -163,6 +163,93 @@ def test_nothing_drawn_to_canvas_hardcodes_white() -> None:
     )
 
 
+def _css_block(common: str, name: str) -> str:
+    start = common.index(f"const {name}")
+    open_backtick = common.index("`", start)
+    return common[open_backtick + 1 : common.index("`", open_backtick + 1)]
+
+
+def test_no_rule_in_the_shared_stylesheet_hardcodes_a_theme_surface() -> None:
+    # Light mode was unreadable where a rule painted a fixed dark-theme colour
+    # — a white tint, or a near-black fill — because a literal does not invert
+    # with the theme. Token declarations (--foo:rgba(...)) are exactly where a
+    # themed colour belongs and are declared in both themes, so this strips
+    # every one and demands the rule bodies left behind contain no white tint
+    # and no near-black background.
+    common = _web("common.js")
+    stylesheet = _css_block(common, "LIGHT_TOKENS") + "\n" + _css_block(common, "BASE_CSS")
+    declared = _strip_token_declarations(stylesheet)
+    assert not _WHITE_TINT.search(declared), (
+        "a rule in the shared stylesheet hardcodes a white tint; it must read a "
+        "token so light mode can invert it"
+    )
+    assert not _fixed_surfaces(declared), (
+        "a rule in the shared stylesheet hardcodes a theme surface: "
+        + ", ".join(_fixed_surfaces(declared))
+    )
+
+
+# The pages carry their own style blocks, and five of the surfaces this rule
+# governs live in them rather than in common.js. Its neighbour above already
+# globs *.html; scanning only common.js here would leave a hardcoded background
+# on the dashboard or the efficiency page green.
+def test_no_page_style_block_hardcodes_a_theme_surface() -> None:
+    web = Path(__file__).resolve().parents[1] / "src" / "arraysense" / "web"
+    offenders = []
+    for path in sorted(web.glob("*.html")):
+        for block in re.findall(r"<style[^>]*>(.*?)</style>", path.read_text(), re.S):
+            offenders += [f"{path.name}: {hit}" for hit in _fixed_surfaces(block)]
+    # A white *background* is a surface and must follow the theme. A white
+    # foreground is not: several rules set text on a filled chart bar, whose
+    # colour is the same in both themes, and those say so in a comment.
+    assert not offenders, "a page hardcodes a theme surface: " + ", ".join(offenders)
+
+
+_WHITE_TINT = re.compile(r"rgba\(\s*255\s*,\s*255\s*,\s*255", re.I)
+_SURFACE = re.compile(
+    r"background(?:-color)?\s*:\s*"
+    r"(rgba?\(\s*\d+\s*,\s*\d+\s*,\s*\d+[^)]*\)|#[0-9a-f]{3,8}\b)",
+    re.I,
+)
+
+
+def _strip_token_declarations(css: str) -> str:
+    # Only inside a token block. Applied to the whole sheet it would also delete
+    # a rule that overrides a token and then paints with it, hiding exactly the
+    # kind of hardcoded surface this is looking for.
+    return re.sub(r"(?<![-a-z])--[a-z0-9-]+\s*:\s*[^;}]+(?=[;}])", "", css, flags=re.I)
+
+
+def _channels(value: str) -> tuple[int, int, int] | None:
+    if value.startswith("#"):
+        digits = value[1:]
+        if len(digits) in (3, 4):
+            digits = "".join(c * 2 for c in digits)
+        if len(digits) not in (6, 8):
+            return None
+        return tuple(int(digits[i : i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    numbers = [int(n) for n in re.findall(r"\d+", value)[:3]]
+    return (numbers[0], numbers[1], numbers[2]) if len(numbers) == 3 else None
+
+
+def _fixed_surfaces(css: str) -> list[str]:
+    """Backgrounds pinned to one theme's end of the range.
+
+    Near-black is unreadable under light mode's dark ink, near-white under dark
+    mode's white ink. The threshold is deliberately loose: this project's own
+    former panel colour was #131a2e, whose blue channel alone is 46, so a test
+    that only caught channels under 40 would have let it through.
+    """
+    offenders = []
+    for match in _SURFACE.finditer(_strip_token_declarations(css)):
+        channels = _channels(match.group(1))
+        if channels is None:
+            continue
+        if max(channels) < 60 or min(channels) > 200:
+            offenders.append(match.group(0).strip())
+    return offenders
+
+
 def test_the_band_shading_legend_does_not_hardcode_a_direction() -> None:
     # On a dark panel the wash is white, so more opacity reads brighter. On a
     # light one it must be dark, and "brighter" becomes exactly wrong — the

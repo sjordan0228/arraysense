@@ -16,13 +16,13 @@
      strip — the Costs page's month bar, adapted for three periods. */
   .effnav{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
   .effnav .periods{display:flex;gap:4px}
-  .effnav .periods button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+  .effnav .periods button{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink2);border-radius:7px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:inherit}
-  .effnav .periods button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink);font-weight:500}
+  .effnav .periods button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink);font-weight:500}
   .effnav .datenav{display:flex;align-items:center;gap:6px}
-  .effnav .datenav button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+  .effnav .datenav button{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink2);border-radius:7px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1}
-  .effnav .datenav button:hover{background:rgba(255,255,255,.14);color:var(--ink)}
+  .effnav .datenav button:hover{background:var(--tint-2);color:var(--ink)}
   .effnav .datenav .datelabel{font-size:14px;font-weight:500;min-width:140px;text-align:center;font-variant-numeric:tabular-nums}
   /* The PR headline. A big number with its tolerance band, beside specific yield.
      Follows the Costs page's card pattern — large value, small unit, sub line. */
@@ -370,6 +370,31 @@ function renderStrings(strings, tolerancePct) {
   }).join('');
 }
 
+// >>> eff-raw-ratio
+// The raw ratio of actual to expected, used by the hourly chart's hover
+// readout. Returns null when it cannot be stated — either value absent, or
+// expected not greater than zero — which produces the same dash the page uses
+// everywhere else. It is deliberately NOT the headline performance ratio: that
+// is actual ÷ (expected − curtailed), but the chart carries only raw expected
+// and raw actual, so this is plainly a simpler figure.
+// The rows above this one state kWh to two places, so anything under this
+// shows as 0.00 there. Dividing by it produces a percentage the reader cannot
+// check against either figure printed directly above — 0.0001 kWh of expected
+// against a real 0.15 measured is arithmetic on rounding noise, and it reads as
+// 150000%. The hours either side of sunrise and sunset are exactly this case
+// and they arrive every day, so this is the ordinary path, not a corner.
+const EFF_RATIO_FLOOR_KWH = 0.005;
+
+function effRawRatio(expected, actual) {
+  if (expected === null || expected === undefined || actual === null || actual === undefined) return null;
+  if (!(expected >= EFF_RATIO_FLOOR_KWH)) return null;
+  // Not a share of anything. A meter reading backwards is a fault to look at,
+  // not a small percentage.
+  if (actual < 0) return null;
+  return actual / expected;
+}
+// <<< eff-raw-ratio
+
 // ---------------------------------------------------------------------------
 // Hourly chart. uPlot, via the shared factory in common.js.
 //
@@ -436,6 +461,7 @@ function renderChart(rows, stampKey, grain) {
         readout('effChart', [
           ['Expected', 1, (v) => uStr(v, 2, 'kWh')],
           ['Actual', 2, (v) => uStr(v, 2, 'kWh')],
+          ['Actual / Expected', (u, idx) => effRawRatio(u.data[1][idx], u.data[2][idx]), prNum],
         ]),
       ],
     }),
