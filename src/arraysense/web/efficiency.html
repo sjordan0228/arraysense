@@ -1,0 +1,684 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Efficiency · Solar ArraySense</title>
+<script src="/common.js"></script>
+<script src="/vendor/uPlot.iife.min.js"></script>
+<style>
+  /* Period and date navigation. A row of period buttons beside a back/date/forward
+     strip — the Costs page's month bar, adapted for three periods. */
+  .effnav{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .effnav .periods{display:flex;gap:4px}
+  .effnav .periods button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+    color:var(--ink2);border-radius:7px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:inherit}
+  .effnav .periods button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink);font-weight:500}
+  .effnav .datenav{display:flex;align-items:center;gap:6px}
+  .effnav .datenav button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+    color:var(--ink2);border-radius:7px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1}
+  .effnav .datenav button:hover{background:rgba(255,255,255,.14);color:var(--ink)}
+  .effnav .datenav .datelabel{font-size:14px;font-weight:500;min-width:140px;text-align:center;font-variant-numeric:tabular-nums}
+  /* The PR headline. A big number with its tolerance band, beside specific yield.
+     Follows the Costs page's card pattern — large value, small unit, sub line. */
+  .prhead{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-end}
+  .prhead .prblock{min-width:0}
+  .prhead .prval{font-size:48px;font-weight:250;letter-spacing:-.035em;line-height:1.04;color:var(--pv);
+    font-variant-numeric:tabular-nums}
+  .prhead .prtol{font-size:18px;font-weight:300;color:var(--ink3);margin-left:6px}
+  .prhead .syval{font-size:30px;font-weight:250;letter-spacing:-.025em;line-height:1.1;color:var(--ink);
+    font-variant-numeric:tabular-nums}
+  .prhead .syval span{font-size:14px;color:var(--ink3);margin-left:4px;font-weight:400}
+  /* The partial-day note. Same shape as the Costs page's .pn — an amber left rule.
+     A partial figure is shown but labelled, never hidden and never passed off
+     as a complete one. */
+  .partialnote{margin-bottom:12px;font-size:12px;color:var(--warn);border-left:3px solid var(--warn)}
+  .partialnote[hidden]{display:none}
+  /* Unconfigured — the same mild tone as Costs's .tno. Nothing is broken; the
+     owner simply has not described their array. */
+  .noconfig{margin-bottom:12px;border-left:3px solid var(--ink3)}
+  .noconfig h2{margin:0;font-size:15px;font-weight:600;letter-spacing:-.01em}
+  .noconfig p{margin:7px 0 0;font-size:12.5px;line-height:1.6;color:var(--ink2);max-width:78ch}
+  .noconfig a{display:inline-block;margin-top:11px;text-decoration:none}
+  /* The string table. PR column gets a light bar for at-a-glance comparison,
+     using --pv at low opacity rather than any new colour. */
+  .strtable{width:100%}
+  .strtable .prbar{display:inline-block;height:3px;border-radius:2px;background:var(--tint);
+    vertical-align:middle;margin-left:6px;min-width:20px}
+  .strtable .prbar i{display:block;height:100%;border-radius:2px;
+    background:linear-gradient(90deg,rgba(207,123,38,.7),rgba(207,123,38,.25))}
+  /* Worst hour — named plainly, no drama. */
+  .worst{margin-top:14px}
+  .worst .when{font-size:13px;font-weight:500}
+  .worst .missing{font-size:12px;color:var(--ink2);margin-top:3px}
+  /* Baseline window. Small, quiet, at the bottom. */
+  .baseline{font-size:11px;color:var(--ink3);line-height:1.6;margin-top:6px}
+  .baseline dd{margin:0 0 6px}
+  .baseline dt{font-weight:500;color:var(--ink2)}
+  /* The hourly chart container. */
+  .effchart{margin-top:8px}
+  /* No-data message inside the chart. */
+  .effchart .nodata{color:var(--ink3);font-size:12px;padding:26px 0;text-align:center;line-height:1.6}
+  /* Zero-data state — no rows at all for this range. */
+  .nodata-msg{margin-bottom:12px;border-left:3px solid var(--ink3)}
+  .nodata-msg p{margin:7px 0 0;font-size:12px;line-height:1.6;color:var(--ink2);max-width:78ch}
+  .nodata-msg[hidden]{display:none}
+  .assume{font-size:11.5px;line-height:1.65;color:var(--ink3);max-width:86ch;margin-top:8px}
+  .assume li{margin-bottom:6px}
+  .assume ul{margin:0;padding-left:17px}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div class="conn" id="stamp"></div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="p partialnote" id="pnote" hidden></div>
+
+  <section class="p">
+    <div class="effnav">
+      <div class="periods" id="periods"></div>
+      <div class="datenav">
+        <button id="prevBtn" title="Previous">←</button>
+        <span class="datelabel" id="dateLabel">—</span>
+        <button id="nextBtn" title="Next">→</button>
+      </div>
+    </div>
+  </section>
+
+  <div class="p partialnote" id="partialNote" hidden></div>
+
+  <div class="p noconfig" id="noconfig" hidden>
+    <h2>No array described, so there is nothing to score</h2>
+    <p>Describe the array — how many panels, how they are wired into strings, their
+      tilt and azimuth — and the model compares what the sun offered against what the
+      inverter actually recorded. Without that there is no expected production, and a
+      performance ratio read from nothing would be an invented number.</p>
+    <a class="iconbtn" href="/settings">Describe the array in settings</a>
+  </div>
+
+  <div class="p nodata-msg" id="nodataMsg" hidden>
+    <p>Nothing has been recorded for this range yet, so there is nothing to
+      compare. A missing reading is not a reading of zero.</p>
+  </div>
+
+  <section class="p" id="prSec" hidden>
+    <div class="chead">
+      <h2>Performance ratio</h2>
+      <span class="legend muted">expected against actual, with curtailment removed from both sides</span>
+    </div>
+    <div class="prhead">
+      <div class="prblock">
+        <span class="lbl">PR</span>
+        <div>
+          <span class="prval" id="prVal">—</span>
+          <span class="prtol" id="prTol"></span>
+        </div>
+      </div>
+      <div class="prblock">
+        <span class="lbl">Specific yield</span>
+        <div class="syval" id="syVal">—</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="p" id="wfSec" hidden>
+    <div id="waterfall"></div>
+  </section>
+
+  <section class="p" id="strSec" hidden>
+    <div class="chead">
+      <h2>By string</h2>
+      <span class="legend muted">each string scored independently, to localise an underperformer</span>
+    </div>
+    <div class="tw">
+      <table class="strtable">
+        <thead><tr>
+          <th>String</th><th>Expected</th><th>Actual</th><th>Curtailed</th><th>Unexplained</th><th>PR</th>
+        </tr></thead>
+        <tbody id="strBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="p" id="chartSec" hidden>
+    <div class="chead">
+      <h2>Hour by hour</h2>
+      <span class="legend muted">expected — a model, not a guarantee · actual — what the inverter recorded</span>
+    </div>
+    <div class="effchart" id="effChartWrap"></div>
+  </section>
+
+  <section class="p" id="worstSec" hidden>
+    <h2>Worst hour</h2>
+    <div class="worst">
+      <div class="when" id="worstWhen">—</div>
+      <div class="missing" id="worstMissing"></div>
+    </div>
+  </section>
+
+  <section class="p" id="baseSec" hidden>
+    <h2>Baseline</h2>
+    <dl class="baseline" id="baseInfo"></dl>
+  </section>
+
+  <section>
+    <details>
+      <summary>What these figures assume</summary>
+      <div class="assume" id="assume"></div>
+    </details>
+  </section>
+</main>
+
+<script>
+// Everything shared — $, esc, DASH, gnum, uStr, the palette, the nav, the chart
+// factory, drawNav, civilNow, siteZone, civilDay, naiveStamp, pad2, numOrNull,
+// zoneQuery, syncDisplayDefaults — comes from /common.js. This file is only what
+// is particular to the efficiency page.
+//
+// Nothing here models anything. The page asks /api/efficiency what the array
+// should have made and draws the answer; the sun position, the transposition,
+// the cell temperature and the curtailment rule all live in efficiency.py and
+// solar.py. Computing expected production a second time in the browser is the
+// same mistake the Costs page made when it kept its own tariff parser — the two
+// would disagree within a day and the page would silently show the wrong ratio.
+
+// ---------------------------------------------------------------------------
+// Period and date navigation.
+// ---------------------------------------------------------------------------
+
+const PERIODS = [
+  { key: 'day',   label: 'Day' },
+  { key: 'week',  label: 'Week' },
+  { key: 'month', label: 'Month' },
+];
+
+// The date the API's start parameter is built from. For period=day this is the
+// day itself; for week it is the Monday; for month it is the first.
+function periodStart(cursor, period) {
+  if (period === 'day') return naiveStamp(cursor).slice(0, 10);
+  if (period === 'week') {
+    const day = cursor.getDay();
+    const offset = day === 0 ? 6 : day - 1;
+    const mon = new Date(cursor);
+    mon.setDate(cursor.getDate() - offset);
+    return naiveStamp(mon).slice(0, 10);
+  }
+  // month
+  return `${cursor.getFullYear()}-${pad2(cursor.getMonth() + 1)}-01`;
+}
+
+function shiftCursor(cursor, period, delta) {
+  const d = new Date(cursor);
+  if (period === 'day') d.setDate(d.getDate() + delta);
+  else if (period === 'week') d.setDate(d.getDate() + delta * 7);
+  else if (period === 'month') d.setMonth(d.getMonth() + delta);
+  return d;
+}
+
+function formatCursor(cursor, period) {
+  if (period === 'day') {
+    return cursor.toLocaleDateString(undefined,
+      { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+  }
+  if (period === 'week') {
+    const day = cursor.getDay();
+    const offset = day === 0 ? 6 : day - 1;
+    const mon = new Date(cursor);
+    mon.setDate(cursor.getDate() - offset);
+    const sun = new Date(mon);
+    sun.setDate(mon.getDate() + 6);
+    const fmt = { month: 'short', day: 'numeric' };
+    const sameMonth = mon.getMonth() === sun.getMonth();
+    return sameMonth
+      ? `${mon.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} – ${sun.getDate()}, ${sun.getFullYear()}`
+      : `${mon.toLocaleDateString(undefined, fmt)} – ${sun.toLocaleDateString(undefined, fmt)}, ${sun.getFullYear()}`;
+  }
+  // month
+  return cursor.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+}
+
+// ---------------------------------------------------------------------------
+// Reading the API.
+// ---------------------------------------------------------------------------
+
+async function getJSON(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  return response.json();
+}
+
+async function fetchEfficiency(period, cursor) {
+  const zone = await siteZone();
+  const start = periodStart(cursor, period);
+  const url = `/api/efficiency?period=${encodeURIComponent(period)}`
+    + `&start=${encodeURIComponent(start)}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : '');
+  return getJSON(url);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing.
+// ---------------------------------------------------------------------------
+
+// A PR as a percentage with its tolerance — '88% ±3%', never '0.8794'.
+function prStr(pr, tolerancePct) {
+  if (pr === null || pr === undefined) return DASH;
+  const pct = Math.round(pr * 100);
+  const tol = tolerancePct === null || tolerancePct === undefined
+    ? '' : ` ±${Math.round(tolerancePct)}%`;
+  return `${pct}%${tol}`;
+}
+
+function prNum(pr) {
+  if (pr === null || pr === undefined) return DASH;
+  return `${Math.round(pr * 100)}%`;
+}
+
+// A tolerance band on its own, for the table.
+function tolStr(tolerancePct) {
+  if (tolerancePct === null || tolerancePct === undefined) return '';
+  return ` ±${Math.round(tolerancePct)}%`;
+}
+
+// Specific yield: kWh per kWp of installed capacity.
+function syStr(sy) {
+  if (sy === null || sy === undefined) return DASH;
+  return `${sy.toFixed(2)}<span>kWh/kWp</span>`;
+}
+
+function renderPR(summary) {
+  if (!summary) {
+    $('prVal').textContent = DASH;
+    $('prTol').textContent = '';
+    $('syVal').innerHTML = DASH;
+    return;
+  }
+  $('prVal').textContent = prNum(summary.pr);
+  $('prTol').textContent = tolStr(summary.tolerance_pct);
+  $('syVal').innerHTML = syStr(summary.specific_yield);
+}
+
+function renderPartialNote(summary) {
+  const box = $('partialNote');
+  if (summary && summary.partial) {
+    box.innerHTML = '<span class="warn">This is a partial period</span> — not all daylight hours '
+      + 'could be modelled, so the performance ratio is drawn from a fraction of the day. '
+      + 'It is labelled rather than hidden, because a partial measurement is useful; it is '
+      + 'only ever wrong when it is presented as a complete one.';
+    box.hidden = false;
+  } else {
+    box.hidden = true;
+  }
+}
+
+function renderWaterfall(waterfall) {
+  const div = $('waterfall');
+  if (typeof window.drawWaterfall === 'function' && waterfall && waterfall.length) {
+    window.drawWaterfall(div, waterfall);
+  }
+  // Otherwise leave the div empty — someone else is writing the renderer.
+}
+
+function renderStrings(strings, tolerancePct) {
+  if (!strings || !strings.length) {
+    $('strBody').innerHTML = '';
+    return;
+  }
+  const tol = tolStr(tolerancePct);
+  // Find the widest PR for bar scaling.
+  const prs = strings.map((s) => s.pr).filter((p) => p !== null && p !== undefined);
+  const maxPr = prs.length ? Math.max(...prs) : 0;
+  $('strBody').innerHTML = strings.map((s) => {
+    const prPct = s.pr !== null && s.pr !== undefined ? Math.round(s.pr * 100) : null;
+    const barWidth = prPct !== null && maxPr > 0
+      ? Math.max(2, (s.pr / maxPr) * 100).toFixed(1)
+      : '0';
+    const prCell = prPct !== null
+      ? `${prPct}%${tol}<span class="prbar"><i style="width:${barWidth}%"></i></span>`
+      : DASH;
+    return `<tr>
+      <td>${esc(s.name)}</td>
+      <td>${esc(uStr(s.expected_kwh, 1, 'kWh'))}</td>
+      <td>${esc(uStr(s.actual_kwh, 1, 'kWh'))}</td>
+      <td>${esc(uStr(s.curtailed_kwh, 1, 'kWh'))}</td>
+      <td>${esc(uStr(s.unexplained_kwh, 1, 'kWh'))}</td>
+      <td>${prCell}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Hourly chart. uPlot, via the shared factory in common.js.
+//
+// Two series over the same axis: expected (model, dashed) and actual (measured,
+// solid). Both use --pv because both are the array's own energy; the dash
+// pattern is the second encoding the palette rule calls for.
+// ---------------------------------------------------------------------------
+
+const kwhTicks = (u, splits) =>
+  splits.map((v) => v >= 10 ? v.toFixed(0) : v.toFixed(1));
+
+const kwhAxis = () => axis({ size: 44, gap: 6, values: kwhTicks });
+
+function kwhRange(u, min, max) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
+  return [0, Math.max(0.5, max) * 1.1];
+}
+
+function renderChart(hours) {
+  const wrap = $('effChartWrap');
+  if (!hours || !hours.length) {
+    wrap.innerHTML = '<div class="nodata">No hourly data for this range — either nothing was '
+      + 'recorded, or the irradiance readings the model needs were absent.</div>';
+    return;
+  }
+
+  // Convert to uPlot data: [timestamps_in_seconds, expected, actual]
+  const points = hours.filter((h) => h && Number.isFinite(Date.parse(h.hour)));
+  if (!points.length) {
+    wrap.innerHTML = '<div class="nodata">No hourly data for this range.</div>';
+    return;
+  }
+  const xs = points.map((h) => Date.parse(h.hour) / 1000);
+  const expected = points.map((h) => numOrNull(h.expected_kwh));
+  const actual = points.map((h) => numOrNull(h.actual_kwh));
+  const data = [xs, expected, actual];
+
+  const spec = {
+    height: 280,
+    unit: 'kWh',
+    opts: chartBase({
+      axes: [
+        timeAxis(),
+        kwhAxis(),
+      ],
+      series: [
+        {},
+        trace('Expected', '--pv', 1.2, {
+          dash: [6, 4],
+          points: { show: false },
+        }),
+        trace('Actual', '--pv', 2.2, {}),
+      ],
+      scales: {
+        x: {},
+        y: { range: kwhRange },
+      },
+      plugins: [
+        zeroRule(),
+        readout('effChart', [
+          ['Expected', 1, (v) => uStr(v, 2, 'kWh')],
+          ['Actual', 2, (v) => uStr(v, 2, 'kWh')],
+        ]),
+      ],
+    }),
+  };
+
+  paint('effChart', spec, data);
+}
+
+// ---------------------------------------------------------------------------
+// Worst hour. Named plainly — the hour, and how much went unexplained.
+// ---------------------------------------------------------------------------
+
+function renderWorst(worstHour) {
+  if (!worstHour) {
+    $('worstSec').hidden = true;
+    return;
+  }
+  $('worstSec').hidden = false;
+  const when = new Date(worstHour.hour);
+  $('worstWhen').textContent = when.toLocaleString(undefined, {
+    weekday: 'short', month: 'short', day: 'numeric',
+    hour: 'numeric', minute: '2-digit',
+  });
+  $('worstMissing').textContent = `${uStr(worstHour.unexplained_kwh, 2, 'kWh')} unexplained in that hour`;
+}
+
+// ---------------------------------------------------------------------------
+// Baseline window. So a reader can tell a calibrated system from a fresh one.
+// ---------------------------------------------------------------------------
+
+function renderBaseline(baseline) {
+  if (!baseline) {
+    $('baseSec').hidden = true;
+    return;
+  }
+  const ws = baseline.window_start;
+  const we = baseline.window_end;
+  if (!ws || !we) {
+    $('baseSec').hidden = true;
+    return;
+  }
+  $('baseSec').hidden = false;
+  const start = new Date(ws);
+  const end = new Date(we);
+  // The window is one day — the first day from the scored rows. Show it as a
+  // date so the reader knows when the baselines were last fitted.
+  $('baseInfo').innerHTML =
+    `<dt>Calibrated from</dt>`
+    + `<dd>${esc(start.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }))}`
+    + (baseline.samples !== null ? ` · ${baseline.samples} samples` : '')
+    + `</dd>`
+    + `<dt>Current array</dt>`
+    + `<dd>The baselines were fitted against the array as it is described now. `
+    + `If the array has since been reconfigured, the scores above were recomputed `
+    + `against the current description — a stale baseline read against a changed `
+    + `array is a ratio drawn from the wrong expectation.</dd>`;
+}
+
+function renderAssumptions(period) {
+  const bits = [
+    'Expected production is modelled from the sun\'s position, the array\'s tilt '
+      + 'and azimuth, the irradiance components (GHI, DNI, DHI), the outside air '
+      + 'temperature, and the wind speed — which can cool the cells by 13 °C and '
+      + 'is worth up to 12% of output on a still afternoon.',
+    'Curtailed energy is the inverter refusing energy it had nowhere to put — the '
+      + 'bank is full and the house is not calling for it. It is not a fault and not '
+      + 'a loss, and it is removed from both sides of the comparison: the array was '
+      + 'never going to produce it, and the inverter was never going to record it.',
+    'Unexplained energy is a genuine shortfall with no attributed cause. It is '
+      + 'expected minus actual minus curtailed, clamped at zero — a day that '
+      + 'outperforms the model has no unexplained shortfall, and its surplus is '
+      + 'shown separately as an unmodelled gain.',
+    'The performance ratio is actual ÷ (expected − curtailed). Curtailment is '
+      + 'removed from the denominator because the array was never going to produce '
+      + 'that energy; leaving it in would penalise a full battery.',
+    'Specific yield is actual kWh per kilowatt-peak of installed capacity. It '
+      + 'lets you compare a 4 kW array against a 15 kW one on the same terms.',
+    'The meter tolerance accounts for the accuracy of the inverter\'s own power '
+      + 'measurement — a PR inside that band is indistinguishable from the model.',
+    'The model runs in the service, not in this page. There is one implementation '
+      + 'of expected watts, and the page only draws what the endpoint returns — the '
+      + 'same rule that keeps the tariff grammar in one file.',
+  ];
+  if (period === 'day') {
+    bits.push('The hourly chart is computed live from the stored irradiance and '
+      + 'inverter readings. An hour with no irradiance data is absent from the '
+      + 'chart rather than present as a zero — the model cannot run without '
+      + 'knowing what the sun was doing.');
+  }
+  $('assume').innerHTML = `<ul>${bits.map((b) => `<li>${b}</li>`).join('')}</ul>`;
+}
+
+// ---------------------------------------------------------------------------
+// Loading.
+// ---------------------------------------------------------------------------
+
+function pageNote(text) {
+  const box = $('pnote');
+  if (!box) return;
+  box.textContent = text || '';
+  box.hidden = !text;
+}
+
+async function refresh() {
+  const trouble = [];
+
+  let body = null;
+  try {
+    body = await fetchEfficiency(period, cursor);
+  } catch (e) {
+    trouble.push(`The efficiency data could not be read: ${e.message}.`);
+  }
+
+  if (!body) {
+    pageNote(trouble.join(' '));
+    stamp();
+    return;
+  }
+
+  // Unconfigured: no array described.
+  if (!body.configured) {
+    $('noconfig').hidden = false;
+    $('prSec').hidden = true;
+    $('wfSec').hidden = true;
+    $('strSec').hidden = true;
+    $('chartSec').hidden = true;
+    $('worstSec').hidden = true;
+    $('baseSec').hidden = true;
+    $('nodataMsg').hidden = true;
+    renderPartialNote(null);
+    renderAssumptions(period);
+    pageNote(trouble.join(' '));
+    stamp();
+    return;
+  }
+
+  $('noconfig').hidden = true;
+
+  // No data at all for this range.
+  if (!body.summary) {
+    $('prSec').hidden = true;
+    $('wfSec').hidden = true;
+    $('strSec').hidden = true;
+    $('chartSec').hidden = true;
+    $('worstSec').hidden = true;
+    $('baseSec').hidden = true;
+    $('nodataMsg').hidden = false;
+    renderPartialNote(null);
+    renderAssumptions(period);
+    pageNote(trouble.join(' '));
+    stamp();
+    return;
+  }
+
+  $('nodataMsg').hidden = true;
+
+  // Data sections
+  $('prSec').hidden = false;
+  renderPR(body.summary);
+  renderPartialNote(body.summary);
+
+  // Waterfall
+  $('wfSec').hidden = !body.waterfall || !body.waterfall.length;
+  renderWaterfall(body.waterfall);
+
+  // Per-string table
+  const hasStrings = body.strings && body.strings.length > 0;
+  $('strSec').hidden = !hasStrings;
+  if (hasStrings) {
+    renderStrings(body.strings, body.summary ? body.summary.tolerance_pct : null);
+  }
+
+  // Hourly chart — only for period=day.
+  if (period === 'day' && body.hours) {
+    $('chartSec').hidden = false;
+    renderChart(body.hours);
+  } else {
+    $('chartSec').hidden = true;
+    // Clean up any existing chart so it doesn't linger when switching periods.
+    const held = CHARTS['effChart'];
+    if (held) {
+      if (held.ro) held.ro.disconnect();
+      held.u.destroy();
+      delete CHARTS['effChart'];
+    }
+  }
+
+  // Worst hour
+  renderWorst(body.worst_hour);
+
+  // Baseline
+  renderBaseline(body.baseline);
+
+  renderAssumptions(period);
+  pageNote(trouble.join(' '));
+  stamp();
+}
+
+function stamp() {
+  $('stamp').textContent = `updated ${new Date().toLocaleTimeString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Navigation wiring.
+// ---------------------------------------------------------------------------
+
+function drawPeriods() {
+  const el = $('periods');
+  el.innerHTML = PERIODS.map((p) =>
+    `<button data-k="${p.key}" aria-pressed="${p.key === period}">${esc(p.label)}</button>`
+  ).join('');
+  el.querySelectorAll('button').forEach((btn) => {
+    btn.onclick = () => {
+      if (btn.dataset.k === period) return;
+      period = btn.dataset.k;
+      // When switching to month, pin the cursor to the 1st so the label reads
+      // as the month rather than a stray day within it.
+      if (period === 'month') {
+        cursor = civilDay(cursor.getFullYear(), cursor.getMonth() + 1, 1);
+      }
+      drawPeriods();
+      $('dateLabel').textContent = formatCursor(cursor, period);
+      refresh();
+    };
+  });
+}
+
+function drawDateNav() {
+  $('prevBtn').onclick = () => {
+    cursor = shiftCursor(cursor, period, -1);
+    $('dateLabel').textContent = formatCursor(cursor, period);
+    refresh();
+  };
+  $('nextBtn').onclick = () => {
+    cursor = shiftCursor(cursor, period, 1);
+    $('dateLabel').textContent = formatCursor(cursor, period);
+    refresh();
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Boot.
+// ---------------------------------------------------------------------------
+
+async function boot() {
+  await syncDisplayDefaults();
+  drawNav('efficiency');
+
+  // Start at today in the installation's zone.
+  const zone = await siteZone();
+  const now = civilNow(zone);
+  cursor = civilDay(now.year, now.month, now.day);
+
+  drawPeriods();
+  $('dateLabel').textContent = formatCursor(cursor, period);
+  drawDateNav();
+
+  await refresh();
+  // Efficiency changes by the hour at most — the model runs on hourly data,
+  // and the stored daily rows are rebuilt by the maintenance clock.
+  setInterval(refresh, 5 * 60 * 1000);
+}
+
+boot();
+</script>
+</body>
+</html>

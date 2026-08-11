@@ -351,3 +351,110 @@ afterwards, which is how you run a firmware update without stopping the service.
 
 Collection stops for the duration. The gap is recorded rather than papered over, so
 the chart shows a break where the data genuinely does not exist.
+
+## `GET /api/efficiency`
+
+How well the solar array is performing against what it should produce.
+
+| Parameter | Meaning |
+| --- | --- |
+| `period` | One of `day`, `week`, `month`. Defaults to `day`. |
+| `start` | The first day, as `YYYY-MM-DD`. Required. |
+| `tz` | An IANA timezone name such as `America/Chicago`. Optional; the installation's configured zone is used when omitted. |
+
+```json
+{
+  "configured": true,
+  "period": "day",
+  "start": "2026-08-06T00:00:00+00:00",
+  "end": "2026-08-07T00:00:00+00:00",
+  "now": "2026-08-06T21:30:00+00:00",
+  "summary": {
+    "expected_kwh": 12.4,
+    "actual_kwh": 10.1,
+    "curtailed_kwh": 1.8,
+    "unexplained_kwh": 0.5,
+    "unmodelled_gain_kwh": 0.0,
+    "pr": 0.87,
+    "specific_yield": 0.81,
+    "tolerance_pct": 5.0,
+    "partial": false
+  },
+  "waterfall": [
+    {"name": "expected", "kwh": 12.4, "penalised": false},
+    {"name": "unexplained", "kwh": -0.5, "penalised": true},
+    {"name": "curtailed", "kwh": 1.8, "penalised": false},
+    {"name": "unmodelled_gain", "kwh": 0.0, "penalised": false},
+    {"name": "actual", "kwh": 10.1, "penalised": false}
+  ],
+  "strings": [
+    {
+      "id": 1,
+      "summary": {
+        "expected_kwh": 4.2,
+        "actual_kwh": 3.1,
+        "curtailed_kwh": 0.6,
+        "unexplained_kwh": 0.5,
+        "unmodelled_gain_kwh": 0.0,
+        "pr": 0.83,
+        "specific_yield": 0.74,
+        "tolerance_pct": 5.0,
+        "partial": false
+      }
+    }
+  ],
+  "hours": [
+    {"hour": 0, "expected_power_w": 0.0, "actual_power_w": 0.0, "unexplained_w": 0.0},
+    {"hour": 6, "expected_power_w": 1200.0, "actual_power_w": 980.0, "unexplained_w": 220.0}
+  ],
+  "worst_hour": 14,
+  "baseline": {
+    "start": "2026-07-01T00:00:00+00:00",
+    "end": "2026-08-01T00:00:00+00:00"
+  }
+}
+```
+
+`configured` is `false` when no solar array has been described in settings. Every
+other field is then `null` or an empty list, never zero.
+
+`period`, `start`, `end` and `now` define the window being reported and the moment
+the calculation ran.
+
+`summary` contains the core figures:
+
+- `expected_kwh` is what the array should produce under the measured sky conditions.
+- `actual_kwh` is what the inverter actually delivered.
+- `curtailed_kwh` is energy the inverter refused because the battery was full and
+  the house was not drawing. It is NOT a loss and NOT a fault, so it does not count
+  against the performance ratio — `penalised: false` on that segment in the waterfall.
+- `unexplained_kwh` is a genuine shortfall with no cause attributed to it. It does
+  count against the performance ratio.
+- `unmodelled_gain_kwh` is production above the model that cannot be explained by
+  known factors such as reflection or tracking.
+- `pr` is the performance ratio: actual production divided by expected production,
+  with curtailed energy removed from both sides. It is `null` when there is nothing
+  to divide by.
+- `specific_yield` is the actual energy per kilowatt of installed capacity.
+- `tolerance_pct` is the acceptable deviation band around the expected value.
+- `partial` is `true` when the day was not fully observed and its figures cover only
+  part of it.
+
+`waterfall` is an ordered list of segments showing how the expected value becomes
+the actual one. Each segment has `name`, `kwh` and `penalised`. The names are
+`expected`, `unexplained`, `curtailed`, `unmodelled_gain` and `actual`. A segment
+with `penalised: true` counts against the performance ratio; `penalised: false`
+means it does not.
+
+`strings` provides the same summary shape for each configured string, so an
+underperforming string can be located.
+
+`hours` is an hour-by-hour breakdown for `period=day` only. It is `null` for `week`
+and `month`. Each entry has `hour`, `expected_power_w`, `actual_power_w` and
+`unexplained_w`.
+
+`worst_hour` is the hour carrying the largest unexplained shortfall, or `null` when
+there is no shortfall to report.
+
+`baseline` is the window the model's fit came from, with `start` and `end` as ISO
+timestamps.

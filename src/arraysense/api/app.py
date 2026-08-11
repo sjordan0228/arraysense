@@ -37,6 +37,7 @@ PAGES = {
     "/graphs": "graphs.html",
     "/history": "history.html",
     "/costs": "costs.html",
+    "/efficiency": "efficiency.html",
     "/settings": "settings.html",
 }
 
