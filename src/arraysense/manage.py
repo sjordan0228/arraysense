@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,6 +27,9 @@ INSTALL_DIR = "/opt/arraysense"
 CONFIG_PATH = "/etc/arraysense/config.toml"
 PORT_DROPIN = "/etc/systemd/system/arraysense.service.d/port.conf"
 DEFAULT_PORT = 8080
+CLI_SHIM = "/usr/local/bin/arraysense"
+UNIT_PATH = "/etc/systemd/system/arraysense.service"
+DROPIN_DIR = "/etc/systemd/system/arraysense.service.d"
 
 # "Upgrade" fast-forwards the install to this remote-tracking branch: main is
 # the branch that has run on the reference installation, while dev is where a
@@ -422,6 +426,63 @@ def cmd_upgrade(argv: list[str]) -> int:
     return 1
 
 
+def _remove_path(path: str) -> bool:
+    """Delete a file or a tree, tolerating one that is already gone.
+
+    Returns whether the path is now absent. A removal that failed has to be
+    said out loud: an uninstall that prints "removed" over a file it could not
+    delete tells somebody their data is gone when it is still on the disk.
+    """
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+    except FileNotFoundError:
+        return True
+    except OSError as exc:
+        print(f"could not remove {path}: {exc}")
+        return False
+    return True
+
+
+def cmd_uninstall(argv: list[str]) -> int:
+    """Remove the software. The database survives unless --purge is given.
+
+    Two confirmations rather than one when purging, because the second act
+    destroys something no reinstall can bring back.
+    """
+    purge = "--purge" in argv
+    db = _database_path()
+    print(f"This removes the service, the code at {INSTALL_DIR}, and {CLI_SHIM}.")
+    if purge:
+        print(f"--purge given: {db} and /etc/arraysense WILL ALSO BE DELETED.")
+    else:
+        print("The database and config are kept. Pass --purge to remove them too.")
+    if not _confirm("Continue?"):
+        print("nothing done")
+        return 0
+    if purge and not _confirm(f"Really delete {db}? This cannot be undone."):
+        print("nothing done")
+        return 0
+
+    service("stop")
+    service("disable")
+    ok = True
+    for path in (UNIT_PATH, DROPIN_DIR, CLI_SHIM, INSTALL_DIR):
+        ok = _remove_path(path) and ok
+    if purge:
+        for suffix in ("", "-wal", "-shm"):
+            ok = _remove_path(db + suffix) and ok
+        ok = _remove_path("/etc/arraysense") and ok
+    run(["systemctl", "daemon-reload"])
+    if not ok:
+        print("some paths could not be removed; see above")
+        return 1
+    print("removed")
+    return 0
+
+
 COMMANDS = {
     "status": cmd_status,
     "logs": cmd_logs,
@@ -429,6 +490,7 @@ COMMANDS = {
     "version": cmd_version,
 }
 COMMANDS["upgrade"] = cmd_upgrade
+COMMANDS["uninstall"] = cmd_uninstall
 
 
 def main(argv: list[str] | None = None) -> int:

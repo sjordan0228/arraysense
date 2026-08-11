@@ -381,3 +381,105 @@ def test_a_missing_changelog_is_absent_not_invented(
         lambda argv: subprocess.CompletedProcess(argv, 1, "", "no such path"),
     )
     assert manage._incoming_changelog() == ""
+
+
+def test_uninstall_never_removes_the_database_without_purge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Years of readings must survive someone removing the software.
+
+    The database is the only thing here that cannot be reinstalled, so removing
+    it takes a second, explicit act.
+    """
+    db = tmp_path / "arraysense.db"
+    db.write_bytes(b"x")
+    removed: list[str] = []
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+
+    def fake_remove(path: str) -> bool:
+        removed.append(path)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+
+    manage.cmd_uninstall([])
+    assert str(db) not in removed
+    assert db.exists()
+
+    manage.cmd_uninstall(["--purge"])
+    assert str(db) in removed
+
+
+def test_uninstall_removes_the_service_the_code_and_the_shim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the promise: what it says it removes, it removes."""
+    removed: list[str] = []
+    actions: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        removed.append(path)
+        return True
+
+    def fake_service(action: str) -> bool:
+        actions.append(action)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    monkeypatch.setattr(manage, "service", fake_service)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/var/lib/arraysense/arraysense.db")
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+
+    assert manage.cmd_uninstall([]) == 0
+    assert manage.UNIT_PATH in removed
+    assert manage.DROPIN_DIR in removed
+    assert manage.CLI_SHIM in removed
+    assert manage.INSTALL_DIR in removed
+    assert actions == ["stop", "disable"]
+
+
+def test_uninstall_purge_takes_the_wal_and_shm_sidecars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A purge that leaves arraysense.db-wal has left readings behind in a file
+    the owner believes is gone."""
+    removed: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        removed.append(path)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/db/a.db")
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+
+    manage.cmd_uninstall(["--purge"])
+    assert "/db/a.db" in removed
+    assert "/db/a.db-wal" in removed
+    assert "/db/a.db-shm" in removed
+    assert "/etc/arraysense" in removed
+
+
+def test_uninstall_declined_does_nothing_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answering no must not stop the service either."""
+    touched: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        touched.append(path)
+        return True
+
+    def fake_service(action: str) -> bool:
+        touched.append(action)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    monkeypatch.setattr(manage, "service", fake_service)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: False)
+    assert manage.cmd_uninstall([]) == 0
+    assert touched == []
