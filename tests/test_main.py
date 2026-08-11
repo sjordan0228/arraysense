@@ -576,3 +576,44 @@ def test_the_production_store_accepts_a_weather_append(tmp_path: Path) -> None:
         assert row["cloud_cover_pct"] == 0.0
     finally:
         store.close()
+
+
+def test_the_wizard_writes_the_config_unreadable_to_others(tmp_path: Path) -> None:
+    """The setup wizard's config must be 0600, like a hand-written one.
+
+    It carries the dongle serial and the inverter serial, which is what the
+    dongle protocol authenticates with — the installation guide has always told
+    a hand-installer to chmod 600 for that reason. The wizard was writing it
+    world-readable, which made the guided path the less careful one, and a first
+    run is exactly when nobody thinks to check.
+
+    Asserted on the mode the file lands with rather than on a chmod call, since
+    what matters is the state on disk and not how it got there.
+    """
+    import os
+    import stat
+
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_setup_app
+
+    config = tmp_path / "config.toml"
+    app = build_setup_app(str(config))
+    with TestClient(app) as client:
+        reply = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "eg4_luxpower",
+                "model": "18kPV",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.10",
+                "dongle_serial": "BA12345678",
+                "inverter_serial": "CE12345678",
+                "battery_source": "relayed",
+                "database_path": str(tmp_path / "as.db"),
+            },
+        )
+    assert reply.status_code == 200, reply.text
+    assert config.exists()
+    mode = stat.S_IMODE(os.stat(config).st_mode)
+    assert mode == 0o600, f"config landed {oct(mode)}, must be 0o600 — it holds the serials"
