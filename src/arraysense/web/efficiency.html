@@ -157,7 +157,7 @@
 
   <section class="p" id="chartSec" hidden>
     <div class="chead">
-      <h2>Hour by hour</h2>
+      <h2 id="chartTitle">Hour by hour</h2>
       <span class="legend muted">expected — a model, not a guarantee · actual — what the inverter recorded</span>
     </div>
     <div class="chart effchart" id="effChartWrap"></div>
@@ -388,21 +388,25 @@ function kwhRange(u, min, max) {
   return [0, Math.max(0.5, max) * 1.1];
 }
 
-function renderChart(hours) {
+// Hours for a single day, days for a week or a month. The two carry the same
+// shape -- a stamp, an expectation and a reading -- so they are one chart at two
+// resolutions rather than two charts, and there is no second place for the
+// drawing to drift.
+function renderChart(rows, stampKey, grain) {
   const wrap = $('effChartWrap');
-  if (!hours || !hours.length) {
-    wrap.innerHTML = '<div class="nodata">No hourly data for this range — either nothing was '
+  if (!rows || !rows.length) {
+    wrap.innerHTML = `<div class="nodata">No ${grain} data for this range — either nothing was `
       + 'recorded, or the irradiance readings the model needs were absent.</div>';
     return;
   }
 
   // Convert to uPlot data: [timestamps_in_seconds, expected, actual]
-  const points = hours.filter((h) => h && Number.isFinite(Date.parse(h.hour)));
+  const points = rows.filter((h) => h && Number.isFinite(Date.parse(h[stampKey])));
   if (!points.length) {
-    wrap.innerHTML = '<div class="nodata">No hourly data for this range.</div>';
+    wrap.innerHTML = `<div class="nodata">No ${grain} data for this range.</div>`;
     return;
   }
-  const xs = points.map((h) => Date.parse(h.hour) / 1000);
+  const xs = points.map((h) => Date.parse(h[stampKey]) / 1000);
   const expected = points.map((h) => numOrNull(h.expected_kwh));
   const actual = points.map((h) => numOrNull(h.actual_kwh));
   const data = [xs, expected, actual];
@@ -604,10 +608,16 @@ async function refresh() {
     renderStrings(body.strings, body.summary ? body.summary.tolerance_pct : null);
   }
 
-  // Hourly chart — only for period=day.
-  if (period === 'day' && body.hours) {
+  // A day is drawn hour by hour; a week or a month, day by day. Both go through
+  // the same renderer -- a longer period used to drop the chart entirely, which
+  // reads as something broken rather than as a period with coarser detail.
+  const series = period === 'day'
+    ? { points: body.hours, key: 'hour', grain: 'hourly', title: 'Hour by hour' }
+    : { points: body.days, key: 'day', grain: 'daily', title: 'Day by day' };
+  if (series.points && series.points.length) {
     $('chartSec').hidden = false;
-    renderChart(body.hours);
+    $('chartTitle').textContent = series.title;
+    renderChart(series.points, series.key, series.grain);
   } else {
     $('chartSec').hidden = true;
     // Clean up any existing chart so it doesn't linger when switching periods.

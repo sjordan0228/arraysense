@@ -1931,6 +1931,7 @@ def efficiency(
             "waterfall": [],
             "strings": [],
             "hours": None,
+            "days": [],
             "worst_hour": None,
             "baseline": {"window_start": None, "window_end": None, "samples": None},
         }
@@ -1965,6 +1966,7 @@ def efficiency(
             "waterfall": [],
             "strings": [],
             "hours": None,
+            "days": [],
             "worst_hour": None,
             "baseline": {"window_start": None, "window_end": None, "samples": None},
         }
@@ -2073,6 +2075,22 @@ def efficiency(
         "waterfall": waterfall,
         "strings": string_summaries,
         "hours": hours,
+        # The same days the summary was totalled from, so a week or a month has
+        # a trend to draw. Without these the longer periods had a headline
+        # figure and nothing underneath it -- the page simply dropped its chart,
+        # which reads as a fault rather than as a period with no detail.
+        "days": [
+            {
+                "day": r.day.isoformat(),
+                "expected_kwh": round(r.expected_kwh, 3),
+                "actual_kwh": round(r.actual_kwh, 3),
+                "curtailed_kwh": round(r.curtailed_kwh, 3),
+                "unexplained_kwh": round(r.unexplained_kwh, 3),
+                "pr": round(r.pr, 4) if r.pr is not None else None,
+                "partial": r.partial,
+            }
+            for r in sorted(by_string.get("", []), key=lambda r: r.day)
+        ],
         "worst_hour": worst_hour,
         "baseline": baseline,
     }
