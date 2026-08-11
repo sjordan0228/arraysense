@@ -51,6 +51,7 @@ SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
+WEATHER_INTERVAL_KEY = "collector.weather_interval"
 
 
 # Deliberately loose. The full grammar of an address admits quoted local parts

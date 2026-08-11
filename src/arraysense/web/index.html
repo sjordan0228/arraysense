@@ -357,12 +357,12 @@
   </section>
 
   <!-- The forecast panel. A prediction is never drawn as a measurement — the
-       texture IS the label — so the dawn plan is hatched fill behind a dashed
-       revision line, while actual production is a solid line with a gradient
-       fill on top. The dawn band stays visible behind the actual so a day
-       running below plan shows as a gap between solid and hatch by lunchtime,
-       which is the money signal: the eye reads the space between what was
-       expected and what arrived. -->
+       texture IS the label — so the prediction is a dashed line over a hatched
+       fill and actual production is a solid line over a gradient one, on top.
+       One prediction, refreshed through the day, rather than a live curve and a
+       frozen morning one: two prediction curves on the same chart read as
+       clutter, and the gap between the dashed line and the solid one already
+       says what a tracking figure would have said. -->
   <section class="p" id="forecastPanel" hidden>
     <div class="chead"><h2>Today</h2>
       <span class="legend"><span class="muted" id="forecastFigures"></span></span>
@@ -1623,32 +1623,46 @@ function drawSoc(points) {
 
 // ---------------------------------------------------------------------------
 // Forecast chart — the day's predicted solar production against what actually
-// arrived. The whole point of Option B (the owner's chosen design) is that
-// the dawn plan stays visible BEHIND the actual, so a day running below plan
-// shows as a gap between solid and hatch by lunchtime.
+// arrived. The prediction is re-made through the day rather than frozen at
+// dawn, so the dashed line ahead of now is the current expectation and the
+// solid line behind it is what the array did; a day running short shows as a
+// gap between the two by lunchtime.
 //
-// All three series share --pv as their hue. The distinction between forecast
+// Both series share --pv as their hue. The distinction between forecast
 // and measurement is carried by texture — hatch, dash, solid — which is how
 // the chart reads under every form of colour vision deficiency. The foresight
 // of using texture over colour only helps the colour-blind reader; it does
 // not rely on them to see anything differently.
 // ---------------------------------------------------------------------------
 
+// How often the prediction is re-made, in words. The interval arrives from the
+// service because it is a setting an owner may move anywhere between five
+// minutes and a day, and a caption with fifteen written into it would be wrong
+// the moment they did.
+function refreshPhrase(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  const mins = Math.round(seconds / 60);
+  if (mins < 60) return `updated every ${mins} min`;
+  const hours = Math.round(mins / 60);
+  return `updated every ${hours} ${hours === 1 ? 'hour' : 'hours'}`;
+}
+
 // The figures line in the panel header, from the response only. The page
-// computes nothing: expected_today_kwh formatted like the other kWh figures,
-// tracking_pct rendered as "behind" (negative) or "ahead" (positive). Each
-// part is absent when its value is null — never a dash.
+// computes nothing but the wording. Each part is absent when its value is null
+// — never a dash.
+//
+// There is deliberately no ahead-or-behind figure. It used to compare the day
+// against a second, frozen curve drawn behind this one, and two prediction
+// curves on one chart read as clutter. The gap between the prediction and the
+// solid actual line says the same thing without a number whose reference is
+// nowhere on screen.
 function forecastFigures(fc) {
   const parts = [];
   if (fc.expected_today_kwh !== null && fc.expected_today_kwh !== undefined) {
     parts.push(`expected ${fc.expected_today_kwh.toFixed(1)} kWh`);
   }
-  if (fc.tracking_pct !== null && fc.tracking_pct !== undefined) {
-    const abs = Math.abs(fc.tracking_pct);
-    const dir = fc.tracking_pct < 0 ? 'behind' : 'ahead';
-    const cls = fc.tracking_pct < 0 ? 'bad' : 'good';
-    parts.push(`making <span style="color:var(--${cls})">${abs}% ${dir}</span> so far`);
-  }
+  const phrase = refreshPhrase(fc.refresh_seconds);
+  if (phrase) parts.push(phrase);
   return parts.join(' · ');
 }
 
@@ -1657,7 +1671,7 @@ function forecastFigures(fc) {
 // returns the current theme's colour, and a pattern cached from the last draw
 // would carry the old one into the new surface. uPlot's series.fill accepts a
 // function returning a fillStyle, which is how this reaches the canvas.
-function dawnFill(u, seriesIdx) {
+function predictionFill(u, seriesIdx) {
   const pat = document.createElement('canvas');
   pat.width = 10;
   pat.height = 10;
@@ -1711,9 +1725,9 @@ function nowMarker(getNowFn) {
 
 // Build aligned x/y arrays over the day's hours. Each hour boundary becomes
 // one position in the x array; hours absent from a curve are nulls (uPlot
-// gaps), never zeros. The three series may have different hour coverage —
-// dawn and latest cover the full day, actual only has measurements for hours
-// that have already passed.
+// gaps), never zeros. The two series have different hour coverage — the
+// prediction covers the whole day, while actual only has measurements for the
+// hours that have already passed.
 function buildForecastSeries(fc) {
   const dayStart = new Date(fc.day.start);
   const dayEnd = new Date(fc.day.end);
@@ -1732,10 +1746,8 @@ function buildForecastSeries(fc) {
   // "...T05:00:00.000Z", and matching strings across the two spellings made
   // every lookup miss — a chart that said "no forecast data" over a day the
   // API was serving in full.
-  const dawnMap = {};
-  for (const d of fc.dawn) dawnMap[Date.parse(d.hour)] = d.expected_w;
-  const latestMap = {};
-  for (const l of fc.latest) latestMap[Date.parse(l.hour)] = l.expected_w;
+  const predictionMap = {};
+  for (const d of fc.prediction) predictionMap[Date.parse(d.hour)] = d.expected_w;
   const actualMap = {};
   for (const a of fc.actual) actualMap[Date.parse(a.hour)] = a.mean_w;
 
@@ -1744,14 +1756,14 @@ function buildForecastSeries(fc) {
     return v !== undefined ? v : null;
   });
 
-  return { xs, dawn: lookup(dawnMap), latest: lookup(latestMap), actual: lookup(actualMap) };
+  return { xs, prediction: lookup(predictionMap), actual: lookup(actualMap) };
 }
 
 // Draw (or update) the forecast chart. Called on every successful fetch; on
 // failure the caller keeps the last drawn state and does not tear down.
 function drawForecast(fc) {
   const data = buildForecastSeries(fc);
-  if (!anyReading(data.dawn, data.latest, data.actual)) {
+  if (!anyReading(data.prediction, data.actual)) {
     chartMessage('forecast', 'no forecast data for today');
     return;
   }
@@ -1768,18 +1780,16 @@ function drawForecast(fc) {
         y: { range: powerRange },
       },
       axes: [timeAxis(), kwAxis()],
-      // Back to front: the dawn plan (hatched), the latest revision (dashed),
-      // and the actual production (solid with gradient fill). All three share
-      // --pv; the distinction is carried by texture and position alone.
+      // Two series, both --pv, told apart by texture alone: the prediction is a
+      // dashed line over a hatched fill, the measurement a solid line over a
+      // gradient. A prediction is never drawn the way a measurement is drawn,
+      // and neither one relies on hue to say which it is.
       series: [
         {},
-        trace('Dawn plan', '--pv', 1.0, {
-          fill: dawnFill,
+        trace('Prediction', '--pv', 1.2, {
+          fill: predictionFill,
           fillTo: () => 0,
-          stroke: () => fade('--pv', 0.25),
-          dash: [6, 4],
-        }),
-        trace('Latest', '--pv', 1.2, {
+          stroke: () => fade('--pv', 0.55),
           dash: [8, 4],
         }),
         trace('Actual', '--pv', 1.8, {
@@ -1790,13 +1800,12 @@ function drawForecast(fc) {
       plugins: [
         nowMarker(() => (forecastData ? forecastData.now : null)),
         readout('forecast', [
-          ['Dawn plan', 1, kw],
-          ['Latest', 2, kw],
-          ['Actual', 3, kw],
+          ['Prediction', 1, kw],
+          ['Actual', 2, kw],
         ]),
       ],
     }),
-  }, [data.xs, data.dawn, data.latest, data.actual]);
+  }, [data.xs, data.prediction, data.actual]);
 
   $('forecastFigures').innerHTML = forecastFigures(fc);
 }

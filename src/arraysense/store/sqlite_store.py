@@ -671,10 +671,14 @@ class SqliteStore:
         """Record one prediction of the day's production, keeping when it was made.
 
         Append-only on (target_hour, made_at): a revision never overwrites the
-        plan it revises, because the page tracks the day against the dawn plan
-        while drawing the latest expectation ahead of now — two truths from one
-        table, and erasing the older would fake the tracking. A prediction is
-        not a measurement and never touches a metric column.
+        prediction it revises. The dashboard draws only the newest one, so
+        nothing on screen depends on the older rows today — they are kept
+        because they are the only record of how a day's expectation moved, which
+        is what any later attempt to score the forecast against what happened
+        would have to read. Overwriting is unrecoverable and keeping is a few
+        hundred rows a day, pruned at ninety.
+
+        A prediction is not a measurement and never touches a metric column.
         """
         rows = [
             (int(hour.timestamp()), int(made_at.timestamp()), round(watts))
@@ -687,39 +691,34 @@ class SqliteStore:
                 rows,
             )
 
-    def forecast_day(self, start: datetime, end: datetime) -> dict[str, list[dict[str, object]]]:
-        """The day's dawn plan and its latest revision, hour by hour.
+    def forecast_day(self, start: datetime, end: datetime) -> list[dict[str, object]]:
+        """The newest prediction for each hour of a day, oldest hour first.
 
-        ``first`` is the earliest prediction made on the day itself for each
-        hour — the plan the day is tracked against; a forecast made yesterday
-        does not count as the dawn plan. ``latest`` is the newest prediction
-        for each hour whenever it was made. Hours nobody predicted are absent,
-        not zero.
+        One curve, because the page draws one. It used to return a second — the
+        earliest prediction made on the day itself, frozen as a baseline to
+        measure the day against — and the owner found two prediction curves on
+        one chart confusing rather than informative. The rows behind that
+        baseline are still recorded; only the query went away, so reinstating it
+        is a query and not a migration.
+
+        Hours nobody predicted are absent, not zero: a forecast that was never
+        made is not a forecast of nothing.
         """
-        lo, hi = int(start.timestamp()), int(end.timestamp())
-
-        def curve(order: str, floor: int | None) -> list[dict[str, object]]:
-            made_filter = "AND made_at >= ?" if floor is not None else ""
-            params: tuple[int, ...] = (lo, hi, floor) if floor is not None else (lo, hi)
-            rows = self._conn.execute(
-                "SELECT target_hour, expected_w, made_at FROM forecast f "
-                f"WHERE target_hour >= ? AND target_hour < ? {made_filter} "
-                "AND made_at = (SELECT "
-                f"{order}(made_at) FROM forecast WHERE target_hour = f.target_hour"
-                + (" AND made_at >= ?" if floor is not None else "")
-                + ") ORDER BY target_hour",
-                params + ((floor,) if floor is not None else ()),
-            ).fetchall()
-            return [
-                {
-                    "hour": datetime.fromtimestamp(hour, tz=UTC),
-                    "expected_w": float(watts),
-                    "made_at": datetime.fromtimestamp(made, tz=UTC),
-                }
-                for hour, watts, made in rows
-            ]
-
-        return {"first": curve("MIN", lo), "latest": curve("MAX", None)}
+        rows = self._conn.execute(
+            "SELECT target_hour, expected_w, made_at FROM forecast f "
+            "WHERE target_hour >= ? AND target_hour < ? AND made_at = "
+            "(SELECT MAX(made_at) FROM forecast WHERE target_hour = f.target_hour) "
+            "ORDER BY target_hour",
+            (int(start.timestamp()), int(end.timestamp())),
+        ).fetchall()
+        return [
+            {
+                "hour": datetime.fromtimestamp(hour, tz=UTC),
+                "expected_w": float(watts),
+                "made_at": datetime.fromtimestamp(made, tz=UTC),
+            }
+            for hour, watts, made in rows
+        ]
 
     def prune_forecast(self, before: datetime) -> int:
         """Drop predictions for hours older than ``before``; returns rows removed.

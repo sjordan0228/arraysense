@@ -181,7 +181,7 @@ async def test_forecast_falls_back_to_the_observed_peak_without_scored_days(
 
     k = peak_pv / CLEAR_SKY_PEAK_RADIATION
     day = store.forecast_day(hour1, hour2 + timedelta(hours=1))
-    latest = day["latest"]
+    latest = day
     assert len(latest) == 2
     assert latest[0]["expected_w"] == float(round(500.0 * k))
     assert latest[1]["expected_w"] == float(round(800.0 * k))
@@ -213,7 +213,7 @@ async def test_enough_scored_days_switch_the_forecast_to_demonstrated_performanc
     poller = WeatherPoller(store, fetch=lambda lat, lon: _sample(), fetch_forecast=lambda a, b: sky)
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))["latest"]
+    rows = store.forecast_day(hour, hour + timedelta(hours=1))
     assert len(rows) == 1
     watts = rows[0]["expected_w"]
     assert isinstance(watts, float)
@@ -245,7 +245,7 @@ async def test_four_scored_days_are_not_enough(store: SqliteStore) -> None:
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))["latest"]
+    rows = store.forecast_day(hour, hour + timedelta(hours=1))
     assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
 
 
@@ -271,7 +271,7 @@ async def test_partial_days_do_not_count_toward_the_floor(store: SqliteStore) ->
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))["latest"]
+    rows = store.forecast_day(hour, hour + timedelta(hours=1))
     assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
 
 
@@ -297,7 +297,7 @@ async def test_an_undescribed_array_falls_back_however_many_days_are_scored(
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))["latest"]
+    rows = store.forecast_day(hour, hour + timedelta(hours=1))
     assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
 
 
@@ -323,7 +323,7 @@ async def test_no_pv_history_records_no_forecast_but_weather_still_lands(
         datetime(2026, 8, 11, 0, tzinfo=UTC),
         datetime(2026, 8, 12, 0, tzinfo=UTC),
     )
-    assert day["latest"] == []
+    assert day == []
 
     # Weather still landed.
     latest = store.latest(["outside_temperature_c", "cloud_cover_pct"])
@@ -356,7 +356,7 @@ async def test_forecast_fetch_none_writes_no_forecast_weather_unaffected(
         datetime(2026, 8, 11, 0, tzinfo=UTC),
         datetime(2026, 8, 12, 0, tzinfo=UTC),
     )
-    assert day["latest"] == []
+    assert day == []
 
     latest = store.latest(["outside_temperature_c", "cloud_cover_pct"])
     assert latest is not None
@@ -389,10 +389,10 @@ async def test_prune_removes_old_forecast_rows(store: SqliteStore) -> None:
         old_hour - timedelta(hours=1),
         old_hour + timedelta(hours=1),
     )
-    assert old_day["latest"] == []
+    assert old_day == []
 
     new_day = store.forecast_day(
         new_hour - timedelta(hours=1),
         new_hour + timedelta(hours=1),
     )
-    assert len(new_day["latest"]) == 1
+    assert len(new_day) == 1
