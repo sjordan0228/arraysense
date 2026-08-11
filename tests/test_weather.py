@@ -197,3 +197,29 @@ def test_the_client_writes_exactly_the_site_metrics() -> None:
     from arraysense.weather import METRICS
 
     assert METRICS == SITE_METRICS
+
+
+def test_the_current_fetch_carries_irradiance_and_converts_wind(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Open-Meteo reports wind in km/h; Faiman wants m/s. The conversion happens
+    # here, at the boundary, so no consumer can inherit the wrong unit.
+    payload = json.dumps(
+        {
+            "current": {
+                "temperature_2m": 24.0,
+                "cloud_cover": 10,
+                "shortwave_radiation": 700.0,
+                "direct_normal_irradiance": 850.0,
+                "diffuse_radiation": 120.0,
+                "wind_speed_10m": 18.0,  # km/h
+            }
+        }
+    ).encode()
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: payload)
+    sample = open_meteo.fetch_current(35.2, -97.4)
+    assert sample is not None
+    assert sample.readings["ghi_wm2"] == 700.0
+    assert sample.readings["dni_wm2"] == 850.0
+    assert sample.readings["dhi_wm2"] == 120.0
+    assert sample.readings["wind_speed_ms"] == pytest.approx(5.0, abs=0.01)  # 18/3.6

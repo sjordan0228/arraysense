@@ -230,3 +230,22 @@ def test_adding_an_inverter_metric_to_the_registry_is_one_line(
         body = client.get("/api/capabilities").json()
     store.close()
     assert "coolant_temperature_c" in body["devices"][0]["metrics"]
+
+
+def test_the_irradiance_and_wind_metrics_are_registered() -> None:
+    # The efficiency model reads these; they are site readings like the sky
+    # already recorded, so they tier and roll up with everything else.
+    by_name = {spec.name: spec for spec in INVERTER_METRICS}
+    assert (by_name["ghi_wm2"].unit, by_name["ghi_wm2"].upper) == ("W/m²", 1500.0)
+    assert (by_name["dni_wm2"].unit, by_name["dni_wm2"].upper) == ("W/m²", 1200.0)
+    assert (by_name["dhi_wm2"].unit, by_name["dhi_wm2"].upper) == ("W/m²", 800.0)
+    wind = by_name["wind_speed_ms"]
+    assert (wind.unit, wind.lower, wind.upper) == ("m/s", 0.0, 60.0)
+
+
+def test_the_new_inputs_are_site_metrics_not_the_inverters() -> None:
+    # SITE_METRICS gates the staleness witness and the store's writable set.
+    # An irradiance row must not read as the inverter having reported.
+    from arraysense.metrics import SITE_METRICS
+
+    assert {"ghi_wm2", "dni_wm2", "dhi_wm2", "wind_speed_ms"} <= SITE_METRICS

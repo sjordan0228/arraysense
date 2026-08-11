@@ -34,7 +34,16 @@ _BASE = "https://api.open-meteo.com/v1/forecast"
 _FIELDS: dict[str, str] = {
     "temperature_2m": "outside_temperature_c",
     "cloud_cover": "cloud_cover_pct",
+    "shortwave_radiation": "ghi_wm2",
+    "direct_normal_irradiance": "dni_wm2",
+    "diffuse_radiation": "dhi_wm2",
+    "wind_speed_10m": "wind_speed_ms",
 }
+
+# Values the reply gives in one unit and the registry stores in another.
+# Open-Meteo reports wind in km/h; the cell-temperature model wants m/s, and a
+# unit that converts at every reader is a unit that eventually does not.
+_CONVERSIONS: dict[str, float] = {"wind_speed_10m": 1.0 / 3.6}
 
 # The metric names this source writes, for whoever opens the store. A store is
 # opened with a whitelist of writable metrics, and the driver's declaration
@@ -152,13 +161,18 @@ def fetch_current(latitude: float, longitude: float, timeout: float = 10.0) -> S
         value = current.get(field) if isinstance(current, dict) else None
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             continue
+        converted = float(value) * _CONVERSIONS.get(field, 1.0)
         spec = _SPECS[metric]
-        if not spec.lower <= float(value) <= spec.upper:
+        if not spec.lower <= converted <= spec.upper:
             logger.debug(
-                "weather %s=%s is outside %s..%s; dropped", metric, value, spec.lower, spec.upper
+                "weather %s=%s is outside %s..%s; dropped",
+                metric,
+                converted,
+                spec.lower,
+                spec.upper,
             )
             continue
-        readings[metric] = float(value)
+        readings[metric] = converted
     if not readings:
         return None
     return Sample(timestamp=datetime.now(UTC), readings=readings)
