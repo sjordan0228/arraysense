@@ -920,22 +920,23 @@ def test_daily_totals_are_identical_from_hourly_and_minute_tiers(
 ) -> None:
     """Daily totals from the hourly tier match those from the minute tier.
 
-    Covers a week that includes normal days, a spring-forward boundary, and the
-    current (partial) day, so the assertion holds across the calendar shapes
-    that matter. A single day broken here would put the lie to the claim that
-    the tier does not affect the answer.
+    Covers normal days and the 23-hour day the US spring-forward makes, so the
+    assertion holds across the calendar shapes that matter. A single day broken
+    here would put the lie to the claim that the tier does not affect the
+    answer.
     """
     from arraysense.store.rollup import rebuild_inverter_hourly, rebuild_inverter_minute
 
     zone = ZoneInfo("America/New_York")
-    # A week straddling the spring-forward: 7 Mar 2027 is the change in the US.
-    start = datetime(2027, 3, 5, tzinfo=zone)
-    end = datetime(2027, 3, 11, tzinfo=zone)
+    # Straddling the spring-forward, which is the second Sunday of March in the
+    # US: 14 Mar 2027, a day 23 hours long.
+    start = datetime(2027, 3, 12, tzinfo=zone)
+    end = datetime(2027, 3, 16, tzinfo=zone)
     edges = bucket_edges(start, end, "day", zone)
 
     # Write a counter climbing 1 kWh an hour for 10 days so both tiers see the
     # same underlying measurements.
-    samples = _counters(datetime(2027, 3, 3, tzinfo=zone), hours=24 * 10)
+    samples = _counters(datetime(2027, 3, 10, tzinfo=zone), hours=24 * 10)
     store = _store(tmp_path, samples)
 
     # Roll up to both coarse tiers.
