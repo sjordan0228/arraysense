@@ -56,6 +56,10 @@
   .baseline dd{margin:0 0 6px}
   .baseline dt{font-weight:500;color:var(--ink2)}
   /* The hourly chart container. */
+  /* `chart` first, and it is not decoration: the shared stylesheet hangs
+     position:relative and the uplot width rule off it. Without it uPlot's
+     absolutely positioned layers escape to the nearest positioned ancestor --
+     the page -- and the plot draws itself full width behind the cards. */
   .effchart{margin-top:8px}
   /* No-data message inside the chart. */
   .effchart .nodata{color:var(--ink3);font-size:12px;padding:26px 0;text-align:center;line-height:1.6}
@@ -151,7 +155,7 @@
       <h2>Hour by hour</h2>
       <span class="legend muted">expected — a model, not a guarantee · actual — what the inverter recorded</span>
     </div>
-    <div class="effchart" id="effChartWrap"></div>
+    <div class="chart effchart" id="effChartWrap"></div>
   </section>
 
   <section class="p" id="worstSec" hidden>

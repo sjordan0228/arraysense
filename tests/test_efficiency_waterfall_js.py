@@ -140,3 +140,30 @@ def test_the_bar_describes_itself_to_a_screen_reader() -> None:
     for figure in ("80", "67", "11", "2"):
         assert figure in label, f"the description never mentions {figure}"
     assert "not counted against the array" in label
+
+
+PAGES = (Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web").glob("*.html")
+
+
+def test_every_chart_container_carries_the_shared_chart_class() -> None:
+    """uPlot escapes any container the shared stylesheet has not positioned.
+
+    `paint()` looks up `<id>Wrap` and builds the plot inside it, and the base
+    stylesheet hangs position:relative and the uplot width rule off `.chart`.
+    A wrapper that misses that class lets uPlot's absolutely positioned layers
+    resolve against the page instead, and the plot draws itself full width
+    behind everything else -- which is exactly how the Efficiency chart
+    shipped, because nothing in Python or in a linter can see a missing CSS
+    class.
+    """
+    import re
+
+    offenders: list[str] = []
+    for page in PAGES:
+        html = page.read_text()
+        for match in re.finditer(r'<div([^>]*\bid="(\w+)Wrap"[^>]*)>', html):
+            attrs, name = match.group(1), match.group(2)
+            classes = re.search(r'class="([^"]*)"', attrs)
+            if not classes or "chart" not in classes.group(1).split():
+                offenders.append(f"{page.name}: {name}Wrap")
+    assert not offenders, f"chart wrappers missing the 'chart' class: {offenders}"
