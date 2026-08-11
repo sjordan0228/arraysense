@@ -20,10 +20,14 @@ import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from arraysense.collector.source import InverterSource
 from arraysense.drivers.base import SampleBuildError
+from arraysense.efficiency import CONFIG_VERSION_KEY, compute_day
 from arraysense.models import Sample
+from arraysense.panels import parse_strings
+from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
 from arraysense.store.rollup import (
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
@@ -343,6 +347,81 @@ class CollectorService:
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
 
+    async def maintain_efficiency(self, now: datetime | None = None) -> None:
+        """Score yesterday and today once the hourly tier they read is current.
+
+        Runs after the rollup pass, because it reads the hourly tier that pass
+        rebuilds. An installation with no array described, no location, or no
+        timezone is skipped: those are ordinary unconfigured states rather than
+        failures, and an installation that has never been told where it is
+        cannot be told what its sun should have delivered.
+
+        Today is always rescored and yesterday only when its stored score
+        predates the current array description. A day still being written is
+        never final — scored once at breakfast it would hold three hours of
+        dawn until midnight, and then keep that figure forever as the day
+        rolled into history.
+        """
+        settings = SettingsStore(self._store)
+
+        zone_str = settings.get(SETTING_TIMEZONE)
+        if not isinstance(zone_str, str) or not zone_str:
+            return
+        try:
+            tz = ZoneInfo(zone_str)
+        except (ZoneInfoNotFoundError, ValueError):
+            # Refused rather than guessed: a wrong zone silently shifts every
+            # day boundary, which mis-attributes a morning's generation.
+            logger.warning("efficiency pass: unknown timezone %r", zone_str)
+            return
+
+        strings_text = settings.get(PANELS_STRINGS_KEY)
+        if not isinstance(strings_text, str) or not strings_text.strip():
+            return
+        try:
+            strings = parse_strings(strings_text)
+        except ValueError as exc:
+            logger.warning("efficiency pass: array description unusable: %s", exc)
+            return
+        if not strings:
+            return
+
+        raw_version = settings.get(CONFIG_VERSION_KEY)
+        config_version = raw_version if isinstance(raw_version, int) else 0
+
+        local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
+        for days_back in (0, 1):
+            day_start = (local_now - timedelta(days=days_back)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(days=1)
+
+            # Yesterday is settled, so a score already taken against this same
+            # array description stands. Today is not, and is always redone.
+            if days_back > 0:
+                scored = self._store.read_efficiency_days(day_start, day_end)
+                if scored and all(r.config_version == config_version for r in scored):
+                    continue
+
+            try:
+                rows = compute_day(
+                    self._store, settings, day_start, day_end, strings, config_version
+                )
+            except (ValueError, KeyError, sqlite3.Error) as exc:
+                # Logged at warning, not debug: this runs unattended, and the
+                # failure that leaves no trace is the one nobody diagnoses.
+                # The weather feature lost a week to an append that raised into
+                # a swallowing loop while every test stayed green.
+                logger.warning("efficiency pass failed for %s: %s", day_start.date(), exc)
+                continue
+
+            if not rows:
+                continue
+            try:
+                self._store.write_efficiency_day(rows)
+            except sqlite3.Error as exc:
+                logger.warning("could not store efficiency for %s: %s", day_start.date(), exc)
+
     async def poll_once(self) -> Sample | None:
         """Read once and store the result, returning what was stored.
 
@@ -584,6 +663,7 @@ class CollectorService:
                 if now - last_rollup >= ROLLUP_INTERVAL:
                     last_rollup = now
                     await self.maintain_rollups()
+                    await self.maintain_efficiency()
                 await asyncio.sleep(self._wait_from(started))
         except asyncio.CancelledError:
             raise

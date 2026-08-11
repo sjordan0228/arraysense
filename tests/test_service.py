@@ -634,3 +634,82 @@ def test_a_model_refusal_is_wrapped_as_a_build_error_with_its_cause(
     except SampleBuildError as exc:
         assert isinstance(exc.__cause__, ValueError), "the original refusal must be chained"
         assert "timezone-aware" in str(exc.__cause__), "the cause must survive intact"
+
+
+class TestEfficiencyMaintenance:
+    """The summary pass, and the day it must not freeze."""
+
+    @staticmethod
+    def _configured(tmp_path: Path) -> tuple[CollectorService, SqliteStore]:
+        from arraysense.settings import SettingsStore
+
+        store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        settings.set("site.timezone", "America/Chicago")
+        settings.set("site.latitude", 33.0)
+        settings.set("site.longitude", -97.0)
+        settings.set("panels.strings", "East | 1 | 10 | 400 | 25 | 90")
+        return CollectorService(source=FakeSource(), store=store, interval=0.01), store
+
+    @staticmethod
+    def _stage(store: SqliteStore, hours: range | list[int]) -> None:
+        import sys
+
+        sys.path.insert(0, "tests")
+        from datetime import UTC, datetime, timedelta
+
+        from test_efficiency import _insert_hourly
+
+        base = datetime(2026, 8, 10, tzinfo=UTC)
+        for h in hours:
+            _insert_hourly(
+                store._conn,
+                base + timedelta(hours=h + 5),
+                pv_power=3000.0,
+                ghi=750.0,
+                dni=800.0,
+                dhi=110.0,
+                wind=2.0,
+                air_c=30.0,
+            )
+
+    async def test_today_is_rescored_as_the_day_fills_in(self, tmp_path: Path) -> None:
+        """A day still being written is never final.
+
+        Scored once in the morning and then skipped as "already done", today
+        would hold three hours of dawn until midnight — and carry that figure
+        into history when it became yesterday. Whatever else the pass skips,
+        it must not skip the day that is still happening.
+        """
+        from datetime import UTC, datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        svc, store = self._configured(tmp_path)
+        base = datetime(2026, 8, 10, tzinfo=UTC)
+        local = datetime(2026, 8, 10, tzinfo=ZoneInfo("America/Chicago"))
+
+        self._stage(store, [8, 9, 10])
+        await svc.maintain_efficiency(now=base + timedelta(hours=16))
+        morning = store.read_efficiency_days(local, local + timedelta(days=1))
+        assert morning and morning[0].modelled_hours == 3
+
+        self._stage(store, range(11, 19))
+        await svc.maintain_efficiency(now=base + timedelta(hours=24))
+        evening = store.read_efficiency_days(local, local + timedelta(days=1))
+        store.close()
+        assert evening[0].modelled_hours == 11, "today's score went stale"
+        assert evening[0].actual_kwh > morning[0].actual_kwh
+
+    async def test_an_unconfigured_installation_is_skipped_not_scored(self, tmp_path: Path) -> None:
+        # No array described: there is nothing to compare a reading against,
+        # and a row of zeros would be a claim about an array nobody has stated.
+        store = SqliteStore(str(tmp_path / "bare.db"), device=TEST_DEVICE)
+        svc = CollectorService(source=FakeSource(), store=store, interval=0.01)
+        await svc.maintain_efficiency()
+        from datetime import UTC, datetime
+
+        rows = store.read_efficiency_days(
+            datetime(2020, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC)
+        )
+        store.close()
+        assert rows == []

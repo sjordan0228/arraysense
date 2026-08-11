@@ -26,7 +26,7 @@ import logging
 import math
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
@@ -45,6 +45,8 @@ Kind = Literal["str", "int", "float", "bool", "choice"]
 # call site, for the same reason the tariff keys are named in tariff.py: a key
 # typed by hand in one place and mistyped in another reads as an unset setting
 # rather than as an error.
+CONFIG_VERSION_KEY = "efficiency.config_version"
+PANELS_STRINGS_KEY = "panels.strings"
 SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
@@ -738,6 +740,19 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help="Per battery. 0 means unstated.",
     ),
     SettingSpec(
+        key="efficiency.config_version",
+        kind="int",
+        default=0,
+        lower=0,
+        upper=2147483647,
+        label="Efficiency config version",
+        help=(
+            "Bumped automatically when the array or battery config changes, so "
+            "stored efficiency days are recomputed against the new settings. "
+            "Leave it alone — it is not a setting to choose."
+        ),
+    ),
+    SettingSpec(
         key="battery.installed",
         kind="str",
         default="",
@@ -807,6 +822,42 @@ class SettingsStore:
             logger.warning("setting %s holds undecodable %r; using the default", key, row[0])
             return spec.default
 
+    # A change to either of these changes what the array is expected to produce,
+    # which makes every efficiency day scored under the old description stale.
+    # The version is what marks them so: the summary pass rescores a day whose
+    # stored version is not the current one. Bumping is the writer's job because
+    # only the writer knows a change happened — a reader comparing settings to
+    # scored days would have to keep a copy of the settings to compare against,
+    # which is the same problem again one level down.
+    _VERSIONED_PREFIXES = ("panels.", "battery.")
+
+    def _bump_config_version(self, keys: Iterable[str]) -> None:
+        """Advance the efficiency config version if any of ``keys`` describes the array.
+
+        Called inside the caller's transaction, so a write that fails validation
+        leaves the version alone and days scored under it stay valid.
+        """
+        if not any(k.startswith(self._VERSIONED_PREFIXES) for k in keys):
+            return
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)
+        ).fetchone()
+        try:
+            current = int(row[0]) if row and row[0] else 0
+        except ValueError:
+            # A version we cannot read is one we cannot trust to be older than
+            # what comes next; starting again from zero would make every stored
+            # day agree with it and freeze exactly the staleness it exists to
+            # catch, so step somewhere no stored row can already be sitting.
+            logger.warning("efficiency config version unreadable; restarting it")
+            current = 0
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (CONFIG_VERSION_KEY, str(current + 1)),
+        )
+        logger.info("array configuration changed; efficiency version now %d", current + 1)
+
     def set_many(self, values: dict[str, object]) -> None:
         """Validate every value, then store all of them in one transaction.
 
@@ -832,6 +883,7 @@ class SettingsStore:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, stored),
                 )
+            self._bump_config_version(k for k, _ in checked)
 
     def set(self, key: str, value: object) -> None:
         """Validate ``value`` against its spec and store it.
@@ -856,6 +908,7 @@ class SettingsStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, stored),
             )
+            self._bump_config_version((key,))
         logger.info("setting %s changed", key)
 
     def clear(self, key: str) -> None:
@@ -863,6 +916,7 @@ class SettingsStore:
         lookup_setting(key)
         with self._conn:
             self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self._bump_config_version((key,))
 
     def overrides(self) -> dict[str, object]:
         """Return only the settings someone has actually stored a value for.
