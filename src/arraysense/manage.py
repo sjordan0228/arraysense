@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -233,3 +234,57 @@ def cmd_status(argv: list[str]) -> int:
     span = "empty" if facts["first"] is None else f"{facts['first']} .. {facts['last']}"
     print(f"database:  {facts['bytes'] / 1048576:.1f} MB, {span}")
     return 0
+
+
+def cmd_logs(argv: list[str]) -> int:
+    """Journalctl for the unit, so nobody has to remember its name."""
+    args = ["journalctl", "-u", SERVICE, "-n", "200"]
+    if "-f" in argv or "--follow" in argv:
+        args.append("-f")
+    return subprocess.call(args)
+
+
+def cmd_restart(argv: list[str]) -> int:
+    """Restart and prove it came back, rather than trusting systemctl."""
+    if not service("restart"):
+        print("systemctl restart failed; try: arraysense logs")
+        return 1
+    port = configured_port()
+    if wait_until_healthy(port) is None:
+        print("restarted, but the collector did not come back within 90s")
+        print("  try: arraysense logs")
+        return 1
+    print("restarted and collecting")
+    return 0
+
+
+def cmd_version(argv: list[str]) -> int:
+    """Name the installed code and what the running service reports."""
+    commit = run(["git", "-C", INSTALL_DIR, "rev-parse", "--short", "HEAD"]).stdout.strip()
+    body = _probe(status_url(configured_port()), timeout=5.0) or {}
+    print(f"version: {body.get('version') or 'not answering'}")
+    print(f"commit:  {commit or 'unknown'}")
+    return 0
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "logs": cmd_logs,
+    "restart": cmd_restart,
+    "version": cmd_version,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Dispatch a subcommand; no argument means status, an unknown one means 2."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    name = args[0] if args else "status"
+    handler = COMMANDS.get(name)
+    if handler is None:
+        print("usage: arraysense {" + "|".join(sorted(COMMANDS)) + "}")
+        return 2
+    return handler(args[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

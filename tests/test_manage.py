@@ -70,12 +70,18 @@ def test_status_reports_absent_facts_as_absent(
 def test_status_reports_a_real_date_range_from_the_real_schema(
     tmp_path: Any,
 ) -> None:
-    """One real row yields a real date range, through the project's own DDL.
+    """Two real rows yield a real range, through the project's own DDL.
 
     A hand-built table could drift from the real schema and keep passing;
     building it from ddl_for means a renamed table or timestamp column breaks
-    this test, which is the regression it exists to catch.
+    this test, which is the regression it exists to catch. The gap is asserted
+    in days rather than as a hard-coded date because database_facts renders
+    local dates deliberately, and one instant's local date depends on the zone
+    the runner happens to be in.
     """
+    import datetime as _dt
+    from datetime import date
+
     db = tmp_path / "full.db"
     conn = sqlite3.connect(str(db))
     conn.execute(schema.ddl_for("inverter_raw"))
@@ -83,12 +89,19 @@ def test_status_reports_a_real_date_range_from_the_real_schema(
         "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
         (1783512004, "CE12345678"),
     )
+    conn.execute(
+        "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
+        (1783512004 + 10 * 86400, "CE12345678"),
+    )
     conn.commit()
     conn.close()
 
     facts = manage.database_facts(str(db))
-    assert facts["first"] == "2026-07-08"
-    assert facts["last"] == "2026-07-08"
+    assert facts["first"] != facts["last"]
+    first = date.fromisoformat(facts["first"])
+    last = date.fromisoformat(facts["last"])
+    assert (last - first).days == 10
+    assert facts["first"] == _dt.datetime.fromtimestamp(1783512004).date().isoformat()
 
 
 def test_status_reads_the_port_from_the_unit_drop_in(
@@ -211,3 +224,30 @@ def test_driver_line_says_so_when_the_endpoint_cannot_be_read() -> None:
 
 def test_driver_line_with_no_devices_at_all() -> None:
     assert manage.driver_line({"devices": []}) == "driver:    none declared"
+
+
+def test_an_unknown_subcommand_lists_the_real_ones() -> None:
+    """A typo must not read as a failure of the program."""
+    assert manage.main(["frobnicate"]) == 2
+
+
+def test_restart_fails_loudly_when_the_service_does_not_come_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restart is not 'systemctl returned 0'. It is 'the collector answered'."""
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: None)
+    assert manage.cmd_restart([]) == 1
+
+
+def test_usage_lists_only_commands_that_actually_run(capsys: Any) -> None:
+    """Usage that advertises a command the parser rejects is worse than silence.
+
+    An earlier draft carried None placeholders for commands not yet written;
+    they appeared in this line and then failed as typos.
+    """
+    assert manage.main(["frobnicate"]) == 2
+    usage = capsys.readouterr().out
+    for name in manage.COMMANDS:
+        assert name in usage
+        assert manage.COMMANDS[name] is not None
