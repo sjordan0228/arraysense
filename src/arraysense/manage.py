@@ -237,10 +237,17 @@ def cmd_status(argv: list[str]) -> int:
 
 
 def cmd_logs(argv: list[str]) -> int:
-    """Journalctl for the unit, so nobody has to remember its name."""
-    args = ["journalctl", "-u", SERVICE, "-n", "200"]
-    if "-f" in argv or "--follow" in argv:
-        args.append("-f")
+    """Journalctl for the unit, so nobody has to remember its name.
+
+    Arguments are forwarded rather than filtered: this exists to help somebody
+    diagnose an installation, and quietly discarding the `--since` or `-n` they
+    typed would answer a different question from the one they asked.
+    """
+    asked_for_lines = any(a in ("-n", "--lines") or a.startswith("--lines=") for a in argv)
+    args = ["journalctl", "-u", SERVICE]
+    if not asked_for_lines:
+        args += ["-n", "200"]
+    args += argv
     return subprocess.call(args)
 
 

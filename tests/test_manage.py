@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 from typing import Any
 
 import pytest
@@ -240,6 +241,63 @@ def test_restart_fails_loudly_when_the_service_does_not_come_back(
     assert manage.cmd_restart([]) == 1
 
 
+def test_restart_returns_zero_when_the_collector_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without this, a cmd_restart that always failed would pass the suite."""
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: {"running": True})
+    assert manage.cmd_restart([]) == 0
+
+
+def test_restart_gives_up_when_systemctl_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """systemctl failing must not be reported through the health check, which
+    would blame a ninety-second timeout for something that failed at once."""
+    calls: list[str] = []
+
+    def record_poll(port: int, **kw: object) -> None:
+        calls.append("polled")
+
+    monkeypatch.setattr(manage, "service", lambda action: False)
+    monkeypatch.setattr(manage, "wait_until_healthy", record_poll)
+    assert manage.cmd_restart([]) == 1
+    assert calls == [], "a failed systemctl must not then wait 90s for a health check"
+
+
+def test_no_arguments_runs_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bare `arraysense` is what somebody types first, so it must do the
+    harmless, informative thing rather than print usage."""
+    seen: list[list[str]] = []
+
+    def fake_status(argv: list[str]) -> int:
+        seen.append(argv)
+        return 0
+
+    monkeypatch.setitem(manage.COMMANDS, "status", fake_status)
+    assert manage.main([]) == 0
+    assert seen == [[]]
+
+
+def test_logs_forwards_what_the_user_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    def fake_call(argv: list[str]) -> int:
+        seen.append(argv)
+        return 0
+
+    monkeypatch.setattr(subprocess, "call", fake_call)
+
+    manage.cmd_logs(["-f"])
+    assert seen[-1] == ["journalctl", "-u", manage.SERVICE, "-n", "200", "-f"]
+
+    manage.cmd_logs(["-n", "50"])
+    assert seen[-1] == ["journalctl", "-u", manage.SERVICE, "-n", "50"]
+    assert "200" not in seen[-1]
+
+
 def test_usage_lists_only_commands_that_actually_run(capsys: Any) -> None:
     """Usage that advertises a command the parser rejects is worse than silence.
 
@@ -250,4 +308,4 @@ def test_usage_lists_only_commands_that_actually_run(capsys: Any) -> None:
     usage = capsys.readouterr().out
     for name in manage.COMMANDS:
         assert name in usage
-        assert manage.COMMANDS[name] is not None
+        assert callable(manage.COMMANDS[name])
