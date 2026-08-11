@@ -27,6 +27,11 @@ CONFIG_PATH = "/etc/arraysense/config.toml"
 PORT_DROPIN = "/etc/systemd/system/arraysense.service.d/port.conf"
 DEFAULT_PORT = 8080
 
+# "Upgrade" fast-forwards the install to this remote-tracking branch: main is
+# the branch that has run on the reference installation, while dev is where a
+# change proves itself before it is merged to main.
+TRACKING_BRANCH = "origin/main"
+
 # What "healthy" means, and why it is not "systemctl says active": the unit is
 # active the moment the process starts, which is before it binds the port and
 # well before the first poll has reached the inverter. An upgrade that trusted
@@ -274,12 +279,156 @@ def cmd_version(argv: list[str]) -> int:
     return 0
 
 
+def current_commit() -> str:
+    """The commit the install is on, which is also the rollback target.
+
+    The rollback needs an unambiguous pointer, so a full hash is taken rather
+    than the short one printed elsewhere for human reading.
+    """
+    return run(["git", "-C", INSTALL_DIR, "rev-parse", "HEAD"]).stdout.strip()
+
+
+def is_dirty() -> bool:
+    """Whether anything under the install has been edited by hand.
+
+    A local modification would be silently overwritten by the merge, so the
+    refusal has to happen before anything is fetched or applied — the file
+    being replaced is the very code running this command.
+    """
+    return bool(run(["git", "-C", INSTALL_DIR, "status", "--porcelain"]).stdout.strip())
+
+
+def _pending_commits() -> list[str]:
+    """Subjects between here and the tracking branch, newest last.
+
+    Shown before anything is applied so an owner can see what an upgrade means
+    before agreeing to it. Fetched first so the comparison is against what the
+    remote actually holds rather than a stale local view.
+    """
+    run(["git", "-C", INSTALL_DIR, "fetch", "--quiet", "origin"])
+    out = run(
+        [
+            "git",
+            "-C",
+            INSTALL_DIR,
+            "log",
+            "--oneline",
+            "--no-merges",
+            f"HEAD..{TRACKING_BRANCH}",
+        ]
+    ).stdout.strip()
+    return [line for line in out.splitlines() if line]
+
+
+def _confirm(prompt: str) -> bool:
+    """Ask a yes/no question on the terminal; anything but yes means no.
+
+    A refused upgrade must change nothing, so an empty answer defaults to no,
+    and EOF (no terminal attached at all) is a no rather than a silent yes.
+    """
+    try:
+        return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def _incoming_changelog() -> str:
+    """The top changelog entry on the tracking branch, or empty if unreadable.
+
+    The commit subjects say what changed; this says what it means for somebody
+    deciding whether to apply it, and it is where a release carrying a schema
+    migration announces itself. Read from the tracking branch rather than the
+    working tree, because the working tree is still on the old version at the
+    point this is shown.
+    """
+    text = run(["git", "-C", INSTALL_DIR, "show", f"{TRACKING_BRANCH}:CHANGELOG.md"]).stdout
+    lines = text.splitlines()
+    start: int | None = None
+    for index, line in enumerate(lines):
+        if line.startswith("## "):
+            start = index
+            break
+    if start is None:
+        return ""
+    body = [lines[start]]
+    for line in lines[start + 1 :]:
+        if line.startswith("## "):
+            break
+        body.append(line)
+    return "\n".join(body).strip()
+
+
+def _sync_and_restart(port: int) -> bool:
+    """Reinstall dependencies and restart, returning whether the collector came back.
+
+    Both the upgrade path and the rollback path run this same pair — uv sync,
+    then a restart that is proven by a live collector — so a failure in either
+    half is treated the same way: the service did not come back.
+    """
+    if run(["uv", "sync", "--project", INSTALL_DIR]).returncode != 0:
+        return False
+    if not service("restart"):
+        return False
+    return wait_until_healthy(port) is not None
+
+
+def cmd_upgrade(argv: list[str]) -> int:
+    """Fetch, show, confirm, apply, verify — and roll back if it did not work.
+
+    The rollback is the reason this exists rather than three shell commands in
+    the documentation. A home installation upgrades unattended in the evening,
+    and an upgrade that quietly leaves the collector down loses a night of
+    readings that cannot be recovered.
+    """
+    if is_dirty():
+        print(f"{INSTALL_DIR} has local modifications; upgrade refused.")
+        print(run(["git", "-C", INSTALL_DIR, "status", "--short"]).stdout)
+        return 1
+
+    pending = _pending_commits()
+    if not pending:
+        print("already up to date")
+        return 0
+
+    print(f"{len(pending)} change(s) to apply:")
+    for line in pending:
+        print(f"  {line}")
+    entry = _incoming_changelog()
+    if entry:
+        print()
+        print(entry)
+        print()
+    if not _confirm("Apply these and restart?"):
+        print("nothing done")
+        return 0
+
+    previous = current_commit()
+    port = configured_port()
+
+    if run(["git", "-C", INSTALL_DIR, "merge", "--ff-only", TRACKING_BRANCH]).returncode != 0:
+        print("could not fast-forward; upgrade abandoned, nothing changed")
+        return 1
+
+    if _sync_and_restart(port):
+        print("upgraded and collecting")
+        return 0
+
+    print(f"the collector did not come back; rolling back to {previous[:7]}")
+    run(["git", "-C", INSTALL_DIR, "checkout", "--force", previous])
+    if _sync_and_restart(port):
+        print(f"rolled back; running {previous[:7]} again (detached HEAD, which is expected)")
+    else:
+        print("ROLLBACK ALSO FAILED — the service is down. Run: arraysense logs")
+    return 1
+
+
 COMMANDS = {
     "status": cmd_status,
     "logs": cmd_logs,
     "restart": cmd_restart,
     "version": cmd_version,
 }
+COMMANDS["upgrade"] = cmd_upgrade
 
 
 def main(argv: list[str] | None = None) -> int:

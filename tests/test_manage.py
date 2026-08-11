@@ -309,3 +309,75 @@ def test_usage_lists_only_commands_that_actually_run(capsys: Any) -> None:
     for name in manage.COMMANDS:
         assert name in usage
         assert callable(manage.COMMANDS[name])
+
+
+def test_upgrade_rolls_back_when_the_collector_does_not_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point. A failed upgrade must leave a collecting service.
+
+    Safe here for a specific reason rather than a hopeful one: migrations only
+    ever add columns, so the older code coming back selects only the columns it
+    knows and anything the newer version added sits inert. The code rolls back
+    without the database having to.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> Any:
+        calls.append(argv)
+        out = "abc1234" if "rev-parse" in argv else ""
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    monkeypatch.setattr(manage, "is_dirty", lambda: False)
+    monkeypatch.setattr(manage, "_pending_commits", lambda: ["deadbee new thing"])
+    monkeypatch.setattr(manage, "_confirm", lambda _prompt: True)
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: None)
+
+    assert manage.cmd_upgrade([]) == 1
+    checkouts = [c for c in calls if "checkout" in c]
+    assert checkouts, "a failed health check must check the old commit back out"
+    assert "abc1234" in checkouts[-1]
+
+
+def test_upgrade_refuses_a_dirty_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Someone who hand-edited /opt/arraysense finds out now, not mid-merge."""
+    monkeypatch.setattr(manage, "is_dirty", lambda: True)
+    assert manage.cmd_upgrade([]) == 1
+
+
+def test_upgrade_stops_when_there_is_nothing_new(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(manage, "is_dirty", lambda: False)
+    monkeypatch.setattr(manage, "_pending_commits", lambda: [])
+    assert manage.cmd_upgrade([]) == 0
+
+
+def test_the_changelog_entry_shown_is_the_incoming_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release that needs a migration says so at the top of its entry, and
+    this is the only place the owner sees that before agreeing."""
+    text = (
+        "# Changelog\n\npreamble\n\n"
+        "## 0.8.0 \u2014 12 August 2026\n\n### Added\n- a thing\n\n"
+        "## 0.7.3 \u2014 11 August 2026\n\n### Fixed\n- an older thing\n"
+    )
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, text, ""))
+    entry = manage._incoming_changelog()
+    assert entry.startswith("## 0.8.0")
+    assert "a thing" in entry
+    assert "0.7.3" not in entry
+
+
+def test_a_missing_changelog_is_absent_not_invented(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changelog that cannot be read reads as no entry at all, never as an
+    invented one \u2014 the project's absent-data rule reaching the CLI."""
+    monkeypatch.setattr(
+        manage,
+        "run",
+        lambda argv: subprocess.CompletedProcess(argv, 1, "", "no such path"),
+    )
+    assert manage._incoming_changelog() == ""
