@@ -33,8 +33,19 @@ NAME = "fake"
 # battery charging. Hoisted out of ``read`` so the capability declaration can be
 # derived from it rather than repeat it — a fake whose declaration disagreed
 # with what it returns would be a poor test of code that trusts declarations.
+#
+# The per-string powers (2504.0 + 2610.0 + 2500.0) sum to the total 7614.0 W.
 _READINGS: dict[str, float] = {
     "pv_total_power_w": 7614.0,
+    "pv1_power_w": 2504.0,
+    "pv2_power_w": 2610.0,
+    "pv3_power_w": 2500.0,
+    "pv1_voltage_v": 372.9,
+    "pv2_voltage_v": 310.0,
+    "pv3_voltage_v": 310.0,
+    "pv1_current_a": 6.72,
+    "pv2_current_a": 8.42,
+    "pv3_current_a": 8.06,
     "load_power_w": 2810.0,
     "grid_power_w": 0.0,
     "grid_voltage_v": 244.1,

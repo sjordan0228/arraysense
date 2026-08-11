@@ -377,9 +377,11 @@ def test_two_drivers_declaring_different_subsets_produce_two_schemas() -> None:
     a = schema_ddl(eg4_luxpower.CAPABILITIES.metrics)
     b = schema_ddl(fake.CAPABILITIES.metrics)
     assert a != b
-    # Concretely: the fake reports no per-string readings, the real driver does.
-    assert "pv1_power_w" in _table_columns(a, "inverter_raw")
-    assert "pv1_power_w" not in _table_columns(b, "inverter_raw")
+    # Concretely: the real driver counts energy and the fake estimates it, so
+    # the kWh counters are in one schema and not the other. Per-string readings
+    # no longer separate them — the fake reports its three strings since #90.
+    assert "battery_charge_energy_total_kwh" in _table_columns(a, "inverter_raw")
+    assert "battery_charge_energy_total_kwh" not in _table_columns(b, "inverter_raw")
     # Neither driver declares the per-module fault codes: pylxpweb's
     # inverter-register path — the one the eg4 driver reads — never fills
     # them (its direct-BMS transports do, but nothing here speaks those), so
