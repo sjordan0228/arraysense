@@ -41,6 +41,15 @@ const LIGHT_TOKENS = `
       --wash-rgb:0,0,0;
       --tint:rgba(0,0,0,.05); --tint-2:rgba(0,0,0,.10);
       --tint-3:rgba(0,0,0,.16);
+      /* The hover readout and the crosshair sit over a chart, which is not a
+         panel. The readout must be opaque enough to read over whatever the
+         chart shows, and a crosshair is a 1px line that would read as a
+         different strength at any of the tint steps — so each carries its own
+         inverted value: a near-solid white readout with a soft shadow, and a
+         dark crosshair where the dark theme's is white. */
+      --tip:rgba(255,255,255,.96);
+      --tip-shadow:0 6px 22px rgba(0,0,0,.18);
+      --cursor-x:rgba(0,0,0,.34);
       /* The same walk through the same hues, lightened: dawn rather than dusk.
          Keeping the shape means the page still reads as this installation's
          rather than as a generic light theme. */
@@ -116,6 +125,14 @@ const BASE_CSS = `
        white one is invisible and they have to invert with the theme. */
     --tint:rgba(255,255,255,.07); --tint-2:rgba(255,255,255,.12);
     --tint-3:rgba(255,255,255,.19);
+    /* The hover readout and the crosshair sit over a chart, which is not the
+       same surface as a panel: the readout has to be opaque enough to read
+       against whatever the chart shows, and a crosshair is a 1px line that
+       would read as a different strength at any of the tint steps. Dark values
+       are the originals these replaced, unchanged. */
+    --tip:rgba(6,8,18,.94);
+    --tip-shadow:0 6px 22px rgba(0,0,0,.45);
+    --cursor-x:rgba(255,255,255,.34);
     /* The page itself. Left as a literal, a light theme put light panels and
        dark text on a dark page: the headings sat on their own background and
        vanished. The panels are translucent over this, so it is the one colour
@@ -155,9 +172,9 @@ const BASE_CSS = `
   .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
   .rng{display:flex;gap:6px}
-  .rng button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
+  .rng button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
-  .rng button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink)}
+  .rng button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
   svg{display:block;width:100%;height:auto;overflow:visible}
   /* Navigation. Five views of one installation, so the marker is a state of the
      nav rather than a heading each page repeats — landing anywhere, the lit
@@ -165,11 +182,11 @@ const BASE_CSS = `
      the five are separate documents and the two that are not still deserve a
      URL somebody can bookmark. */
   .nav{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
-  .nav a{background:rgba(255,255,255,.06);border:1px solid var(--panel-b);
+  .nav a{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
     line-height:1.45;cursor:pointer;text-decoration:none;transition:background .12s,color .12s}
   .nav a:hover{color:var(--ink2)}
-  .nav a[aria-current="page"]{background:rgba(255,255,255,.17);color:var(--ink);font-weight:500}
+  .nav a[aria-current="page"]{background:var(--tint-3);color:var(--ink);font-weight:500}
   .nav a:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .view[hidden]{display:none}
   /* The stale-data banner. It sits directly under the nav on every page — the
@@ -212,14 +229,14 @@ const BASE_CSS = `
   .chart .nodata{color:var(--ink3);font-size:11.5px;padding:30px 0 30px 48px}
   /* Drag out a window to zoom into it. The vendored rule paints the selection
      near-black, which on this background is no feedback at all. */
-  .u-select{background:rgba(255,255,255,.13);border-radius:3px}
-  .u-hz .u-cursor-x{border-right:1px solid rgba(255,255,255,.34)}
+  .u-select{background:var(--tint-2);border-radius:3px}
+  .u-hz .u-cursor-x{border-right:1px solid var(--cursor-x)}
   /* Hover readout. HTML rather than something painted on the canvas so it can
      wrap, use the page's own type, and sit above everything. */
   .tip{position:absolute;pointer-events:none;opacity:0;transition:opacity .09s;
-    background:rgba(6,8,18,.94);border:1px solid var(--panel-b);border-radius:9px;
+    background:var(--tip);border:1px solid var(--panel-b);border-radius:9px;
     padding:8px 10px;font-size:11.5px;line-height:1.5;white-space:nowrap;z-index:5;
-    box-shadow:0 6px 22px rgba(0,0,0,.45)}
+    box-shadow:var(--tip-shadow)}
   .tip.on{opacity:1}
   .tip .when{color:var(--ink3);font-size:10px;letter-spacing:.03em;margin-bottom:4px}
   .tip .row{display:flex;justify-content:space-between;gap:14px;
@@ -229,9 +246,9 @@ const BASE_CSS = `
   .chartbar{display:flex;align-items:center;gap:11px;margin-bottom:9px;min-height:22px}
   .chartbar .note{font-size:11.5px;color:var(--warn)}
   .chartbar .zoomhint{font-size:10.5px;color:var(--ink3);margin-left:auto}
-  .chartbar button{background:rgba(255,255,255,.09);border:1px solid var(--panel-b);
+  .chartbar button{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink2);border-radius:7px;padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
-  .chartbar button:hover{background:rgba(255,255,255,.17);color:var(--ink)}
+  .chartbar button:hover{background:var(--tint-3);color:var(--ink)}
   .chartbar button[hidden]{display:none}
   .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
   .kv u{text-decoration:none;color:var(--ink3)}
@@ -242,9 +259,9 @@ const BASE_CSS = `
   th,td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--grid-line)}
   th:first-child,td:first-child{text-align:left}
   th{color:var(--ink3);font-weight:600;font-size:10px;letter-spacing:.1em;text-transform:uppercase}
-  .iconbtn{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);color:var(--ink2);
+  .iconbtn{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.4}
-  .iconbtn:hover{background:rgba(255,255,255,.14);color:var(--ink)}
+  .iconbtn:hover{background:var(--tint-2);color:var(--ink)}
   .iconbtn.wide{font-size:11px;flex:1}
   details{margin-top:10px}
   summary{cursor:pointer;font-size:11px;color:var(--ink3)}
