@@ -399,7 +399,15 @@ class CollectorService:
             # Yesterday is settled, so a score already taken against this same
             # array description stands. Today is not, and is always redone.
             if days_back > 0:
-                scored = self._store.read_efficiency_days(day_start, day_end)
+                try:
+                    scored = self._store.read_efficiency_days(day_start, day_end)
+                except sqlite3.Error as exc:
+                    # The loop above re-raises anything that escapes, which would
+                    # stop polling until someone restarted the service and leave a
+                    # hole in history nothing can backfill. A summary we cannot
+                    # read is a reason to recompute, never a reason to stop.
+                    logger.warning("could not read stored efficiency; recomputing: %s", exc)
+                    scored = []
                 if scored and all(r.config_version == config_version for r in scored):
                     continue
 

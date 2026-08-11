@@ -506,3 +506,35 @@ class TestCurtailmentIsWiredIn:
         row = self._day(tmp_path, "faulty.db", bad_volts=310.0, bad_amps=1.0)
         assert row.curtailed_kwh == 0.0, "a fault was excused as curtailment"
         assert row.unexplained_kwh > 0.0, "the shortfall vanished instead of being named"
+
+
+def test_an_hour_with_no_wind_reading_is_unmodelled_not_modelled_as_still_air(
+    tmp_path: Path,
+) -> None:
+    """Still air is a measurement, not a default.
+
+    Faiman puts the cells about 13 C hotter at zero wind than at 2 m/s, which
+    is five percent of expected output on this array -- and it understates
+    what the array should have made, so the ratio it is judged by comes out
+    flattering. An hour nobody measured the wind for is an hour the model
+    cannot run, and the coverage figure is where that gets said.
+    """
+    store = _store(str(tmp_path / "nowind.db"))
+    day_start = _summer_day(0)
+    for h in range(8, 16):
+        _insert_hourly(
+            store._conn,
+            _utc(h),
+            pv_power=3000.0,
+            ghi=800.0,
+            dni=850.0,
+            dhi=120.0,
+            wind=None if h == 12 else 2.0,
+            air_c=30.0,
+        )
+    rows = compute_day(
+        store, SettingsStore(store), day_start, day_start + timedelta(days=1), _ONE_STRING, 1
+    )
+    store.close()
+    total = next(r for r in rows if r.string_name == "")
+    assert total.modelled_hours == 7, "the windless hour was modelled from air nobody measured"

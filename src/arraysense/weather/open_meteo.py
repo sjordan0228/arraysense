@@ -192,7 +192,12 @@ def fetch_archive_hours(
         except (TypeError, ValueError):
             continue
         samples.append(Sample(timestamp=stamp, readings=readings))
-    return samples or None
+    # An empty list and None mean different things and the caller acts on the
+    # difference: None is "the fetch failed", which must stop a backfill where
+    # it stands, and [] is "the archive answered and had nothing for that day",
+    # which a backfill should step over. Collapsing the two into None halted a
+    # whole range on the first day the archive happened to be thin.
+    return samples
 
 
 def fetch_current(latitude: float, longitude: float, timeout: float = 10.0) -> Sample | None:

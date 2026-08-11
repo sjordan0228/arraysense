@@ -266,3 +266,16 @@ def test_the_archive_returns_one_sample_per_hour(monkeypatch: pytest.MonkeyPatch
 def test_an_archive_failure_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b"<html>nope</html>")
     assert open_meteo.fetch_archive_hours(35.2, -97.4, date(2026, 8, 1), date(2026, 8, 1)) is None
+
+
+def test_an_empty_archive_day_is_not_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A thin day and a broken connection must not look the same.
+
+    A backfill stops on failure so it can report where it stopped, and steps
+    over a day the archive has nothing for. Reporting both as None halted a
+    whole range on the first thin day and called it an error.
+    """
+    empty = b'{"hourly": {"time": [], "shortwave_radiation": []}}'
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: empty)
+    result = open_meteo.fetch_archive_hours(35.2, -97.4, date(2026, 8, 1), date(2026, 8, 1))
+    assert result == [], "an answered-but-empty day must not read as a failed fetch"

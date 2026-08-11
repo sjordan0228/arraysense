@@ -830,6 +830,12 @@ class SettingsStore:
     # scored days would have to keep a copy of the settings to compare against,
     # which is the same problem again one level down.
     _VERSIONED_PREFIXES = ("panels.", "battery.")
+    # Not a prefix: "site." also holds a contact address and other things that
+    # change nothing about the sun. These three do. Latitude and longitude place
+    # the sun in the sky, and the zone decides where one day stops and the next
+    # begins -- a day scored before a correction to any of them was scored
+    # against a different sky than the one the array was under.
+    _VERSIONED_KEYS = (SETTING_LATITUDE, SETTING_LONGITUDE, SETTING_TIMEZONE)
 
     def _bump_config_version(self, keys: Iterable[str]) -> None:
         """Advance the efficiency config version if any of ``keys`` describes the array.
@@ -837,7 +843,10 @@ class SettingsStore:
         Called inside the caller's transaction, so a write that fails validation
         leaves the version alone and days scored under it stay valid.
         """
-        if not any(k.startswith(self._VERSIONED_PREFIXES) for k in keys):
+        touched = list(keys)
+        if not any(
+            k.startswith(self._VERSIONED_PREFIXES) or k in self._VERSIONED_KEYS for k in touched
+        ):
             return
         row = self._conn.execute(
             "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)

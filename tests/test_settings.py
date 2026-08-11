@@ -552,13 +552,35 @@ class TestEfficiencyConfigVersion:
     def test_an_unrelated_setting_leaves_it_alone(self, tmp_path: Path) -> None:
         # Every bump costs a rescore of every stored day, so a setting that
         # does not change what the array should produce must not trigger one.
+        # A contact address is the clearest case of that.
         store = SqliteStore(str(tmp_path / "u.db"), device=TEST_DEVICE)
         settings = SettingsStore(store)
         before = self._version(settings)
-        settings.set("site.timezone", "America/Chicago")
+        settings.set(SETTING_CONTACT_EMAIL, "someone@example.com")
         after = self._version(settings)
         store.close()
         assert after == before
+
+    def test_moving_the_site_invalidates_what_was_scored_there(self, tmp_path: Path) -> None:
+        """Where the array is decides what its sun should have been.
+
+        Latitude and longitude place the sun in the sky; the zone decides where
+        one day stops and the next begins. A day scored before any of the three
+        was corrected was scored against a different sky than the array was
+        actually under, and must not be left standing as though it were current.
+        """
+        for key, value in (
+            (SETTING_LATITUDE, 45.0),
+            (SETTING_LONGITUDE, -93.0),
+            (SETTING_TIMEZONE, "America/Denver"),
+        ):
+            store = SqliteStore(str(tmp_path / f"{key}.db"), device=TEST_DEVICE)
+            settings = SettingsStore(store)
+            before = self._version(settings)
+            settings.set(key, value)
+            after = self._version(settings)
+            store.close()
+            assert after > before, f"{key} left the efficiency version untouched"
 
     def test_a_batch_write_bumps_once_not_per_key(self, tmp_path: Path) -> None:
         store = SqliteStore(str(tmp_path / "m.db"), device=TEST_DEVICE)

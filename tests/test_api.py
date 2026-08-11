@@ -3503,3 +3503,190 @@ def test_efficiency_with_no_data_is_absent_not_zero(tmp_path: Path) -> None:
     assert body["configured"] is True
     assert body["summary"] is None
     assert body["waterfall"] == []
+
+
+def test_efficiency_waterfall_reconciles_across_a_mixed_range(tmp_path: Path) -> None:
+    """A week holding both a short day and a generous one must still add up.
+
+    Each day's unexplained figure is clamped at zero, so summing them counts
+    every day that fell short and ignores every day that ran ahead. A range
+    with one of each then reports a shortfall beside an expected and an actual
+    that are equal, and the walk from expected to actual visibly fails to close
+    in front of the owner. The residual has to come from the totals.
+    """
+
+    def build(store: SqliteStore) -> None:
+        # Two days of the same sun, one producing far less than the other.
+        for day_offset, watts in ((0, 1000.0), (1, 8000.0)):
+            store.append(
+                Sample(
+                    timestamp=datetime(2026, 8, 4 + day_offset, 13, 0, tzinfo=UTC),
+                    readings={
+                        "pv1_power_w": watts,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": watts / 310.0,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    wf = {s["name"]: s["kwh"] for s in body["waterfall"]}
+    closed = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert closed == pytest.approx(wf["actual"], abs=0.01), (
+        f"expected({wf['expected']}) - unexplained({wf['unexplained']}) "
+        f"- curtailed({wf['curtailed']}) + gain({wf['unmodelled_gain']}) "
+        f"!= actual({wf['actual']})"
+    )
+    assert wf["unexplained"] == 0.0 or wf["unmodelled_gain"] == 0.0
+
+
+def test_efficiency_does_not_serve_a_day_scored_against_a_different_array(
+    tmp_path: Path,
+) -> None:
+    """A stored score belongs to the array description it was taken under.
+
+    The maintenance pass rescores today and yesterday, but nothing revisits
+    last month. Without this check, correcting a panel count leaves every
+    older day carrying a score computed for an array that no longer exists,
+    served as though it were current.
+    """
+    from arraysense.efficiency import EfficiencyRow
+
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        # A stored row from an older description of the array, with an
+        # unmistakable figure that must not reach the response.
+        store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+        local_day = datetime(2026, 8, 10, tzinfo=ZoneInfo("America/Chicago"))
+        store.write_efficiency_day(
+            [
+                EfficiencyRow(
+                    day=local_day,
+                    string_name="",
+                    expected_kwh=999.0,
+                    actual_kwh=999.0,
+                    curtailed_kwh=0.0,
+                    unexplained_kwh=0.0,
+                    modelled_hours=24,
+                    partial=False,
+                    pr=1.0,
+                    config_version=-1,
+                )
+            ]
+        )
+        store.close()
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["summary"] is not None
+    assert body["summary"]["expected_kwh"] != 999.0, (
+        "a day scored against a different array was served as current"
+    )
+
+
+def test_efficiency_books_real_curtailment_and_never_penalises_it(tmp_path: Path) -> None:
+    """Staged so curtailment is actually produced, not merely asserted about.
+
+    A test whose fixture yields zero curtailment passes whatever the code does
+    with it -- the segment reads 0.0 and every claim about it is vacuously
+    true. This stages a full bank, a pinched charge limit and a string held
+    near open circuit, so a regression that penalised refused energy or filed
+    it as an unexplained loss turns this red.
+    """
+
+    def build(store: SqliteStore) -> None:
+        base = datetime(2026, 8, 10, tzinfo=UTC)
+        # Ordinary hours give the string an operating point to be judged against.
+        for hour in (13, 14, 15, 16, 17, 19, 20):
+            store.append(
+                Sample(
+                    timestamp=base + timedelta(hours=hour),
+                    readings={
+                        "pv1_power_w": 6000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 19.4,
+                        "ghi_wm2": 800.0,
+                        "dni_wm2": 850.0,
+                        "dhi_wm2": 120.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+        # Then one hour with the bank full, the limit pinched, and the string
+        # walked up toward open circuit while producing almost nothing.
+        store.append(
+            Sample(
+                timestamp=base + timedelta(hours=18),
+                readings={
+                    "pv1_power_w": 400.0,
+                    "pv1_voltage_v": 372.0,
+                    "pv1_current_a": 1.1,
+                    "ghi_wm2": 800.0,
+                    "dni_wm2": 850.0,
+                    "dhi_wm2": 120.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 100.0,
+                    "bms_charge_current_limit_a": 40.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    summary = body["summary"]
+    assert summary["curtailed_kwh"] > 0.0, "the fixture produced no curtailment to test"
+
+    segments = {s["name"]: s for s in body["waterfall"]}
+    assert segments["curtailed"]["kwh"] > 0.0
+    assert segments["curtailed"]["penalised"] is False, "refused energy was drawn as a loss"
+
+    # And it must leave the ratio's denominator, which is the entire point:
+    # a demand-limited hour must not read as a fault.
+    naive = summary["actual_kwh"] / summary["expected_kwh"]
+    assert summary["pr"] > naive, "curtailed energy is still counted against the score"
+
+    wf = {k: v["kwh"] for k, v in segments.items()}
+    closed = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert closed == pytest.approx(wf["actual"], abs=0.01)

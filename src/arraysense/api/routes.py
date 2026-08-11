@@ -1717,7 +1717,16 @@ def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict
     while current <= end:
         samples = fetch_archive_hours(latitude, longitude, current, current)
         if samples is None:
+            # The fetch failed. Stop here and report where, rather than
+            # marching on and leaving holes nobody can see.
             break
+        if not samples:
+            # The archive simply had nothing for this day. Step over it.
+            logger.info("archive holds no readings for %s; skipping", current)
+            days += 1
+            last_day = current.isoformat()
+            current += timedelta(days=1)
+            continue
         for sample in samples:
             try:
                 store.append(sample)
@@ -1933,11 +1942,16 @@ def efficiency(
     daily_rows: list[EfficiencyRow] = []
     for ds, de in days:
         stored = store.read_efficiency_days(ds, de)
-        if stored:
+        # A stored day is only usable if it was scored against the array as it
+        # is described now. The maintenance pass rescores today and yesterday,
+        # but nothing revisits last month, so after the owner corrects a panel
+        # count or moves the site every older day would keep a score taken
+        # against an array that no longer exists -- and be served without a
+        # word to say so. Recomputing is the honest answer and is cheap.
+        if stored and all(r.config_version == config_version for r in stored):
             daily_rows.extend(stored)
         else:
-            computed = compute_day(store, settings, ds, de, strings, config_version)
-            daily_rows.extend(computed)
+            daily_rows.extend(compute_day(store, settings, ds, de, strings, config_version))
 
     if not daily_rows:
         # No rows at all — likely no data for this range.
@@ -1966,7 +1980,15 @@ def efficiency(
         expected = sum(r.expected_kwh for r in rows)
         actual = sum(r.actual_kwh for r in rows)
         curtailed = sum(r.curtailed_kwh for r in rows)
-        unexplained = sum(r.unexplained_kwh for r in rows)
+        # Derived from the totals, never summed from the days. Each day's own
+        # figure is clamped at zero, so adding them counts every day that fell
+        # short while ignoring every day that ran ahead: a week of one 5 kWh
+        # shortfall and one 5 kWh surplus would report 5 kWh unexplained beside
+        # an expected and an actual that are equal, and the waterfall would
+        # visibly fail to add up in front of the owner.
+        residual = expected - curtailed - actual
+        unexplained = max(0.0, residual)
+        surplus = max(0.0, -residual)
         denom = expected - curtailed
         pr: float | None = actual / denom if denom > 0.0 else None
         # Per-string kWp for per-string yield; total for total.
@@ -1977,6 +1999,7 @@ def efficiency(
             "actual_kwh": round(actual, 3),
             "curtailed_kwh": round(curtailed, 3),
             "unexplained_kwh": round(unexplained, 3),
+            "unmodelled_gain_kwh": round(surplus, 3),
             "pr": round(pr, 4) if pr is not None else None,
             "specific_yield": round(sy, 3) if sy is not None else None,
             "tolerance_pct": _METER_TOLERANCE_PCT,
@@ -2005,7 +2028,7 @@ def efficiency(
     # its own segment and is not penalised, because producing more than
     # predicted is not a loss; a persistently large one means the array is
     # described wrongly, which is worth seeing rather than rounding away.
-    surplus = max(0.0, actual - (expected - curtailed))
+    surplus = summary["unmodelled_gain_kwh"]
     waterfall = [
         {"name": "expected", "kwh": round(expected, 3), "penalised": True},
         {"name": "unexplained", "kwh": round(unexplained, 3), "penalised": True},

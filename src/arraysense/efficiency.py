@@ -285,8 +285,17 @@ def compute_hours(
             and isinstance(air_c, float)
         ):
             continue
+        # Wind is not optional and must not default to still air. Faiman puts
+        # the cells 13 C hotter at zero wind than at two metres per second,
+        # which is five percent of this array's expected output -- understating
+        # what the array should have made, and so flattering the ratio it is
+        # judged by. Absent is absent: the hour goes unmodelled and says so
+        # through the coverage figure, rather than being modelled from a wind
+        # speed nobody measured.
         wind = row.get("wind_speed_ms")
-        wind_val: float = wind if isinstance(wind, float) else 0.0
+        if not isinstance(wind, float):
+            continue
+        wind_val: float = wind
         day_of_year = when.timetuple().tm_yday
 
         soc = row.get("battery_soc_pct")

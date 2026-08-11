@@ -171,8 +171,11 @@ class TestBooking:
         assert curtailed_kwh_for_hour(4.0, 1.0, gate_open=False, signature_seen=True) == 0.0
 
     def test_a_shortfall_inside_the_models_own_error_is_not_attributed(self) -> None:
-        # Reading a two-percent gap as a diagnosis is reading noise.
-        assert curtailed_kwh_for_hour(4.0, 3.92, gate_open=True, signature_seen=True) == 0.0
+        # The floor is five percent of expected, and these pin it from both
+        # sides rather than merely sitting under it: a gap the wrong side of
+        # the line must book, or the constant could drift with nothing failing.
+        assert curtailed_kwh_for_hour(4.0, 3.84, gate_open=True, signature_seen=True) == 0.0
+        assert curtailed_kwh_for_hour(4.0, 3.76, gate_open=True, signature_seen=True) > 0.0
 
     def test_producing_more_than_expected_books_nothing(self) -> None:
         assert curtailed_kwh_for_hour(3.0, 3.4, gate_open=True, signature_seen=True) == 0.0
