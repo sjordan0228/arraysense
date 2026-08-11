@@ -416,7 +416,7 @@ function renderChart(rows, stampKey, grain) {
     unit: 'kWh',
     opts: chartBase({
       axes: [
-        timeAxis(),
+        pointTimeAxis(),
         kwhAxis(),
       ],
       series: [

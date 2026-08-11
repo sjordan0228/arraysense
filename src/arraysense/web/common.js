@@ -1346,6 +1346,40 @@ const axis = (extra) => Object.assign({
 // spacing is the only thing standing between a readable axis and an overlapping
 // one — 80 leaves a clear gap at the widest format timeTicks produces.
 const timeAxis = () => axis({ size: 32, space: 80, values: timeTicks });
+
+// A chart whose points are days must place its ticks on its own data points and
+// never between them: uPlot picks the increment from the span and the pixels,
+// and over six days at 1106px it chose twelve hours, so each calendar day
+// carried two ticks printing the same date twice. This is the shared factory
+// behind those fixed points.
+//
+// Reading ``u.data[0]`` rather than closing over the array it was built with is
+// load-bearing. ``paint()`` builds each chart exactly once and only calls
+// ``setData`` afterwards, so anything in ``spec.opts`` that captured an array
+// keeps showing the FIRST range's data forever; ``u.data[0]`` is whatever
+// ``setData`` last wrote, so the splits stay correct across every refresh,
+// every period switch and every zoom. That is also what makes one chart correct
+// at both grains: the Efficiency page reuses a single chart across the hourly
+// and daily periods, so an axis built for one grain would otherwise survive
+// into the other — an axis that ticks on its own points is right at both, and
+// the reuse stops mattering.
+function pointSplits(minPx) {
+  return (u, axisIdx, min, max) => {
+    const xs = (u.data[0] || []).filter((t) => t >= min && t <= max);
+    if (!xs.length) return [];
+    const ratio = (typeof uPlot !== 'undefined' && uPlot.pxRatio) || 1;
+    const room = Math.max(1, Math.floor((u.bbox.width / ratio) / minPx));
+    const step = Math.max(1, Math.ceil(xs.length / room));
+    return xs.filter((_, i) => i % step === 0);
+  };
+}
+
+// The daily-grain axis. Same formats as ``timeAxis``, but the splits come from
+// ``pointSplits`` so a tick can never land between two days. No ``space`` here:
+// uPlot consults it only when choosing its own increment, and there is no
+// increment left to choose once the splits are given outright — the 80 px that
+// keeps neighbouring labels apart is handed to ``pointSplits`` instead.
+const pointTimeAxis = () => axis({ size: 32, splits: pointSplits(80), values: timeTicks });
 const kwAxis = () => axis({ size: 56, gap: 6, values: kwTicks });
 
 // The zero line is not a gridline: it is the thing a signed reading is signed

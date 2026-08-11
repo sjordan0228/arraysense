@@ -523,6 +523,14 @@ function kwhTicks(u, splits) {
 // increments fall. These are calendar buckets: a tick three days into a month
 // labels nothing that exists, and on the monthly chart it would name a month
 // whose column is somewhere else.
+//
+// common.js carries a `pointSplits` factory that does the same thinning for the
+// Efficiency chart, and this deliberately does not use it: that one reads
+// `u.data[0]`, and this chart holds one more x than it draws — `chartData`
+// appends the closing boundary so the last bucket has width to shade. That
+// boundary is not a bucket, so ticking it would name the month after the last
+// column, which is the very thing the paragraph above is about. The buckets
+// come from the page's own rows instead.
 function bucketSplits(u, axisIdx, min, max) {
   const xs = shown.map((r) => r.xs).filter((t) => t >= min && t <= max);
   if (!xs.length) return [];
