@@ -370,6 +370,31 @@ function renderStrings(strings, tolerancePct) {
   }).join('');
 }
 
+// >>> eff-raw-ratio
+// The raw ratio of actual to expected, used by the hourly chart's hover
+// readout. Returns null when it cannot be stated — either value absent, or
+// expected not greater than zero — which produces the same dash the page uses
+// everywhere else. It is deliberately NOT the headline performance ratio: that
+// is actual ÷ (expected − curtailed), but the chart carries only raw expected
+// and raw actual, so this is plainly a simpler figure.
+// The rows above this one state kWh to two places, so anything under this
+// shows as 0.00 there. Dividing by it produces a percentage the reader cannot
+// check against either figure printed directly above — 0.0001 kWh of expected
+// against a real 0.15 measured is arithmetic on rounding noise, and it reads as
+// 150000%. The hours either side of sunrise and sunset are exactly this case
+// and they arrive every day, so this is the ordinary path, not a corner.
+const EFF_RATIO_FLOOR_KWH = 0.005;
+
+function effRawRatio(expected, actual) {
+  if (expected === null || expected === undefined || actual === null || actual === undefined) return null;
+  if (!(expected >= EFF_RATIO_FLOOR_KWH)) return null;
+  // Not a share of anything. A meter reading backwards is a fault to look at,
+  // not a small percentage.
+  if (actual < 0) return null;
+  return actual / expected;
+}
+// <<< eff-raw-ratio
+
 // ---------------------------------------------------------------------------
 // Hourly chart. uPlot, via the shared factory in common.js.
 //
@@ -436,6 +461,7 @@ function renderChart(rows, stampKey, grain) {
         readout('effChart', [
           ['Expected', 1, (v) => uStr(v, 2, 'kWh')],
           ['Actual', 2, (v) => uStr(v, 2, 'kWh')],
+          ['Actual / Expected', (u, idx) => effRawRatio(u.data[1][idx], u.data[2][idx]), prNum],
         ]),
       ],
     }),
