@@ -70,7 +70,15 @@ class SampleBuildError(Exception):
 
 # A metric belonging to one numbered PV string, as in ``pv2_voltage_v``. The
 # number is what makes a declaration checkable against the string count.
-_STRING_METRIC = re.compile(r"^pv([1-9])_")
+#
+# Two or more digits are matched deliberately. Nothing supported has ten
+# strings — the LuxPower family tops out at six MPPTs — but a single-digit
+# pattern fails silently rather than loudly if one ever does: ``pv10_power_w``
+# would read as not-a-string-metric, so the count check would call string 10
+# missing, the beyond-the-count check would not refuse it, and the model
+# resolver would carry it through unchanged. A leading zero is still refused,
+# because ``pv0_`` names no string.
+_STRING_METRIC = re.compile(r"^pv([1-9]\d*)_")
 
 # A registry column belonging to one battery slot, capturing the template it was
 # expanded from.

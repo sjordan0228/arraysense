@@ -548,3 +548,16 @@ def test_a_built_source_reports_the_models_cited_capabilities() -> None:
     config = _setup_config(driver="eg4_luxpower", model="18kPV", transport="dongle")
     source = drivers.create(config)
     assert source.capabilities.pv_strings == 3
+
+
+def test_a_double_digit_string_is_still_a_string_metric() -> None:
+    # Nothing supported has ten strings, so this pins the pattern rather than a
+    # device: a single-digit match would read pv10_power_w as not-a-string,
+    # which fails open — the count check would call string 10 missing while the
+    # beyond-the-count check let it through.
+    with pytest.raises(ValueError, match="pv10_power_w"):
+        Capabilities(
+            pv_strings=3,
+            energy=EnergyReporting.ESTIMATED,
+            metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w", "pv10_power_w"}),
+        )
