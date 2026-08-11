@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Efficiency · Solar ArraySense</title>
 <script src="/common.js"></script>
+<!-- Both halves of uPlot, and the stylesheet is not optional: the library
+     sizes its canvas to logical pixels times the device ratio and leaves the
+     laying out to its own CSS. Without it the canvas keeps its raw size --
+     twice the container on a retina screen -- and paints across the page. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
 <script src="/vendor/uPlot.iife.min.js"></script>
 <style>
   /* Period and date navigation. A row of period buttons beside a back/date/forward
