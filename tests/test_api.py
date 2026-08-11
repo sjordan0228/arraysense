@@ -3702,3 +3702,59 @@ def test_the_efficiency_page_is_served(client: Any) -> None:
     r = client.get("/efficiency")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
+
+
+def test_efficiency_week_and_month_carry_a_daily_series(tmp_path: Path) -> None:
+    """A longer period needs something to draw, or the page drops its chart.
+
+    `hours` is a single day's detail and is null for week and month. Without a
+    per-day series beside it the page had a headline figure and nothing under
+    it, which reads as a fault rather than as a period at coarser resolution.
+    """
+
+    def build(store: SqliteStore) -> None:
+        for day in (4, 5, 6):
+            store.append(
+                Sample(
+                    timestamp=datetime(2026, 8, day, 13, 0, tzinfo=UTC),
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        week = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    assert week["hours"] is None, "a week must not ship a full hour-by-hour array"
+    assert len(week["days"]) >= 3, "a week with three scored days must offer three points"
+    for entry in week["days"]:
+        assert entry["day"], "every point needs a stamp for the time axis"
+        assert entry["actual_kwh"] is not None
+    # And the days must be ordered, or the trend line doubles back on itself.
+    stamps = [d["day"] for d in week["days"]]
+    assert stamps == sorted(stamps)
+
+
+def test_efficiency_unconfigured_still_offers_an_empty_daily_series(tmp_path: Path) -> None:
+    # Absent, not missing: the page reads the key unconditionally, and a null
+    # where a list belongs is the shape that throws rather than draws nothing.
+    with _efficiency_client(tmp_path, lambda s: None, strings=None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "month", "start": "2026-08-01", "tz": "America/Chicago"},
+        ).json()
+    assert body["configured"] is False
+    assert body["days"] == []
