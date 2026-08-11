@@ -82,20 +82,28 @@ class TestTheSignature:
 
     def test_held_near_open_circuit_with_current_strangled_matches(self) -> None:
         # The measured event: 372.8 V at 4.9 A against a 310 V / 8.6 A baseline.
-        assert signature_matches(372.8, 4.9, _NORMAL)
+        assert signature_matches(372.8, _NORMAL)
 
     def test_a_string_at_its_normal_operating_point_does_not(self) -> None:
-        assert not signature_matches(310.0, 8.6, _NORMAL)
+        assert not signature_matches(310.0, _NORMAL)
 
     def test_low_current_at_normal_voltage_is_not_curtailment(self) -> None:
         # Cloud, shading, or a fault. The voltage would climb if the MPPT were
         # walking off the power point on purpose; it has not, so this is a
         # shortfall that must keep its own name.
-        assert not signature_matches(308.0, 3.0, _NORMAL)
+        assert not signature_matches(308.0, _NORMAL)
 
-    def test_high_voltage_at_normal_current_is_not_curtailment(self) -> None:
-        # A cold bright morning lifts voltage without anything being throttled.
-        assert not signature_matches(340.0, 8.6, _NORMAL)
+    def test_a_high_voltage_hour_that_lost_nothing_books_nothing(self) -> None:
+        """A cold bright morning lifts voltage without anything being throttled.
+
+        The signature is voltage alone, so this hour matches it — and books
+        nothing regardless, because a string producing what the sun allowed has
+        no shortfall to attribute. That is the division of labour: voltage says
+        the MPPT may have stepped away, and the shortfall says whether anything
+        was actually given up.
+        """
+        assert signature_matches(340.0, _NORMAL)
+        assert curtailed_kwh_for_hour(3.0, 3.0, gate_open=True, signature_seen=True) == 0.0
 
     def test_string_one_is_judged_against_its_own_baseline(self) -> None:
         """The finding that changes the implementation rather than confirming it.
@@ -106,12 +114,12 @@ class TestTheSignature:
         the inverter protecting the battery.
         """
         # Its ordinary operating point, which a shared threshold would condemn:
-        assert not signature_matches(377.0, 47.0, _STRING_ONE)
+        assert not signature_matches(377.0, _STRING_ONE)
         # And it is still detectable when genuinely throttled, on its own terms:
-        assert signature_matches(410.0, 6.0, _STRING_ONE)
+        assert signature_matches(410.0, _STRING_ONE)
 
     def test_an_unfitted_baseline_matches_nothing(self) -> None:
-        assert not signature_matches(372.8, 4.9, None)
+        assert not signature_matches(372.8, None)
 
 
 class TestTheBaselineFit:
@@ -127,7 +135,7 @@ class TestTheBaselineFit:
         fit = baseline_for("South", normal + throttled)
         assert fit is not None
         assert fit.operating_voltage_v == pytest.approx(310.0)
-        assert signature_matches(372.8, 4.9, fit), "the fit must still catch the throttle"
+        assert signature_matches(372.8, fit), "the fit must still catch the throttle"
 
     def test_too_little_data_fits_nothing_rather_than_guessing(self) -> None:
         # A guessed baseline is a diagnosis drawn from no evidence.

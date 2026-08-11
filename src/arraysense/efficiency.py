@@ -312,7 +312,6 @@ def compute_day(
             soc = row.get("battery_soc_pct")
             limit = row.get("bms_charge_current_limit_a")
             volts = row.get(f"pv{s.mppt}_voltage_v")
-            amps = row.get(f"pv{s.mppt}_current_a")
             refused = curtailed_kwh_for_hour(
                 exp_kwh,
                 act_kwh,
@@ -323,7 +322,6 @@ def compute_day(
                 ),
                 signature_seen=signature_matches(
                     volts if isinstance(volts, float) else None,
-                    amps if isinstance(amps, float) else None,
                     baselines.get(s.name),
                 ),
             )

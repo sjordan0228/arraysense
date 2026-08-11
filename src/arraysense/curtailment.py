@@ -43,10 +43,10 @@ logger = logging.getLogger(__name__)
 _FULL_SOC_PCT = 95.0
 
 # The BMS pinches charge current long before anything else moves, and it is the
-# least ambiguous signal on the system: 400 A normally, stepping down through
-# 80 and 60 to 40 as the bank fills. Measured against the window's own maximum
-# rather than a constant, because 400 A is this bank's figure and not a fact
-# about batteries.
+# least ambiguous signal on the system: 800 A normally on this bank, stepping
+# down through 160, 80 and 40 to zero as it fills. Measured against the window's
+# own widest limit rather than a constant, because 800 A is this bank's figure
+# and not a fact about batteries.
 _LIMIT_PINCHED_FRACTION = 0.5
 
 # A string held off its maximum power point sits near open-circuit voltage.
@@ -54,16 +54,24 @@ _LIMIT_PINCHED_FRACTION = 0.5
 # percent that ordinary irradiance and temperature swings produce.
 _VOLTAGE_ELEVATED_FRACTION = 1.06
 
-# ...while its current is strangled. Read off the measured event rather than
-# chosen: the throttled string carried 4.9 A against the 8.6 A it runs at
-# normally, a ratio of 0.57, so a half-current rule would have missed the one
-# throttle anybody has actually looked at. This sits just above it.
+# There is deliberately no current threshold here, and finding out why cost a
+# run against real history.
 #
-# It is loose on its own — an overcast hour halves current too — and it is meant
-# to be. The elevated voltage beside it is what separates a throttle from a
-# cloud: current falls under both, but only a throttle walks the voltage up
-# toward open circuit. Both must hold.
-_CURRENT_STRANGLED_FRACTION = 0.65
+# A throttled string is held near open circuit *and* has its current strangled,
+# so an obvious rule tests both against the string's ordinary operating point.
+# That rule is wrong, because the two halves do not behave alike: MPP voltage
+# barely moves with irradiance, while current is very nearly proportional to it.
+# A flat current threshold therefore asks a different question every hour. Run
+# against the reference installation's own 8 August throttle it compared a
+# 16:00 reading to a baseline the dawn and dusk hours had dragged downward, and
+# missed the event by six hundredths of an amp — while at 19:00, an ordinary
+# evening hour cleared the same threshold effortlessly at 0.77 A and was saved
+# from a false positive by the voltage test alone.
+#
+# The irradiance-normalised form of "its current is strangled" is "it produced
+# far less than this hour's sun allowed", which is exactly the shortfall the
+# booking rule already requires. So the signature is voltage, the shortfall is
+# the other half, and neither is asked a question that changes with the weather.
 
 # Below this the hour is not short enough to be worth attributing to anything.
 # Modelled expectation carries real error, and a five-percent gap is inside it.
@@ -144,24 +152,28 @@ def gate_is_open(
 
 def signature_matches(
     voltage_v: float | None,
-    current_a: float | None,
     baseline: StringBaseline | None,
 ) -> bool:
-    """Say whether this string's electrical shape is that of a throttled one.
+    """Say whether this string is being held off its maximum power point.
 
-    The MPPT walking off the maximum power point on purpose: voltage climbing
-    toward open circuit while current is strangled. Both halves are required,
-    against this string's own baseline and no other's.
+    The MPPT walking away from the power point on purpose puts the string near
+    open-circuit voltage, and it is measured against this string's own baseline
+    and no other's — string 1 of the reference array runs higher *normally* than
+    its neighbours read while throttled.
+
+    Voltage alone, and the comment on the constants above says why: current is
+    the half that scales with irradiance, so testing it against a flat baseline
+    asks a different question every hour. What that test was reaching for — the
+    string produced far less than it could have — is the shortfall the booking
+    rule already requires, measured against this hour's own modelled sun.
 
     Missing data or an unfitted baseline means no match, for the same reason the
     gate closes on absence — the conservative direction is the one that leaves a
     real fault visible.
     """
-    if baseline is None or voltage_v is None or current_a is None:
+    if baseline is None or voltage_v is None:
         return False
-    elevated = voltage_v >= baseline.operating_voltage_v * _VOLTAGE_ELEVATED_FRACTION
-    strangled = current_a <= baseline.operating_current_a * _CURRENT_STRANGLED_FRACTION
-    return elevated and strangled
+    return voltage_v >= baseline.operating_voltage_v * _VOLTAGE_ELEVATED_FRACTION
 
 
 def curtailed_kwh_for_hour(
