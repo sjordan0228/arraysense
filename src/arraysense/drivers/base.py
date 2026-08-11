@@ -229,6 +229,23 @@ class Capabilities:
             raise ValueError(
                 f"declares {self.pv_strings} PV string(s) but produces {', '.join(beyond)}"
             )
+        # And the converse: a string declared but never reported. The check
+        # above refuses metrics past the count; this one refuses a count the
+        # metrics do not reach. A driver that cannot read a string individually
+        # declares the strings it can read, not the strings the array has —
+        # otherwise the page draws a card per declared string and leaves the
+        # unreported ones permanently blank, which is what #90 was.
+        if self.pv_strings > 0:
+            present = {
+                int(match.group(1))
+                for name in self.metrics
+                if (match := _STRING_METRIC.match(name))
+            }
+            if missing := [n for n in range(1, self.pv_strings + 1) if n not in present]:
+                raise ValueError(
+                    f"declares {self.pv_strings} PV string(s) but produces no metrics for "
+                    f"string(s) {', '.join(str(m) for m in missing)}"
+                )
 
 
 @dataclass(frozen=True)
@@ -389,10 +406,33 @@ def resolve_model(family: Capabilities, model: ModelSpec) -> Capabilities:
     """
     resolved = family
     if model.pv_strings is not None:
-        resolved = replace(resolved, pv_strings=model.pv_strings)
+        # The metrics move with the count, in one replace rather than two: a
+        # model with fewer strings than its family would otherwise be built
+        # holding metrics for strings it does not have, which Capabilities
+        # refuses — and refuses on an intermediate value the caller never asked
+        # for. Which per-string readings exist is a property of the family's
+        # driver; how many strings there are is the model's fact.
+        resolved = replace(
+            resolved,
+            pv_strings=model.pv_strings,
+            metrics=_metrics_for_strings(family.metrics, model.pv_strings),
+        )
     if model.battery_module_slots is not None:
         resolved = replace(resolved, battery_module_slots=model.battery_module_slots)
     return resolved
+
+
+def _metrics_for_strings(metrics: frozenset[str], count: int) -> frozenset[str]:
+    """Re-cut the per-string metrics to cover exactly strings 1..count.
+
+    The per-string readings a driver takes are the same whatever the count —
+    power, voltage, current and the rest — so the set is rebuilt by applying
+    those same readings to the strings this model actually has. Everything that
+    is not per-string passes through untouched.
+    """
+    suffixes = {name[match.end() :] for name in metrics if (match := _STRING_METRIC.match(name))}
+    rest = {name for name in metrics if not _STRING_METRIC.match(name)}
+    return frozenset(rest | {f"pv{n}_{suffix}" for n in range(1, count + 1) for suffix in suffixes})
 
 
 def find_model(entry: DriverEntry, name: str) -> ModelSpec:

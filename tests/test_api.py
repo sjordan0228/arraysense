@@ -1907,9 +1907,10 @@ def test_capabilities_names_what_the_device_produces(client: Any) -> None:
     assert device["energy"] == "estimated"
     assert device["per_module_battery"] is True
     # Inverter-level names come from the driver's declaration, in registry
-    # order — the fake reports a total but nothing per string.
+    # order. The fake declares three strings and now reports all three: a
+    # declaration the readings do not reach draws blank string cards (#90).
     assert "pv_total_power_w" in device["metrics"]
-    assert "pv1_power_w" not in device["metrics"]
+    assert {"pv1_power_w", "pv2_power_w", "pv3_power_w"} <= set(device["metrics"])
     assert device["metrics"][0] == "pv_total_power_w"
     # Module names are the bare per-module ones the battery endpoints accept.
     assert "soc_pct" in device["battery_module_metrics"]
