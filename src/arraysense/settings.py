@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
+from arraysense.panels import EXAMPLE_STRINGS, parse_strings
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
 if TYPE_CHECKING:
@@ -603,6 +604,146 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "Where battery data comes from: relayed through the inverter, or "
             "no communicating battery. Empty derives it from the driver."
         ),
+    ),
+    # --- Solar panels --------------------------------------------------------
+    # The array, one line per string, in the grammar panels.py owns. Stored as
+    # text for the same reason the tariff is: a repeating structure in a flat
+    # registry, composed by the page and parsed only in Python. Empty means no
+    # array configured, which is a state and not an error.
+    SettingSpec(
+        key="panels.strings",
+        kind="str",
+        default="",
+        multiline=True,
+        max_length=4000,
+        label="Array strings",
+        help=(
+            "One line per string: name | MPPT | panels | watts each | tilt° | "
+            "azimuth° — then optional key=value pairs (temp_coeff, noct, "
+            "mounting, bifacial, installed, degradation, vmp, voc, note). "
+            "For example: " + EXAMPLE_STRINGS.replace("\n", "  •  ")
+        ),
+        check=parse_strings,
+    ),
+    # --- Battery bank --------------------------------------------------------
+    # Static specs the efficiency accounting reads; live BMS values win
+    # wherever they exist. Everything optional with a named default, because
+    # every value has a sane fallback and a wall of required fields would be
+    # the setup burden the panels grammar just avoided.
+    SettingSpec(
+        key="battery.chemistry",
+        kind="str",
+        default="lifepo4",
+        choices=("lifepo4", "other"),
+        label="Battery chemistry",
+        help="LiFePO4 is every current EG4 pack; 'other' only changes labels today.",
+    ),
+    SettingSpec(
+        key="battery.count",
+        kind="int",
+        default=0,
+        lower=0,
+        upper=64,
+        label="Batteries in the bank",
+        help="0 means unstated — bank arithmetic then stays off rather than guessing.",
+    ),
+    SettingSpec(
+        key="battery.capacity_kwh_each",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=100.0,
+        unit="kWh",
+        label="Capacity per battery",
+        help="Nameplate, not derived from live voltage — that figure drifts 7% over a cycle.",
+    ),
+    SettingSpec(
+        key="battery.round_trip_pct",
+        kind="float",
+        default=91.4,
+        lower=50.0,
+        upper=100.0,
+        unit="%",
+        label="Round-trip efficiency",
+        help="Defaults to the reference installation's measured figure, not a datasheet.",
+    ),
+    SettingSpec(
+        key="battery.min_soc_pct",
+        kind="float",
+        default=10.0,
+        lower=0.0,
+        upper=90.0,
+        unit="%",
+        label="Minimum state of charge",
+        help="The floor the inverter is configured to hold; usable capacity ends here.",
+    ),
+    SettingSpec(
+        key="battery.max_charge_a",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="A",
+        label="Max charge current",
+        help="0 means unstated. Context for charge-limit detection, not a command.",
+    ),
+    SettingSpec(
+        key="battery.max_discharge_a",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="A",
+        label="Max discharge current",
+        help="0 means unstated.",
+    ),
+    SettingSpec(
+        key="battery.heater_w",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="W",
+        label="Heater draw",
+        help="Per battery, while heating. 0 for packs without heaters.",
+    ),
+    SettingSpec(
+        key="battery.heater_on_c",
+        kind="float",
+        default=5.0,
+        lower=-30.0,
+        upper=20.0,
+        unit="°C",
+        label="Heater on below",
+        help="",
+    ),
+    SettingSpec(
+        key="battery.heater_off_c",
+        kind="float",
+        default=10.0,
+        lower=-20.0,
+        upper=30.0,
+        unit="°C",
+        label="Heater off above",
+        help="",
+    ),
+    SettingSpec(
+        key="battery.idle_draw_w",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=500.0,
+        unit="W",
+        label="BMS idle draw",
+        help="Per battery. 0 means unstated.",
+    ),
+    SettingSpec(
+        key="battery.installed",
+        kind="str",
+        default="",
+        max_length=7,
+        label="Bank installed (YYYY-MM)",
+        help="For future capacity-fade context; empty is fine.",
     ),
 )
 

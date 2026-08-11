@@ -3006,3 +3006,49 @@ def test_forecast_tracking_null_when_no_dawn_covers_the_actual_hours(tmp_path: P
     # actual_so_far counts all actuals regardless of forecast coverage.
     assert body["actual_so_far_kwh"] is not None
     assert body["actual_so_far_kwh"] > 0
+
+
+# --- /api/panels: the parsed array, bank, and MPPT guard -----------------------
+
+
+def test_panels_serves_the_parsed_array_with_defaults_named(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put(
+        "/api/settings",
+        json={"panels.strings": "East | 1 | 9 | 410 | 25 | 90 | bifacial=9"},
+    )
+    assert r.status_code == 200
+    body = client.get("/api/panels").json()
+    (s,) = body["strings"]
+    assert s["name"] == "East"
+    assert s["watts"] == 410.0
+    assert s["bifacial_pct"] == 9.0
+    assert "temp_coeff" in s["defaulted"] and "bifacial" not in s["defaulted"]
+    assert body["battery"]["round_trip_pct"] == 91.4
+    assert body["declared_mppts"] == 3  # the fake declares pv_strings=3
+
+
+def test_an_unconfigured_array_serves_empty_not_error(client: Any) -> None:
+    body = client.get("/api/panels").json()
+    assert body["strings"] == []
+
+
+def test_a_string_on_an_undeclared_mppt_is_refused_at_the_write(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The parser cannot know the driver (no context in check=), so the write
+    # path enforces it where drivers are already in scope — the same layering
+    # as _reject_unbootable_connection. The fake declares three strings.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put(
+        "/api/settings",
+        json={"panels.strings": "Ghost | 7 | 9 | 410 | 25 | 90"},
+    )
+    assert r.status_code == 400
+    assert "mppt" in r.json()["detail"].lower()
+    values = client.get("/api/settings").json()["values"]
+    assert values["panels.strings"] == "", "a refused write must store nothing"

@@ -54,6 +54,7 @@ from arraysense.costs import (
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
+from arraysense.panels import parse_strings
 from arraysense.settings import (
     SETTING_TIMEZONE,
     SettingsStore,
@@ -715,6 +716,29 @@ def _reject_unbootable_connection(request: Request, wanted: dict[str, Any]) -> N
     drivers.validate(effective(file_config, settings, pending=wanted))
 
 
+def _reject_undeclared_mppts(request: Request, wanted: dict[str, Any]) -> None:
+    """Refuse an array whose strings name MPPTs the inverter does not have.
+
+    The grammar cannot know the driver — check= is a pure function of the
+    text — so the write path enforces it, where the built source's declaration
+    is in scope. Same layering as the connection guard above: refuse at the
+    write, never store a config a later reader chokes on.
+    """
+    text = wanted.get("panels.strings")
+    if not isinstance(text, str) or not text.strip():
+        return
+    declared = getattr(request.app.state.service.source, "capabilities", None)
+    if declared is None:
+        return  # a bare source declares nothing; nothing to enforce against
+    strings = parse_strings(text)  # already validated by the registry; cheap
+    for s in strings:
+        if s.mppt > declared.pv_strings:
+            raise ValueError(
+                f"string {s.name!r} is on MPPT {s.mppt}, but this inverter "
+                f"declares {declared.pv_strings} string input(s)"
+            )
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -735,6 +759,7 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         # so it is validated against the true next-boot merge before any row is
         # written. Inside the try so its ValueError maps to 400 like the rest.
         _reject_unbootable_connection(request, wanted)
+        _reject_undeclared_mppts(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1633,6 +1658,42 @@ async def setup(request: Request) -> dict[str, Any]:
     (#34) and a serial number is an installation secret.
     """
     return describe_setup(request.app.state.config)
+
+
+@router.get("/panels")
+def panels(request: Request, store: _ReadStore) -> dict[str, Any]:
+    """The parsed array and bank, for anything that must not read the grammar.
+
+    One shape, defaults resolved and named, so the future efficiency engine
+    and the settings editor read identical truth — the page composes the
+    grammar but never parses it, which is the tariff's own lesson applied.
+    """
+    settings = SettingsStore(store)
+    text = settings.get("panels.strings")
+    strings = parse_strings(text) if isinstance(text, str) else ()
+    battery = {
+        key.split(".", 1)[1]: settings.get(key)
+        for key in (
+            "battery.chemistry",
+            "battery.count",
+            "battery.capacity_kwh_each",
+            "battery.round_trip_pct",
+            "battery.min_soc_pct",
+            "battery.max_charge_a",
+            "battery.max_discharge_a",
+            "battery.heater_w",
+            "battery.heater_on_c",
+            "battery.heater_off_c",
+            "battery.idle_draw_w",
+            "battery.installed",
+        )
+    }
+    declared = getattr(request.app.state.service.source, "capabilities", None)
+    return {
+        "strings": [{**asdict(s), "defaulted": sorted(s.defaulted)} for s in strings],
+        "battery": battery,
+        "declared_mppts": declared.pv_strings if declared is not None else None,
+    }
 
 
 def _reject_control_text(value: str) -> str:

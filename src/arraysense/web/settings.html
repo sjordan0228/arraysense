@@ -189,6 +189,18 @@ const GROUPS = [
     title: 'General',
   },
   {
+    prefix: 'panels',
+    title: 'Solar panels',
+    intro: 'The array, one line per string — the efficiency model reads exactly what is '
+      + 'entered here, and every value left blank falls to a default the form shows.',
+  },
+  {
+    prefix: 'battery',
+    title: 'Battery bank',
+    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
+      + 'fill the gaps and set the heater and idle-draw accounting.',
+  },
+  {
     prefix: 'display',
     title: 'Display',
   },
@@ -1046,6 +1058,378 @@ function mountBandEditor(spec) {
 }
 
 // ---------------------------------------------------------------------------
+// The string editor — panels compose the grammar the way the band editor
+// composes the tariff: the browser builds the text, only Python reads it.
+// One editor above one textarea, with the same "edit as text" fallback and the
+// same rule: the browser never judges whether a config is valid, because a
+// second parser that disagrees is the bug this shape exists to prevent.
+// ---------------------------------------------------------------------------
+
+const PANELS_KEY = 'panels.strings';
+
+// Defaults the server applies, mirrored from panels.py::_FLOAT_DEFAULTS and
+// _DEFAULT_MOUNTING. Shown as greyed placeholder text for fields the owner has
+// left empty, so a blank box reads as the assumption rather than a mystery.
+// The test at tests/test_settings_panels_editor.py pins these against the
+// actual parser by round-tripping through composeStringLine.
+const PANEL_DEFAULTS = {
+  temp_coeff: -0.35,
+  noct: 45.0,
+  mounting: 'open_rack',
+  bifacial: 0.0,
+  degradation: 0.5,
+};
+
+const MOUNTINGS = ['open_rack', 'close_roof', 'ground'];
+
+// One grammar line from a row object. Advanced fields whose value is empty are
+// left off — the server applies its own default — except note, which is only
+// included when non-empty so an unset note is not stored as the empty string.
+function composeStringLine(row) {
+  const parts = [
+    String(row.name || '').trim(),
+    row.mppt,
+    row.panels,
+    row.watts,
+    row.tilt,
+    row.azimuth,
+  ];
+  const adv = row.advanced || {};
+  for (const [key, value] of Object.entries(adv)) {
+    if (value === '' || value === null || value === undefined) continue;
+    // Quoted so a note with spaces stays as one token.
+    if (key === 'note') {
+      // Escaped the way panels.py unescapes: backslashes first, then quotes,
+      // so a note that quotes something survives the round trip instead of
+      // being refused at the door.
+      const safe = String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      parts.push(`note="${safe}"`);
+    } else {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.join(' | ');
+}
+
+// Every row joined, one string per line.
+function composeStrings(rows) {
+  return rows.map((r) => composeStringLine(r)).join('\n');
+}
+
+// Read one line back into a row object for populating the editor from stored
+// text. Permissive on purpose — the server re-validates — but must round-trip
+// everything composeStringLine emits. Comments and blanks are the caller's to
+// skip; this reads a single line.
+function splitStringLine(line) {
+  const parts = line.split('|').map((p) => p.trim());
+  const row = {
+    name: parts[0] || '',
+    mppt: parts[1] || '',
+    panels: parts[2] || '',
+    watts: parts[3] || '',
+    tilt: parts[4] || '',
+    azimuth: parts[5] || '',
+    advanced: {},
+  };
+  // The tail is rejoined before its tokens are read, exactly as panels.py
+  // rejoins it: a quoted note may contain the separator, and splitting the
+  // whole line on "|" would tear such a note in half — the editor would then
+  // show a truncated value for a config the server reads correctly.
+  const tail = parts.slice(6).join(' | ');
+  const token = /(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
+  let m = token.exec(tail);
+  while (m !== null) {
+    const raw = m[2] !== undefined
+      ? m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      : m[3];
+    row.advanced[m[1]] = raw;
+    m = token.exec(tail);
+  }
+  return row;
+}
+
+// Terminal marker for the node-test extraction harness. This empty function
+// is the stable end-of-slice sentinel and is never called.
+function panelsEditorEnd() {}
+
+// State of the string editor. Same shape as bandState: holds what was
+// originally in the textarea, and while nothing is touched that exact string
+// goes back.
+let panelState = null;
+
+// The default placeholder text for an advanced key, or the empty string when
+// the server has no default for it.
+function panelDefault(key) {
+  return String(key in PANEL_DEFAULTS ? PANEL_DEFAULTS[key] : '');
+}
+
+// One row as controls. The six positional fields always show; the rest live
+// inside an Advanced disclosure so the common case — name, MPPT, count,
+// rating, tilt, azimuth — is the visible one and the uncommon case is two
+// clicks away.
+function panelMarkup(row, i) {
+  const adv = row.advanced || {};
+  const ph = (key) => {
+    const d = panelDefault(key);
+    return d ? ` placeholder="${esc(d)}"` : '';
+  };
+  const val = (key) => esc(adv[key] || '');
+
+  const advRows = [
+    `<div class="span">
+       <span class="cap">Temp coefficient</span>
+       <input type="text" data-role="adv" data-key="temp_coeff"
+         value="${val('temp_coeff')}"${ph('temp_coeff')}
+         inputmode="decimal" aria-label="Temperature coefficient %/°C">
+       <span class="u">%/°C</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">NOCT</span>
+       <input type="text" data-role="adv" data-key="noct"
+         value="${val('noct')}"${ph('noct')}
+         inputmode="decimal" aria-label="NOCT °C">
+       <span class="u">°C</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Mounting</span>
+       <select data-role="adv" data-key="mounting" aria-label="Mounting">
+         ${MOUNTINGS.map((m) => `<option value="${m}"${adv.mounting === m ? ' selected' : ''}>${m.replace(/_/g, ' ')}</option>`).join('')}
+       </select>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Bifacial</span>
+       <input type="text" data-role="adv" data-key="bifacial"
+         value="${val('bifacial')}"${ph('bifacial')}
+         inputmode="decimal" aria-label="Bifacial percentage">
+       <span class="u">%</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Installed</span>
+       <input type="text" data-role="adv" data-key="installed"
+         value="${val('installed')}"
+         placeholder="YYYY-MM" aria-label="Installed date">
+     </div>`,
+    `<div class="span">
+       <span class="cap">Degradation</span>
+       <input type="text" data-role="adv" data-key="degradation"
+         value="${val('degradation')}"${ph('degradation')}
+         inputmode="decimal" aria-label="Degradation %/yr">
+       <span class="u">%/yr</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Vmp</span>
+       <input type="text" data-role="adv" data-key="vmp"
+         value="${val('vmp')}"
+         inputmode="decimal" aria-label="Vmp volts">
+       <span class="u">V</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Voc</span>
+       <input type="text" data-role="adv" data-key="voc"
+         value="${val('voc')}"
+         inputmode="decimal" aria-label="Voc volts">
+       <span class="u">V</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Note</span>
+       <input type="text" data-role="adv" data-key="note"
+         value="${val('note')}"
+         aria-label="Note">
+     </div>`,
+  ].join('');
+
+  return `<div class="band" data-i="${i}">
+    <div class="top">
+      <div class="who">
+        <span class="cap">String name</span>
+        <input type="text" data-role="name" value="${esc(row.name)}"
+          aria-label="String name" spellcheck="false">
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div><span class="cap">MPPT</span>
+          <input type="text" data-role="mppt" value="${esc(row.mppt)}"
+            inputmode="numeric" aria-label="MPPT number" style="width:5ch"></div>
+        <div><span class="cap">Panels</span>
+          <input type="text" data-role="panels" value="${esc(row.panels)}"
+            inputmode="numeric" aria-label="Number of panels" style="width:5ch"></div>
+        <div><span class="cap">Watts each</span>
+          <input type="text" data-role="watts" value="${esc(row.watts)}"
+            inputmode="decimal" aria-label="Watts per panel" style="width:7ch"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><span class="cap">Tilt °</span>
+        <input type="text" data-role="tilt" value="${esc(row.tilt)}"
+          inputmode="decimal" aria-label="Tilt degrees" style="width:6ch"></div>
+      <div><span class="cap">Azimuth °</span>
+        <input type="text" data-role="azimuth" value="${esc(row.azimuth)}"
+          inputmode="decimal" aria-label="Azimuth degrees" style="width:6ch"></div>
+    </div>
+    <details>
+      <summary><span style="font-size:11px;color:var(--ink3)">Advanced</span></summary>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">${advRows}</div>
+    </details>
+    <div class="bandacts">
+      <button type="button" class="iconbtn" data-role="drop">Remove this string</button>
+    </div>
+  </div>`;
+}
+
+// Push the composed text into the registry's textarea so the save path, the
+// dirty check and error reporting all work on the field they always worked on.
+function pushPanels() {
+  const box = document.querySelector(`[data-key="${CSS.escape(PANELS_KEY)}"]`);
+  if (!box) return;
+  box.value = composeStrings(panelState.rows);
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// Mark a row as touched so composeStrings emits it rather than handing back
+// the original text unchanged.
+function touchPanel() {
+  panelState.changed = true;
+  pushPanels();
+}
+
+// An empty row, seeded from the defaults so the owner fills in the six
+// required fields and the advanced ones already read as the assumption.
+function newPanelRow() {
+  return {
+    name: '', mppt: '', panels: '', watts: '', tilt: '', azimuth: '',
+    advanced: {},
+  };
+}
+
+function drawPanels() {
+  const host = $('panelEditor');
+  if (!host) return;
+  const rows = panelState.rows;
+  host.innerHTML = rows.map((row, i) => panelMarkup(row, i)).join('')
+    + `<div class="bandacts">
+         <button type="button" class="iconbtn" id="panelAdd">Add a string</button>
+       </div>`
+    + (rows.length ? '' : '<p class="bandnote">No strings yet. Add one, or write the array as '
+      + 'text.</p>');
+  wirePanels(host);
+}
+
+function wirePanels(host) {
+  const rowAt = (el) => panelState.rows[Number(el.closest('.band').dataset.i)];
+
+  host.querySelectorAll('[data-role="name"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      // Pipe is the field separator in this grammar. A name containing one
+      // produces a different config than the one shown on screen — the service
+      // reads what was stored, and what was stored has an extra field.
+      const clean = el.value.replace(/[|\n]/g, '');
+      if (clean !== el.value) el.value = clean;
+      rowAt(el).name = clean;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="mppt"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).mppt = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="panels"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).panels = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="watts"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).watts = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="tilt"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).tilt = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="azimuth"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).azimuth = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="adv"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      rowAt(el).advanced[el.dataset.key] = el.value;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="adv"][data-key="mounting"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      rowAt(el).advanced.mounting = el.value;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="drop"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      panelState.rows.splice(Number(el.closest('.band').dataset.i), 1);
+      panelState.changed = true;
+      pushPanels();
+      drawPanels();
+    });
+  });
+  const add = $('panelAdd');
+  if (add) {
+    add.addEventListener('click', () => {
+      panelState.rows.push(newPanelRow());
+      panelState.changed = true;
+      pushPanels();
+      drawPanels();
+      const boxes = $('panelEditor').querySelectorAll('[data-role="name"]');
+      if (boxes.length) boxes[boxes.length - 1].focus();
+    });
+  }
+}
+
+function mountPanelsEditor(spec) {
+  const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
+  if (!box) return;
+  const area = box.querySelector('[data-key]');
+  if (!area) return;
+
+  const rows = [];
+  if (area.value.trim()) {
+    for (const raw of area.value.split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      rows.push(splitStringLine(line));
+    }
+  }
+  panelState = { original: area.value, rows, changed: false };
+
+  const shell = document.createElement('div');
+  shell.className = 'bands';
+  shell.id = 'panelEditor';
+  const bar = document.createElement('div');
+  bar.className = 'bandacts';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'iconbtn';
+  toggle.textContent = 'Edit as text';
+  bar.appendChild(toggle);
+  area.parentNode.insertBefore(shell, area);
+  area.parentNode.insertBefore(bar, area.nextSibling);
+  area.hidden = true;
+
+  toggle.addEventListener('click', () => {
+    if (area.hidden) {
+      area.hidden = false;
+      shell.hidden = true;
+      toggle.textContent = 'Back to the editor';
+      area.focus();
+    } else {
+      const lines = [];
+      for (const raw of area.value.split('\n')) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        lines.push(splitStringLine(line));
+      }
+      panelState = { original: area.value, rows: lines, changed: false };
+      area.hidden = true;
+      shell.hidden = false;
+      toggle.textContent = 'Edit as text';
+      drawPanels();
+    }
+  });
+
+  drawPanels();
+}
+
+// ---------------------------------------------------------------------------
 // Filling the coordinates from the device.
 //
 // The one per-key affordance on this page, and it earns it: a latitude typed
@@ -1149,6 +1533,8 @@ function mountLocation() {
 function mountExtras() {
   const bands = fields.find((f) => f.key === BANDS_KEY);
   if (bands) mountBandEditor(bands);
+  const panels = fields.find((f) => f.key === PANELS_KEY);
+  if (panels) mountPanelsEditor(panels);
   mountLocation();
 }
 
