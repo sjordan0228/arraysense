@@ -39,6 +39,23 @@ _FLOAT_DEFAULTS: dict[str, float] = {
 # refuses anything else, and refusing is the point: a gauge nobody has a
 # resistance for cannot become a silent zero loss.
 WIRE_GAUGES = frozenset({2, 4, 6, 8, 10, 12, 14})
+
+# Every optional key the tail accepts, named once. The settings registry quotes
+# this in the help the page renders, and a test holds the two together: a key
+# added here and forgotten there is a setting the owner cannot discover.
+KNOWN_STRING_KEYS: tuple[str, ...] = (
+    "temp_coeff",
+    "noct",
+    "mounting",
+    "bifacial",
+    "installed",
+    "degradation",
+    "vmp",
+    "voc",
+    "wire_awg",
+    "wire_run_ft",
+    "note",
+)
 _DEFAULT_MOUNTING = "open_rack"
 _DEFAULTS: dict[str, float | str] = {**_FLOAT_DEFAULTS, "mounting": _DEFAULT_MOUNTING}
 
@@ -129,24 +146,11 @@ def _parse_line(line: str) -> StringSpec:
         if leftovers and tail.rstrip().endswith("|"):
             raise _refuse(line, "the tail ends with a stray separator")
 
-    known = {
-        "temp_coeff",
-        "noct",
-        "mounting",
-        "bifacial",
-        "installed",
-        "degradation",
-        "vmp",
-        "voc",
-        "wire_awg",
-        "wire_run_ft",
-        "note",
-    }
-    unknown = set(keys) - known
+    unknown = set(keys) - set(KNOWN_STRING_KEYS)
     if unknown:
         # Refused loudly, never ignored: a typo that quietly became a default
         # would be a config the owner believes is set.
-        raise _refuse(line, f"unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+        raise _refuse(line, f"unknown key(s) {sorted(unknown)}; known: {sorted(KNOWN_STRING_KEYS)}")
 
     defaulted = {k for k in _DEFAULTS if k not in keys}
     if "installed" not in keys:

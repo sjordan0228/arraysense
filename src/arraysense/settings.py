@@ -622,7 +622,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help=(
             "One line per string: name | MPPT | panels | watts each | tilt° | "
             "azimuth° — then optional key=value pairs (temp_coeff, noct, "
-            "mounting, bifacial, installed, degradation, vmp, voc, note). "
+            "mounting, bifacial, installed, degradation, vmp, voc, wire_awg, "
+            "wire_run_ft, note). "
             "For example: " + EXAMPLE_STRINGS.replace("\n", "  •  ")
         ),
         check=parse_strings,

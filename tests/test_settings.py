@@ -592,3 +592,18 @@ class TestEfficiencyConfigVersion:
         after = self._version(settings)
         store.close()
         assert after == before + 1
+
+
+def test_the_array_help_names_every_key_the_parser_accepts() -> None:
+    """A help text that drifts from the grammar is a config nobody can write.
+
+    The page renders this string verbatim, so a key missing from it is a key
+    the owner has no way to discover -- and one listed but unparsed is worse.
+    Checked against the parser rather than a copy of the list, so adding a key
+    to panels.py and forgetting the help turns this red.
+    """
+    from arraysense.panels import KNOWN_STRING_KEYS
+
+    help_text = lookup_setting("panels.strings").help
+    missing = sorted(k for k in KNOWN_STRING_KEYS if k not in help_text)
+    assert not missing, f"the array help never mentions {missing}"
