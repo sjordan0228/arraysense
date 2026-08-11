@@ -282,11 +282,12 @@ def _forecast_ddl(as_name: str) -> str:
     the importer has enforced since day one by refusing to import
     SolarAssistant's predicted series into the metric tables. So the forecast
     is its own table, append-only: every prediction keeps the moment it was
-    made, because the page draws two different truths from the same day — the
-    dawn plan the day is tracked against, and the latest expectation for the
-    hours still to come — and a table that kept only the newest would erase
-    the plan the moment it was revised. Site-level like the weather itself,
-    so it carries no device.
+    made. The page draws only the newest of them, so nothing on screen depends
+    on the older rows — they are kept because they are the only record of how a
+    day's expectation moved, which is what scoring the forecast against what
+    actually happened would have to read, and because overwriting is
+    unrecoverable while keeping costs a few hundred pruned rows a day.
+    Site-level like the weather itself, so it carries no device.
     """
     return (
         f"CREATE TABLE IF NOT EXISTS {as_name} (\n"

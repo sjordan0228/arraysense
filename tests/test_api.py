@@ -2866,19 +2866,22 @@ def test_forecast_empty_table_returns_configured_false(empty_client: Any) -> Non
     """With no forecast rows the page shows nothing — not zeros, not a guessed curve."""
     body = empty_client.get("/api/forecast").json()
     assert body["configured"] is False
-    assert body["dawn"] == []
-    assert body["latest"] == []
+    assert body["prediction"] == []
     assert body["actual"] == []
     assert body["expected_today_kwh"] is None
     assert body["actual_so_far_kwh"] is None
-    assert body["tracking_pct"] is None
     assert "start" in body["day"]
     assert "now" in body
+    # Served even with nothing to draw: the caption says how often the page
+    # refreshes, which is true whether or not a prediction exists yet.
+    assert body["refresh_seconds"] == 900.0
 
 
-def test_forecast_delivers_curves_and_tracking_for_matched_hours(tmp_path: Path) -> None:
-    """Dawn + revision staged for three hours, actuals for two — tracking covers only
-    the hours that carry both a dawn expectation and a measurement.
+def test_forecast_serves_the_newest_revision_and_the_hours_measured(tmp_path: Path) -> None:
+    """A prediction and its revision staged for three hours, actuals for two.
+
+    The curve must carry the revision rather than the figure it replaced, and
+    the measured hours must be only the ones that have actually happened.
 
     Staged in the real current UTC day and asked for with tz=UTC, so the
     endpoint's own "today" needs no pinning: datetime.now is immutable and the
@@ -2890,15 +2893,15 @@ def test_forecast_delivers_curves_and_tracking_for_matched_hours(tmp_path: Path)
 
     store = SqliteStore(str(tmp_path / "fc.db"), device=TEST_DEVICE)
 
-    # --- stage forecast: dawn plan at 00:05 local, revision at 06:00 local ---
-    made_dawn = day_start + timedelta(minutes=5)
+    # --- stage forecast: first plan at 00:05 local, revision at 06:00 local ---
+    made_first = day_start + timedelta(minutes=5)
     made_rev = day_start + timedelta(hours=6)
 
     h1 = day_start
     h2 = day_start + timedelta(hours=1)
     h3 = day_start + timedelta(hours=2)
 
-    store.append_forecast(made_dawn, [(h1, 100.0), (h2, 500.0), (h3, 800.0)])
+    store.append_forecast(made_first, [(h1, 100.0), (h2, 500.0), (h3, 800.0)])
     store.append_forecast(made_rev, [(h1, 120.0), (h2, 550.0), (h3, 900.0)])
 
     # --- stage actuals for the first two hours (h1 and h2) ---
@@ -2929,83 +2932,61 @@ def test_forecast_delivers_curves_and_tracking_for_matched_hours(tmp_path: Path)
 
     assert body["configured"] is True
 
-    # Dawn curve carries the early plan — the revision must not change it.
-    assert len(body["dawn"]) == 3
-    dawn_w = [e["expected_w"] for e in body["dawn"]]
-    assert dawn_w == [100.0, 500.0, 800.0]
-
-    # Latest curve carries the revision.
-    assert len(body["latest"]) == 3
-    latest_w = [e["expected_w"] for e in body["latest"]]
-    assert latest_w == [120.0, 550.0, 900.0]
+    # One curve, and it carries the revision rather than the plan it revised.
+    assert len(body["prediction"]) == 3
+    predicted_w = [e["expected_w"] for e in body["prediction"]]
+    assert predicted_w == [120.0, 550.0, 900.0]
 
     # Only hours 1 and 2 have actual readings.
     assert len(body["actual"]) == 2
     actual_w = [e["mean_w"] for e in body["actual"]]
     assert actual_w == [150.0, 600.0]  # hour 2 mean: (550+650)/2
 
-    # expected_today_kwh: sum latest / 1000
+    # expected_today_kwh: the prediction summed, in kWh
     assert body["expected_today_kwh"] == pytest.approx(1.57, abs=0.01)
 
     # actual_so_far_kwh: (150 + 600) / 1000
     assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
 
-    # tracking_pct: only hours 1 and 2 (both have dawn and actual)
-    # dawn sum = 100 + 500 = 600, actual sum = 150 + 600 = 750
-    # (750/600 - 1) * 100 = 25.0%
-    assert body["tracking_pct"] == 25.0
+
+def test_forecast_refresh_seconds_follows_the_setting(client: Any, monkeypatch: Any) -> None:
+    """The caption's cadence comes from the registry, never from the page.
+
+    The interval is an owner-editable setting between five minutes and a day, so
+    a page with fifteen minutes written into its markup would be wrong for
+    anybody who moved it. The endpoint reports whatever is actually configured.
+    """
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    assert client.get("/api/forecast").json()["refresh_seconds"] == 900.0
+
+    r = client.put("/api/settings", json={"collector.weather_interval": 1800.0})
+    assert r.status_code == 200
+    assert client.get("/api/forecast").json()["refresh_seconds"] == 1800.0
 
 
-def test_forecast_tracking_null_when_no_dawn_covers_the_actual_hours(tmp_path: Path) -> None:
-    """Actual readings exist but no dawn plan covers the same hours — tracking
-    must be null, never a figure from mismatched hours. Staged in the real
-    current UTC day, asked with tz=UTC, no pinned clock."""
-    import sqlite3
+def test_forecast_refresh_seconds_survives_an_unreadable_stored_value(
+    client: Any, monkeypatch: Any
+) -> None:
+    """A cadence nobody can read falls back to the registry, not to a blank page.
 
-    day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+    The settings API refuses a non-numeric interval, so the only way one lands
+    in the table is a hand-edited database or a row written by an older version.
+    The caption is the least important thing on the dashboard and must not be
+    what takes it down.
+    """
+    from arraysense.api import routes
 
-    store = SqliteStore(str(tmp_path / "fc2.db"), device=TEST_DEVICE)
-
-    # Forecast only covers hours 4-5 (later in the day).
-    made_at = day_start + timedelta(minutes=5)
-    h4 = day_start + timedelta(hours=4)
-    h5 = day_start + timedelta(hours=5)
-    store.append_forecast(made_at, [(h4, 400.0), (h5, 500.0)])
-
-    # Actuals land in hours 1-2 (earlier, no forecast overlap).
-    h1 = day_start
-    h2 = day_start + timedelta(hours=1)
-    store.append(Sample(timestamp=h1 + timedelta(minutes=30), readings={"pv_total_power_w": 200.0}))
-    store.append(Sample(timestamp=h2 + timedelta(minutes=30), readings={"pv_total_power_w": 300.0}))
-
-    conn = sqlite3.connect(str(tmp_path / "fc2.db"))
-    rebuild_inverter_hourly(
-        conn, int(day_start.timestamp()) - 3600, int((day_start + timedelta(days=1)).timestamp())
-    )
-    conn.commit()
-    conn.close()
-
-    config = Config(
-        dongle_host="h",
-        dongle_serial="s",
-        inverter_serial="i",
-        database_path=str(tmp_path / "fc2.db"),
-        poll_interval=10.0,
-    )
-    service = CollectorService(source=FakeSource(), store=store, interval=3600)
-    app = create_app(store=store, service=service, config=config)
-    with TestClient(app) as c:
-        body = c.get("/api/forecast", params={"tz": "UTC"}).json()
-    store.close()
-
-    assert body["configured"] is True
-    assert len(body["actual"]) == 2
-    assert len(body["dawn"]) == 2
-    # The hours carry no overlap: tracking must be absent.
-    assert body["tracking_pct"] is None
-    # actual_so_far counts all actuals regardless of forecast coverage.
-    assert body["actual_so_far_kwh"] is not None
-    assert body["actual_so_far_kwh"] > 0
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    store = client.app.state.store
+    with store._conn:
+        store._conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ("collector.weather_interval", "every so often"),
+        )
+    body = client.get("/api/forecast").json()
+    assert body["refresh_seconds"] == 900.0
 
 
 # --- /api/panels: the parsed array, bank, and MPPT guard -----------------------

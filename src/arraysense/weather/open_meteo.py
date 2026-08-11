@@ -153,8 +153,8 @@ def fetch_conditions_forecast(
             # UTC day ends at 6 PM in Chicago — which cut the owner's chart off
             # mid-evening and left mornings without the day's tail. Two days
             # always cover the whole local day whatever the zone; hours beyond
-            # today land in the table and simply become tomorrow's early
-            # "latest" curve until tomorrow's own dawn plan is made.
+            # today land in the table and stand as tomorrow's early prediction
+            # until tomorrow's own fetches revise them.
             "forecast_days": "2",
             "timezone": "UTC",
         }

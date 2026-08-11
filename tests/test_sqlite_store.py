@@ -1218,29 +1218,43 @@ def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
     assert reading["error"] is None
 
 
-def test_forecast_keeps_every_revision_and_serves_dawn_and_latest(tmp_path: Path) -> None:
-    # Two truths from one table: the dawn plan the day is tracked against, and
-    # the latest expectation for the hours still to come. A revision must never
-    # erase the plan it revises — and a forecast made yesterday is not today's
-    # dawn plan.
+def test_forecast_serves_the_newest_revision_of_each_hour(tmp_path: Path) -> None:
+    # The page draws one prediction, so the read answers with one: the newest
+    # figure for each hour, whenever it was made. A forecast made yesterday for
+    # an hour nobody has revised since still counts, because it is the newest
+    # thing anybody has said about that hour.
     store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
     day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
     noon = day.replace(hour=12)
     one_pm = day.replace(hour=13)
-    # yesterday's forecast for today: excluded from "first"
-    store.append_forecast(day - timedelta(hours=10), [(noon, 5000.0)])
-    # dawn plan
+    two_pm = day.replace(hour=14)
+    store.append_forecast(day - timedelta(hours=10), [(noon, 5000.0), (two_pm, 3300.0)])
     store.append_forecast(day.replace(hour=6), [(noon, 6000.0), (one_pm, 6500.0)])
-    # midday revision
     store.append_forecast(day.replace(hour=11), [(noon, 4200.0), (one_pm, 4400.0)])
-    curves = store.forecast_day(day, day + timedelta(days=1))
+    curve = store.forecast_day(day, day + timedelta(days=1))
     store.close()
-    first = {c["hour"]: c["expected_w"] for c in curves["first"]}
-    latest = {c["hour"]: c["expected_w"] for c in curves["latest"]}
-    assert first[noon] == 6000.0, "the dawn plan survives its revision"
-    assert first[one_pm] == 6500.0
-    assert latest[noon] == 4200.0, "the latest expectation is the revision"
-    assert latest[one_pm] == 4400.0
+    hours = {c["hour"]: c["expected_w"] for c in curve}
+    assert hours[noon] == 4200.0
+    assert hours[one_pm] == 4400.0
+    assert hours[two_pm] == 3300.0, "yesterday's figure stands where nothing revised it"
+    assert [c["hour"] for c in curve] == [noon, one_pm, two_pm], "oldest hour first"
+
+
+def test_forecast_keeps_every_revision_it_was_given(tmp_path: Path) -> None:
+    # The read shows one curve; the table still holds the whole history behind
+    # it. Nothing on screen depends on that today, but overwriting would be
+    # unrecoverable and it is the only record of how a day's expectation moved.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    noon = day.replace(hour=12)
+    for hour, watts in ((6, 6000.0), (9, 5200.0), (11, 4200.0)):
+        store.append_forecast(day.replace(hour=hour), [(noon, watts)])
+    kept = store._conn.execute(
+        "SELECT expected_w FROM forecast WHERE target_hour = ? ORDER BY made_at",
+        (int(noon.timestamp()),),
+    ).fetchall()
+    store.close()
+    assert [row[0] for row in kept] == [6000, 5200, 4200]
 
 
 def test_forecast_prune_drops_old_hours(tmp_path: Path) -> None:
@@ -1250,10 +1264,10 @@ def test_forecast_prune_drops_old_hours(tmp_path: Path) -> None:
     store.append_forecast(old, [(old, 4000.0)])
     store.append_forecast(new, [(new, 5000.0)])
     removed = store.prune_forecast(datetime(2026, 6, 1, tzinfo=UTC))
-    curves = store.forecast_day(new.replace(hour=0), new.replace(hour=0) + timedelta(days=1))
+    curve = store.forecast_day(new.replace(hour=0), new.replace(hour=0) + timedelta(days=1))
     store.close()
     assert removed == 1
-    assert len(curves["latest"]) == 1
+    assert len(curve) == 1
 
 
 def test_efficiency_days_are_written_and_read_back(tmp_path: Path) -> None:
