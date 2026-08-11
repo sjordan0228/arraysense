@@ -7,6 +7,41 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.7.3 — 11 August 2026
+
+### Fixed
+
+- **The Inverter tab drew a row for every reading the reference machine has,
+  whatever machine you actually own**
+  ([#12](https://github.com/sjordan0228/arraysense/issues/12)). Cards already
+  disappeared when a device declared nothing they could show — a machine with no
+  backup panel has no Legs card rather than an all-dash one — but inside the
+  cards that remained, every row was drawn regardless.
+
+  Measured on a device declaring 19 metrics against the reference machine's 91:
+  **28 dashes across six of the seven cards**, for registers that hardware never
+  reads. "Cell high", "Charge reference", "Discharge cutoff" and the rest were
+  all present and all empty. The same device now shows four cards and no dashes
+  at all.
+
+  A permanent dash is worse than a missing row, which is the whole reason this
+  matters: it teaches you to read past dashes, and the next one is a sensor that
+  has actually failed.
+
+  Two kinds of row needed more than a yes or no. A per-pack reading is declared
+  in a different list from an inverter reading, so asking the wrong list would
+  have answered no on every machine. And a row naming two readings — "H1 · H2",
+  "Health / cycles" — cannot simply be kept or dropped: an inverter with one
+  heatsink used to draw a real number beside a dash, which reads as a broken
+  sensor rather than as a machine built differently. Those rows now name only
+  the halves that exist, so one heatsink reads "H1". A row that is a difference
+  rather than a pair — cell spread, temperature spread — still requires both
+  ends, because a spread measured from one end is not a spread.
+
+  Nothing changes on an inverter that declares everything. The row set was
+  captured from the reference installation before the change and compared after:
+  identical, down to the separators.
+
 ## 0.7.2 — 11 August 2026
 
 ### Fixed
