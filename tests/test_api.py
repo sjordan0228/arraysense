@@ -3690,3 +3690,15 @@ def test_efficiency_books_real_curtailment_and_never_penalises_it(tmp_path: Path
     wf = {k: v["kwh"] for k, v in segments.items()}
     closed = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
     assert closed == pytest.approx(wf["actual"], abs=0.01)
+
+
+def test_the_efficiency_page_is_served(client: Any) -> None:
+    """The Efficiency page is a nav destination, and a nav target that answers
+    404 reads as the feature being down rather than a page that was never
+    written. The allow-list test only proves the route exists; this is what
+    proves the file behind it is actually served, which is how a PAGES entry
+    whose page never lands gets noticed at all.
+    """
+    r = client.get("/efficiency")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]

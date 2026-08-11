@@ -64,6 +64,27 @@ const LIGHT_TOKEN_BLOCK = `
 `;
 
 const BASE_CSS = `
+    /* The efficiency budget bar. Texture and order carry the meaning; see
+       drawWaterfall for why hue deliberately does not. */
+    .wf-track{position:relative;display:flex;align-items:stretch;height:34px;width:100%;
+      border:1px solid var(--panel-b);border-radius:4px;overflow:hidden;
+      background:var(--tint)}
+    .wf-seg{height:100%}
+    .wf-actual{background:var(--pv)}
+    .wf-lost{background:repeating-linear-gradient(135deg,
+      var(--zero-rule) 0 3px,transparent 3px 7px)}
+    .wf-mark{position:absolute;top:-3px;bottom:-3px;width:2px;
+      background:var(--zero-rule)}
+    .wf-markkey{background:var(--zero-rule);width:3px;border:0}
+    /* Outlined rather than filled, and beyond the gap: it was never scored. */
+    .wf-curt{background:transparent;border:1px dashed var(--zero-rule)}
+    .wf-gap{width:10px;flex:0 0 10px;background:transparent}
+    .wf-legend{display:flex;flex-wrap:wrap;gap:.35rem 1rem;margin-top:.4rem;
+      font-size:.82rem;color:var(--muted,inherit)}
+    .wf-key{display:inline-flex;align-items:center;gap:.35rem}
+    .wf-sw{display:inline-block;width:14px;height:10px;border-radius:2px;
+      border:1px solid var(--panel-b)}
+
   :root {
     /* Validated against protanopia, deuteranopia and tritanopia across every
        pair, not just adjacent ones — the previous grid violet and home blue sat
@@ -629,8 +650,99 @@ const NAV = [
   { key:'graphs',  label:'Graphs',      href:'/graphs' },
   { key:'history', label:'History',     href:'/history' },
   { key:'costs',   label:'Costs',       href:'/costs' },
+  { key:'efficiency', label:'Efficiency', href:'/efficiency' },
   { key:'settings', label:'Settings',   href:'/settings' },
 ];
+
+// ---------------------------------------------------------------------------
+// The efficiency budget bar.
+//
+// One bar the width of the day's expected production, divided into what the
+// array actually made, what it lost, and what the inverter refused because
+// there was nowhere to put it. The last of those is the reason this is drawn
+// by hand rather than as a stacked chart: refused energy is not a loss, and a
+// bar that shades it like one tells the owner their array is faulty on exactly
+// the days it behaved perfectly.
+//
+// Hue carries almost nothing here, deliberately. The obvious encoding — solar
+// orange for what you made, discharge red for what you lost — measures dE 3.6
+// between those two under tritanopia and 13.6 under deuteranopia against this
+// project's own validated palette, which is to say invisible to the person who
+// owns this installation. So position (order along the bar), texture (solid,
+// hatched, outlined) and an explicit gap carry the meaning, and colour only
+// agrees with them. That ordering survives any colour vision, including none.
+//
+// Reads the endpoint's own segments and never recomputes them: the walk from
+// expected to actual has to close, and it closes in the API where the numbers
+// are, not twice.
+function drawWaterfall(host, segments) {
+  if (!host) return;
+  host.innerHTML = '';
+  if (!Array.isArray(segments) || !segments.length) return;
+
+  const by = {};
+  for (const s of segments) by[s.name] = s;
+  const expected = numOrNull(by.expected && by.expected.kwh);
+  const actual = numOrNull(by.actual && by.actual.kwh);
+  // Absent is absent. A bar drawn from nothing would be a claim that the array
+  // was expected to make nothing and made nothing.
+  if (expected === null || actual === null || expected <= 0) {
+    host.innerHTML = `<p class="muted">${DASH} nothing measured for this period.</p>`;
+    return;
+  }
+  const unexplained = numOrNull(by.unexplained && by.unexplained.kwh) || 0;
+  const curtailed = numOrNull(by.curtailed && by.curtailed.kwh) || 0;
+  const gain = numOrNull(by.unmodelled_gain && by.unmodelled_gain.kwh) || 0;
+
+  // Everything is scaled against the widest thing the bar has to hold, so a day
+  // that beat its model does not run off the end.
+  const span = Math.max(expected, actual + curtailed) || 1;
+  const pct = (v) => `${Math.max(0, (v / span) * 100)}%`;
+
+  const parts = [];
+  parts.push(`<div class="wf-seg wf-actual" style="width:${pct(actual)}"
+      title="Produced ${gnum(actual, 1)} kWh"></div>`);
+  if (unexplained > 0) {
+    parts.push(`<div class="wf-seg wf-lost" style="width:${pct(unexplained)}"
+      title="Unexplained shortfall ${gnum(unexplained, 1)} kWh"></div>`);
+  }
+  // Deliberately not a segment of its own. A day that beat its model has that
+  // surplus already inside `actual` -- the walk is expected - unexplained -
+  // curtailed + gain = actual -- so drawing it again pushed the bar past its
+  // own track by exactly the gain. It is marked instead by where `expected`
+  // falls, which is the honest way to show production running past the model.
+  // The gap is the argument: everything left of it was scored, and what sits
+  // beyond it was never counted against the array at all.
+  if (curtailed > 0) {
+    parts.push(`<div class="wf-gap" aria-hidden="true"></div>`);
+    parts.push(`<div class="wf-seg wf-curt" style="width:${pct(curtailed)}"
+      title="Refused ${gnum(curtailed, 1)} kWh — nowhere to put it, not a fault"></div>`);
+  }
+
+  const legend = [
+    `<span class="wf-key"><i class="wf-sw wf-actual"></i>produced ${gnum(actual, 1)} kWh</span>`,
+  ];
+  if (unexplained > 0) {
+    legend.push(`<span class="wf-key"><i class="wf-sw wf-lost"></i>unexplained ${gnum(unexplained, 1)} kWh</span>`);
+  }
+  if (gain > 0) {
+    legend.push(`<span class="wf-key"><i class="wf-sw wf-markkey"></i>${gnum(gain, 1)} kWh above the model</span>`);
+  }
+  if (curtailed > 0) {
+    legend.push(`<span class="wf-key"><i class="wf-sw wf-curt"></i>curtailed ${gnum(curtailed, 1)} kWh — not counted against the array</span>`);
+  }
+
+  // Where the model said the day should have ended. Left of it is shortfall,
+  // right of it is the array beating its own description.
+  const mark = `<div class="wf-mark" style="left:${pct(expected)}"
+      title="modelled ${gnum(expected, 1)} kWh" aria-hidden="true"></div>`;
+
+  host.innerHTML =
+    `<div class="wf-track" role="img" aria-label="Of ${gnum(expected, 1)} kilowatt hours expected, ` +
+    `${gnum(actual, 1)} produced, ${gnum(unexplained, 1)} unexplained, ` +
+    `${gnum(curtailed, 1)} curtailed and not counted against the array.">${parts.join('')}${mark}</div>` +
+    `<div class="wf-legend">${legend.join('')}</div>`;
+}
 
 // Called again whenever the current view changes, not only at boot: on the
 // dashboard the marker moves between two entries without the document
