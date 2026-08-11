@@ -35,6 +35,10 @@ _FLOAT_DEFAULTS: dict[str, float] = {
     "bifacial": 0.0,
     "degradation": 0.5,
 }
+# The gauges a PV string is plausibly run in. Listed here because the grammar
+# refuses anything else, and refusing is the point: a gauge nobody has a
+# resistance for cannot become a silent zero loss.
+WIRE_GAUGES = frozenset({2, 4, 6, 8, 10, 12, 14})
 _DEFAULT_MOUNTING = "open_rack"
 _DEFAULTS: dict[str, float | str] = {**_FLOAT_DEFAULTS, "mounting": _DEFAULT_MOUNTING}
 
@@ -64,6 +68,8 @@ class StringSpec:
     degradation: float
     vmp: float | None
     voc: float | None
+    wire_awg: int | None
+    wire_run_ft: float | None
     note: str
     defaulted: frozenset[str]
 
@@ -132,6 +138,8 @@ def _parse_line(line: str) -> StringSpec:
         "degradation",
         "vmp",
         "voc",
+        "wire_awg",
+        "wire_run_ft",
         "note",
     }
     unknown = set(keys) - known
@@ -152,6 +160,24 @@ def _parse_line(line: str) -> StringSpec:
     noct = (
         _number(line, "noct", keys["noct"], 20, 90) if "noct" in keys else _FLOAT_DEFAULTS["noct"]
     )
+    wire_awg: int | None = None
+    if "wire_awg" in keys:
+        gauge = int(_number(line, "wire_awg", keys["wire_awg"], 0, 20))
+        if gauge not in WIRE_GAUGES:
+            raise _refuse(line, f"wire_awg must be one of {sorted(WIRE_GAUGES)}, got {gauge}")
+        wire_awg = gauge
+    wire_run_ft = (
+        _number(line, "wire_run_ft", keys["wire_run_ft"], 0, 2000)
+        if "wire_run_ft" in keys
+        else None
+    )
+    # Both or neither: a gauge with no length, or a length with no gauge, is
+    # half a measurement and cannot produce a resistance. Refused at the door
+    # rather than silently ignored, because a wire loss the owner believes is
+    # modelled and is not would flatter every figure downstream.
+    if (wire_awg is None) != (wire_run_ft is None):
+        raise _refuse(line, "wire_awg and wire_run_ft must be given together")
+
     mounting = keys.get("mounting", _DEFAULT_MOUNTING)
     if mounting not in MOUNTINGS:
         raise _refuse(line, f"mounting must be one of {MOUNTINGS}, got {mounting!r}")
@@ -186,6 +212,8 @@ def _parse_line(line: str) -> StringSpec:
         degradation=degradation,
         vmp=vmp,
         voc=voc,
+        wire_awg=wire_awg,
+        wire_run_ft=wire_run_ft,
         note=keys.get("note", ""),
         defaulted=frozenset(defaulted),
     )

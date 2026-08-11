@@ -31,6 +31,27 @@ from arraysense.panels import StringSpec
 # and a measured one.
 SYSTEM_DERATE = 0.86
 
+# Resistance in ohms per 1000 feet, uncoated copper, from NEC chapter 9
+# table 8's 75 C column. The warm column rather than the 20 C one because a PV
+# string's conductors run in sun-heated conduit, and the cool figure would
+# understate the loss by about a fifth on a summer afternoon -- the hours that
+# carry the energy.
+_AWG_OHMS_PER_KFT: dict[int, float] = {
+    2: 0.194,
+    4: 0.308,
+    6: 0.491,
+    8: 0.778,
+    10: 1.24,
+    12: 1.98,
+    14: 3.14,
+}
+
+# PVWatts bundles a flat 2 % wiring allowance into SYSTEM_DERATE. A string that
+# declares its actual run has that allowance divided back out before its real
+# loss is subtracted, or the wire would be paid for twice -- once as a guess
+# and once as a measurement.
+_GENERIC_WIRING_FACTOR = 0.98
+
 # The solar constant, for the extraterrestrial irradiance the anisotropy index
 # is measured against.
 _SOLAR_CONSTANT = 1367.0
@@ -210,6 +231,33 @@ def _years_since(installed: str | None, when: datetime) -> float:
     return max(months, 0) / 12.0
 
 
+def wire_loss_watts(spec: StringSpec, watts: float) -> float:
+    """What this string's DC run dissipates carrying ``watts`` to the inverter.
+
+    I squared R over both conductors, so the run length counts twice. The
+    current comes from the power and the string's own operating voltage rather
+    than from a nameplate figure, because loss goes as the square of current:
+    the same panels on a higher-voltage string lose proportionally less, and a
+    long thin run on a low-voltage string is where the energy actually goes.
+
+    Zero when the string has not been described -- no gauge, no length, or no
+    module Vmp to derive a string voltage from. That is a real zero rather than
+    an absent one: with nothing declared, the loss stays inside the generic
+    derate where it has always been, and no figure moves.
+    """
+    if spec.wire_awg is None or spec.wire_run_ft is None or spec.vmp is None:
+        return 0.0
+    ohms_per_kft = _AWG_OHMS_PER_KFT.get(spec.wire_awg)
+    if ohms_per_kft is None or watts <= 0.0:
+        return 0.0
+    volts = spec.panels * spec.vmp
+    if volts <= 0.0:
+        return 0.0
+    resistance = 2.0 * (spec.wire_run_ft / 1000.0) * ohms_per_kft
+    current = watts / volts
+    return current * current * resistance
+
+
 def expected_watts(spec: StringSpec, poa: float, cell_c: float, when: datetime) -> float:
     """What this string should be producing, in watts, under these conditions.
 
@@ -229,4 +277,8 @@ def expected_watts(spec: StringSpec, poa: float, cell_c: float, when: datetime) 
     bifacial = 1 + spec.bifacial_pct / 100.0
     age = 1 - spec.degradation * _years_since(spec.installed, when) / 100.0
     watts = nameplate * (poa / 1000.0) * heat * bifacial * max(age, 0.0) * SYSTEM_DERATE
+    if spec.wire_awg is not None and spec.wire_run_ft is not None and spec.vmp is not None:
+        # Its own run replaces the guess rather than joining it.
+        watts /= _GENERIC_WIRING_FACTOR
+        watts -= wire_loss_watts(spec, watts)
     return max(watts, 0.0)

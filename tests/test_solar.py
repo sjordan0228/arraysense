@@ -20,6 +20,7 @@ from arraysense.solar import (
     expected_watts,
     poa_irradiance,
     solar_position,
+    wire_loss_watts,
 )
 
 
@@ -144,3 +145,70 @@ def test_expected_watts_scales_with_irradiance() -> None:
 def test_no_irradiance_is_no_production_not_a_negative_one() -> None:
     (spec,) = parse_strings("A | 1 | 10 | 400 | 25 | 180")
     assert expected_watts(spec, 0.0, 40.0, datetime(2026, 8, 11, 6, tzinfo=UTC)) == 0.0
+
+
+def test_wire_loss_goes_as_the_square_of_current_and_counts_both_conductors() -> None:
+    """Hand-checked against the reference installation's own runs.
+
+    PV2 and PV3 are 260 ft of 10 AWG carrying about 15 A at their peak. NEC
+    chapter 9 table 8 puts 10 AWG copper at 1.24 ohm per 1000 ft at 75 C, so
+    both conductors together are 2 x 0.260 x 1.24 = 0.645 ohm, and 15 A through
+    that dissipates about 145 W.
+    """
+    (spec,) = parse_strings("PV2 | 2 | 12 | 400 | 5 | 180 | vmp=31.01 wire_awg=10 wire_run_ft=260")
+    volts = 12 * 31.01
+    watts = 15.0 * volts
+    assert wire_loss_watts(spec, watts) == pytest.approx(0.645 * 15.0**2, rel=0.01)
+
+    # Half the run is half the resistance, and so half the loss.
+    (short,) = parse_strings("PV1 | 1 | 12 | 400 | 5 | 180 | vmp=31.01 wire_awg=10 wire_run_ft=130")
+    assert wire_loss_watts(short, watts) == pytest.approx(
+        wire_loss_watts(spec, watts) / 2, rel=1e-6
+    )
+
+    # Twice the power is four times the loss, because current is squared.
+    assert wire_loss_watts(spec, watts * 2) == pytest.approx(
+        wire_loss_watts(spec, watts) * 4, rel=1e-6
+    )
+
+
+def test_a_string_with_no_run_described_loses_nothing_extra() -> None:
+    # Undeclared means the loss stays inside the generic derate, where it has
+    # always been. Nothing may move for a string nobody has measured.
+    (bare,) = parse_strings("A | 1 | 12 | 400 | 5 | 180")
+    assert wire_loss_watts(bare, 4000.0) == 0.0
+    # ...and a gauge without a Vmp cannot produce a string voltage, so it is
+    # still nothing rather than a guess.
+    (no_vmp,) = parse_strings("A | 1 | 12 | 400 | 5 | 180 | wire_awg=10 wire_run_ft=260")
+    assert wire_loss_watts(no_vmp, 4000.0) == 0.0
+
+
+def test_declaring_a_run_replaces_the_generic_allowance_rather_than_joining_it() -> None:
+    """Otherwise the wire is paid for twice, once as a guess and once measured.
+
+    A very short run must come out slightly BETTER than the undeclared case,
+    because PVWatts' flat 2 % is more than that run actually loses. If the
+    explicit loss were simply subtracted on top, no declared run could ever
+    beat the default and every honest short run would be punished for being
+    measured.
+    """
+    when = datetime(2026, 8, 11, 18, tzinfo=UTC)
+    (undeclared,) = parse_strings("A | 1 | 12 | 400 | 5 | 180 | vmp=31.01")
+    (tiny_run,) = parse_strings("A | 1 | 12 | 400 | 5 | 180 | vmp=31.01 wire_awg=10 wire_run_ft=1")
+    assert expected_watts(tiny_run, 1000.0, 25.0, when) > expected_watts(
+        undeclared, 1000.0, 25.0, when
+    )
+
+
+def test_a_gauge_without_a_length_is_refused() -> None:
+    # Half a measurement cannot produce a resistance, and a wire loss the owner
+    # believes is modelled but is not would flatter every figure downstream.
+    with pytest.raises(ValueError, match="together"):
+        parse_strings("A | 1 | 12 | 400 | 5 | 180 | wire_awg=10")
+    with pytest.raises(ValueError, match="together"):
+        parse_strings("A | 1 | 12 | 400 | 5 | 180 | wire_run_ft=260")
+
+
+def test_an_unknown_gauge_is_refused_rather_than_silently_lossless() -> None:
+    with pytest.raises(ValueError, match="wire_awg"):
+        parse_strings("A | 1 | 12 | 400 | 5 | 180 | vmp=31.0 wire_awg=11 wire_run_ft=260")
