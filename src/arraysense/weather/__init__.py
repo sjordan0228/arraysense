@@ -10,8 +10,8 @@ from __future__ import annotations
 from arraysense.weather.open_meteo import (
     METRICS,
     fetch_archive_hours,
+    fetch_conditions_forecast,
     fetch_current,
-    fetch_radiation_forecast,
 )
 
-__all__ = ["METRICS", "fetch_archive_hours", "fetch_current", "fetch_radiation_forecast"]
+__all__ = ["METRICS", "fetch_archive_hours", "fetch_conditions_forecast", "fetch_current"]

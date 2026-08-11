@@ -16,12 +16,12 @@ No location means no fetch: the location settings are the enable, read fresh
 every tick so setting them takes effect within one interval, no restart needed.
 
 As well as the current sky conditions, tick() records the day's production
-forecast — the hourly shortwave radiation scaled to watts by the array's own
-observed peak over the last thirty days. The model is deliberately simple: a
-single ratio of observed peak to clear-sky peak radiation, with no nameplate
-rating anywhere in the arithmetic. A fresh install with no PV history records
-no forecast (an honest cold start), and a failed radiation fetch leaves the
-current-conditions write undisturbed.
+forecast. The arithmetic lives in forecast.py; what happens here is the choice
+between its two bases — the array's demonstrated performance ratio when enough
+days have been scored, and the old observed-peak curve when they have not — and
+the fetch that feeds either. A fresh install with neither scored days nor PV
+history records no forecast at all, an honest cold start, and a failed forecast
+fetch leaves the current-conditions write undisturbed exactly as before.
 """
 
 from __future__ import annotations
@@ -30,18 +30,28 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 
+from arraysense.forecast import (
+    MIN_SCORED_DAYS,
+    PR_WINDOW_DAYS,
+    SkyHour,
+    expected_points,
+    fallback_points,
+    trailing_pr,
+)
 from arraysense.models import Sample
+from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
+    PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SettingsStore,
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
-from arraysense.weather import fetch_current, fetch_radiation_forecast
+from arraysense.weather import fetch_conditions_forecast, fetch_current
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +62,6 @@ _INTERVAL_KEY = "collector.weather_interval"
 # separable from the inverter collector; a busy database is the same condition
 # whichever writer hit it.
 STORE_ERRORS = (sqlite3.Error,)
-
-# A typical clear-sky summer peak at this scale of installation. The honest
-# calibration is this array's own observed peak against it, not a nameplate
-# rating — the ratio K = observed_peak_pv / CLEAR_SKY_PEAK_RADIATION turns a
-# radiation forecast in W/m² into an expected wattage for this specific array.
-CLEAR_SKY_PEAK_RADIATION = 950.0  # W/m²
 
 
 class WeatherPoller:
@@ -72,9 +76,7 @@ class WeatherPoller:
         self,
         store: SqliteStore,
         fetch: Callable[[float, float], Sample | None] = fetch_current,
-        fetch_forecast: Callable[
-            [float, float], list[tuple[datetime, float]] | None
-        ] = fetch_radiation_forecast,
+        fetch_forecast: Callable[[float, float], list[SkyHour] | None] = fetch_conditions_forecast,
     ) -> None:
         """Wire the poller to the store it appends to and the fetch it asks."""
         self._store = store
@@ -83,7 +85,9 @@ class WeatherPoller:
         self._fetch_forecast = fetch_forecast
         self._task: asyncio.Task[None] | None = None
         self._said_idle = False
-        self._said_no_pv_history = False
+        # Which way the forecast is currently being scaled, so a change of basis
+        # is logged once instead of every quarter of an hour forever.
+        self._basis = ""
 
     @property
     def running(self) -> bool:
@@ -134,26 +138,15 @@ class WeatherPoller:
                 wrote = True
 
         # --- Production forecast ---
-        # v1 model: scale the day's radiation forecast (W/m²) by K, where
-        # K = observed_peak_pv / CLEAR_SKY_PEAK_RADIATION.  The constant is a
-        # typical clear-sky summer peak at this scale of installation; the honest
-        # calibration is this array's own observed peak against it, not a
-        # nameplate rating.  expected_w(hour) = radiation(hour) * K, floored at 0.
-        forecast = await asyncio.to_thread(self._fetch_forecast, latitude, longitude)
-        if forecast is not None:
+        # The same chain the efficiency engine runs, over predicted conditions
+        # instead of recorded ones, scaled by what this array has actually been
+        # delivering. See forecast.py for why a trailing median of scored days
+        # beats the observed peak this used to scale by.
+        sky = await asyncio.to_thread(self._fetch_forecast, latitude, longitude)
+        if sky is not None:
             now = datetime.now(UTC)
-            observed_peak_pv = self._store.peak("pv_total_power_w", now - timedelta(days=30), now)
-            if observed_peak_pv is None:
-                if not self._said_no_pv_history:
-                    logger.info(
-                        "no PV history in the last 30 days; "
-                        "recording no forecast until the array has been measured"
-                    )
-                    self._said_no_pv_history = True
-            else:
-                self._said_no_pv_history = False
-                k = observed_peak_pv / CLEAR_SKY_PEAK_RADIATION
-                points = [(hour, max(radiation * k, 0.0)) for hour, radiation in forecast]
+            points = self._forecast_points(sky, latitude, longitude, now)
+            if points:
                 try:
                     self._store.append_forecast(now, points)
                     self._store.prune_forecast(now - timedelta(days=90))
@@ -163,6 +156,76 @@ class WeatherPoller:
                     wrote = True
 
         return wrote
+
+    def _array(self) -> tuple[StringSpec, ...]:
+        """The strings as described today, or none when the array is undescribed.
+
+        Read fresh on every tick, like the location, so correcting a panel count
+        changes the next forecast rather than waiting for a restart. An
+        unparseable description is an unconfigured installation and not a
+        failure worth killing the poll over — it is already reported loudly by
+        the settings page that accepted it.
+        """
+        text = self._settings.get(PANELS_STRINGS_KEY)
+        if not isinstance(text, str) or not text.strip():
+            return ()
+        try:
+            return parse_strings(text)
+        except ValueError as exc:
+            logger.debug("forecast: array description unusable: %s", exc)
+            return ()
+
+    def _forecast_points(
+        self,
+        sky: Sequence[SkyHour],
+        latitude: float,
+        longitude: float,
+        now: datetime,
+    ) -> list[tuple[datetime, float]]:
+        """Model the coming hours, scaled the best way the record supports.
+
+        Demonstrated performance is preferred. The peak-scaled fallback is
+        reached only by an installation with fewer than ``MIN_SCORED_DAYS``
+        scored days behind it — days the maintenance clock writes, so a system
+        collecting normally leaves the fallback within a week of being
+        configured and never returns to it.
+
+        Which basis is in force is logged when it changes rather than on every
+        tick, because this runs every fifteen minutes forever and a line per
+        tick is a log nobody reads.
+        """
+        strings = self._array()
+        if strings:
+            rows = self._store.read_efficiency_days(now - timedelta(days=PR_WINDOW_DAYS), now)
+            ratio = trailing_pr(rows)
+            if ratio is not None:
+                if self._basis != "pr":
+                    logger.info(
+                        "forecast scaled by demonstrated performance ratio %.3f, "
+                        "from the scored days of the last %d",
+                        ratio,
+                        PR_WINDOW_DAYS,
+                    )
+                    self._basis = "pr"
+                return expected_points(strings, latitude, longitude, sky, ratio)
+
+        observed_peak_pv = self._store.peak("pv_total_power_w", now - timedelta(days=30), now)
+        if observed_peak_pv is None:
+            if self._basis != "none":
+                logger.info(
+                    "no scored days and no PV history in the last 30 days; "
+                    "recording no forecast until the array has been measured"
+                )
+                self._basis = "none"
+            return []
+        if self._basis != "peak":
+            logger.info(
+                "fewer than %d scored days; forecasting from the observed peak until "
+                "the array has been measured for longer",
+                MIN_SCORED_DAYS,
+            )
+            self._basis = "peak"
+        return fallback_points(sky, observed_peak_pv)
 
     def _interval(self) -> float:
         """Seconds until the next tick, read fresh so a settings change applies.
