@@ -415,6 +415,69 @@ function capHasMetric(caps, metric) {
   if (!caps || !Array.isArray(caps.metrics)) return true;
   return caps.metrics.includes(metric);
 }
+
+// A row is only worth drawing when the metric behind it exists for this
+// device. An absent reading and an absent capability both draw as a dash,
+// and only one of them is a fault worth showing: a register the hardware
+// never reads drawing a permanent dash teaches the reader to ignore the
+// dash entirely, which is how a real outage goes quiet. capHasMetric answers
+// true on an unknown declaration, so a bare source and a device whose
+// declaration has not loaded yet keep every row they draw today — that is
+// what makes this safe to apply everywhere.
+function capRow(caps, metrics, label, value, cls) {
+  const names = Array.isArray(metrics) ? metrics : [metrics];
+  if (!names.every((m) => capHasMetric(caps, m))) return '';
+  return kvRow(label, value, cls);
+}
+
+// The halves of a two-reading row that this device actually produces. A row
+// like "H1 · H2" or "Health / cycles" names two things at once, and on a
+// machine with only one of them the pair rendered a real number beside a dash
+// — which reads as a broken sensor rather than as a machine built differently.
+// The caller composes label and value from what comes back, so one heatsink
+// reads "H1" and not "H1 · H2" with half of it missing.
+//
+// An empty result means the row should not be drawn at all: a label naming two
+// readings the hardware does not have is worse than no row.
+// Draw the surviving halves of a two-reading row as one line. `parts` is what
+// capParts returned; each carries its own label, its value, and optionally its
+// own formatter for rows whose halves are not the same kind of number.
+//
+// The label is built from the halves that survived, so a machine reporting one
+// heatsink reads "H1" and one reporting both reads "H1 · H2". `lead` prefixes
+// it where the row needs a noun of its own ("DC bus 1 · 2"). The whole row
+// disappears when nothing survived, and shows the dash when every surviving
+// half is unread — an absent reading still has to look absent.
+function pairRow(parts, lead, fmt, unit, sep, vsep) {
+  if (!parts.length) return '';
+  // The label's separator and the value's are not always the same character:
+  // "Leg 1 / Leg 2" labels with a slash and reads its watts with a dot. Both
+  // default to the dot the temperature and voltage pairs use.
+  const ls = sep || ' · ';
+  const vs = vsep || ls;
+  const label = (lead ? lead + ' ' : '') + parts.map((p) => p.label).join(ls);
+  if (parts.every((p) => p.v === null)) return kvRow(label, DASH);
+  // A part may bring its own formatter for a row whose halves are not the same
+  // kind of number. Falling back to String rather than to whatever `fmt` holds
+  // keeps a caller that passes neither from throwing here — this runs inside
+  // the detail render, so an exception would take the whole panel down over one
+  // row's formatting.
+  const shown = parts.map((p) => (p.fmt || fmt || String)(p.v)).join(vs);
+  return kvRow(label, unit ? `${shown} ${unit}` : shown);
+}
+
+function capParts(caps, parts) {
+  return parts.filter((p) => capHasMetric(caps, p.metric));
+}
+
+// Module metrics are declared in caps.battery_module_metrics, a different
+// list from caps.metrics — the inverter metrics live in one and the bare
+// per-pack templates in the other. Asking capHasMetric for a per-pack
+// reading would look in the wrong list and answer no to every device.
+function capHasModuleMetric(caps, metric) {
+  if (!caps || !Array.isArray(caps.battery_module_metrics)) return true;
+  return caps.battery_module_metrics.includes(metric);
+}
 // <<< caps-logic
 
 // ---------------------------------------------------------------------------
