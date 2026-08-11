@@ -198,6 +198,14 @@ const PERIODS = [
   { key: 'month', label: 'Month' },
 ];
 
+// The view's own state, declared rather than conjured. `cursor` was being
+// created implicitly by its first assignment at boot, which works only because
+// the page is not in strict mode; `period` is read before anything assigns it,
+// so it threw on load and the page rendered its chrome and nothing else. Both
+// are named here so neither depends on assignment order again.
+let period = 'day';
+let cursor = null;
+
 // The date the API's start parameter is built from. For period=day this is the
 // day itself; for week it is the Monday; for month it is the first.
 function periodStart(cursor, period) {
