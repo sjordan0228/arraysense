@@ -21,7 +21,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.models import Sample
@@ -58,6 +58,8 @@ _SPECS = {spec.name: spec for spec in INVERTER_METRICS}
 # URLError covers HTTPError and DNS, OSError covers socket teardown mid-read,
 # TimeoutError the socket timeout, ValueError the JSON that is not JSON.
 _FETCH_ERRORS = (urllib.error.URLError, OSError, TimeoutError, ValueError)
+
+_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 
 
 def _http_get(url: str, timeout: float) -> bytes:
@@ -129,6 +131,68 @@ def fetch_radiation_forecast(
             continue
         pairs.append((ts, float(value)))
     return pairs or None
+
+
+def fetch_archive_hours(
+    latitude: float,
+    longitude: float,
+    start: date,
+    end: date,
+    timeout: float = 30.0,
+) -> list[Sample] | None:
+    """Read past hourly conditions, one Sample per hour, or nothing.
+
+    The same free service keeps an ERA5 archive, so a system that has been
+    collecting for months can be scored against the conditions those months
+    actually had rather than starting its trend from today. An hour whose
+    values are all missing contributes no Sample at all — absent, not zero —
+    and any failure returns None so a partial archive is never mistaken for a
+    complete one.
+    """
+    query = urllib.parse.urlencode(
+        {
+            "latitude": latitude,
+            "longitude": longitude,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "hourly": ",".join(_FIELDS),
+            "timezone": "UTC",
+        }
+    )
+    try:
+        raw = _http_get(f"{_ARCHIVE}?{query}", timeout)
+        hourly = json.loads(raw)["hourly"]
+        times = hourly["time"]
+    except _FETCH_ERRORS as exc:
+        logger.debug("archive fetch failed, recording nothing: %s", exc)
+        return None
+    except (KeyError, TypeError):
+        logger.debug("archive reply carried no hourly block; recording nothing")
+        return None
+
+    samples: list[Sample] = []
+    for index, when in enumerate(times):
+        readings: dict[str, float] = {}
+        for field, metric in _FIELDS.items():
+            column = hourly.get(field)
+            if not isinstance(column, list) or index >= len(column):
+                continue
+            value = column[index]
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            converted = float(value) * _CONVERSIONS.get(field, 1.0)
+            spec = _SPECS[metric]
+            if not spec.lower <= converted <= spec.upper:
+                continue
+            readings[metric] = converted
+        if not readings:
+            continue
+        try:
+            stamp = datetime.fromisoformat(when).replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            continue
+        samples.append(Sample(timestamp=stamp, readings=readings))
+    return samples or None
 
 
 def fetch_current(latitude: float, longitude: float, timeout: float = 10.0) -> Sample | None:

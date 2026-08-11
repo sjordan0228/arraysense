@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from urllib.error import URLError
 
 import pytest
@@ -223,3 +224,45 @@ def test_the_current_fetch_carries_irradiance_and_converts_wind(
     assert sample.readings["dni_wm2"] == 850.0
     assert sample.readings["dhi_wm2"] == 120.0
     assert sample.readings["wind_speed_ms"] == pytest.approx(5.0, abs=0.01)  # 18/3.6
+
+
+# -- fetch_archive_hours -------------------------------------------------------
+# The same Open-Meteo service keeps an ERA5 archive of past hourly conditions.
+# One Sample per hour carrying whichever site metrics that hour had; None on
+# any failure, so a partial archive is never mistaken for a complete one.
+
+
+def test_the_archive_returns_one_sample_per_hour(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = json.dumps(
+        {
+            "hourly": {
+                "time": ["2026-08-01T00:00", "2026-08-01T01:00", "2026-08-01T02:00"],
+                "shortwave_radiation": [0.0, 120.0, None],
+                "direct_normal_irradiance": [0.0, 300.0, None],
+                "diffuse_radiation": [0.0, 40.0, None],
+                "wind_speed_10m": [7.2, 10.8, None],
+                "temperature_2m": [21.0, 22.0, None],
+            }
+        }
+    ).encode()
+    seen: dict[str, str] = {}
+
+    def fake_get(url: str, timeout: float) -> bytes:
+        seen["url"] = url
+        return payload
+
+    monkeypatch.setattr(open_meteo, "_http_get", fake_get)
+    samples = open_meteo.fetch_archive_hours(35.2, -97.4, date(2026, 8, 1), date(2026, 8, 1))
+    assert samples is not None
+    # The hour whose values are all null contributes nothing: absent, not zero.
+    assert len(samples) == 2
+    assert samples[1].readings["ghi_wm2"] == 120.0
+    assert samples[0].readings["wind_speed_ms"] == pytest.approx(2.0, abs=0.01)  # 7.2/3.6
+    assert samples[0].timestamp.tzinfo is not None
+    assert "archive-api.open-meteo.com" in seen["url"]
+    assert "start_date=2026-08-01" in seen["url"] and "end_date=2026-08-01" in seen["url"]
+
+
+def test_an_archive_failure_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b"<html>nope</html>")
+    assert open_meteo.fetch_archive_hours(35.2, -97.4, date(2026, 8, 1), date(2026, 8, 1)) is None

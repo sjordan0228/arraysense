@@ -26,9 +26,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
 
@@ -56,6 +57,8 @@ from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, 
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.panels import parse_strings
 from arraysense.settings import (
+    SETTING_LATITUDE,
+    SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     SettingsStore,
     check_serial_device,
@@ -77,6 +80,7 @@ from arraysense.tariff import (
     load_tariff,
     merge_shortfalls,
 )
+from arraysense.weather import fetch_archive_hours
 
 if TYPE_CHECKING:
     # For the annotation only. Nothing here calls into the collector: the
@@ -1658,6 +1662,71 @@ async def setup(request: Request) -> dict[str, Any]:
     (#34) and a serial number is an installation secret.
     """
     return describe_setup(request.app.state.config)
+
+
+# The most days one backfill request may cover. Two years is more archive than
+# any installation here has history for, and the ceiling is what stops a typo
+# in a date from asking the free service for a decade in one go.
+_BACKFILL_MAX_DAYS = 760
+
+
+class BackfillRequest(BaseModel):
+    """A date range to recover past conditions for."""
+
+    start: str
+    end: str
+
+
+@router.post("/efficiency/backfill")
+def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict[str, Any]:
+    """Fetch past hourly conditions into the store, a day at a time.
+
+    Owner-triggered rather than implicit: the archive is a few hundred
+    requests for a year of history, and a page load must never start that.
+    Resumable by construction — rows are keyed by timestamp, so re-running a
+    range rewrites the same hours rather than duplicating them, and a failure
+    reports the last day that landed so the next run can carry on from there.
+    """
+    settings = SettingsStore(store)
+    latitude = settings.get(SETTING_LATITUDE)
+    longitude = settings.get(SETTING_LONGITUDE)
+    if not isinstance(latitude, float) or not isinstance(longitude, float):
+        raise HTTPException(
+            status_code=400,
+            detail="backfill needs a location; set latitude and longitude first",
+        )
+    try:
+        start = date.fromisoformat(body.start)
+        end = date.fromisoformat(body.end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"dates must be YYYY-MM-DD: {exc}") from exc
+    if end < start:
+        raise HTTPException(status_code=400, detail="end must not precede start")
+    if (end - start).days + 1 > _BACKFILL_MAX_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"range is longer than {_BACKFILL_MAX_DAYS} days; ask for less at a time",
+        )
+
+    written = 0
+    days = 0
+    last_day: str | None = None
+    current = start
+    while current <= end:
+        samples = fetch_archive_hours(latitude, longitude, current, current)
+        if samples is None:
+            break
+        for sample in samples:
+            try:
+                store.append(sample)
+            except sqlite3.Error as exc:
+                logger.warning("backfill could not store an hour: %s", exc)
+                break
+            written += 1
+        days += 1
+        last_day = current.isoformat()
+        current += timedelta(days=1)
+    return {"days": days, "hours_written": written, "last_day": last_day}
 
 
 @router.get("/panels")

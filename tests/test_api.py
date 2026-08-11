@@ -3052,3 +3052,49 @@ def test_a_string_on_an_undeclared_mppt_is_refused_at_the_write(
     assert "mppt" in r.json()["detail"].lower()
     values = client.get("/api/settings").json()["values"]
     assert values["panels.strings"] == "", "a refused write must store nothing"
+
+
+# --- efficiency backfill -------------------------------------------------------
+
+
+def test_backfill_writes_archive_hours_and_reports_progress(client: Any, monkeypatch: Any) -> None:
+    # An owner-triggered range, never an implicit one: nobody's page load
+    # should fire three hundred archive requests.
+    from arraysense.api import routes
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        return [
+            Sample(
+                timestamp=datetime(2026, 8, 1, 12, tzinfo=UTC),
+                readings={"ghi_wm2": 900.0, "wind_speed_ms": 2.0},
+            )
+        ]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["days"] == 1
+    assert body["hours_written"] == 1
+    assert body["last_day"] == "2026-08-01"
+
+
+def test_backfill_without_a_location_is_a_named_refusal(client: Any) -> None:
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 400
+    assert "location" in r.json()["detail"].lower()
+
+
+def test_backfill_refuses_a_backwards_or_huge_range(client: Any, monkeypatch: Any) -> None:
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    back = client.post(
+        "/api/efficiency/backfill", json={"start": "2026-08-05", "end": "2026-08-01"}
+    )
+    assert back.status_code == 400
+    huge = client.post(
+        "/api/efficiency/backfill", json={"start": "2020-01-01", "end": "2026-08-01"}
+    )
+    assert huge.status_code == 400
