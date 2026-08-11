@@ -7,11 +7,13 @@ tiny so the suite stays fast; nothing sleeps for a real second.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from arraysense.collector import service as service_module
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.drivers.base import SampleBuildError
@@ -713,3 +715,195 @@ class TestEfficiencyMaintenance:
         )
         store.close()
         assert rows == []
+
+
+class TestEfficiencyBackfill:
+    """The bounded historical backfill, and the days it must not touch twice."""
+
+    @staticmethod
+    def _configured(tmp_path: Path) -> tuple[CollectorService, SqliteStore]:
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        store = SqliteStore(str(tmp_path / "backfill.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        settings.set("site.timezone", "America/Chicago")
+        settings.set("site.latitude", 33.0)
+        settings.set("site.longitude", -97.0)
+        settings.set("panels.strings", "East | 1 | 10 | 400 | 25 | 90")
+        # Pinned after the versioned writes above, which bump the config version
+        # for every key they touch; the tests want to know it exactly.
+        settings.set(CONFIG_VERSION_KEY, 1)
+        return CollectorService(source=FakeSource(), store=store, interval=0.01), store
+
+    @staticmethod
+    def _stage(store: SqliteStore, day: int, hours: range | list[int] = range(8, 17)) -> None:
+        """Stage a sunlit August day of hourly rows, ``day`` being the local date."""
+        from datetime import UTC, datetime, timedelta, timezone
+
+        from test_efficiency import _insert_hourly
+
+        local = timezone(timedelta(hours=-5))  # Chicago in August is UTC-5
+        for h in hours:
+            when = datetime(2026, 8, day, h, tzinfo=local)
+            _insert_hourly(
+                store._conn,
+                when.astimezone(UTC),
+                pv_power=3000.0,
+                ghi=750.0,
+                dni=800.0,
+                dhi=110.0,
+                wind=2.0,
+                air_c=30.0,
+            )
+        # A real collector commits each poll; the backfill computes on its own
+        # read-view connection, which cannot see rows left in an open
+        # transaction on the primary one.
+        store._conn.commit()
+
+    @staticmethod
+    def _midnight(day: int) -> datetime:
+        from zoneinfo import ZoneInfo
+
+        return datetime(2026, 8, day, 0, 0, tzinfo=ZoneInfo("America/Chicago"))
+
+    async def test_every_historical_day_is_scored_but_not_today_or_yesterday(
+        self, tmp_path: Path
+    ) -> None:
+        """A store with several days of hourly data is caught up, minus the live two."""
+        from datetime import UTC, datetime, timedelta
+
+        svc, store = self._configured(tmp_path)
+        for day in (6, 7, 8, 9, 10):
+            self._stage(store, day)
+        now = datetime(2026, 8, 10, 18, 0, tzinfo=UTC)  # 13:00 local on the 10th
+
+        await svc.backfill_efficiency(now=now)
+
+        for day in (6, 7, 8):
+            rows = store.read_efficiency_days(
+                self._midnight(day), self._midnight(day) + timedelta(days=1)
+            )
+            assert rows, f"the backfill never reached {day} August"
+            assert any(r.string_name == "" for r in rows)
+        for day in (9, 10):
+            rows = store.read_efficiency_days(
+                self._midnight(day), self._midnight(day) + timedelta(days=1)
+            )
+            assert rows == [], "today and yesterday are the summary pass's job"
+        store.close()
+
+    async def test_a_pass_writes_at_most_efficiency_backfill_days(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bound holds: one call takes the newest slice, older days wait."""
+        from datetime import UTC, datetime
+
+        monkeypatch.setattr(service_module, "EFFICIENCY_BACKFILL_DAYS", 3)
+        svc, store = self._configured(tmp_path)
+        for day in (1, 2, 3, 4, 5):
+            self._stage(store, day)
+        now = datetime(2026, 8, 10, 18, 0, tzinfo=UTC)
+
+        await svc.backfill_efficiency(now=now)
+
+        # Newest first: the 5th, 4th and 3rd were taken, the 1st and 2nd wait.
+        scored = store.scored_days(1)
+        assert scored == {int(self._midnight(d).timestamp()) for d in (3, 4, 5)}
+        store.close()
+
+    async def test_a_scored_day_is_skipped_until_the_config_version_moves(
+        self, tmp_path: Path
+    ) -> None:
+        """A day scored against the current array is done; a version bump reopens it."""
+        from datetime import UTC, datetime
+
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        svc, store = self._configured(tmp_path)
+        self._stage(store, 6)
+        now = datetime(2026, 8, 10, 18, 0, tzinfo=UTC)
+
+        await svc.backfill_efficiency(now=now)
+
+        # A recompute would overwrite this marker; a skip leaves it standing.
+        with store._conn:
+            store._conn.execute(
+                "UPDATE efficiency_day SET expected_kwh = 12345.0 WHERE string_name = ''"
+            )
+        await svc.backfill_efficiency(now=now)
+        marker = store._conn.execute(
+            "SELECT expected_kwh FROM efficiency_day WHERE string_name = ''"
+        ).fetchone()
+        assert marker is not None and marker[0] == 12345.0, (
+            "the day was recomputed when it should have been skipped"
+        )
+
+        SettingsStore(store).set(CONFIG_VERSION_KEY, 2)
+        await svc.backfill_efficiency(now=now)
+        recomputed = store._conn.execute(
+            "SELECT expected_kwh FROM efficiency_day WHERE string_name = ''"
+        ).fetchone()
+        assert recomputed is not None and recomputed[0] != 12345.0, (
+            "the version bump did not make the day eligible again"
+        )
+        store.close()
+
+    async def test_today_and_yesterday_are_never_touched_by_the_backfill(
+        self, tmp_path: Path
+    ) -> None:
+        """The live two days belong to the summary pass, whatever data they hold."""
+        from datetime import UTC, datetime, timedelta
+
+        svc, store = self._configured(tmp_path)
+        self._stage(store, 9)
+        self._stage(store, 10)
+        now = datetime(2026, 8, 10, 18, 0, tzinfo=UTC)
+
+        await svc.backfill_efficiency(now=now)
+
+        for day in (9, 10):
+            rows = store.read_efficiency_days(
+                self._midnight(day), self._midnight(day) + timedelta(days=1)
+            )
+            assert rows == [], f"the backfill wrote a summary the summary pass owns ({day} August)"
+        store.close()
+
+    async def test_a_store_with_no_hourly_rows_is_a_noop(self, tmp_path: Path) -> None:
+        """No hourly data means nothing to backfill, and that is not an error."""
+        from datetime import UTC, datetime
+
+        svc, store = self._configured(tmp_path)
+        now = datetime(2026, 8, 10, 18, 0, tzinfo=UTC)
+
+        await svc.backfill_efficiency(now=now)  # must not raise
+
+        rows = store.read_efficiency_days(
+            datetime(2020, 1, 1, tzinfo=UTC), datetime(2030, 1, 1, tzinfo=UTC)
+        )
+        store.close()
+        assert rows == []
+
+    async def test_a_memory_backed_store_is_scored_inline(self) -> None:
+        # ":memory:" cannot be reopened — every connect() makes a new, empty
+        # database — so a threaded pass would score a different database and
+        # report success while the real one stayed blank. The pass runs inline
+        # instead, exactly as maintain_rollups does.
+        from datetime import UTC, timedelta
+
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        store = SqliteStore(":memory:", device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        settings.set("site.timezone", "America/Chicago")
+        settings.set("site.latitude", 33.0)
+        settings.set("site.longitude", -97.0)
+        settings.set("panels.strings", "East | 1 | 10 | 400 | 25 | 90")
+        settings.set(CONFIG_VERSION_KEY, 1)
+        svc = CollectorService(source=FakeSource(), store=store, interval=0.01)
+
+        self._stage(store, 6)
+        await svc.backfill_efficiency(now=datetime(2026, 8, 10, 18, 0, tzinfo=UTC))
+
+        rows = store.read_efficiency_days(self._midnight(6), self._midnight(6) + timedelta(days=1))
+        store.close()
+        assert rows, "a memory-backed pass scored a different, empty database"

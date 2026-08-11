@@ -1304,6 +1304,42 @@ def test_efficiency_days_are_written_and_read_back(tmp_path: Path) -> None:
     assert by_name[""].string_name == ""
 
 
+def test_scored_days_reports_only_total_rows_at_the_asked_version(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "scored.db"), device=TEST_DEVICE)
+    day1 = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
+    day2 = datetime(2026, 8, 9, 0, 0, tzinfo=UTC)
+
+    def rows(day: datetime, version: int) -> list[EfficiencyRow]:
+        return [
+            EfficiencyRow(
+                day=day,
+                string_name=name,
+                expected_kwh=10.0,
+                actual_kwh=9.0,
+                curtailed_kwh=0.0,
+                unexplained_kwh=1.0,
+                modelled_hours=8,
+                partial=False,
+                pr=0.9,
+                config_version=version,
+            )
+            for name in ("East", "")
+        ]
+
+    # day1 at version 1; day2 has only a string row at version 1 — no total —
+    # plus a full tally at version 2. Only a complete day counts, and only at
+    # the version asked for.
+    store.write_efficiency_day(rows(day1, 1))
+    store.write_efficiency_day(rows(day2, 1)[:1])
+    store.write_efficiency_day(rows(day2, 2))
+
+    assert store.scored_days(1) == {int(day1.timestamp())}
+    assert store.scored_days(2) == {int(day2.timestamp())}
+    store.close()
+
+
 def test_efficiency_day_writes_overwrite_by_primary_key(tmp_path: Path) -> None:
     from arraysense.efficiency import EfficiencyRow
 

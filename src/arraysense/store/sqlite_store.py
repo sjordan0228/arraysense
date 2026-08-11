@@ -790,6 +790,51 @@ class SqliteStore:
                 data,
             )
 
+    def hourly_span(self, device: str | None = None) -> tuple[datetime, datetime] | None:
+        """The first and last hour this database holds, or None when it holds none.
+
+        The backfill needs to know how far back there is anything to score, and
+        asking the store rather than reaching for its connection is what keeps
+        the tier name and the device narrowing in the one file that owns them.
+        Both bounds come back as aware UTC instants, because every timestamp
+        that leaves this class does.
+        """
+        row = self._conn.execute(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM inverter_hourly WHERE device = ?",
+            (self._device(device),),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return (
+            datetime.fromtimestamp(int(row[0]), tz=UTC),
+            datetime.fromtimestamp(int(row[1]), tz=UTC),
+        )
+
+    def scored_days(self, config_version: int) -> set[int]:
+        """Return the day epochs already carrying a TOTAL row at ``config_version``.
+
+        A day scored against the array as it is described now is a day the
+        backfill need not revisit. One carrying any other version was scored
+        against a description that has since changed and has to be scored again,
+        so it is deliberately absent from the set.
+
+        Narrowed to the total row because there is exactly one of those per day,
+        which makes the result a clean set of day keys; without the narrowing the
+        same day would arrive once per string. It is not a completeness check —
+        ``write_efficiency_day`` puts every string and the total down in one
+        transaction, so a day with string rows and no total is a state this
+        database cannot reach.
+
+        The caller only needs the keys — it asks which days are missing, never
+        what a stored day says — so the rows are not decoded into
+        ``EfficiencyRow``.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT day FROM efficiency_day WHERE string_name = '' AND config_version = ?",
+            (config_version,),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+
     def read_efficiency_days(self, start: datetime, end: datetime) -> list[EfficiencyRow]:
         """Return stored efficiency rows, oldest first.
 
