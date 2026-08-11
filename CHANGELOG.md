@@ -7,6 +7,59 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.7.2 — 11 August 2026
+
+### Fixed
+
+- **The History page's 30-day view no longer takes seven seconds**
+  ([#87](https://github.com/sjordan0228/arraysense/issues/87)). It read the
+  minute tier to answer a question about days — roughly a quarter of a million
+  rows to produce thirty numbers. A day's kWh telescopes, being the counter at
+  the end minus the counter at the start, so a coarser tier moves at most one
+  bucket-edge's worth of energy between neighbours and never loses any. Both the
+  daily and monthly views now read the hourly tier. Measured on the reference
+  installation, a Raspberry Pi 4: about seven seconds before, 0.06 seconds now.
+
+  The fallback order was revisited at the same time. The coarse tiers are rollup
+  destinations, so a database whose rollup has not yet run has empty ones, and
+  answering "no energy" out of an empty tier while the readings sit in the raw
+  table would be the worst of both.
+
+- **Light mode is readable where colours had been written into rules rather
+  than into the theme.** The hover readout took its text from a token and its
+  background from a fixed near-black, so under light mode it drew dark text on a
+  dark box. Several neighbours hardcoded white tints that simply vanish on a
+  light surface: the range and navigation buttons and their selected states, the
+  chart bar and icon buttons, the selection box and crosshair on every chart,
+  and the efficiency page's date navigation.
+
+  The readout and the crosshair now carry their own tokens, because a readout
+  sits over a chart rather than on a panel and has to stay legible against
+  whatever is behind it. Dark mode is unchanged except at the tint call sites,
+  where each took the nearest existing step — a shift of one or two hundredths
+  of alpha — and at the settings select, which had been a hardcoded dark well
+  and now matches the selects on the settings page.
+
+- **The fake driver reports the strings it declares**
+  ([#90](https://github.com/sjordan0228/arraysense/issues/90)). It advertised
+  three PV strings and then produced no per-string metrics, so anything written
+  against it was written against a shape no real inverter has.
+
+### Added
+
+- **The efficiency chart's hover says what the ratio was**, not only the
+  expected and actual figures with the division left to the reader. The row is
+  labelled Actual / Expected rather than Performance, because the page's
+  headline ratio divides by expected minus curtailed and the chart carries only
+  the two raw series — a row implying the headline figure would be wrong on any
+  day something was curtailed.
+
+  It states a ratio only where the figures above it can support one. The hours
+  either side of sunrise and sunset arrive with expected production rounded to
+  four decimals, and dividing there once reported 150000%, or 100% directly
+  beneath two rows both reading 0.00 kWh. Below that floor, and for a negative
+  measurement, the row shows the same dash it shows for a reading nobody took.
+
 ## 0.7.1 — 11 August 2026
 
 ### Changed
