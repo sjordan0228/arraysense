@@ -1231,6 +1231,20 @@ function panelMarkup(row, i) {
        <span class="u">V</span>
      </div>`,
     `<div class="span">
+       <span class="cap">Wire gauge</span>
+       <input type="text" data-role="adv" data-key="wire_awg"
+         value="${val('wire_awg')}"
+         inputmode="numeric" aria-label="DC wire gauge, AWG">
+       <span class="u">AWG</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Wire run</span>
+       <input type="text" data-role="adv" data-key="wire_run_ft"
+         value="${val('wire_run_ft')}"
+         inputmode="decimal" aria-label="One-way DC run length in feet">
+       <span class="u">ft one way</span>
+     </div>`,
+    `<div class="span">
        <span class="cap">Note</span>
        <input type="text" data-role="adv" data-key="note"
          value="${val('note')}"
