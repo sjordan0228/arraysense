@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
 from typing import Any
 
 import pytest
 
 from arraysense import manage
+from arraysense.store import schema
 
 
 def test_health_returns_the_body_once_the_collector_is_live(
@@ -54,10 +56,8 @@ def test_status_reports_absent_facts_as_absent(
     looking for data that was never there.
     """
     db = tmp_path / "empty.db"
-    import sqlite3
-
     conn = sqlite3.connect(str(db))
-    conn.execute("CREATE TABLE inverter_raw (timestamp INTEGER)")
+    conn.execute(schema.ddl_for("inverter_raw"))
     conn.commit()
     conn.close()
 
@@ -65,6 +65,30 @@ def test_status_reports_absent_facts_as_absent(
     assert facts["first"] is None
     assert facts["last"] is None
     assert facts["bytes"] > 0
+
+
+def test_status_reports_a_real_date_range_from_the_real_schema(
+    tmp_path: Any,
+) -> None:
+    """One real row yields a real date range, through the project's own DDL.
+
+    A hand-built table could drift from the real schema and keep passing;
+    building it from ddl_for means a renamed table or timestamp column breaks
+    this test, which is the regression it exists to catch.
+    """
+    db = tmp_path / "full.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.execute(
+        "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
+        (1783512004, "CE12345678"),
+    )
+    conn.commit()
+    conn.close()
+
+    facts = manage.database_facts(str(db))
+    assert facts["first"] == "2026-07-08"
+    assert facts["last"] == "2026-07-08"
 
 
 def test_status_reads_the_port_from_the_unit_drop_in(
@@ -80,9 +104,61 @@ def test_status_reads_the_port_from_the_unit_drop_in(
     assert manage.configured_port() == 8099
 
 
+def test_status_ignores_a_commented_port_line(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A commented-out ExecStart must not win over the real one.
+
+    The old scan matched '--port' anywhere on the line, so a commented
+    'Was: ExecStart=... --port 8080' beat the live '--port 8099' and status
+    probed a port nothing listened on.
+    """
+    drop = tmp_path / "port.conf"
+    drop.write_text(
+        "[Service]\n"
+        "# Was: ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8080\n"
+        "ExecStart=\n"
+        "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8099\n"
+    )
+    monkeypatch.setattr(manage, "PORT_DROPIN", str(drop))
+    assert manage.configured_port() == 8099
+
+
+def test_status_takes_the_last_execstart_line(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The final ExecStart in a drop-in wins, exactly as systemd resolves it.
+
+    Each assignment replaces the previous one, so status must probe the port on
+    the last line, not the first.
+    """
+    drop = tmp_path / "port.conf"
+    drop.write_text(
+        "[Service]\n"
+        "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8080\n"
+        "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8099\n"
+    )
+    monkeypatch.setattr(manage, "PORT_DROPIN", str(drop))
+    assert manage.configured_port() == 8099
+
+
 def test_status_defaults_the_port_when_no_drop_in_exists(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(manage, "PORT_DROPIN", "/nonexistent/port.conf")
     assert manage.configured_port() == 8080
+
+
+def test_status_reads_a_path_with_an_inline_comment(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inline comment after the value must not leak into the returned path.
+
+    Without cutting at the '#', the comment survives quote-stripping and the
+    path comes back with '  # on the SSD' appended — a file that does not exist.
+    """
+    conf = tmp_path / "config.toml"
+    conf.write_text('database_path = "/var/lib/arraysense/arraysense.db"  # on the SSD\n')
+    monkeypatch.setattr(manage, "CONFIG_PATH", str(conf))
+    assert manage._database_path() == "/var/lib/arraysense/arraysense.db"
 
 
 def test_driver_line_names_the_family_and_what_it_declares() -> None:

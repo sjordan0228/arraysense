@@ -10,7 +10,10 @@ interpreter is what runs this — uv's 3.12 belongs to the service, not here.
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
+import sqlite3
 import subprocess
 import time
 import urllib.error
@@ -90,19 +93,47 @@ def configured_port() -> int:
 
     Read from the drop-in rather than remembered anywhere else: the drop-in is
     what systemd actually obeys, so anything else would be a second answer that
-    can disagree with the running service.
+    can disagree with the running service. The LAST ExecStart= wins, which is
+    how systemd itself resolves a drop-in — each assignment replaces the
+    previous one.
     """
+    port = DEFAULT_PORT
     try:
         with open(PORT_DROPIN) as handle:
             text = handle.read()
     except OSError:
-        return DEFAULT_PORT
+        return port
     for line in text.splitlines():
-        if "--port" in line:
-            parts = line.split("--port", 1)[1].split()
-            if parts and parts[0].isdigit():
-                return int(parts[0])
-    return DEFAULT_PORT
+        stripped = line.strip()
+        if stripped.startswith("#") or stripped.startswith(";"):
+            continue
+        if not stripped.startswith("ExecStart="):
+            continue
+        if "--port" not in stripped:
+            continue
+        parts = stripped.split("--port", 1)[1].split()
+        if parts and parts[0].isdigit():
+            port = int(parts[0])
+    return port
+
+
+def _cut_inline_comment(raw: str) -> str:
+    """Drop a TOML inline comment, so a trailing '#' cannot leak into a path.
+
+    TOML's comment starts at the first '#' outside a quoted string; a path that
+    contains '#' is inside the quotes and survives. Without the cut, stripping
+    quotes first would leave the comment attached to the value.
+    """
+    quote: str | None = None
+    for index, char in enumerate(raw):
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#":
+            return raw[:index]
+    return raw
 
 
 def _database_path() -> str:
@@ -115,7 +146,8 @@ def _database_path() -> str:
         with open(CONFIG_PATH) as handle:
             for line in handle:
                 if line.strip().startswith("database_path"):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+                    value = _cut_inline_comment(line.split("=", 1)[1])
+                    return value.strip().strip('"').strip("'")
     except OSError:
         pass
     return "/var/lib/arraysense/arraysense.db"
@@ -128,9 +160,6 @@ def database_facts(path: str) -> dict[str, Any]:
     support conversation needs, and because a fresh install legitimately has no
     range at all — which must read as absent rather than as a guessed date.
     """
-    import os
-    import sqlite3
-
     facts: dict[str, Any] = {"bytes": 0, "first": None, "last": None}
     try:
         facts["bytes"] = os.path.getsize(path)
@@ -147,8 +176,10 @@ def database_facts(path: str) -> dict[str, Any]:
     finally:
         conn.close()
     if row and row[0] is not None:
-        import datetime
-
+        # Local dates, deliberately. energy.py cuts every calendar day in the
+        # installation's local zone, so a UTC date here would disagree with the
+        # History page about the same database. zoneinfo is 3.9+, so the
+        # machine's zone is both the best available and normally the right one.
         facts["first"] = datetime.datetime.fromtimestamp(row[0]).date().isoformat()
         facts["last"] = datetime.datetime.fromtimestamp(row[1]).date().isoformat()
     return facts
