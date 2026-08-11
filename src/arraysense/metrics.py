@@ -11,6 +11,33 @@ detectable on the way in. The reference product recorded a battery power of
 25,583 W as fact, about double what an 18kPV can deliver into a 48 V bank;
 bounds exist to stop that. Bounds are generous enough that a real reading is
 never rejected and tight enough that a garbage one is.
+
+A bound belongs to the METRIC, not to the machine: one registry serves every
+driver and every model, so a ceiling has to hold for the largest inverter the
+project supports rather than for the one it was developed on. The whole-machine
+power ceilings were 20 kW, set from an 18kPV, and measured against that
+machine's own history they were tighter than they looked — grid power had
+reached 18,550 W against 20,000, and house load 17,644 W.
+
+What drives grid power that high is worth knowing, because it is not the
+obvious thing. The peak was recorded at 23:47 with no sun on the array: 8,596 W
+of house load and 9,777 W going into the battery at once, the bank being
+charged from the grid inside the off-peak window. Grid import is therefore
+bounded by load PLUS charge rate rather than by either alone, and a machine that
+charges harder and serves more load reaches the ceiling sooner. A FlexBOSS21 at
+21 kW would cross 20 kW routinely.
+
+Six ceilings move to 30 kW, chosen by projecting each observed maximum by the
+ratio of the two machines' ratings (21/18) and raising only where that reaches
+four fifths of the ceiling: pv total, load, grid and its two legs, and EPS. The
+rest keep theirs, because the same arithmetic says they are not close —
+per-string PV peaks at 5,120 W against 8,000, and the EPS legs at 7,814 W
+against 20,000.
+
+battery_power_w keeps its 20 kW ceiling deliberately, and it is the reason this
+paragraph is here: 25,583 W is the misreading quoted above, and raising that
+particular ceiling to 30 kW would let the very reading these bounds exist to
+catch pass as fact.
 """
 
 from __future__ import annotations
@@ -90,7 +117,7 @@ class MetricSpec:
 # makes the integer wider on every row for the life of the database.
 INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # --- Solar strings ------------------------------------------------------
-    MetricSpec("pv_total_power_w", "W", 1, 0.0, 20000.0),
+    MetricSpec("pv_total_power_w", "W", 1, 0.0, 30000.0),
     MetricSpec("pv1_power_w", "W", 1, 0.0, 8000.0),
     MetricSpec("pv2_power_w", "W", 1, 0.0, 8000.0),
     MetricSpec("pv3_power_w", "W", 1, 0.0, 8000.0),
@@ -108,17 +135,17 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # --- House load and the grid --------------------------------------------
     # Load can read slightly negative on some inverters; 65 such readings appear
     # in 22 months of reference data, so zero is the wrong floor.
-    MetricSpec("load_power_w", "W", 1, -2000.0, 20000.0),
+    MetricSpec("load_power_w", "W", 1, -2000.0, 30000.0),
     # Grid power is signed: export below zero, import above. Battery power is
     # signed too — charge above the line, discharge below — so each chart needs
     # one axis rather than two. Both lower bounds are negative by design.
-    MetricSpec("grid_power_w", "W", 1, -20000.0, 20000.0),
+    MetricSpec("grid_power_w", "W", 1, -30000.0, 30000.0),
     # The same quantity per leg. A split-phase service can be importing on one
     # leg while exporting on the other, and the combined figure above nets that
     # out to something close to zero — which reads as a balanced house when it
     # is in fact a badly balanced one.
-    MetricSpec("grid_power_l1_w", "W", 1, -20000.0, 20000.0),
-    MetricSpec("grid_power_l2_w", "W", 1, -20000.0, 20000.0),
+    MetricSpec("grid_power_l1_w", "W", 1, -30000.0, 30000.0),
+    MetricSpec("grid_power_l2_w", "W", 1, -30000.0, 30000.0),
     # Grid voltage and frequency floor at zero, not at a "normal" value: during a
     # power cut the inverter genuinely measures 0, and a hybrid system exists to
     # ride those out. Flagging an outage as a decode error would hide the event
@@ -140,7 +167,7 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # What the protected loads are actually drawing. On this hardware the two
     # legs are wildly unequal in normal use — 1937 W against 456 W in one
     # reference read — so the per-leg figures are the point, not a refinement.
-    MetricSpec("eps_power_w", "W", 1, 0.0, 20000.0),
+    MetricSpec("eps_power_w", "W", 1, 0.0, 30000.0),
     MetricSpec("eps_l1_power_w", "W", 1, 0.0, 20000.0),
     MetricSpec("eps_l2_power_w", "W", 1, 0.0, 20000.0),
     # Apparent power beside real power gives the power factor of each leg,
