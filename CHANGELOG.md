@@ -7,6 +7,33 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.7.1 — 11 August 2026
+
+### Changed
+
+- **The forecast panel draws one prediction, not two**
+  ([#96](https://github.com/sjordan0228/arraysense/issues/96)). It carried a
+  frozen morning baseline behind a live revision, and a figure saying how far
+  ahead or behind the day was running against the frozen one. Two prediction
+  curves on one chart read as clutter rather than as insight. There is now a
+  single curve, called Prediction, re-made on the weather poller's own clock,
+  and the gap between it and the solid actual line says what the tracking figure
+  said without a number whose reference was nowhere on screen.
+
+  The ahead-or-behind figure went with the baseline rather than being pointed at
+  the live curve. Measured against the live curve it would have looked like it
+  worked and meant almost nothing: the prediction for an hour already past is
+  re-made from a forecast that has since seen that hour, so it converges on what
+  happened and would read near zero all day.
+
+  The header now says how often the prediction is re-made, served by the
+  endpoint rather than written into the page, because that interval is a setting
+  an owner may move between five minutes and a day.
+
+  Every revision is still recorded. Nothing on screen reads the older rows now,
+  but they are the only account of how a day's expectation moved, and
+  reinstating the baseline is a query rather than a migration.
+
 ## 0.7.0 — 11 August 2026
 
 ### Added
