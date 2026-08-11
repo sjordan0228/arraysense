@@ -20,6 +20,8 @@ from typing import Any
 SERVICE = "arraysense"
 INSTALL_DIR = "/opt/arraysense"
 CONFIG_PATH = "/etc/arraysense/config.toml"
+PORT_DROPIN = "/etc/systemd/system/arraysense.service.d/port.conf"
+DEFAULT_PORT = 8080
 
 # What "healthy" means, and why it is not "systemctl says active": the unit is
 # active the moment the process starts, which is before it binds the port and
@@ -41,6 +43,15 @@ def service(action: str) -> bool:
 def status_url(port: int) -> str:
     """The health endpoint on loopback — the CLI runs on the same box as the service."""
     return f"http://127.0.0.1:{port}/api/status"
+
+
+def capabilities_url(port: int) -> str:
+    """The declaration endpoint, written beside status_url so both agree on the host.
+
+    Kept next to the health endpoint so neither can drift to a different one —
+    the CLI must probe the same box the service runs on.
+    """
+    return f"http://127.0.0.1:{port}/api/capabilities"
 
 
 def _probe(url: str, timeout: float) -> dict[str, Any] | None:
@@ -72,3 +83,122 @@ def wait_until_healthy(
             return body
         time.sleep(sleep)
     return None
+
+
+def configured_port() -> int:
+    """The port the unit was installed with, or the default.
+
+    Read from the drop-in rather than remembered anywhere else: the drop-in is
+    what systemd actually obeys, so anything else would be a second answer that
+    can disagree with the running service.
+    """
+    try:
+        with open(PORT_DROPIN) as handle:
+            text = handle.read()
+    except OSError:
+        return DEFAULT_PORT
+    for line in text.splitlines():
+        if "--port" in line:
+            parts = line.split("--port", 1)[1].split()
+            if parts and parts[0].isdigit():
+                return int(parts[0])
+    return DEFAULT_PORT
+
+
+def _database_path() -> str:
+    """Where the config says the database is, falling back to the default.
+
+    Parsed with a plain scan rather than a TOML library because this file runs
+    on the distribution's Python 3.8, which has no tomllib.
+    """
+    try:
+        with open(CONFIG_PATH) as handle:
+            for line in handle:
+                if line.strip().startswith("database_path"):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "/var/lib/arraysense/arraysense.db"
+
+
+def database_facts(path: str) -> dict[str, Any]:
+    """Size and date range, or None for a range that does not exist yet.
+
+    Asked because "how big is it and how far back does it go" is most of what a
+    support conversation needs, and because a fresh install legitimately has no
+    range at all — which must read as absent rather than as a guessed date.
+    """
+    import os
+    import sqlite3
+
+    facts: dict[str, Any] = {"bytes": 0, "first": None, "last": None}
+    try:
+        facts["bytes"] = os.path.getsize(path)
+    except OSError:
+        return facts
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return facts
+    try:
+        row = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM inverter_raw").fetchone()
+    except sqlite3.Error:
+        return facts
+    finally:
+        conn.close()
+    if row and row[0] is not None:
+        import datetime
+
+        facts["first"] = datetime.datetime.fromtimestamp(row[0]).date().isoformat()
+        facts["last"] = datetime.datetime.fromtimestamp(row[1]).date().isoformat()
+    return facts
+
+
+def driver_line(body: dict[str, Any] | None) -> str:
+    """Name the driver and what it declares, or say plainly that it is unknown.
+
+    Which family the service thinks it is talking to, and how many strings it
+    believes exist, is where a support conversation starts. Every field here is
+    nullable at the source, and one that was never declared prints as a dash:
+    printing a plausible default would be the absent-data rule broken in the
+    place it is most likely to be believed.
+    """
+    if body is None:
+        return "driver:    unavailable"
+    devices = body.get("devices") or []
+    if not devices:
+        return "driver:    none declared"
+    first = devices[0]
+    dash = "—"
+    name = first.get("driver") or dash
+    model = first.get("model") or dash
+    serial = first.get("device") or dash
+    strings = first.get("pv_strings")
+    shown = dash if strings is None else strings
+    energy = first.get("energy") or dash
+    transport = first.get("transport") or dash
+    return (
+        f"driver:    {name} {model} ({serial}), "
+        f"{shown} PV strings, energy {energy}, via {transport}"
+    )
+
+
+def cmd_status(argv: list[str]) -> int:
+    """Print what is running and what it sees. Read-only by design — see #34."""
+    port = configured_port()
+    body = _probe(status_url(port), timeout=5.0)
+    if body is None:
+        print(f"service: not answering on port {port}")
+        print("  try: arraysense logs")
+        return 1
+    print(f"version:   {body.get('version')}")
+    staleness = (body.get("staleness") or {}).get("verdict")
+    print(
+        f"collector: running={body.get('running')} connected={body.get('connected')} "
+        f"staleness={staleness}"
+    )
+    print(driver_line(_probe(capabilities_url(port), timeout=5.0)))
+    facts = database_facts(_database_path())
+    span = "empty" if facts["first"] is None else f"{facts['first']} .. {facts['last']}"
+    print(f"database:  {facts['bytes'] / 1048576:.1f} MB, {span}")
+    return 0
