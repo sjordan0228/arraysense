@@ -394,6 +394,14 @@ class ModelSpec:
     pv_strings: int | None = None
     battery_module_slots: int | None = None
     citation: str = ""
+    # What is known to be wrong or unproven about this model, in a sentence a
+    # page can show. A model reaches the wizard because the family's protocol
+    # covers it, which is not the same as the family's *readings* having been
+    # proven to mean the same thing on it — the EG4 off-grid machines share
+    # every register address with the hybrids and disagree about what several
+    # of them hold. Offering such a model silently is the failure this field
+    # exists to prevent; offering it labelled is a decision the owner can make.
+    caveat: str = ""
 
     def __post_init__(self) -> None:
         """Refuse a delta that cites nothing."""

@@ -1,4 +1,4 @@
-"""eg4_luxpower — the LuxPower-protocol family: 18kPV, 6000XP, 12kPV.
+"""eg4_luxpower — the LuxPower-protocol family: 18kPV, 12kPV, FlexBOSS, 6000XP.
 
 One package per protocol family rather than per model, because these units
 share a register surface: the same 141 registers, the same 31 kWh counters.
@@ -27,7 +27,7 @@ DRIVER = DriverEntry(
     name=NAME,
     description=(
         "EG4 and LuxPower hybrid inverters over the WiFi dongle or a "
-        "USB-to-RS485 adapter (18kPV, 6000XP, 12kPV)"
+        "USB-to-RS485 adapter (18kPV, 12kPV, FlexBOSS21, FlexBOSS18; 6000XP unverified)"
     ),
     manufacturer="EG4",
     models=MODELS,

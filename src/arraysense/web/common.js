@@ -277,6 +277,12 @@ const BASE_CSS = `
   .setup select:focus,.setup input:focus{outline:2px solid var(--pv);outline-offset:1px;
     border-color:transparent}
   .setup .hint{font-size:11px;color:var(--ink3);line-height:1.5}
+  /* A caveat is not a hint. It takes the warning ink and a rule down its edge
+     so it reads as something to weigh rather than as help text, and it uses
+     --warn rather than a colour of its own: the palette is CVD-validated and
+     this must not introduce a hue nobody checked. */
+  .setup .warn-note{color:var(--warn);border-left:2px solid var(--warn);
+    padding-left:8px;margin-top:-2px}
   .setup .row.bad input,.setup .row.bad select{border-color:var(--bad)}
   .setup .err{font-size:11px;color:var(--bad);line-height:1.5}
   .setup .err[hidden]{display:none}
@@ -1973,7 +1979,9 @@ function mountSetup(host, payload, opts) {
     const mk = makers.find((m) => m.name === makerName);
     const out = [];
     for (const fam of (mk && mk.families) || []) {
-      for (const m of fam.models || []) out.push({ driver: fam.driver, name: m.name });
+      for (const m of fam.models || []) {
+        out.push({ driver: fam.driver, name: m.name, caveat: m.caveat || '' });
+      }
     }
     return out;
   };
@@ -2030,11 +2038,18 @@ function mountSetup(host, payload, opts) {
 
     const makerSel = makerNames.map((n) =>
       `<option value="${esc(n)}"${n === state.manufacturer ? ' selected' : ''}>${esc(n)}</option>`).join('');
+    // A model with a caveat says so in the option itself, not only once it is
+    // chosen. Someone scanning the list for their machine decides there and
+    // then, and a warning that appears afterwards has already lost the argument.
     const modelSel = models.map((m) => {
       const v = `${m.driver}::${m.name}`;
       const on = m.name === state.model && m.driver === state.driver;
-      return `<option value="${esc(v)}"${on ? ' selected' : ''}>${esc(m.name)}</option>`;
+      const label = m.caveat ? `${m.name} — unverified` : m.name;
+      return `<option value="${esc(v)}"${on ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
+    const chosenModel = models.find((m) => m.name === state.model && m.driver === state.driver);
+    const modelNote = chosenModel && chosenModel.caveat
+      ? `<div class="hint warn-note">${esc(chosenModel.caveat)}</div>` : '';
     const transSel = [['dongle', 'WiFi dongle'], ['modbus_serial', 'RS485 serial']].map(([v, lbl]) =>
       `<option value="${v}"${v === state.transport ? ' selected' : ''}>${lbl}</option>`).join('');
     const battLabel = {
@@ -2053,6 +2068,7 @@ function mountSetup(host, payload, opts) {
         <select id="su_maker" data-role="maker">${makerSel}</select></div>
       <div class="row"><label for="su_model">Model</label>
         <select id="su_model" data-role="model">${modelSel}</select></div>
+      ${modelNote}
       <div class="row"><label for="su_transport">Connection</label>
         <select id="su_transport" data-role="transport">${transSel}</select></div>
       <div data-role="fields">${connectionFields()}</div>
