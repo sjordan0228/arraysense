@@ -16,13 +16,13 @@
      strip — the Costs page's month bar, adapted for three periods. */
   .effnav{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
   .effnav .periods{display:flex;gap:4px}
-  .effnav .periods button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+  .effnav .periods button{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink2);border-radius:7px;padding:4px 12px;font-size:11.5px;cursor:pointer;font-family:inherit}
-  .effnav .periods button[aria-pressed="true"]{background:rgba(255,255,255,.2);color:var(--ink);font-weight:500}
+  .effnav .periods button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink);font-weight:500}
   .effnav .datenav{display:flex;align-items:center;gap:6px}
-  .effnav .datenav button{background:rgba(255,255,255,.07);border:1px solid var(--panel-b);
+  .effnav .datenav button{background:var(--tint);border:1px solid var(--panel-b);
     color:var(--ink2);border-radius:7px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1}
-  .effnav .datenav button:hover{background:rgba(255,255,255,.14);color:var(--ink)}
+  .effnav .datenav button:hover{background:var(--tint-2);color:var(--ink)}
   .effnav .datenav .datelabel{font-size:14px;font-weight:500;min-width:140px;text-align:center;font-variant-numeric:tabular-nums}
   /* The PR headline. A big number with its tolerance band, beside specific yield.
      Follows the Costs page's card pattern — large value, small unit, sub line. */
