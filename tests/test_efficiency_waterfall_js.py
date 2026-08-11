@@ -50,9 +50,7 @@ def _draw(segments: list[dict[str, object]]) -> str:
         f"drawWaterfall(h, {json.dumps(segments)});\n"
         f"console.log(h.innerHTML);"
     )
-    result = subprocess.run(
-        ["node", "-e", body], capture_output=True, text=True, check=True
-    )
+    result = subprocess.run(["node", "-e", body], capture_output=True, text=True, check=True)
     return result.stdout
 
 

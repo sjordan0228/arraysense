@@ -21,7 +21,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from arraysense.metrics import INVERTER_METRICS
 from arraysense.models import Sample
@@ -51,6 +51,24 @@ _CONVERSIONS: dict[str, float] = {"wind_speed_10m": 1.0 / 3.6}
 # weather append with a KeyError. Exported here, beside the mapping it is
 # derived from, so the set cannot drift from what fetch_current produces.
 METRICS: frozenset[str] = frozenset(_FIELDS.values())
+
+# Open-Meteo labels a radiation hour by the hour it ENDS: the figure against
+# 14:00 is the mean over 13:00 to 14:00. This project's tiers label a bucket by
+# the hour it BEGINS, so radiation arrives attributed to the hour after the one
+# it describes and has to be moved back by one.
+#
+# Measured rather than taken from the documentation: across four clear days at
+# the reference site, true solar noon falls at 13:35, the inverter's power peaks
+# in the 13:00 bucket, and the irradiance peaked in the 14:00 one. The model was
+# therefore reading each hour's sun against the next hour's sky, which made the
+# array look almost twice as good as modelled at 08:00 and a fifth as good at
+# 19:00 while the daily totals quietly cancelled out.
+#
+# Temperature, cloud and wind are instantaneous readings at their label and must
+# NOT move; shifting those would trade one misalignment for another.
+_PRECEDING_HOUR_MEAN: frozenset[str] = frozenset(
+    {"shortwave_radiation", "direct_normal_irradiance", "diffuse_radiation"}
+)
 
 _SPECS = {spec.name: spec for spec in INVERTER_METRICS}
 
@@ -172,7 +190,10 @@ def fetch_archive_hours(
 
     samples: list[Sample] = []
     for index, when in enumerate(times):
-        readings: dict[str, float] = {}
+        # Split by what the label means: a mean over the hour just gone, or a
+        # reading taken at that moment. They belong to different hours.
+        at_label: dict[str, float] = {}
+        over_previous: dict[str, float] = {}
         for field, metric in _FIELDS.items():
             column = hourly.get(field)
             if not isinstance(column, list) or index >= len(column):
@@ -184,14 +205,20 @@ def fetch_archive_hours(
             spec = _SPECS[metric]
             if not spec.lower <= converted <= spec.upper:
                 continue
-            readings[metric] = converted
-        if not readings:
+            if field in _PRECEDING_HOUR_MEAN:
+                over_previous[metric] = converted
+            else:
+                at_label[metric] = converted
+        if not at_label and not over_previous:
             continue
         try:
             stamp = datetime.fromisoformat(when).replace(tzinfo=UTC)
         except (TypeError, ValueError):
             continue
-        samples.append(Sample(timestamp=stamp, readings=readings))
+        if over_previous:
+            samples.append(Sample(timestamp=stamp - timedelta(hours=1), readings=over_previous))
+        if at_label:
+            samples.append(Sample(timestamp=stamp, readings=at_label))
     # An empty list and None mean different things and the caller acts on the
     # difference: None is "the fetch failed", which must stop a backfill where
     # it stands, and [] is "the archive answered and had nothing for that day",
