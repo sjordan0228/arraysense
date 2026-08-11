@@ -1503,6 +1503,30 @@ let hoveredChart = null;
 
 // The hover readout. Each chart carries its own so the values belong to the
 // series under the pointer.
+// >>> readout-value
+// A row's second element is either a series index — a number, as it always was
+// — or a function (u, idx) => number | null computing a value no single series
+// holds. The test is on the type and not on truthiness, because series 0 is the
+// x axis and a truthiness test would call it as a function and throw on the
+// first hover of every chart on every page.
+function readoutValue(u, idx, si) {
+  if (typeof si !== 'function') return numOrNull(u.data[si][idx]);
+  // Anything that is not a finite number becomes the dash: null and undefined
+  // alike, and the Infinity a division by nothing produces. Letting undefined
+  // through would reach the formatter and print whatever it makes of it, which
+  // is how a gap starts looking like a reading. A row function that throws is
+  // caught here rather than escaping into uPlot's cursor handler, where it
+  // would strand the tooltip mid-update with stale text at a stale position.
+  let raw;
+  try {
+    raw = si(u, idx);
+  } catch (err) {
+    return null;
+  }
+  return Number.isFinite(raw) ? raw : null;
+}
+// <<< readout-value
+
 function readout(id, rows) {
   let tip = null;
   return {
@@ -1531,7 +1555,7 @@ function readout(id, rows) {
         // took and a zero is a reading of nothing, and on a chart whose whole
         // argument is that difference they cannot be allowed to look alike.
         const body = rows.map(([label, si, fmt]) => {
-          const v = numOrNull(u.data[si][idx]);
+          const v = readoutValue(u, idx, si);
           return `<div class="row"><u>${esc(label)}</u><b>${v === null ? DASH : fmt(v)}</b></div>`;
         }).join('');
         tip.innerHTML = `<div class="when">${esc(when.toLocaleString())}</div>${body}`;
