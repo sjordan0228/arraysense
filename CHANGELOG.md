@@ -7,6 +7,138 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.7.0 — 11 August 2026
+
+### Added
+
+- **The array and the battery bank are now things you describe, and everything
+  else reads that description** ([#97](https://github.com/sjordan0228/arraysense/issues/97)).
+  One multiline setting holds a line per string — name, MPPT input, panel count,
+  watts each, tilt and azimuth, then optional `key=value` fields for the rest —
+  parsed by exactly one parser, which is also the one that refuses a bad line at
+  the settings page. Every default that gets applied is also named, so no page
+  presents an assumption as something you typed, and an unknown key is refused
+  loudly rather than quietly becoming a default you believe is set. The battery
+  group records chemistry, module count, capacity and round-trip efficiency.
+  `GET /api/panels` serves the parsed result so nothing else has to know the
+  grammar. Without this there is no array to model, and the rest of this release
+  depends on it.
+
+- **The Efficiency tab shows what the array actually made against what it should
+  have made, and why not every watt was counted** ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+  A headline performance ratio with a tolerance band, a budget bar that reconciles
+  expected to actual through named causes, and a per-string breakdown that locates
+  an underperformer. The waterfall treats refused energy differently from lost
+  energy: curtailment sits past the gap as an outlined segment, so a full-battery
+  afternoon does not read as a faulty array. A day is drawn hour by hour; a week
+  or a month, day by day — the longer periods used to carry a headline figure with
+  no chart under it, which reads as something broken rather than as a period with
+  coarser detail. `GET /api/efficiency` serves all of it, so the page computes
+  nothing itself.
+
+  A string is judged curtailed only when the battery had nowhere to put the power
+  **and** its own voltage says so — each string against its own operating point,
+  never a threshold shared across the array. On the reference installation string
+  one runs at about 377 V where the others sit near 310, so a shared threshold
+  would mark it permanently curtailed and hide every real fault on it.
+
+- **Every day of history is scored once and kept**, rather than remodelled each
+  time a page asks for it ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+  The maintenance clock rescores today and yesterday and fills the rest of history
+  a bounded slice at a time — at most sixty days a pass, newest first, off the
+  event loop so nothing stalls an open page. On the reference installation's 671
+  days that converged in thirteen passes. Once a day is scored, it is a durable
+  fact the trend and the forecast both read rather than a figure that happens to
+  be recomputed the same way twice.
+
+- **Past weather can be recovered, so a system with history can be scored against
+  the weather it actually had** ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+  `POST /api/efficiency/backfill` with a date range reads Open-Meteo's ERA5
+  archive a day at a time into the ordinary hourly rows. Owner-triggered rather
+  than implicit, because a year is a few hundred requests and no page load should
+  start that; resumable, because rows are keyed by timestamp, so a re-run rewrites
+  the same hours rather than duplicating them and a failure reports the last day
+  that landed. Without it a new installation's performance trend starts from the
+  day you set it up rather than the day the array did.
+
+- **The dashboard forecasts the day's production, and draws the plan hardening
+  into fact** ([#5](https://github.com/sjordan0228/arraysense/issues/5)). The
+  morning's expectation is drawn as a hatched band, the day's measured output over
+  it, and the panel says how far ahead or behind the day is running. A prediction
+  is stored apart from every measurement and never in a metric column.
+
+  It is calibrated by what this array has demonstrated, not by its best moment.
+  The forecast runs the same model the Efficiency tab runs, over predicted
+  conditions, and scales it by the median performance ratio of the scored days in
+  the last 28 — which means an array described wrongly still forecasts correctly,
+  because the model is then wrong by some factor and the measured ratio wrong by
+  its reciprocal. Below five scored days it falls back to scaling by the observed
+  peak, and says so in the log.
+
+- **Per-string wiring is modelled, and the efficiency engine subtracts the
+  resistive loss the wire actually incurs** ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+  A string can declare the gauge and run length it is wired with, and the model
+  subtracts that string's own ohmic loss instead of PVWatts' flat 2% allowance.
+  New `solar.py` holds the physics: NOAA solar position, Hay-Davies transposition,
+  Faiman cell temperature, and the PVWatts derate chain. `pvlib` remains a
+  development dependency only, used to hold the transcription to a reference
+  implementation at five sites across a year; the runtime dependency list is
+  unchanged.
+
+- **The weather is recorded and plotted, on its own slow clock**
+  ([#5](https://github.com/sjordan0228/arraysense/issues/5)). Four site-level
+  metrics — global horizontal irradiance, direct normal irradiance, diffuse
+  horizontal irradiance, and wind speed — join outside temperature and cloud cover.
+  The Graphs page draws the sky beside the solar bands; the dashboard shows the
+  current conditions. Radiation is read against the hour it actually describes:
+  Open-Meteo labels an irradiance hour by the hour it ends, and this project's
+  buckets are labelled by the hour they begin, so every hour is now scored against
+  its own sky rather than the next hour's.
+
+- **The settings page can edit the wire fields** the efficiency engine now models
+  ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+
+- **The dashboard and Graphs page render what the inverter actually is**, not the
+  reference machine's shape ([#12](https://github.com/sjordan0228/arraysense/issues/12)).
+  Cards and charts read from `/api/capabilities`: one PV string on a one-string
+  machine, none where none are declared, three on the reference. The Legs card
+  gates on a declared backup panel, the BMS card on the battery its state-of-charge
+  witnesses. A machine with no backup panel no longer shows an all-dash Legs card
+  that reads as a fault.
+
+- **The connection kind is rendered from capabilities**, not hard-coded as "Dongle"
+  ([#72](https://github.com/sjordan0228/arraysense/issues/72)). The dashboard
+  fetches the transport once at boot and names the connection from a single map
+  used by both the label over the release controls and the yield copy — dongle
+  yields a TCP slot, serial yields the port, and the two spots cannot disagree.
+
+- **A systemd unit for a serial installation** ([#71](https://github.com/sjordan0228/arraysense/issues/71)).
+  `PrivateDevices=false` so the USB-to-RS485 adapter is visible,
+  `SupplementaryGroups=dialout` so the dedicated user can open it. The rest of the
+  sandbox is intact. A dongle installation uses neither and may re-harden
+  `PrivateDevices` with a drop-in.
+
+### Fixed
+
+- **The Efficiency chart escaped its container, and the page did not load
+  uPlot's stylesheet** ([#96](https://github.com/sjordan0228/arraysense/issues/96)).
+
+- **The day-by-day chart printed every date twice** on its x axis
+  ([#96](https://github.com/sjordan0228/arraysense/issues/96)). uPlot chose a
+  twelve-hour tick increment over the six days a week spans, so two ticks landed
+  inside each calendar day and both printed the same date.
+
+### Changed
+
+- **The documentation explains the USB SSD carve-out** for a database on external
+  storage ([#89](https://github.com/sjordan0228/arraysense/issues/89)). A
+  `ReadWritePaths` directive is needed because `ProtectSystem=strict` in the
+  service file blocks writes outside the declared paths.
+
+**Upgrading.** This release adds `efficiency_day` and four site-level metrics
+(irradiance components and wind) to the schema. The store lays down missing
+columns on open; no manual migration is needed.
+
 ## 0.6.14 — 10 August 2026
 
 ### Added

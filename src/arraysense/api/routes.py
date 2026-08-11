@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Any
+from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -52,9 +53,14 @@ from arraysense.costs import (
     price_period,
     unpriced_minutes,
 )
+from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day, compute_hours
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
-from arraysense.metrics import INVERTER_METRICS
+from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
+from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
+    PANELS_STRINGS_KEY,
+    SETTING_LATITUDE,
+    SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     SettingsStore,
     check_serial_device,
@@ -76,6 +82,7 @@ from arraysense.tariff import (
     load_tariff,
     merge_shortfalls,
 )
+from arraysense.weather import fetch_archive_hours
 
 if TYPE_CHECKING:
     # For the annotation only. Nothing here calls into the collector: the
@@ -114,8 +121,13 @@ _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 # A live view gets everything the inverter reports, not a chosen subset. It is
 # one row from one table either way, so narrowing it would save nothing and
 # would mean editing this file every time a panel wants a reading it does not
-# already have.
-_LIVE_INVERTER = tuple(spec.name for spec in INVERTER_METRICS)
+# already have. Everything the INVERTER reports: the site metrics are excluded,
+# because latest() answers with the newest row carrying any requested column,
+# and a weather row carries its own two — including them handed the dashboard
+# the sky's row, every inverter field null, for the seconds between a weather
+# tick and the next poll. The sky reaches a page through its own request, not
+# by riding this one.
+_LIVE_INVERTER = tuple(spec.name for spec in INVERTER_METRICS if spec.name not in SITE_METRICS)
 
 # How far back to look for the last full charge. Sixty days is twice the most
 # lenient interval any vendor publishes, so a bank that has not charged fully
@@ -253,8 +265,19 @@ def _row_time(row: Mapping[str, Any] | None) -> datetime | None:
     return stamp if isinstance(stamp, datetime) else None
 
 
+# What witnesses "the inverter reported": every inverter metric that is not the
+# site's. Two writers share the raw tier, and the sky landing a row every
+# fifteen minutes must not read as the inverter answering — a stale banner the
+# weather keeps quiet would hide exactly the outage it exists to announce.
+# Computed lazily because the registry is read at call time everywhere else,
+# and a test that extends the registry must see the new column here too.
+def _inverter_witness() -> list[str]:
+    """The metric columns whose presence means the inverter itself reported."""
+    return [name for name in inverter_metric_columns() if name not in SITE_METRICS]
+
+
 def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None, bool]:
-    """When the newest stored reading was taken, and whether the store holds anything.
+    """When the newest stored inverter reading was taken, and whether rows exist.
 
     The store's clock, deliberately, and not the collector's. ``last_success``
     lives in the process and comes back None the moment it restarts, so a
@@ -264,8 +287,11 @@ def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None,
 
     A recorded gap is not a reading. It carries a reason and no values, so a
     page drawing it shows dashes, and counting one as data reports a screen
-    full of nothing as up to date. No metric columns are asked for: only the
-    timestamp and the gap marker decide this.
+    full of nothing as up to date. Nor is a weather row: the sky poller writes
+    on its own clock, and its rows carry no inverter column at all — aging the
+    dashboard by them would keep the banner quiet through an inverter outage.
+    So the question is asked with the inverter's own columns as the witness,
+    and ``latest`` answers with the newest row carrying any of them or a gap.
 
     Returns no timestamp when every row inside the search window is a gap,
     which is a longer outage rather than a fresh install — the second half of
@@ -273,13 +299,17 @@ def _newest_reading(store: SqliteStore, now: datetime) -> tuple[datetime | None,
     warn about an install that has simply not polled yet or stay quiet through
     an outage that has run all day.
     """
-    newest = store.latest([])
+    witness = _inverter_witness()
+    newest = store.latest(witness)
     if newest is None:
-        return None, False
+        # No inverter reading and no gap ever — but the tier may still hold
+        # weather rows, and "holds anything" keeps its row-based meaning so a
+        # sky-only database reads as an install that has not polled yet.
+        return None, store.latest([]) is not None
     if not newest.get("error"):
         return _row_time(newest), True
-    for row in reversed(store.query([], now - READING_SEARCH, now)):
-        if not row.get("error"):
+    for row in reversed(store.query(witness, now - READING_SEARCH, now)):
+        if not row.get("error") and any(row.get(name) is not None for name in witness):
             return _row_time(row), True
     return None, True
 
@@ -419,6 +449,13 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
 
     ``device`` names an inverter and defaults to the configured one, so a page
     that sends nothing gets exactly what it always got.
+
+    The ``sky`` block carries the site's own weather readings — outside
+    temperature and cloud cover — written by a second poller on its own clock.
+    It rides the live response as its own object so the dashboard needs no
+    second request, but it never mixes into the inverter block: a weather row
+    must not blank the inverter read, and an inverter gap must not blank the
+    sky.
     """
     device = _device(device)
     inverter = store.latest(list(_LIVE_INVERTER), device=device)
@@ -435,6 +472,23 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
     # whose capacity or power nobody reported carries null for the rate; zero
     # is a real reading (an idle bank) and stays zero.
     battery_block = _battery_block(inverter)
+    # Weather: the site metrics the sky poller writes on its own clock.
+    # include_gaps=False so an inverter gap newer than the last weather tick
+    # does not blank the sky — the walk continues past gaps to the last real
+    # reading. None when no weather row exists or when the row has no values
+    # at all, never an object of two nulls.
+    sky: dict[str, Any] | None = None
+    sky_row = store.latest(sorted(SITE_METRICS), device=device, include_gaps=False)
+    if sky_row is not None:
+        formatted = _isoformat_row(sky_row)
+        temp = formatted.get("outside_temperature_c")
+        cover = formatted.get("cloud_cover_pct")
+        if temp is not None or cover is not None:
+            sky = {
+                "timestamp": formatted["timestamp"],
+                "outside_temperature_c": temp,
+                "cloud_cover_pct": cover,
+            }
     return {
         "inverter": _isoformat_row(inverter) if inverter else None,
         "modules": [_isoformat_row(m) for m in modules],
@@ -445,6 +499,7 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
             "known": status.known,
         },
         "battery": battery_block,
+        "sky": sky,
     }
 
 
@@ -472,6 +527,10 @@ async def capabilities(request: Request) -> dict[str, Any]:
     ``energy`` says whether kWh figures are counters the inverter keeps itself
     or an estimate integrated from power — a page must be able to tell a meter
     reading from a guess.
+    ``transport`` is how this installation reaches the inverter — the built
+    source reports what its configuration chose, not the family default — so a
+    page labels the connection it actually has instead of hard-coding the
+    dongle's.
 
     ``devices`` is a list because a parallel stack is several inverters behind
     one service, even though today's collector polls one. Three states, kept
@@ -501,6 +560,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "three_phase": None,
             "parallel_capable": None,
             "per_module_battery": None,
+            "transport": None,
             "metrics": None,
             "battery_module_metrics": None,
         }
@@ -515,6 +575,7 @@ async def capabilities(request: Request) -> dict[str, Any]:
                     "three_phase": declared.three_phase,
                     "parallel_capable": declared.parallel_capable,
                     "per_module_battery": declared.per_module_battery,
+                    "transport": declared.transport,
                     "metrics": list(inverter_metric_columns(declared.metrics)),
                     "battery_module_metrics": list(module_metric_columns(declared.metrics)),
                 }
@@ -661,6 +722,29 @@ def _reject_unbootable_connection(request: Request, wanted: dict[str, Any]) -> N
     drivers.validate(effective(file_config, settings, pending=wanted))
 
 
+def _reject_undeclared_mppts(request: Request, wanted: dict[str, Any]) -> None:
+    """Refuse an array whose strings name MPPTs the inverter does not have.
+
+    The grammar cannot know the driver — check= is a pure function of the
+    text — so the write path enforces it, where the built source's declaration
+    is in scope. Same layering as the connection guard above: refuse at the
+    write, never store a config a later reader chokes on.
+    """
+    text = wanted.get("panels.strings")
+    if not isinstance(text, str) or not text.strip():
+        return
+    declared = getattr(request.app.state.service.source, "capabilities", None)
+    if declared is None:
+        return  # a bare source declares nothing; nothing to enforce against
+    strings = parse_strings(text)  # already validated by the registry; cheap
+    for s in strings:
+        if s.mppt > declared.pv_strings:
+            raise ValueError(
+                f"string {s.name!r} is on MPPT {s.mppt}, but this inverter "
+                f"declares {declared.pv_strings} string input(s)"
+            )
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -681,6 +765,7 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         # so it is validated against the true next-boot merge before any row is
         # written. Inside the try so its ValueError maps to 400 like the rest.
         _reject_unbootable_connection(request, wanted)
+        _reject_undeclared_mppts(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1441,6 +1526,133 @@ def bands(
     }
 
 
+@router.get("/forecast")
+def forecast(
+    request: Request,
+    store: _ReadStore,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """The day's forecast curves, measured production, and how reality tracks the plan.
+
+    The page draws what this serves and computes nothing itself — the tracking
+    figure especially lives here, once, because a page-side copy is the
+    two-parsers drift this project already paid for.
+
+    The dawn curve is the earliest prediction made on the day itself for each
+    hour and is the baseline the day is tracked against. The latest curve is the
+    newest revision per hour for drawing ahead of now. Actuals come from the
+    hourly rollup — mean pv_total_power_w per hour, so each hour's energy is
+    that mean multiplied by one hour.
+
+    With no forecast rows for today every data field is null or empty: the page
+    shows nothing, not zeros.
+    """
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    now = datetime.now(tz=UTC)
+    local_now = now.astimezone(zone)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # The instant of local midnight in UTC, and the instant of the next local
+    # midnight. Adding a day in local time is the only way to land on the right
+    # UTC instant when the day is not 24 hours.
+    day_start = local_midnight.astimezone(UTC)
+    day_end = (local_midnight + timedelta(days=1)).astimezone(UTC)
+
+    curves = store.forecast_day(day_start, day_end)
+    configured = bool(curves["first"] or curves["latest"])
+
+    if not configured:
+        return {
+            "configured": False,
+            "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
+            "now": now.isoformat(),
+            "dawn": [],
+            "latest": [],
+            "actual": [],
+            "expected_today_kwh": None,
+            "actual_so_far_kwh": None,
+            "tracking_pct": None,
+        }
+
+    # Hourly mean pv_total_power_w for the day so far. Each hour's energy is the
+    # mean wattage multiplied by one hour, so the values are already in Wh.
+    actual_rows: list[dict[str, object]] = store.query(
+        ["pv_total_power_w"], day_start, day_end, tier="hourly"
+    )
+    actual: list[dict[str, object]] = [
+        {
+            "hour": cast(datetime, row["timestamp"]).isoformat(),
+            "mean_w": cast(float, row["pv_total_power_w"]),
+        }
+        for row in actual_rows
+        if not row.get("error") and row.get("pv_total_power_w") is not None
+    ]
+
+    dawn = [
+        {
+            "hour": cast(datetime, e["hour"]).isoformat(),
+            "expected_w": cast(float, e["expected_w"]),
+        }
+        for e in curves["first"]
+    ]
+    latest = [
+        {
+            "hour": cast(datetime, e["hour"]).isoformat(),
+            "expected_w": cast(float, e["expected_w"]),
+        }
+        for e in curves["latest"]
+    ]
+
+    # Expected today: sum of the latest curve in Wh, divided by 1000 for kWh.
+    latest_sum = sum(cast(float, e["expected_w"]) for e in curves["latest"])
+    expected_today_kwh: float | None = latest_sum / 1000.0 if curves["latest"] else None
+
+    # Actual production so far. Null when no hour has a reading yet — a dash,
+    # never zero, because zero means the array produced nothing and that is a
+    # different statement from "nobody has looked yet".
+    actual_by_hour: dict[datetime, float] = {}
+    actual_wh = 0.0
+    for row in actual_rows:
+        if not row.get("error") and row.get("pv_total_power_w") is not None:
+            ts = cast(datetime, row["timestamp"])
+            w = cast(float, row["pv_total_power_w"])
+            actual_by_hour[ts] = w
+            actual_wh += w
+    actual_so_far_kwh: float | None = actual_wh / 1000.0 if actual_by_hour else None
+
+    # Tracking: how actual production compares to the dawn plan, over hours that
+    # carry both a dawn expectation and a measurement. Absent before any such
+    # hour exists and absent when the dawn-plan sum over those hours is zero —
+    # never a division by zero, never a figure from mismatched hours.
+    dawn_by_hour: dict[datetime, float] = {
+        cast(datetime, e["hour"]): cast(float, e["expected_w"]) for e in curves["first"]
+    }
+    matched = set(dawn_by_hour) & set(actual_by_hour)
+    tracking_pct: float | None = None
+    if matched:
+        matched_dawn = sum(dawn_by_hour[h] for h in matched)
+        if matched_dawn > 0:
+            matched_actual = sum(actual_by_hour[h] for h in matched)
+            tracking_pct = round((matched_actual / matched_dawn - 1.0) * 100.0, 1)
+
+    return {
+        "configured": True,
+        "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
+        "now": now.isoformat(),
+        "dawn": dawn,
+        "latest": latest,
+        "actual": actual,
+        "expected_today_kwh": round(expected_today_kwh, 3)
+        if expected_today_kwh is not None
+        else None,
+        "actual_so_far_kwh": round(actual_so_far_kwh, 3) if actual_so_far_kwh is not None else None,
+        "tracking_pct": tracking_pct,
+    }
+
+
 @router.get("/setup")
 async def setup(request: Request) -> dict[str, Any]:
     """Everything the setup wizard renders, from one place.
@@ -1452,6 +1664,436 @@ async def setup(request: Request) -> dict[str, Any]:
     (#34) and a serial number is an installation secret.
     """
     return describe_setup(request.app.state.config)
+
+
+# The most days one backfill request may cover. Two years is more archive than
+# any installation here has history for, and the ceiling is what stops a typo
+# in a date from asking the free service for a decade in one go.
+_BACKFILL_MAX_DAYS = 760
+
+
+class BackfillRequest(BaseModel):
+    """A date range to recover past conditions for."""
+
+    start: str
+    end: str
+
+
+@router.post("/efficiency/backfill")
+def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict[str, Any]:
+    """Fetch past hourly conditions into the store, a day at a time.
+
+    Owner-triggered rather than implicit: the archive is a few hundred
+    requests for a year of history, and a page load must never start that.
+    Resumable by construction — rows are keyed by timestamp, so re-running a
+    range rewrites the same hours rather than duplicating them, and a failure
+    reports the last day that landed so the next run can carry on from there.
+    """
+    settings = SettingsStore(store)
+    latitude = settings.get(SETTING_LATITUDE)
+    longitude = settings.get(SETTING_LONGITUDE)
+    if not isinstance(latitude, float) or not isinstance(longitude, float):
+        raise HTTPException(
+            status_code=400,
+            detail="backfill needs a location; set latitude and longitude first",
+        )
+    try:
+        start = date.fromisoformat(body.start)
+        end = date.fromisoformat(body.end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"dates must be YYYY-MM-DD: {exc}") from exc
+    if end < start:
+        raise HTTPException(status_code=400, detail="end must not precede start")
+    if (end - start).days + 1 > _BACKFILL_MAX_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"range is longer than {_BACKFILL_MAX_DAYS} days; ask for less at a time",
+        )
+
+    written = 0
+    days = 0
+    last_day: str | None = None
+    current = start
+    while current <= end:
+        samples = fetch_archive_hours(latitude, longitude, current, current)
+        if samples is None:
+            # The fetch failed. Stop here and report where, rather than
+            # marching on and leaving holes nobody can see.
+            break
+        if not samples:
+            # The archive simply had nothing for this day. Step over it.
+            logger.info("archive holds no readings for %s; skipping", current)
+            days += 1
+            last_day = current.isoformat()
+            current += timedelta(days=1)
+            continue
+        for sample in samples:
+            try:
+                store.append(sample)
+            except sqlite3.Error as exc:
+                logger.warning("backfill could not store an hour: %s", exc)
+                break
+            written += 1
+        days += 1
+        last_day = current.isoformat()
+        current += timedelta(days=1)
+    return {"days": days, "hours_written": written, "last_day": last_day}
+
+
+@router.get("/panels")
+def panels(request: Request, store: _ReadStore) -> dict[str, Any]:
+    """The parsed array and bank, for anything that must not read the grammar.
+
+    One shape, defaults resolved and named, so the future efficiency engine
+    and the settings editor read identical truth — the page composes the
+    grammar but never parses it, which is the tariff's own lesson applied.
+    """
+    settings = SettingsStore(store)
+    text = settings.get("panels.strings")
+    strings = parse_strings(text) if isinstance(text, str) else ()
+    battery = {
+        key.split(".", 1)[1]: settings.get(key)
+        for key in (
+            "battery.chemistry",
+            "battery.count",
+            "battery.capacity_kwh_each",
+            "battery.round_trip_pct",
+            "battery.min_soc_pct",
+            "battery.max_charge_a",
+            "battery.max_discharge_a",
+            "battery.heater_w",
+            "battery.heater_on_c",
+            "battery.heater_off_c",
+            "battery.idle_draw_w",
+            "battery.installed",
+        )
+    }
+    declared = getattr(request.app.state.service.source, "capabilities", None)
+    return {
+        "strings": [{**asdict(s), "defaulted": sorted(s.defaulted)} for s in strings],
+        "battery": battery,
+        "declared_mppts": declared.pv_strings if declared is not None else None,
+    }
+
+
+# Meter accuracy the spec sheets quote, used where no site-specific figure has
+# been measured. 3 % is the typical tolerance for a revenue-grade meter, and a
+# system that has not entered its own is assumed to be at least that accurate.
+_METER_TOLERANCE_PCT = 3.0
+
+
+def _daily_range(
+    day_start: datetime,
+    period: str,
+) -> list[tuple[datetime, datetime]]:
+    """Return (start, end) pairs for each day in the period.
+
+    ``day_start`` is the opening edge of the first day, already zone-aware.
+    The result edges carry the same timezone.
+    """
+    if period == "day":
+        return [(day_start, day_start + timedelta(days=1))]
+    if period == "week":
+        return [
+            (day_start + timedelta(days=i), day_start + timedelta(days=i + 1)) for i in range(7)
+        ]
+    # Month: the calendar month that contains day_start, from its first day
+    # through the first day of the following month.
+    if period == "month":
+        first_of_month = day_start.replace(day=1)
+        if first_of_month.month == 12:
+            next_month = first_of_month.replace(year=first_of_month.year + 1, month=1, day=1)
+        else:
+            next_month = first_of_month.replace(month=first_of_month.month + 1, day=1)
+        days_count = (next_month - first_of_month).days
+        return [
+            (first_of_month + timedelta(days=i), first_of_month + timedelta(days=i + 1))
+            for i in range(days_count)
+        ]
+    return []
+
+
+def _hourly_efficiency_for_range(
+    store: SqliteStore,
+    settings: SettingsStore,
+    start: datetime,
+    end: datetime,
+    strings: tuple[StringSpec, ...],
+    zone: ZoneInfo,
+) -> list[dict[str, Any]]:
+    """Render the engine's hour-by-hour scoring for the page.
+
+    Shape only. The arithmetic belongs to ``efficiency.compute_hours`` and is
+    not repeated here -- an endpoint that modelled expected production a second
+    time would drift from the summaries it sits beside, which is exactly how
+    the Costs page came to price a January evening at the summer peak rate.
+    """
+    return [
+        {
+            "hour": hour.hour.astimezone(zone).isoformat(),
+            "expected_kwh": round(hour.expected_kwh, 4),
+            "actual_kwh": round(hour.actual_kwh, 4),
+            "curtailed_kwh": round(hour.curtailed_kwh, 4),
+            "unexplained_kwh": round(hour.unexplained_kwh, 4),
+        }
+        for hour in compute_hours(store, settings, start, end, strings)
+    ]
+
+
+def _baseline_info(daily_rows: list[EfficiencyRow]) -> dict[str, Any]:
+    """Build the baseline block from the computed rows.
+
+    Reports the window the first day's rows cover.  Sample count is absent
+    because the daily summary rows do not carry it — a day whose baseline
+    could not be fitted returns no rows at all, so the presence of rows is
+    itself the signal that the system is calibrated.
+    """
+    if not daily_rows:
+        return {"window_start": None, "window_end": None, "samples": None}
+    first_day = daily_rows[0].day
+    return {
+        "window_start": first_day.isoformat(),
+        "window_end": (first_day + timedelta(days=1)).isoformat(),
+        "samples": None,
+    }
+
+
+def _string_kwp(s: StringSpec) -> float:
+    """Nameplate kilowatts-peak for one string."""
+    return s.panels * s.watts / 1000.0
+
+
+@router.get("/efficiency")
+def efficiency(
+    request: Request,
+    store: _ReadStore,
+    start: str,
+    period: str = Query(default="day"),
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """How the array performed against what the sun offered.
+
+    The answer covers a day, a week or a calendar month.  Each day is scored
+    by the efficiency engine and the results are aggregated: the summary is
+    the total across all days, the waterfall reconciles expected to actual
+    through unexplained and curtailed, and the per-string breakdown lets an
+    underperformer be localised.
+
+    ``period=day`` also returns an hourly breakdown computed live from the
+    stored irradiance and inverter readings rather than from any stored
+    summary, because the stored summary nets across the day and an hour that
+    genuinely lost energy can be cancelled by others the model under-called.
+
+    With no array configured every figure is null or empty — never zero,
+    because zero expected and zero actual is a claim that the array was
+    meant to make nothing and made nothing.
+    """
+    if period not in ("day", "week", "month"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"period must be day, week or month, not {period!r}",
+        )
+
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        start_date = date.fromisoformat(start)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"start must be YYYY-MM-DD: {exc}") from exc
+
+    day_start = datetime.combine(start_date, datetime.min.time(), tzinfo=zone)
+    days = _daily_range(day_start, period)
+    if not days:
+        raise HTTPException(
+            status_code=400, detail=f"could not compute range for period={period!r}"
+        )
+
+    range_start = days[0][0]
+    range_end = days[-1][1]
+
+    settings = SettingsStore(store)
+    text = settings.get(PANELS_STRINGS_KEY)
+    strings = parse_strings(text) if isinstance(text, str) and text.strip() else ()
+
+    now = datetime.now(tz=UTC)
+
+    if not strings:
+        return {
+            "configured": False,
+            "period": period,
+            "start": range_start.isoformat(),
+            "end": range_end.isoformat(),
+            "now": now.isoformat(),
+            "summary": None,
+            "waterfall": [],
+            "strings": [],
+            "hours": None,
+            "days": [],
+            "worst_hour": None,
+            "baseline": {"window_start": None, "window_end": None, "samples": None},
+        }
+
+    config_version_raw = settings.get(CONFIG_VERSION_KEY)
+    config_version = config_version_raw if isinstance(config_version_raw, int) else 0
+
+    # Collect daily rows: try stored first, compute live for missing days.
+    daily_rows: list[EfficiencyRow] = []
+    for ds, de in days:
+        stored = store.read_efficiency_days(ds, de)
+        # A stored day is only usable if it was scored against the array as it
+        # is described now. The maintenance pass rescores today and yesterday,
+        # but nothing revisits last month, so after the owner corrects a panel
+        # count or moves the site every older day would keep a score taken
+        # against an array that no longer exists -- and be served without a
+        # word to say so. Recomputing is the honest answer and is cheap.
+        if stored and all(r.config_version == config_version for r in stored):
+            daily_rows.extend(stored)
+        else:
+            daily_rows.extend(compute_day(store, settings, ds, de, strings, config_version))
+
+    if not daily_rows:
+        # No rows at all — likely no data for this range.
+        return {
+            "configured": True,
+            "period": period,
+            "start": range_start.isoformat(),
+            "end": range_end.isoformat(),
+            "now": now.isoformat(),
+            "summary": None,
+            "waterfall": [],
+            "strings": [],
+            "hours": None,
+            "days": [],
+            "worst_hour": None,
+            "baseline": {"window_start": None, "window_end": None, "samples": None},
+        }
+
+    # Aggregate: group by string_name.  The total row has string_name == "".
+    by_string: dict[str, list[EfficiencyRow]] = {}
+    for r in daily_rows:
+        by_string.setdefault(r.string_name, []).append(r)
+
+    total_kwp = sum(_string_kwp(s) for s in strings)
+
+    def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
+        expected = sum(r.expected_kwh for r in rows)
+        actual = sum(r.actual_kwh for r in rows)
+        curtailed = sum(r.curtailed_kwh for r in rows)
+        # Derived from the totals, never summed from the days. Each day's own
+        # figure is clamped at zero, so adding them counts every day that fell
+        # short while ignoring every day that ran ahead: a week of one 5 kWh
+        # shortfall and one 5 kWh surplus would report 5 kWh unexplained beside
+        # an expected and an actual that are equal, and the waterfall would
+        # visibly fail to add up in front of the owner.
+        residual = expected - curtailed - actual
+        unexplained = max(0.0, residual)
+        surplus = max(0.0, -residual)
+        denom = expected - curtailed
+        pr: float | None = actual / denom if denom > 0.0 else None
+        # Per-string kWp for per-string yield; total for total.
+        kwp = total_kwp if name == "" else sum(_string_kwp(s) for s in strings if s.name == name)
+        sy: float | None = actual / kwp if kwp > 0.0 else None
+        return {
+            "expected_kwh": round(expected, 3),
+            "actual_kwh": round(actual, 3),
+            "curtailed_kwh": round(curtailed, 3),
+            "unexplained_kwh": round(unexplained, 3),
+            "unmodelled_gain_kwh": round(surplus, 3),
+            "pr": round(pr, 4) if pr is not None else None,
+            "specific_yield": round(sy, 3) if sy is not None else None,
+            "tolerance_pct": _METER_TOLERANCE_PCT,
+            "partial": any(r.partial for r in rows),
+        }
+
+    summary = _summarise("", by_string.get("", []))
+
+    # Per-string summaries
+    string_summaries: list[dict[str, Any]] = []
+    for s in strings:
+        rows = by_string.get(s.name, [])
+        if rows:
+            string_summaries.append({"name": s.name, **_summarise(s.name, rows)})
+
+    # Waterfall
+    expected = summary["expected_kwh"]
+    unexplained = summary["unexplained_kwh"]
+    curtailed = summary["curtailed_kwh"]
+    actual = summary["actual_kwh"]
+    # The walk from expected to actual has to close, and it has to close in both
+    # directions. An array can beat its model -- a nameplate typed in low, a
+    # tilt guessed, a bifacial gain the model does not credit -- and a shortfall
+    # figure clamped at zero can never account for that, so the segments would
+    # silently fail to sum to what the inverter actually made. The surplus gets
+    # its own segment and is not penalised, because producing more than
+    # predicted is not a loss; a persistently large one means the array is
+    # described wrongly, which is worth seeing rather than rounding away.
+    surplus = summary["unmodelled_gain_kwh"]
+    waterfall = [
+        {"name": "expected", "kwh": round(expected, 3), "penalised": True},
+        {"name": "unexplained", "kwh": round(unexplained, 3), "penalised": True},
+        {"name": "curtailed", "kwh": round(curtailed, 3), "penalised": False},
+        {"name": "unmodelled_gain", "kwh": round(surplus, 3), "penalised": False},
+        {"name": "actual", "kwh": round(actual, 3), "penalised": True},
+    ]
+
+    # Hourly breakdown — only for period=day.
+    hours: list[dict[str, Any]] | None = None
+    worst_hour: dict[str, Any] | None = None
+    if period == "day":
+        hours = _hourly_efficiency_for_range(store, settings, range_start, range_end, strings, zone)
+    elif len(days) <= 31:
+        # For week and month, compute hourly to find the worst hour, but do not
+        # ship the full array.
+        hours = _hourly_efficiency_for_range(store, settings, range_start, range_end, strings, zone)
+
+    # Worst hour: the one with the largest unexplained shortfall.
+    if hours:
+        candidates = [h for h in hours if h["unexplained_kwh"] > 0.0]
+        if candidates:
+            worst = max(candidates, key=lambda h: h["unexplained_kwh"])
+            worst_hour = {
+                "hour": worst["hour"],
+                "unexplained_kwh": worst["unexplained_kwh"],
+            }
+
+    # Hours array: only for period=day.
+    if period != "day":
+        hours = None
+
+    baseline = _baseline_info(daily_rows)
+
+    return {
+        "configured": True,
+        "period": period,
+        "start": range_start.isoformat(),
+        "end": range_end.isoformat(),
+        "now": now.isoformat(),
+        "summary": summary,
+        "waterfall": waterfall,
+        "strings": string_summaries,
+        "hours": hours,
+        # The same days the summary was totalled from, so a week or a month has
+        # a trend to draw. Without these the longer periods had a headline
+        # figure and nothing underneath it -- the page simply dropped its chart,
+        # which reads as a fault rather than as a period with no detail.
+        "days": [
+            {
+                "day": r.day.isoformat(),
+                "expected_kwh": round(r.expected_kwh, 3),
+                "actual_kwh": round(r.actual_kwh, 3),
+                "curtailed_kwh": round(r.curtailed_kwh, 3),
+                "unexplained_kwh": round(r.unexplained_kwh, 3),
+                "pr": round(r.pr, 4) if r.pr is not None else None,
+                "partial": r.partial,
+            }
+            for r in sorted(by_string.get("", []), key=lambda r: r.day)
+        ],
+        "worst_hour": worst_hour,
+        "baseline": baseline,
+    }
 
 
 def _reject_control_text(value: str) -> str:

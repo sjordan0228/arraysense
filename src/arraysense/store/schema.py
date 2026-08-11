@@ -120,6 +120,8 @@ MODULE_TIERS: tuple[Tier, ...] = (
 SERIALS_TABLE = "serials"
 INVALID_TABLE = "invalid_readings"
 SETTINGS_TABLE = "settings"
+FORECAST_TABLE = "forecast"
+EFFICIENCY_TABLE = "efficiency_day"
 
 _MODULE_PREFIX = re.compile(r"^battery_module\d+_")
 
@@ -273,6 +275,60 @@ def _settings_ddl(as_name: str) -> str:
     )
 
 
+def _forecast_ddl(as_name: str) -> str:
+    """Return the DDL for the production forecast, which is not a measurement.
+
+    A prediction must never sit in a column a measured reading uses — the rule
+    the importer has enforced since day one by refusing to import
+    SolarAssistant's predicted series into the metric tables. So the forecast
+    is its own table, append-only: every prediction keeps the moment it was
+    made, because the page draws two different truths from the same day — the
+    dawn plan the day is tracked against, and the latest expectation for the
+    hours still to come — and a table that kept only the newest would erase
+    the plan the moment it was revised. Site-level like the weather itself,
+    so it carries no device.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    target_hour INTEGER NOT NULL,\n"
+        "    made_at INTEGER NOT NULL,\n"
+        "    expected_w INTEGER NOT NULL,\n"
+        "    PRIMARY KEY (target_hour, made_at)\n"
+        f") {_TABLE_OPTIONS}"
+    )
+
+
+def _efficiency_day_ddl(as_name: str) -> str:
+    """Return the DDL for the per-day efficiency summary table.
+
+    Site-level like the forecast: one row per string per day, plus a total row
+    whose ``string_name`` is the empty string. The performance ratio is stored
+    rather than computed on read so a day scored once keeps its score forever,
+    and a row carries its config version so a day recomputed after the array
+    changes replaces the stale one rather than sitting beside it.
+
+    Curtailed energy is a separate column from unexplained shortfall because the
+    two are different things with different remedies — a curtailed hour is the
+    inverter protecting the battery, not a fault — and a page that cannot show
+    them apart cannot show the owner where to look.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    day INTEGER NOT NULL,\n"
+        "    string_name TEXT NOT NULL,\n"
+        "    expected_kwh REAL NOT NULL,\n"
+        "    actual_kwh REAL NOT NULL,\n"
+        "    curtailed_kwh REAL NOT NULL,\n"
+        "    unexplained_kwh REAL NOT NULL,\n"
+        "    modelled_hours INTEGER NOT NULL,\n"
+        "    partial INTEGER NOT NULL,\n"
+        "    pr REAL,\n"
+        "    config_version INTEGER NOT NULL,\n"
+        "    PRIMARY KEY (day, string_name)\n"
+        f") {_TABLE_OPTIONS}"
+    )
+
+
 def _inverter_tier_ddl(tier: Tier, metric_names: tuple[str, ...], as_name: str) -> str:
     """Return the DDL for one inverter-tier wide-row table.
 
@@ -358,6 +414,10 @@ def ddl_for(table: str, as_name: str | None = None, declared: Iterable[str] | No
     name = table if as_name is None else as_name
     if table == SETTINGS_TABLE:
         return _settings_ddl(name)
+    if table == FORECAST_TABLE:
+        return _forecast_ddl(name)
+    if table == EFFICIENCY_TABLE:
+        return _efficiency_day_ddl(name)
     if table == SERIALS_TABLE:
         return _serials_ddl(name)
     if table == INVALID_TABLE:
@@ -500,9 +560,13 @@ def schema_ddl(declared: Iterable[str] | None = None) -> str:
     left exactly as it is, silently. That is why the device column arrived as
     an explicit migration rather than as an edit here.
     """
-    # Settings carry no device and are deliberately separate from
-    # DEVICED_TABLES, whose members the device-identity migration rebuilds.
-    statements: list[str] = [ddl_for(SETTINGS_TABLE)]
+    # Settings and the forecast carry no device and are deliberately separate
+    # from DEVICED_TABLES, whose members the device-identity migration rebuilds.
+    statements: list[str] = [
+        ddl_for(SETTINGS_TABLE),
+        ddl_for(FORECAST_TABLE),
+        ddl_for(EFFICIENCY_TABLE),
+    ]
     for table in DEVICED_TABLES:
         statements.append(ddl_for(table, declared=declared))
         statements.extend(indexes_for(table))

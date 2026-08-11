@@ -1122,3 +1122,325 @@ def test_relaxed_durability_still_stores_and_reads_back(tmp_path: Path) -> None:
     rows = store.query(["battery_voltage_v"], now, now)
     store.close()
     assert rows[0]["battery_voltage_v"] == 55.9
+
+
+def test_latest_skips_a_newer_row_that_carries_none_of_the_asked_metrics(
+    tmp_path: Path,
+) -> None:
+    # Two writers share this tier: the weather poller lands a row whose
+    # inverter columns are all null. Row-based recency returned that row and
+    # blanked the live dashboard for a poll cycle after every weather tick —
+    # an absence drawn where data exists. The most recent READING of the asked
+    # metrics is the answer, in both directions.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0, "battery_soc_pct": 64.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, 30, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    live = store.latest(["pv_total_power_w", "battery_soc_pct"])
+    assert live is not None
+    assert live["pv_total_power_w"] == 5000.0, "a weather row must not blank the live view"
+    assert live["timestamp"] == datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    # The mirror: the sky is readable under newer inverter rows.
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={"pv_total_power_w": 5100.0},
+        )
+    )
+    sky = store.latest(["outside_temperature_c"])
+    store.close()
+    assert sky is not None
+    assert sky["outside_temperature_c"] == 37.4
+
+
+def test_latest_still_surfaces_a_gap_row(tmp_path: Path) -> None:
+    # Recency is not health: a recorded gap answers every request, whatever
+    # metrics it was asked for, because a gap is information and hiding it
+    # would dress an outage as the last good reading with no timestamp shift.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    row = store.latest(["pv_total_power_w"])
+    store.close()
+    assert row is not None
+    assert row["error"] == "ConnectionError: nobody answered"
+    assert row["timestamp"] == datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
+
+
+def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
+    # The sky readout asks for the newest actual weather reading. A recorded
+    # inverter gap lands newer than the last weather tick many times an hour on
+    # a lossy link, and surfacing it there would blank the readout while a
+    # five-minute-old reading exists. Opting out of gaps walks past them; the
+    # default still surfaces them, because for the dashboard recency is not
+    # health.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    with_gaps = store.latest(["outside_temperature_c"])
+    assert with_gaps is not None
+    assert with_gaps["error"] is not None, "the default keeps surfacing gaps"
+    reading = store.latest(["outside_temperature_c"], include_gaps=False)
+    store.close()
+    assert reading is not None
+    assert reading["outside_temperature_c"] == 37.4
+    assert reading["error"] is None
+
+
+def test_forecast_keeps_every_revision_and_serves_dawn_and_latest(tmp_path: Path) -> None:
+    # Two truths from one table: the dawn plan the day is tracked against, and
+    # the latest expectation for the hours still to come. A revision must never
+    # erase the plan it revises — and a forecast made yesterday is not today's
+    # dawn plan.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    noon = day.replace(hour=12)
+    one_pm = day.replace(hour=13)
+    # yesterday's forecast for today: excluded from "first"
+    store.append_forecast(day - timedelta(hours=10), [(noon, 5000.0)])
+    # dawn plan
+    store.append_forecast(day.replace(hour=6), [(noon, 6000.0), (one_pm, 6500.0)])
+    # midday revision
+    store.append_forecast(day.replace(hour=11), [(noon, 4200.0), (one_pm, 4400.0)])
+    curves = store.forecast_day(day, day + timedelta(days=1))
+    store.close()
+    first = {c["hour"]: c["expected_w"] for c in curves["first"]}
+    latest = {c["hour"]: c["expected_w"] for c in curves["latest"]}
+    assert first[noon] == 6000.0, "the dawn plan survives its revision"
+    assert first[one_pm] == 6500.0
+    assert latest[noon] == 4200.0, "the latest expectation is the revision"
+    assert latest[one_pm] == 4400.0
+
+
+def test_forecast_prune_drops_old_hours(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    old = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
+    new = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    store.append_forecast(old, [(old, 4000.0)])
+    store.append_forecast(new, [(new, 5000.0)])
+    removed = store.prune_forecast(datetime(2026, 6, 1, tzinfo=UTC))
+    curves = store.forecast_day(new.replace(hour=0), new.replace(hour=0) + timedelta(days=1))
+    store.close()
+    assert removed == 1
+    assert len(curves["latest"]) == 1
+
+
+def test_efficiency_days_are_written_and_read_back(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    rows = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=32.0,
+            actual_kwh=28.5,
+            curtailed_kwh=1.5,
+            unexplained_kwh=2.0,
+            modelled_hours=10,
+            partial=False,
+            pr=0.89,
+            config_version=1,
+        ),
+        EfficiencyRow(
+            day=day,
+            string_name="",
+            expected_kwh=32.0,
+            actual_kwh=28.5,
+            curtailed_kwh=1.5,
+            unexplained_kwh=2.0,
+            modelled_hours=10,
+            partial=False,
+            pr=0.89,
+            config_version=1,
+        ),
+    ]
+    store.write_efficiency_day(rows)
+
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 2
+    by_name = {r.string_name: r for r in got}
+    assert by_name["East"].expected_kwh == 32.0
+    assert by_name["East"].actual_kwh == 28.5
+    assert by_name["East"].curtailed_kwh == 1.5
+    assert by_name["East"].unexplained_kwh == 2.0
+    assert by_name["East"].modelled_hours == 10
+    assert not by_name["East"].partial
+    assert by_name["East"].pr == 0.89
+    assert by_name["East"].config_version == 1
+    assert by_name[""].string_name == ""
+
+
+def test_scored_days_reports_only_total_rows_at_the_asked_version(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "scored.db"), device=TEST_DEVICE)
+    day1 = datetime(2026, 8, 8, 0, 0, tzinfo=UTC)
+    day2 = datetime(2026, 8, 9, 0, 0, tzinfo=UTC)
+
+    def rows(day: datetime, version: int) -> list[EfficiencyRow]:
+        return [
+            EfficiencyRow(
+                day=day,
+                string_name=name,
+                expected_kwh=10.0,
+                actual_kwh=9.0,
+                curtailed_kwh=0.0,
+                unexplained_kwh=1.0,
+                modelled_hours=8,
+                partial=False,
+                pr=0.9,
+                config_version=version,
+            )
+            for name in ("East", "")
+        ]
+
+    # day1 at version 1; day2 has only a string row at version 1 — no total —
+    # plus a full tally at version 2. Only a complete day counts, and only at
+    # the version asked for.
+    store.write_efficiency_day(rows(day1, 1))
+    store.write_efficiency_day(rows(day2, 1)[:1])
+    store.write_efficiency_day(rows(day2, 2))
+
+    assert store.scored_days(1) == {int(day1.timestamp())}
+    assert store.scored_days(2) == {int(day2.timestamp())}
+    store.close()
+
+
+def test_efficiency_day_writes_overwrite_by_primary_key(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "eff2.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    v1 = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=30.0,
+            actual_kwh=25.0,
+            curtailed_kwh=0.0,
+            unexplained_kwh=5.0,
+            modelled_hours=8,
+            partial=False,
+            pr=0.83,
+            config_version=1,
+        )
+    ]
+    store.write_efficiency_day(v1)
+    v2 = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=31.0,
+            actual_kwh=25.0,
+            curtailed_kwh=0.0,
+            unexplained_kwh=6.0,
+            modelled_hours=8,
+            partial=False,
+            pr=0.81,
+            config_version=2,
+        )
+    ]
+    store.write_efficiency_day(v2)
+
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 1
+    assert got[0].expected_kwh == 31.0
+    assert got[0].config_version == 2
+
+
+def test_peak_reads_the_raw_maximum(tmp_path: Path) -> None:
+    # The forecast calibrates on the system's own observed peak — the raw tier,
+    # because a coarser tier's mean flattens exactly the peak this is for.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    for minute, watts in ((0, 9000.0), (1, 13000.0), (2, 11000.0)):
+        store.append(
+            Sample(
+                timestamp=datetime(2026, 8, 6, 12, minute, tzinfo=UTC),
+                readings={"pv_total_power_w": watts},
+            )
+        )
+    peak = store.peak(
+        "pv_total_power_w",
+        datetime(2026, 8, 1, tzinfo=UTC),
+        datetime(2026, 8, 7, tzinfo=UTC),
+    )
+    empty = store.peak(
+        "pv_total_power_w",
+        datetime(2020, 1, 1, tzinfo=UTC),
+        datetime(2020, 1, 2, tzinfo=UTC),
+    )
+    store.close()
+    assert peak == 13000.0
+    assert empty is None
+
+
+def test_an_efficiency_day_keeps_its_calendar_date_east_of_utc(tmp_path: Path) -> None:
+    """A day is the instant of local midnight, and must read back as that day.
+
+    Returned as UTC, local midnight in any zone east of Greenwich lands on the
+    previous calendar date, so every day would be labelled as the one before.
+    Sydney rather than Chicago on purpose: the reference installation is west
+    of UTC and cannot show this at all.
+    """
+    from zoneinfo import ZoneInfo
+
+    from arraysense.efficiency import EfficiencyRow
+
+    sydney = ZoneInfo("Australia/Sydney")
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=sydney)
+    store = SqliteStore(str(tmp_path / "tz.db"), device=TEST_DEVICE)
+    store.write_efficiency_day(
+        [
+            EfficiencyRow(
+                day=day,
+                string_name="",
+                expected_kwh=10.0,
+                actual_kwh=9.0,
+                curtailed_kwh=0.0,
+                unexplained_kwh=1.0,
+                modelled_hours=8,
+                partial=False,
+                pr=0.9,
+                config_version=1,
+            )
+        ]
+    )
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 1
+    assert got[0].day.date() == day.date(), "the day slipped to the one before"

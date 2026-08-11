@@ -518,3 +518,61 @@ def test_first_run_detect_refuses_a_url_serial_device(tmp_path: Path) -> None:
             json={"transport": "modbus_serial", "serial_device": "loop://?foo=bar"},
         )
         assert r.status_code == 422
+
+
+def test_the_weather_poller_starts_and_stops_with_the_service(tmp_path: Path) -> None:
+    """The weather poller lives and dies with the lifespan, exactly like the collector.
+
+    A service that stopped cleanly must leave no orphan task behind. With the
+    fake driver the collector won't dial anything, so entering the lifespan is
+    safe — and is the only way to exercise the weather poller's start and stop
+    through the same hook the production service uses.
+    """
+    from dataclasses import replace
+
+    from fastapi.testclient import TestClient
+
+    from arraysense.__main__ import build_app
+
+    config = _config(tmp_path)
+    config = replace(config, driver="fake")
+    app, store, _service = build_app(config)
+    try:
+        weather = app.state.weather
+        assert weather.running is False
+        with TestClient(app):
+            assert weather.running is True
+        assert weather.running is False
+    finally:
+        store.close()
+
+
+def test_the_production_store_accepts_a_weather_append(tmp_path: Path) -> None:
+    """build_app's store must take the poller's writes, not only the driver's.
+
+    The store is opened with a whitelist of writable metrics, and the driver's
+    declaration does not include the sky: opened for the driver alone, every
+    weather append raised KeyError — not a sqlite error, so it escaped the
+    poller's store guard and weather was silently never recorded in
+    production while every unit test (full-registry stores) stayed green.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from arraysense.models import Sample
+
+    config = replace(_config(tmp_path), driver="fake")
+    _app, store, _service = build_app(config)
+    try:
+        store.append(
+            Sample(
+                timestamp=datetime.now(UTC),
+                readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+            )
+        )
+        row = store.latest(["outside_temperature_c", "cloud_cover_pct"])
+        assert row is not None
+        assert row["outside_temperature_c"] == 37.4
+        assert row["cloud_cover_pct"] == 0.0
+    finally:
+        store.close()

@@ -105,9 +105,13 @@
       <span class="legend muted">grid, backup panel and the inverter itself</span>
     </div>
     <div id="acBands"></div>
-    <!-- Outside temperature and cloud cover belong beside the solar bands once
-         a weather source exists. Tracked as issue #5; the note that used to
-         stand here explaining their absence was longer than the absence. -->
+  </section>
+
+  <section class="p">
+    <div class="chead"><h2>Weather</h2>
+      <span class="legend muted">the sky over the site</span>
+    </div>
+    <div id="weatherBands"></div>
   </section>
 </main>
 
@@ -373,9 +377,12 @@ const BANDS = [
   // the whole house and the backup panel, and what is left is on the other
   // panel. Both terms come from the same read, so the subtraction is exact —
   // and absent the moment either term is, because a difference with a missing
-  // operand is a guess.
+  // operand is a guess. `needs` names the operands values() reads, so the
+  // fetch asks for them and the capability filter drops the band on a device
+  // that cannot produce one of them: no backup panel, no passthrough figure.
   { sec: 'ac', id: 'loadNon', source: 'load_power_w − eps_power_w',
     label: 'Load power, non-essential (grid passthrough)', kind: 'power', ink: '--load',
+    needs: ['load_power_w', 'eps_power_w'],
     values: (f) => minus(f.of('load_power_w'), f.of('eps_power_w')) },
   { sec: 'ac', id: 'gridP', metric: 'grid_power_w', label: 'Grid power',
     kind: 'power', ink: '--grid', signed: true,
@@ -388,6 +395,23 @@ const BANDS = [
     kind: 'freq', ink: '--grid' },
   { sec: 'ac', id: 'invTemp', metric: 'inverter_temperature_c', label: 'Inverter temperature',
     kind: 'temp', ink: '--load' },
+
+  // --- Weather (site metrics, not inverter registers) -----------------------
+  // These are written by the weather poller on its own clock, not by the
+  // inverter. site:true exempts them from the capability filter: no driver
+  // declares these, and a band whose presence is not a driver capability must
+  // not be filtered as one.
+  { sec: 'weather', id: 'outsideTemp', metric: 'outside_temperature_c',
+    label: 'Outside temperature', kind: 'temp', ink: '--batt', site: true,
+    // All temperature traces share one hue so the page does not invent a new
+    // colour for every thermometer; --batt is already used by bank and pack
+    // temperature bands and the weather section is not adjacent to either.
+  },
+  { sec: 'weather', id: 'cloudCover', metric: 'cloud_cover_pct',
+    label: 'Cloud cover', kind: 'percent', ink: '--pv', site: true,
+    // Cloud cover modulates PV output; sharing --pv with the solar bands ties
+    // cause to effect without introducing a hue nobody measured.
+  },
 ];
 
 const SECTIONS = [
@@ -395,16 +419,48 @@ const SECTIONS = [
   { key: 'battery', host: 'batteryBands' },
   { key: 'packs', host: 'packBands' },
   { key: 'ac', host: 'acBands' },
+  { key: 'weather', host: 'weatherBands' },
 ];
 
-// Every inverter metric the bands read, asked for in one request. Derived
-// bands name their inputs through values(), so the list is built from what is
-// plotted rather than kept beside it and allowed to drift.
-const WANTED = [
-  'load_power_w', 'eps_power_w',
-  ...BANDS.filter((b) => b.metric).map((b) => b.metric),
-];
-const METRICS = [...new Set(WANTED)].join(',');
+// The inverter metrics one band reads: its own, or the operands a computed
+// band names in `needs`. Both the fetch list and the capability filter below
+// are built from this, so a band cannot be drawn without its inputs being
+// asked for, nor a metric fetched for a band that is not drawn.
+//
+// Site bands carry `site: true` and bypass the capability filter (see
+// loadCaps): their presence is not a driver capability, so they must never be
+// dropped on the say-so of a device that has never heard of weather.
+const neededBy = (b) => b.needs || (b.metric ? [b.metric] : []);
+
+// The bands this device can fill, from /api/capabilities. A band is kept only
+// when every inverter metric it reads is one the device declares, which is
+// the single rule that drops the absent PV strings and anything else this
+// hardware does not produce: an empty chart reads as a fault, so a chart for
+// hardware that does not exist is not rendered at all. capHasMetric answers
+// yes where nothing has declared — no endpoint, a failed fetch, a bare source
+// — so unknown keeps every band, which is what this page always drew. The
+// spread and pack bands carry no inverter metric and pass untouched: they key
+// on serials, not on this list.
+let bands = BANDS;
+
+async function loadCaps() {
+  let device = null;
+  try {
+    const r = await fetch('/api/capabilities');
+    if (r.ok) device = ((await r.json()).devices || [])[0] || null;
+  } catch (err) { /* unknown: every band stays */ }
+  bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)));
+}
+
+// Every inverter metric the kept bands read, asked for in one request. Built
+// from what is plotted rather than kept beside it and allowed to drift.
+//
+// Site metrics (weather) are always present here because the caps filter never
+// drops site bands — they are exempt. The weather section hides when the
+// fetched window carries no data rather than the bands being removed, so the
+// metrics must still be fetched: without the fetch the page cannot tell that
+// data has appeared and the section would stay hidden forever.
+const metricsAsk = () => [...new Set(bands.flatMap(neededBy))].join(',');
 
 // What a pack band holds, in the order the columns are stacked into the data.
 // Both drawn traces are temperatures of the same battery from the same BMS, so
@@ -472,7 +528,7 @@ const unitOf = (b) => {
 };
 
 const sectionBands = (key) =>
-  (key === 'packs' ? packBands : BANDS.filter((b) => b.sec === key));
+  (key === 'packs' ? packBands : bands.filter((b) => b.sec === key));
 
 // Only the last band of a section carries time labels. Twenty-odd copies of
 // the same axis is twenty-odd rows of clutter, and the crosshair readout names
@@ -560,7 +616,7 @@ function drawInverter(body) {
   const f = frame(body.points || []);
   // The spread bands sit in this section but are not inverter registers; they
   // are painted from the module endpoint by drawSpreads.
-  for (const b of BANDS) if (!b.derived) paintBand(b, f.xs, [valuesFor(b, f)]);
+  for (const b of bands) if (!b.derived) paintBand(b, f.xs, [valuesFor(b, f)]);
 }
 
 // One spread series: the distance between the highest and lowest pack at each
@@ -600,7 +656,7 @@ function spreadOf(points, serials, metric, scale) {
 }
 
 function drawSpreads(points, serials) {
-  for (const b of BANDS) {
+  for (const b of bands) {
     if (!b.derived) continue;
     const s = spreadOf(points, serials, b.derived, b.scale);
     if (!s.xs.length) { chartMessage(b.id, 'needs two or more packs reporting'); continue; }
@@ -733,7 +789,7 @@ async function load() {
   const packWidth = moduleWidthFor(range.seconds);
   const problems = [];
   const [inv, packs] = await Promise.all([
-    get(`/api/history?${when}&metrics=${METRICS}&width=${width}`).catch(() => null),
+    get(`/api/history?${when}&metrics=${metricsAsk()}&width=${width}`).catch(() => null),
     get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
       .catch(() => null),
   ]);
@@ -753,6 +809,20 @@ async function load() {
   packResolution(packs);
   drawInverter(inv);
   drawPacks(packs);
+  // The data-in-window rule for site metrics: hide the weather section when the
+  // fetched window carries no non-null value for either site metric. An install
+  // that has never recorded weather must not show two permanently empty charts
+  // — an empty chart reads as a fault — and an install where the weather poller
+  // stopped a month ago degrades right when the owner scrolls to a window
+  // before it stopped. Only on a successful fetch: a failed poll must not tear
+  // the section down over a problem that usually lasts one request.
+  if (inv) {
+    const hasWeather = (inv.points || []).some(
+      (p) => numOrNull(p.outside_temperature_c) !== null
+          || numOrNull(p.cloud_cover_pct) !== null,
+    );
+    $('weatherBands').parentElement.hidden = !hasWeather;
+  }
   rangeChanged = false;
   refreshZoomState();
 }
@@ -787,14 +857,20 @@ async function pollInterval() {
   }
 }
 
-// Boot. Everything above is definitions; nothing runs until here.
+// Boot. Everything above is definitions; nothing runs until here. The
+// sections are built only after the capabilities answer, because they are
+// built from the filtered band list: built before it, a reduced device would
+// flash the reference machine's empty charts and then keep their husks.
 async function boot() {
   await syncDisplayDefaults();
   drawNav('graphs');
-  buildSections();
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
-  cadence = await pollInterval();
+  // Both answers shape the first request — the cadence decides the width and
+  // the capabilities decide the band list — and neither needs the other.
+  const [secs] = await Promise.all([pollInterval(), loadCaps()]);
+  cadence = secs;
+  buildSections();
   showRanges();
   await load();
   setInterval(load, REFRESH_MS);

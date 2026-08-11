@@ -47,6 +47,7 @@ import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from arraysense.metrics import lookup
 from arraysense.models import BatteryModuleSample, Sample
@@ -61,6 +62,9 @@ from arraysense.store.schema import (
     module_metric_columns,
     schema_ddl,
 )
+
+if TYPE_CHECKING:
+    from arraysense.efficiency import EfficiencyRow
 
 
 def _is_memory_path(path: str) -> bool:
@@ -566,7 +570,13 @@ class SqliteStore:
             for row in self._conn.execute(sql, params).fetchall()
         ]
 
-    def latest(self, metrics: Sequence[str], device: str | None = None) -> dict[str, object] | None:
+    def latest(
+        self,
+        metrics: Sequence[str],
+        device: str | None = None,
+        *,
+        include_gaps: bool = True,
+    ) -> dict[str, object] | None:
         """Return one inverter's most recent reading, or None if it has stored none.
 
         This is what a live view asks for on every refresh, so it rides the primary
@@ -581,12 +591,43 @@ class SqliteStore:
 
         The row it returns may be a recorded gap, carrying ``error`` and no readings;
         recency is not health.
+
+        A row that carries *none* of the requested metrics and no error is not a
+        reading of them and is skipped, because two writers share this tier: the
+        weather poller lands a row every fifteen minutes whose inverter columns
+        are all null, and returning it here blanked the live dashboard until the
+        next inverter poll — an absence drawn where data exists, the exact
+        mistake this project forbids. The mirror holds too: a request for the
+        weather metrics walks past the inverter rows to the last sky reading.
+        Gap rows still answer every request, because recency is not health and a
+        gap is information — unless the caller opts out with ``include_gaps=False``,
+        which asks for the newest actual reading of the named metrics and walks
+        past gaps. With no metrics named there is nothing to qualify a reading,
+        so ``include_gaps`` has no effect and the newest row of any kind answers.
         """
         names = self._check_inverter_names(metrics)
         columns = ["timestamp", *names, "error"]
         selected = ["timestamp", *(self._selected("inverter_raw", n) for n in names), "error"]
+        # Asked for no metrics, the question is "when did any row land" and the
+        # newest row of any kind is the answer — the row-based contract callers
+        # like the gap search rely on. Names are whitelist-checked above, so
+        # interpolating them into the predicate is safe.
+        carries = ""
+        if names:
+            # include_gaps=False asks for the newest actual reading of these
+            # metrics and nothing else. The default surfaces gap rows because
+            # for the dashboard recency is not health — but a reader of the
+            # site metrics (the sky readout) must not blank every time an
+            # inverter gap lands newer than the last weather tick, so it opts
+            # out and the walk continues past the gaps to the last real value.
+            witness = [f"{n} IS NOT NULL" for n in names]
+            if include_gaps:
+                witness.append("error IS NOT NULL")
+            terms = " OR ".join(witness)
+            carries = f"AND ({terms}) "
         row = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM inverter_raw WHERE device = ? "
+            f"{carries}"
             "ORDER BY timestamp DESC LIMIT 1",
             (self._device(device),),
         ).fetchone()
@@ -625,6 +666,211 @@ class SqliteStore:
         ).fetchall()
         columns = ["timestamp", "serial", *names]
         return [self._decode_row(columns, row, names, module=True) for row in rows]
+
+    def append_forecast(self, made_at: datetime, points: Sequence[tuple[datetime, float]]) -> None:
+        """Record one prediction of the day's production, keeping when it was made.
+
+        Append-only on (target_hour, made_at): a revision never overwrites the
+        plan it revises, because the page tracks the day against the dawn plan
+        while drawing the latest expectation ahead of now — two truths from one
+        table, and erasing the older would fake the tracking. A prediction is
+        not a measurement and never touches a metric column.
+        """
+        rows = [
+            (int(hour.timestamp()), int(made_at.timestamp()), round(watts))
+            for hour, watts in points
+        ]
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO forecast (target_hour, made_at, expected_w) "
+                "VALUES (?, ?, ?)",
+                rows,
+            )
+
+    def forecast_day(self, start: datetime, end: datetime) -> dict[str, list[dict[str, object]]]:
+        """The day's dawn plan and its latest revision, hour by hour.
+
+        ``first`` is the earliest prediction made on the day itself for each
+        hour — the plan the day is tracked against; a forecast made yesterday
+        does not count as the dawn plan. ``latest`` is the newest prediction
+        for each hour whenever it was made. Hours nobody predicted are absent,
+        not zero.
+        """
+        lo, hi = int(start.timestamp()), int(end.timestamp())
+
+        def curve(order: str, floor: int | None) -> list[dict[str, object]]:
+            made_filter = "AND made_at >= ?" if floor is not None else ""
+            params: tuple[int, ...] = (lo, hi, floor) if floor is not None else (lo, hi)
+            rows = self._conn.execute(
+                "SELECT target_hour, expected_w, made_at FROM forecast f "
+                f"WHERE target_hour >= ? AND target_hour < ? {made_filter} "
+                "AND made_at = (SELECT "
+                f"{order}(made_at) FROM forecast WHERE target_hour = f.target_hour"
+                + (" AND made_at >= ?" if floor is not None else "")
+                + ") ORDER BY target_hour",
+                params + ((floor,) if floor is not None else ()),
+            ).fetchall()
+            return [
+                {
+                    "hour": datetime.fromtimestamp(hour, tz=UTC),
+                    "expected_w": float(watts),
+                    "made_at": datetime.fromtimestamp(made, tz=UTC),
+                }
+                for hour, watts, made in rows
+            ]
+
+        return {"first": curve("MIN", lo), "latest": curve("MAX", None)}
+
+    def prune_forecast(self, before: datetime) -> int:
+        """Drop predictions for hours older than ``before``; returns rows removed.
+
+        Ninety days of revisions is enough to score the forecast against what
+        the day actually did; unbounded, a fifteen-minute refresh writes nine
+        hundred rows a day forever on a machine whose database already outgrew
+        one SD card.
+        """
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM forecast WHERE target_hour < ?", (int(before.timestamp()),)
+            )
+        return cur.rowcount
+
+    def peak(
+        self,
+        metric: str,
+        start: datetime,
+        end: datetime,
+        device: str | None = None,
+    ) -> float | None:
+        """The highest raw reading of one metric in a window, or None if nothing.
+
+        This is what calibrates the forecast: the system's own observed peak is
+        the honest measure of what the array can do, where a nameplate rating
+        would be an assumption. Reads the raw tier because a coarser tier's
+        mean flattens exactly the peak this is for.
+        """
+        (name,) = self._check_inverter_names([metric])
+        row = self._conn.execute(
+            f"SELECT MAX({name}) FROM inverter_raw "
+            "WHERE device = ? AND timestamp >= ? AND timestamp < ?",
+            (self._device(device), int(start.timestamp()), int(end.timestamp())),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return lookup(name).decode(row[0])
+
+    def write_efficiency_day(self, rows: Sequence[EfficiencyRow]) -> None:
+        """Store one day's expected and actual production, overwriting what exists.
+
+        Keyed on (day, string_name), so re-computing a day after a config change
+        replaces the stale rows rather than duplicating them. One row per string
+        plus a total row whose ``string_name`` is the empty string.
+        """
+        data = [
+            (
+                int(r.day.timestamp()),
+                r.string_name,
+                r.expected_kwh,
+                r.actual_kwh,
+                r.curtailed_kwh,
+                r.unexplained_kwh,
+                r.modelled_hours,
+                1 if r.partial else 0,
+                r.pr,
+                r.config_version,
+            )
+            for r in rows
+        ]
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO efficiency_day "
+                "(day, string_name, expected_kwh, actual_kwh, curtailed_kwh, "
+                "unexplained_kwh, modelled_hours, partial, pr, config_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                data,
+            )
+
+    def hourly_span(self, device: str | None = None) -> tuple[datetime, datetime] | None:
+        """The first and last hour this database holds, or None when it holds none.
+
+        The backfill needs to know how far back there is anything to score, and
+        asking the store rather than reaching for its connection is what keeps
+        the tier name and the device narrowing in the one file that owns them.
+        Both bounds come back as aware UTC instants, because every timestamp
+        that leaves this class does.
+        """
+        row = self._conn.execute(
+            "SELECT MIN(timestamp), MAX(timestamp) FROM inverter_hourly WHERE device = ?",
+            (self._device(device),),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return (
+            datetime.fromtimestamp(int(row[0]), tz=UTC),
+            datetime.fromtimestamp(int(row[1]), tz=UTC),
+        )
+
+    def scored_days(self, config_version: int) -> set[int]:
+        """Return the day epochs already carrying a TOTAL row at ``config_version``.
+
+        A day scored against the array as it is described now is a day the
+        backfill need not revisit. One carrying any other version was scored
+        against a description that has since changed and has to be scored again,
+        so it is deliberately absent from the set.
+
+        Narrowed to the total row because there is exactly one of those per day,
+        which makes the result a clean set of day keys; without the narrowing the
+        same day would arrive once per string. It is not a completeness check —
+        ``write_efficiency_day`` puts every string and the total down in one
+        transaction, so a day with string rows and no total is a state this
+        database cannot reach.
+
+        The caller only needs the keys — it asks which days are missing, never
+        what a stored day says — so the rows are not decoded into
+        ``EfficiencyRow``.
+        """
+        rows = self._conn.execute(
+            "SELECT DISTINCT day FROM efficiency_day WHERE string_name = '' AND config_version = ?",
+            (config_version,),
+        ).fetchall()
+        return {int(row[0]) for row in rows}
+
+    def read_efficiency_days(self, start: datetime, end: datetime) -> list[EfficiencyRow]:
+        """Return stored efficiency rows, oldest first.
+
+        The half-open range is asked in whatever zone ``start`` carries, and
+        each row's ``day`` comes back in that same zone. That is not a courtesy:
+        a day is stored as the instant of local midnight, and handing it back as
+        UTC moves the calendar date a day earlier everywhere east of Greenwich —
+        a Berlin or Sydney owner would see every day labelled as the one before.
+        The reference installation is west of UTC and would never have shown it.
+
+        Days with no stored row are absent from the result, not zeroed.
+        """
+        from arraysense.efficiency import EfficiencyRow
+
+        zone = start.tzinfo or UTC
+        rows = self._conn.execute(
+            "SELECT day, string_name, expected_kwh, actual_kwh, curtailed_kwh, "
+            "unexplained_kwh, modelled_hours, partial, pr, config_version "
+            "FROM efficiency_day WHERE day >= ? AND day < ? ORDER BY day, string_name",
+            (int(start.timestamp()), int(end.timestamp())),
+        ).fetchall()
+        return [
+            EfficiencyRow(
+                day=datetime.fromtimestamp(r[0], tz=zone),
+                string_name=r[1],
+                expected_kwh=r[2],
+                actual_kwh=r[3],
+                curtailed_kwh=r[4],
+                unexplained_kwh=r[5],
+                modelled_hours=r[6],
+                partial=bool(r[7]),
+                pr=r[8],
+                config_version=r[9],
+            )
+            for r in rows
+        ]
 
     def _check_inverter_names(self, metrics: Sequence[str]) -> list[str]:
         """Return ``metrics`` unchanged, raising if any is not an inverter metric.

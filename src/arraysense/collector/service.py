@@ -19,11 +19,15 @@ import contextlib
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from arraysense.collector.source import InverterSource
 from arraysense.drivers.base import SampleBuildError
+from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
 from arraysense.models import Sample
+from arraysense.panels import StringSpec, parse_strings
+from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
 from arraysense.store.rollup import (
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
@@ -66,6 +70,17 @@ HOURLY_REBUILD_WINDOW = 3 * 3600
 # cadence that would rebuild the same buckets three hundred times an hour for a
 # minute bucket that changes five times.
 ROLLUP_INTERVAL = 60.0
+
+# How many of the missed days each backfill pass scores, newest first. Replayed
+# over the reference installation's 671-day span, sixty a pass took thirteen
+# passes to converge and wrote 2,660 rows in all — a few hundred kilobytes,
+# which is the figure that matters. The reference installation keeps this
+# database on a USB SSD that has dropped off the bus once under sustained
+# writes and now runs behind a kernel quirk for it, so a backfill that wrote
+# its whole history in one burst would be spending exactly the budget that
+# incident set. Newest first, because the owner opens last month before they
+# open last year.
+EFFICIENCY_BACKFILL_DAYS = 60
 
 # How long the loop may produce neither a success nor a failure before it is
 # judged stuck rather than slow. Well above the maximum backoff, because a
@@ -343,6 +358,224 @@ class CollectorService:
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
 
+    def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int] | None:
+        """Return what scoring a day needs, or None when the installation is unconfigured.
+
+        An installation with no timezone or no array described cannot be told
+        what its sun should have delivered, and both are ordinary unconfigured
+        states rather than failures. Location is not checked here: ``compute_day``
+        asks for it itself and returns nothing without it, so a second check
+        would be a second place for the rule to live.
+
+        The summary pass and the backfill both stand down on the same answer,
+        which is why the guard sits in one place rather than two: a second copy
+        drifts, and a backfill scoring against a different timezone or array
+        than the summary would fill history with rows computed against a sky the
+        array was never under.
+        """
+        settings = SettingsStore(self._store)
+
+        zone_str = settings.get(SETTING_TIMEZONE)
+        if not isinstance(zone_str, str) or not zone_str:
+            return None
+        try:
+            tz = ZoneInfo(zone_str)
+        except (ZoneInfoNotFoundError, ValueError):
+            # Refused rather than guessed: a wrong zone silently shifts every
+            # day boundary, which mis-attributes a morning's generation.
+            logger.warning("efficiency pass: unknown timezone %r", zone_str)
+            return None
+
+        strings_text = settings.get(PANELS_STRINGS_KEY)
+        if not isinstance(strings_text, str) or not strings_text.strip():
+            return None
+        try:
+            strings = parse_strings(strings_text)
+        except ValueError as exc:
+            logger.warning("efficiency pass: array description unusable: %s", exc)
+            return None
+        if not strings:
+            return None
+
+        raw_version = settings.get(CONFIG_VERSION_KEY)
+        config_version = raw_version if isinstance(raw_version, int) else 0
+        return tz, strings, config_version
+
+    async def maintain_efficiency(self, now: datetime | None = None) -> None:
+        """Score yesterday and today once the hourly tier they read is current.
+
+        Runs after the rollup pass, because it reads the hourly tier that pass
+        rebuilds. An installation with no array described, no location, or no
+        timezone is skipped: those are ordinary unconfigured states rather than
+        failures, and an installation that has never been told where it is
+        cannot be told what its sun should have delivered.
+
+        Today is always rescored and yesterday only when its stored score
+        predates the current array description. A day still being written is
+        never final — scored once at breakfast it would hold three hours of
+        dawn until midnight, and then keep that figure forever as the day
+        rolled into history.
+        """
+        config = self._efficiency_config()
+        if config is None:
+            return
+        tz, strings, config_version = config
+        settings = SettingsStore(self._store)
+
+        local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
+        for days_back in (0, 1):
+            day_start = (local_now - timedelta(days=days_back)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            day_end = day_start + timedelta(days=1)
+
+            # Yesterday is settled, so a score already taken against this same
+            # array description stands. Today is not, and is always redone.
+            if days_back > 0:
+                try:
+                    scored = self._store.read_efficiency_days(day_start, day_end)
+                except sqlite3.Error as exc:
+                    # The loop above re-raises anything that escapes, which would
+                    # stop polling until someone restarted the service and leave a
+                    # hole in history nothing can backfill. A summary we cannot
+                    # read is a reason to recompute, never a reason to stop.
+                    logger.warning("could not read stored efficiency; recomputing: %s", exc)
+                    scored = []
+                if scored and all(r.config_version == config_version for r in scored):
+                    continue
+
+            try:
+                rows = compute_day(
+                    self._store, settings, day_start, day_end, strings, config_version
+                )
+            except (ValueError, KeyError, sqlite3.Error) as exc:
+                # Logged at warning, not debug: this runs unattended, and the
+                # failure that leaves no trace is the one nobody diagnoses.
+                # The weather feature lost a week to an append that raised into
+                # a swallowing loop while every test stayed green.
+                logger.warning("efficiency pass failed for %s: %s", day_start.date(), exc)
+                continue
+
+            if not rows:
+                continue
+            try:
+                self._store.write_efficiency_day(rows)
+            except sqlite3.Error as exc:
+                logger.warning("could not store efficiency for %s: %s", day_start.date(), exc)
+
+    async def backfill_efficiency(self, now: datetime | None = None) -> None:
+        """Score history the summary pass never reaches, a bounded slice at a time.
+
+        ``maintain_efficiency`` scores only today and yesterday, so a database
+        with years of hourly history holds an efficiency row for a handful of
+        days and ``/api/efficiency`` recomputes every older day on every
+        request — 195 ms a month on the reference Pi, once per page load.
+        This fills the gap on the same maintenance clock, newest first, at most
+        ``EFFICIENCY_BACKFILL_DAYS`` per pass.
+
+        The computing runs off the event loop: ``compute_day`` reads the hourly
+        tier, and sixty of them inline would hold the loop and stall every open
+        page — the whole of #30, measured at 1141 ms twice a minute before it
+        was fixed. The worker opens its own store view, because a connection
+        must be created, used and closed on one thread; the rows it returns are
+        written back on the loop through the primary connection, which is where
+        every other writer already goes and which keeps the single-writer
+        reasoning ``maintenance_connection``'s docstring sets out. A memory-
+        backed store runs inline instead, exactly as ``maintain_rollups`` does:
+        a second connection to ``:memory:`` is a different, empty database, so
+        a threaded pass would score nothing and report success.
+
+        There is no watermark recording how far the backfill has got. A day the
+        model cannot score — the collector was down, or the irradiance to judge
+        it by was never recorded — writes no row, so it stays in the pending set
+        and is re-attempted every pass. That is deliberate, and it is bounded by
+        how cheaply such a day fails: ``compute_hours`` finds nothing to model
+        and returns. Replayed over the reference installation's own history, the
+        backfill converged in thirteen passes and every pass after that cost
+        2 ms for the four unscorable days between them. A watermark would save
+        that and give up something worth more: a day scored the moment the owner
+        backfills archive weather over it, rather than never.
+
+        A failure is logged at warning and the pass returns: this is
+        housekeeping beside the poll, and the poll is the thing that cannot be
+        caught up on later. Rows the pass cannot score are logged individually,
+        exactly as ``maintain_efficiency`` does, so a bad day never aborts the
+        slice.
+        """
+        config = self._efficiency_config()
+        if config is None:
+            return
+        tz, strings, config_version = config
+
+        try:
+            span = self._store.hourly_span()
+        except sqlite3.Error as exc:
+            logger.warning("efficiency backfill: could not read hourly span: %s", exc)
+            return
+        if span is None:
+            return
+        first, last = span
+
+        today = (now or datetime.now(tz=UTC)).astimezone(tz).date()
+        days: list[datetime] = []
+        date = first.astimezone(tz).date()
+        last_date = last.astimezone(tz).date()
+        while date <= last_date:
+            # Today and yesterday belong to the summary pass: today is still
+            # being written and yesterday is rescored against the current array
+            # description for good reason, and the backfill stepping on either
+            # would freeze a half-day at breakfast until midnight.
+            if date not in (today, today - timedelta(days=1)):
+                days.append(datetime.combine(date, datetime.min.time(), tzinfo=tz))
+            date += timedelta(days=1)
+
+        try:
+            scored = self._store.scored_days(config_version)
+        except sqlite3.Error as exc:
+            logger.warning("efficiency backfill: could not read scored days: %s", exc)
+            return
+
+        pending = [d for d in days if int(d.timestamp()) not in scored]
+        # Newest first, because the owner looks at recent months before old
+        # ones, and the bound means a full 671-day span still converges in
+        # about twelve minutes of passes.
+        pending.sort(key=lambda d: d.timestamp(), reverse=True)
+        pending = pending[:EFFICIENCY_BACKFILL_DAYS]
+        if not pending:
+            return
+
+        def _compute_all() -> list[EfficiencyRow]:
+            rows: list[EfficiencyRow] = []
+            with self._store.read_view() as view:
+                settings = SettingsStore(view)
+                for day_start in pending:
+                    day_end = day_start + timedelta(days=1)
+                    try:
+                        rows.extend(
+                            compute_day(view, settings, day_start, day_end, strings, config_version)
+                        )
+                    except (ValueError, KeyError, sqlite3.Error) as exc:
+                        logger.warning(
+                            "efficiency backfill failed for %s: %s", day_start.date(), exc
+                        )
+            return rows
+
+        try:
+            if self._store.is_memory_backed:
+                computed = _compute_all()
+            else:
+                computed = await asyncio.to_thread(_compute_all)
+        except (ValueError, KeyError, sqlite3.Error) as exc:
+            logger.warning("efficiency backfill failed: %s", exc)
+            return
+
+        if not computed:
+            return
+        try:
+            self._store.write_efficiency_day(computed)
+        except sqlite3.Error as exc:
+            logger.warning("could not store backfilled efficiency: %s", exc)
+
     async def poll_once(self) -> Sample | None:
         """Read once and store the result, returning what was stored.
 
@@ -584,6 +817,8 @@ class CollectorService:
                 if now - last_rollup >= ROLLUP_INTERVAL:
                     last_rollup = now
                     await self.maintain_rollups()
+                    await self.maintain_efficiency()
+                    await self.backfill_efficiency()
                 await asyncio.sleep(self._wait_from(started))
         except asyncio.CancelledError:
             raise

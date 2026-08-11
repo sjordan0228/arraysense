@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from arraysense.settings import (
+    CONFIG_VERSION_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -469,6 +470,17 @@ def test_the_setup_connection_keys_are_registered_with_bounds() -> None:
     assert lookup_setting("connection.battery_source").choices == ("", "relayed", "none")
 
 
+def test_the_weather_interval_is_registered_with_bounds() -> None:
+    # The weather poller reads this every tick, so an install tunes cadence
+    # without a code change. 900 s is Open-Meteo's own refresh rate for
+    # current conditions; polling faster stores near-identical points.
+    spec = lookup_setting("collector.weather_interval")
+    assert spec.kind == "float"
+    assert spec.default == 900.0
+    assert (spec.lower, spec.upper) == (300.0, 86400.0)
+    assert spec.unit == "seconds"
+
+
 def test_a_serial_device_that_is_a_url_is_refused() -> None:
     # pyserial reads any device string with "://" as a URL and dispatches to a
     # handler that raises an undeclared exception at connect. The registry
@@ -479,3 +491,119 @@ def test_a_serial_device_that_is_a_url_is_refused() -> None:
         spec.validate("loop://?foo=bar")
     # A real device path is still accepted.
     assert spec.validate("/dev/serial/by-id/usb-1a86") == "/dev/serial/by-id/usb-1a86"
+
+
+def test_the_panel_strings_setting_parses_at_the_door() -> None:
+    # One grammar, one parser: the registry refuses exactly what panels.py
+    # cannot read, so a stored config is always a readable one.
+    spec = lookup_setting("panels.strings")
+    assert spec.kind == "str"
+    assert spec.multiline is True
+    assert spec.default == ""
+    spec.validate("East | 1 | 9 | 410 | 25 | 90")
+    with pytest.raises(ValueError, match="tilt"):
+        spec.validate("East | 1 | 9 | 410 | 95 | 90")
+
+
+def test_the_battery_group_is_registered_with_the_measured_default() -> None:
+    rt = lookup_setting("battery.round_trip_pct")
+    assert rt.default == 91.4  # the owner's measured round trip, not a datasheet
+    assert lookup_setting("battery.chemistry").choices == ("lifepo4", "other")
+    heater = lookup_setting("battery.heater_w")
+    assert heater.default == 0.0
+    assert lookup_setting("battery.min_soc_pct").default == 10.0
+
+
+class TestEfficiencyConfigVersion:
+    """Describing the array differently invalidates what was scored under the old one."""
+
+    @staticmethod
+    def _version(settings: SettingsStore) -> int:
+        value = settings.get(CONFIG_VERSION_KEY)
+        assert isinstance(value, int)
+        return value
+
+    def test_changing_the_array_bumps_the_version(self, tmp_path: Path) -> None:
+        """Without this the invalidation is decorative.
+
+        Days carry the version they were scored under, and the summary pass
+        rescores a day whose version has moved on. If nothing ever moves it,
+        a day scored against ten panels keeps that score after the owner
+        describes twenty, and the record silently describes an array that no
+        longer exists.
+        """
+        store = SqliteStore(str(tmp_path / "v.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set("panels.strings", "East | 1 | 10 | 400 | 25 | 90")
+        after = self._version(settings)
+        store.close()
+        assert after > before
+
+    def test_a_battery_change_counts_as_an_array_change(self, tmp_path: Path) -> None:
+        store = SqliteStore(str(tmp_path / "b.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set("battery.installed", "2024-08")
+        after = self._version(settings)
+        store.close()
+        assert after > before
+
+    def test_an_unrelated_setting_leaves_it_alone(self, tmp_path: Path) -> None:
+        # Every bump costs a rescore of every stored day, so a setting that
+        # does not change what the array should produce must not trigger one.
+        # A contact address is the clearest case of that.
+        store = SqliteStore(str(tmp_path / "u.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set(SETTING_CONTACT_EMAIL, "someone@example.com")
+        after = self._version(settings)
+        store.close()
+        assert after == before
+
+    def test_moving_the_site_invalidates_what_was_scored_there(self, tmp_path: Path) -> None:
+        """Where the array is decides what its sun should have been.
+
+        Latitude and longitude place the sun in the sky; the zone decides where
+        one day stops and the next begins. A day scored before any of the three
+        was corrected was scored against a different sky than the array was
+        actually under, and must not be left standing as though it were current.
+        """
+        for key, value in (
+            (SETTING_LATITUDE, 45.0),
+            (SETTING_LONGITUDE, -93.0),
+            (SETTING_TIMEZONE, "America/Denver"),
+        ):
+            store = SqliteStore(str(tmp_path / f"{key}.db"), device=TEST_DEVICE)
+            settings = SettingsStore(store)
+            before = self._version(settings)
+            settings.set(key, value)
+            after = self._version(settings)
+            store.close()
+            assert after > before, f"{key} left the efficiency version untouched"
+
+    def test_a_batch_write_bumps_once_not_per_key(self, tmp_path: Path) -> None:
+        store = SqliteStore(str(tmp_path / "m.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set_many(
+            {"panels.strings": "East | 1 | 10 | 400 | 25 | 90", "battery.installed": "2024-08"}
+        )
+        after = self._version(settings)
+        store.close()
+        assert after == before + 1
+
+
+def test_the_array_help_names_every_key_the_parser_accepts() -> None:
+    """A help text that drifts from the grammar is a config nobody can write.
+
+    The page renders this string verbatim, so a key missing from it is a key
+    the owner has no way to discover -- and one listed but unparsed is worse.
+    Checked against the parser rather than a copy of the list, so adding a key
+    to panels.py and forgetting the help turns this red.
+    """
+    from arraysense.panels import KNOWN_STRING_KEYS
+
+    help_text = lookup_setting("panels.strings").help
+    missing = sorted(k for k in KNOWN_STRING_KEYS if k not in help_text)
+    assert not missing, f"the array help never mentions {missing}"

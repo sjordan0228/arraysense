@@ -14,6 +14,8 @@ import pytest
 
 from arraysense.metrics import BATTERY_MODULE_METRICS, INVERTER_METRICS
 from arraysense.store.schema import (
+    EFFICIENCY_TABLE,
+    FORECAST_TABLE,
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
     MODULE_TIERS,
@@ -145,6 +147,8 @@ def test_executing_ddl_creates_expected_tables() -> None:
             "serials",
             "invalid_readings",
             SETTINGS_TABLE,
+            FORECAST_TABLE,
+            EFFICIENCY_TABLE,
         }
     )
     assert tables == expected

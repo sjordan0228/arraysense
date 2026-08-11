@@ -17,8 +17,8 @@ You need one of the following connections to the inverter:
 
 | Connection | Status | Notes |
 | --- | --- | --- |
-| WiFi dongle, TCP port 8000 | Primary target | Requires the dongle serial and inverter serial |
-| Wired RS485 | Planned | Dongle port pins 14 (B) and 15 (A) |
+| WiFi dongle, TCP port 8000 | Supported | Requires the dongle serial and inverter serial |
+| Wired RS485 | Supported | A USB-to-RS485 adapter to the 485A/485B terminals; set `transport = "modbus_serial"` |
 
 Newer dongle firmware removes port 8000, and Ethernet dongles never had it. If your
 dongle has been updated recently, the WiFi path may not be available to you.
@@ -123,9 +123,34 @@ shutdown. A process killed before it finishes leaves the dongle occupied until i
 times the connection out by itself, which blocks both the next start and the vendor's
 app.
 
+It runs a serial installation out of the box as well as a dongle one. A serial
+adapter lives in `/dev` and is owned by the `dialout` group (that name on the
+Debian-family systems this targets; a few distributions call it `uucp`), so the
+unit sets `PrivateDevices=false` to leave the device node visible and gives the
+service user `dialout` membership to open it — without either, every serial poll fails
+with `could not open port ... No such file or directory` while the adapter
+plainly exists, an error that points nowhere near the sandbox. A dongle-only
+installation uses neither and may set `PrivateDevices=true` back with a drop-in.
+
 On a Raspberry Pi, point `database_path` at a USB SSD rather than the SD card.
 Continuous writes wear cards out, and at the default poll interval this writes about
 9 MB a day.
+
+One catch, because it does not announce itself: the shipped unit's
+`ProtectSystem=strict` makes the whole filesystem read-only except the
+`StateDirectory` (`/var/lib/arraysense`), so a database *outside* it fails every
+write with `attempt to write a readonly database` — the SSD is visible but
+read-only to the service. Either mount the SSD at `/var/lib/arraysense` so the
+database stays inside the writable directory, or add a drop-in carving the SSD
+path back out:
+
+```
+# /etc/systemd/system/arraysense.service.d/ssd.conf
+[Service]
+ReadWritePaths=/mnt/ssd/arraysense
+```
+
+The rest of the sandbox is unaffected either way.
 
 ### Serving on port 80
 
@@ -175,6 +200,11 @@ reach it.
 The pages are read from disk on every request, so **changing HTML, CSS or
 JavaScript needs no restart at all** — copy the files into place and reload the
 browser. Only a change to the Python requires restarting the service.
+
+When a release adds or changes a dependency — as `pyserial` did in 0.6.9 for
+serial installations — copying `src/` is not enough. The deploy must also copy
+`pyproject.toml` and `uv.lock` and run `uv sync`, or the new package is missing
+at runtime and the service fails to start.
 
 That distinction is worth respecting, because a restart is not free. The dongle
 takes time to start serving a new client after the previous one drops, measured

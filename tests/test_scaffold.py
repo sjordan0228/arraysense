@@ -114,9 +114,17 @@ def test_the_power_flow_chart_fills_only_the_grid_series() -> None:
     # house runs on the grid, import equals house load to the watt, so a grid
     # *line* lies exactly under the home line and vanishes beneath it. Solar has
     # no such coincidence, so as a line it stays legible.
+    # Scoped to the power-flow chart's own builder rather than the whole page:
+    # the rule protects the tariff shading drawn behind THIS chart, and the
+    # forecast chart fills its actual series legitimately — nothing is shaded
+    # beneath it, and its solid-against-hatch mass is the owner's chosen way to
+    # tell a measurement from a prediction.
     page = _web("index.html")
-    assert "gridFill" in page, "grid lost the fill that stops it vanishing under home"
-    assert "pvFill" not in page, "solar is still filled, so shading cannot be read beneath it"
+    start = page.index("function drawPower(")
+    end = page.index("function drawBatt", start)
+    flow = page[start:end]
+    assert "gridFill" in flow, "grid lost the fill that stops it vanishing under home"
+    assert "pvFill" not in flow, "solar is still filled, so shading cannot be read beneath it"
 
 
 def test_pv_fill_is_kept_available_even_though_unused() -> None:
@@ -230,3 +238,29 @@ def test_the_shortfall_mark_claims_no_unplaced_amount() -> None:
         "the mark claims unplaced energy exists; a named band need not have any"
     )
     assert "was not measured" in page, "the mark no longer says why the figure is qualified"
+
+
+def test_pvlib_is_a_development_dependency_only() -> None:
+    # The physics ships as our own arithmetic; pvlib is the referee that keeps
+    # it honest in tests. If it ever reached the runtime list the collector
+    # would inherit numpy and pandas on a Raspberry Pi that has no use for
+    # them, which is the trade the transcription exists to avoid.
+    import tomllib
+
+    config = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    runtime = " ".join(config["project"]["dependencies"])
+    assert "pvlib" not in runtime
+    assert "numpy" not in runtime and "pandas" not in runtime
+    assert "pvlib" in " ".join(config["dependency-groups"]["dev"])
+
+
+def test_no_shipped_module_imports_pvlib() -> None:
+    # The dependency list is only half the guarantee: an import in src/ would
+    # break the collector at runtime however the manifest reads. Imports, not
+    # mentions — solar.py's docstring names pvlib to say what holds it honest,
+    # and a check that could not tell prose from an import would forbid the
+    # explanation along with the dependency.
+    importing = re.compile(r"^\s*(?:import\s+pvlib|from\s+pvlib\b)", re.MULTILINE)
+    source = Path(__file__).resolve().parents[1] / "src"
+    offenders = sorted(p.name for p in source.rglob("*.py") if importing.search(p.read_text()))
+    assert offenders == [], f"pvlib reached the shipped code: {offenders}"

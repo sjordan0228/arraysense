@@ -1,6 +1,6 @@
 [project]
 name = "arraysense"
-version = "0.6.14"
+version = "0.7.0"
 description = "Open-source solar and battery monitoring for EG4 and LuxPower inverters"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -18,6 +18,12 @@ arraysense = "arraysense.__main__:main"
 
 [dependency-groups]
 dev = [
+    # The referee for src/arraysense/solar.py. A development dependency on
+    # purpose: the physics ships as our own arithmetic, and this is what proves
+    # that arithmetic matches the library the industry trusts. It must never
+    # reach [project] dependencies — the collector would inherit numpy and
+    # pandas on a Raspberry Pi that has no use for them.
+    "pvlib>=0.11",
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",

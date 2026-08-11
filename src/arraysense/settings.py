@@ -26,11 +26,12 @@ import logging
 import math
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
+from arraysense.panels import EXAMPLE_STRINGS, parse_strings
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
 if TYPE_CHECKING:
@@ -44,6 +45,8 @@ Kind = Literal["str", "int", "float", "bool", "choice"]
 # call site, for the same reason the tariff keys are named in tariff.py: a key
 # typed by hand in one place and mistyped in another reads as an unset setting
 # rather than as an error.
+CONFIG_VERSION_KEY = "efficiency.config_version"
+PANELS_STRINGS_KEY = "panels.strings"
 SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
@@ -387,6 +390,21 @@ SETTINGS: tuple[SettingSpec, ...] = (
         # the box is the same sentence twice.
         help="",
     ),
+    SettingSpec(
+        key="collector.weather_interval",
+        kind="float",
+        default=900.0,
+        lower=300.0,
+        upper=86400.0,
+        unit="seconds",
+        label="Weather interval",
+        help=(
+            "Seconds between weather fetches. Open-Meteo refreshes its current "
+            "conditions about every fifteen minutes, so asking faster stores "
+            "near-identical points. Weather is fetched only while a location "
+            "is set under This installation."
+        ),
+    ),
     # --- Tariff -------------------------------------------------------------
     # What the owner pays. Nothing here has a default that prices anything: an
     # install that has entered no tariff shows energy and no money at all,
@@ -589,6 +607,160 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "no communicating battery. Empty derives it from the driver."
         ),
     ),
+    # --- Solar panels --------------------------------------------------------
+    # The array, one line per string, in the grammar panels.py owns. Stored as
+    # text for the same reason the tariff is: a repeating structure in a flat
+    # registry, composed by the page and parsed only in Python. Empty means no
+    # array configured, which is a state and not an error.
+    SettingSpec(
+        key="panels.strings",
+        kind="str",
+        default="",
+        multiline=True,
+        max_length=4000,
+        label="Array strings",
+        help=(
+            "One line per string: name | MPPT | panels | watts each | tilt° | "
+            "azimuth° — then optional key=value pairs (temp_coeff, noct, "
+            "mounting, bifacial, installed, degradation, vmp, voc, wire_awg, "
+            "wire_run_ft, note). "
+            "For example: " + EXAMPLE_STRINGS.replace("\n", "  •  ")
+        ),
+        check=parse_strings,
+    ),
+    # --- Battery bank --------------------------------------------------------
+    # Static specs the efficiency accounting reads; live BMS values win
+    # wherever they exist. Everything optional with a named default, because
+    # every value has a sane fallback and a wall of required fields would be
+    # the setup burden the panels grammar just avoided.
+    SettingSpec(
+        key="battery.chemistry",
+        kind="str",
+        default="lifepo4",
+        choices=("lifepo4", "other"),
+        label="Battery chemistry",
+        help="LiFePO4 is every current EG4 pack; 'other' only changes labels today.",
+    ),
+    SettingSpec(
+        key="battery.count",
+        kind="int",
+        default=0,
+        lower=0,
+        upper=64,
+        label="Batteries in the bank",
+        help="0 means unstated — bank arithmetic then stays off rather than guessing.",
+    ),
+    SettingSpec(
+        key="battery.capacity_kwh_each",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=100.0,
+        unit="kWh",
+        label="Capacity per battery",
+        help="Nameplate, not derived from live voltage — that figure drifts 7% over a cycle.",
+    ),
+    SettingSpec(
+        key="battery.round_trip_pct",
+        kind="float",
+        default=91.4,
+        lower=50.0,
+        upper=100.0,
+        unit="%",
+        label="Round-trip efficiency",
+        help="Defaults to the reference installation's measured figure, not a datasheet.",
+    ),
+    SettingSpec(
+        key="battery.min_soc_pct",
+        kind="float",
+        default=10.0,
+        lower=0.0,
+        upper=90.0,
+        unit="%",
+        label="Minimum state of charge",
+        help="The floor the inverter is configured to hold; usable capacity ends here.",
+    ),
+    SettingSpec(
+        key="battery.max_charge_a",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="A",
+        label="Max charge current",
+        help="0 means unstated. Context for charge-limit detection, not a command.",
+    ),
+    SettingSpec(
+        key="battery.max_discharge_a",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="A",
+        label="Max discharge current",
+        help="0 means unstated.",
+    ),
+    SettingSpec(
+        key="battery.heater_w",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=2000.0,
+        unit="W",
+        label="Heater draw",
+        help="Per battery, while heating. 0 for packs without heaters.",
+    ),
+    SettingSpec(
+        key="battery.heater_on_c",
+        kind="float",
+        default=5.0,
+        lower=-30.0,
+        upper=20.0,
+        unit="°C",
+        label="Heater on below",
+        help="",
+    ),
+    SettingSpec(
+        key="battery.heater_off_c",
+        kind="float",
+        default=10.0,
+        lower=-20.0,
+        upper=30.0,
+        unit="°C",
+        label="Heater off above",
+        help="",
+    ),
+    SettingSpec(
+        key="battery.idle_draw_w",
+        kind="float",
+        default=0.0,
+        lower=0.0,
+        upper=500.0,
+        unit="W",
+        label="BMS idle draw",
+        help="Per battery. 0 means unstated.",
+    ),
+    SettingSpec(
+        key="efficiency.config_version",
+        kind="int",
+        default=0,
+        lower=0,
+        upper=2147483647,
+        label="Efficiency config version",
+        help=(
+            "Bumped automatically when the array or battery config changes, so "
+            "stored efficiency days are recomputed against the new settings. "
+            "Leave it alone — it is not a setting to choose."
+        ),
+    ),
+    SettingSpec(
+        key="battery.installed",
+        kind="str",
+        default="",
+        max_length=7,
+        label="Bank installed (YYYY-MM)",
+        help="For future capacity-fade context; empty is fine.",
+    ),
 )
 
 _BY_KEY: dict[str, SettingSpec] = {spec.key: spec for spec in SETTINGS}
@@ -651,6 +823,51 @@ class SettingsStore:
             logger.warning("setting %s holds undecodable %r; using the default", key, row[0])
             return spec.default
 
+    # A change to either of these changes what the array is expected to produce,
+    # which makes every efficiency day scored under the old description stale.
+    # The version is what marks them so: the summary pass rescores a day whose
+    # stored version is not the current one. Bumping is the writer's job because
+    # only the writer knows a change happened — a reader comparing settings to
+    # scored days would have to keep a copy of the settings to compare against,
+    # which is the same problem again one level down.
+    _VERSIONED_PREFIXES = ("panels.", "battery.")
+    # Not a prefix: "site." also holds a contact address and other things that
+    # change nothing about the sun. These three do. Latitude and longitude place
+    # the sun in the sky, and the zone decides where one day stops and the next
+    # begins -- a day scored before a correction to any of them was scored
+    # against a different sky than the one the array was under.
+    _VERSIONED_KEYS = (SETTING_LATITUDE, SETTING_LONGITUDE, SETTING_TIMEZONE)
+
+    def _bump_config_version(self, keys: Iterable[str]) -> None:
+        """Advance the efficiency config version if any of ``keys`` describes the array.
+
+        Called inside the caller's transaction, so a write that fails validation
+        leaves the version alone and days scored under it stay valid.
+        """
+        touched = list(keys)
+        if not any(
+            k.startswith(self._VERSIONED_PREFIXES) or k in self._VERSIONED_KEYS for k in touched
+        ):
+            return
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)
+        ).fetchone()
+        try:
+            current = int(row[0]) if row and row[0] else 0
+        except ValueError:
+            # A version we cannot read is one we cannot trust to be older than
+            # what comes next; starting again from zero would make every stored
+            # day agree with it and freeze exactly the staleness it exists to
+            # catch, so step somewhere no stored row can already be sitting.
+            logger.warning("efficiency config version unreadable; restarting it")
+            current = 0
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (CONFIG_VERSION_KEY, str(current + 1)),
+        )
+        logger.info("array configuration changed; efficiency version now %d", current + 1)
+
     def set_many(self, values: dict[str, object]) -> None:
         """Validate every value, then store all of them in one transaction.
 
@@ -676,6 +893,7 @@ class SettingsStore:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, stored),
                 )
+            self._bump_config_version(k for k, _ in checked)
 
     def set(self, key: str, value: object) -> None:
         """Validate ``value`` against its spec and store it.
@@ -700,6 +918,7 @@ class SettingsStore:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, stored),
             )
+            self._bump_config_version((key,))
         logger.info("setting %s changed", key)
 
     def clear(self, key: str) -> None:
@@ -707,6 +926,7 @@ class SettingsStore:
         lookup_setting(key)
         with self._conn:
             self._conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+            self._bump_config_version((key,))
 
     def overrides(self) -> dict[str, object]:
         """Return only the settings someone has actually stored a value for.

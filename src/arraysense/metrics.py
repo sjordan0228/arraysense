@@ -295,6 +295,22 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     MetricSpec("grid_export_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("ac_charge_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
     MetricSpec("inverter_energy_total_kwh", "kWh", 10, 0.0, 1000000.0, "max"),
+    # --- Weather -------------------------------------------------------------
+    # Site readings, not inverter registers: written by the weather poller on
+    # its own clock. They live in this registry so schema, storage, rollup and
+    # the API treat them like any reading — issue #5. SITE_METRICS below is the
+    # classification: everything that asks "did the inverter report" must
+    # exclude these, or a fresh sky reading masks a quiet inverter.
+    MetricSpec("outside_temperature_c", "\N{DEGREE SIGN}C", 10, -60.0, 60.0),
+    MetricSpec("cloud_cover_pct", "%", 1, 0.0, 100.0),
+    # The irradiance components and wind the efficiency model needs: what the
+    # sky delivered, and how fast the air was moving over the panels. Wind is
+    # stored in m/s because that is what the cell-temperature model wants; the
+    # conversion happens once, where the reply is read.
+    MetricSpec("ghi_wm2", "W/m\N{SUPERSCRIPT TWO}", 1, 0.0, 1500.0),
+    MetricSpec("dni_wm2", "W/m\N{SUPERSCRIPT TWO}", 1, 0.0, 1200.0),
+    MetricSpec("dhi_wm2", "W/m\N{SUPERSCRIPT TWO}", 1, 0.0, 800.0),
+    MetricSpec("wind_speed_ms", "m/s", 10, 0.0, 60.0),
     # --- Status and diagnostics ---------------------------------------------
     # Bitfields, not measurements. They aggregate with max rather than mean
     # because the average of two bitfields is not a bitfield, and because a
@@ -315,6 +331,23 @@ INVERTER_METRICS: tuple[MetricSpec, ...] = (
     # a restart is distinguishable from a gap in collection: our own downtime
     # leaves this climbing across the hole, the inverter's resets it.
     MetricSpec("inverter_run_time_s", "s", 1, 0.0, 4294967295.0, "max"),
+)
+
+# The metrics above that are the site's, not the inverter's. Two writers share
+# the raw tier, and every question of the form "did the inverter report" — the
+# staleness verdict most of all — must exclude these, or a sky reading landing
+# every fifteen minutes reads as the inverter answering while it is dark. The
+# registry owns this classification because it owns what each metric is; the
+# weather client's own export is tested equal to it, so the two cannot drift.
+SITE_METRICS: frozenset[str] = frozenset(
+    {
+        "outside_temperature_c",
+        "cloud_cover_pct",
+        "ghi_wm2",
+        "dni_wm2",
+        "dhi_wm2",
+        "wind_speed_ms",
+    }
 )
 
 # This is a ceiling, not a per-device fact: Capabilities.battery_module_slots

@@ -1916,6 +1916,17 @@ def test_capabilities_names_what_the_device_produces(client: Any) -> None:
     assert "status_code" not in device["battery_module_metrics"]
 
 
+def test_capabilities_reports_the_transport(client: Any) -> None:
+    # The dashboard labels its connection controls from this field — with it
+    # missing the page hard-coded "Dongle", which was wrong on the RS485
+    # installation the reference system now runs (#72). The value is the
+    # source's own declaration: the fake declares no override, so this is the
+    # Capabilities default. A built EG4 source substitutes its configured
+    # transport, which test_eg4_luxpower_source covers.
+    device = client.get("/api/capabilities").json()["devices"][0]
+    assert device["transport"] == "dongle"
+
+
 def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> None:
     # The collector only requires an InverterSource, which names its device but
     # carries no identity and no declaration. Absent capability is not absent
@@ -1956,6 +1967,7 @@ def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> 
     assert device["pv_strings"] is None
     assert device["energy"] is None
     assert device["per_module_battery"] is None
+    assert device["transport"] is None
     assert device["metrics"] is None
     assert device["battery_module_metrics"] is None
 
@@ -2234,6 +2246,7 @@ def test_tier_scanning_endpoints_are_not_coroutines() -> None:
         routes.battery_history,
         routes.energy,
         routes.bands,
+        routes.forecast,
     ):
         assert not asyncio.iscoroutinefunction(handler), (
             f"{handler.__name__} is async again: its synchronous queries would "
@@ -2746,3 +2759,1002 @@ def test_apply_rejects_control_text_in_a_serial_as_422(client: Any, monkeypatch:
         headers={"content-type": "application/json"},
     )
     assert r.status_code == 422
+
+
+def test_a_fresh_weather_row_does_not_mask_a_quiet_inverter(empty_client: Any) -> None:
+    # The weather poller writes every fifteen minutes whatever the inverter is
+    # doing. If those rows aged the dashboard, the stale banner would stay
+    # quiet through a real outage — the sky is not the inverter answering.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=40), readings={"pv_total_power_w": 1000.0})
+    )
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(minutes=1), readings={"outside_temperature_c": 37.4})
+    )
+    service = empty_client.app.state.service
+    service.status.running = True
+    service.status.started_at = now
+    service.status.last_success = None
+
+    body = _staleness(empty_client)
+    assert body["stale"] is True, "a sky reading must not count as the inverter reporting"
+    assert body["reading_at"] == (now - timedelta(minutes=40)).replace(microsecond=0).isoformat()
+
+
+def test_live_survives_a_weather_row_landing_between_polls(empty_client: Any) -> None:
+    # The caller-level proof, not just the store mechanism: /api/live asks with
+    # _LIVE_INVERTER, and if that list carried the site metrics a weather row
+    # would match on its own two columns and hand the dashboard a row of nulls
+    # for the seconds between a weather tick and the next poll. The store test
+    # proves latest() skips foreign rows for the metrics it is asked; this
+    # proves the live endpoint asks for the right ones.
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now - timedelta(seconds=30), readings={"pv_total_power_w": 5000.0})
+    )
+    empty_client.app.state.store.append(
+        Sample(timestamp=now, readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 13.0})
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0, (
+        "a weather row must not blank the live view"
+    )
+
+
+# --- the sky block in /api/live ------------------------------------------------
+
+
+def test_live_sky_returns_weather_when_stored(empty_client: Any) -> None:
+    """A weather row stored -> sky carries the values, inverter unaffected."""
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(
+        Sample(timestamp=now - timedelta(minutes=1), readings={"pv_total_power_w": 5000.0})
+    )
+    store.append(
+        Sample(
+            timestamp=now,
+            readings={"outside_temperature_c": 22.5, "cloud_cover_pct": 65.0},
+        )
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0
+    assert body["sky"] is not None
+    assert body["sky"]["outside_temperature_c"] == 22.5
+    assert body["sky"]["cloud_cover_pct"] == 65.0
+    assert "timestamp" in body["sky"]
+
+
+def test_live_sky_is_none_with_no_weather(empty_client: Any) -> None:
+    """No weather ever stored -> sky is None."""
+    now = datetime.now(tz=UTC)
+    empty_client.app.state.store.append(
+        Sample(timestamp=now, readings={"pv_total_power_w": 5000.0})
+    )
+    body = empty_client.get("/api/live").json()
+    assert body["inverter"]["pv_total_power_w"] == 5000.0
+    assert body["sky"] is None
+
+
+def test_live_sky_survives_a_newer_gap(empty_client: Any) -> None:
+    """Weather row followed by a newer gap -> sky still carries the weather values.
+
+    include_gaps=False makes the store walk past the gap row to the last real
+    reading, so an inverter gap that lands newer than the last weather tick
+    does not blank the sky.
+    """
+    now = datetime.now(tz=UTC)
+    store = empty_client.app.state.store
+    store.append(
+        Sample(
+            timestamp=now - timedelta(minutes=30),
+            readings={"outside_temperature_c": 18.2, "cloud_cover_pct": 90.0},
+        )
+    )
+    store.append(Sample.failed(now - timedelta(seconds=5), "TimeoutError: read timed out"))
+    body = empty_client.get("/api/live").json()
+    assert body["sky"] is not None
+    assert body["sky"]["outside_temperature_c"] == 18.2
+    assert body["sky"]["cloud_cover_pct"] == 90.0
+
+
+# --- forecast -------------------------------------------------------------------
+
+
+def test_forecast_empty_table_returns_configured_false(empty_client: Any) -> None:
+    """With no forecast rows the page shows nothing — not zeros, not a guessed curve."""
+    body = empty_client.get("/api/forecast").json()
+    assert body["configured"] is False
+    assert body["dawn"] == []
+    assert body["latest"] == []
+    assert body["actual"] == []
+    assert body["expected_today_kwh"] is None
+    assert body["actual_so_far_kwh"] is None
+    assert body["tracking_pct"] is None
+    assert "start" in body["day"]
+    assert "now" in body
+
+
+def test_forecast_delivers_curves_and_tracking_for_matched_hours(tmp_path: Path) -> None:
+    """Dawn + revision staged for three hours, actuals for two — tracking covers only
+    the hours that carry both a dawn expectation and a measurement.
+
+    Staged in the real current UTC day and asked for with tz=UTC, so the
+    endpoint's own "today" needs no pinning: datetime.now is immutable and the
+    day bounds are deterministic the moment the zone is UTC.
+    """
+    import sqlite3
+
+    day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    store = SqliteStore(str(tmp_path / "fc.db"), device=TEST_DEVICE)
+
+    # --- stage forecast: dawn plan at 00:05 local, revision at 06:00 local ---
+    made_dawn = day_start + timedelta(minutes=5)
+    made_rev = day_start + timedelta(hours=6)
+
+    h1 = day_start
+    h2 = day_start + timedelta(hours=1)
+    h3 = day_start + timedelta(hours=2)
+
+    store.append_forecast(made_dawn, [(h1, 100.0), (h2, 500.0), (h3, 800.0)])
+    store.append_forecast(made_rev, [(h1, 120.0), (h2, 550.0), (h3, 900.0)])
+
+    # --- stage actuals for the first two hours (h1 and h2) ---
+    store.append(Sample(timestamp=h1 + timedelta(minutes=30), readings={"pv_total_power_w": 150.0}))
+    store.append(Sample(timestamp=h2 + timedelta(minutes=10), readings={"pv_total_power_w": 550.0}))
+    store.append(Sample(timestamp=h2 + timedelta(minutes=40), readings={"pv_total_power_w": 650.0}))
+
+    # --- rebuild the hourly tier so the endpoint can read it ---
+    conn = sqlite3.connect(str(tmp_path / "fc.db"))
+    rebuild_inverter_hourly(
+        conn, int(day_start.timestamp()) - 3600, int((day_start + timedelta(days=1)).timestamp())
+    )
+    conn.commit()
+    conn.close()
+
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "fc.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        body = c.get("/api/forecast", params={"tz": "UTC"}).json()
+    store.close()
+
+    assert body["configured"] is True
+
+    # Dawn curve carries the early plan — the revision must not change it.
+    assert len(body["dawn"]) == 3
+    dawn_w = [e["expected_w"] for e in body["dawn"]]
+    assert dawn_w == [100.0, 500.0, 800.0]
+
+    # Latest curve carries the revision.
+    assert len(body["latest"]) == 3
+    latest_w = [e["expected_w"] for e in body["latest"]]
+    assert latest_w == [120.0, 550.0, 900.0]
+
+    # Only hours 1 and 2 have actual readings.
+    assert len(body["actual"]) == 2
+    actual_w = [e["mean_w"] for e in body["actual"]]
+    assert actual_w == [150.0, 600.0]  # hour 2 mean: (550+650)/2
+
+    # expected_today_kwh: sum latest / 1000
+    assert body["expected_today_kwh"] == pytest.approx(1.57, abs=0.01)
+
+    # actual_so_far_kwh: (150 + 600) / 1000
+    assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
+
+    # tracking_pct: only hours 1 and 2 (both have dawn and actual)
+    # dawn sum = 100 + 500 = 600, actual sum = 150 + 600 = 750
+    # (750/600 - 1) * 100 = 25.0%
+    assert body["tracking_pct"] == 25.0
+
+
+def test_forecast_tracking_null_when_no_dawn_covers_the_actual_hours(tmp_path: Path) -> None:
+    """Actual readings exist but no dawn plan covers the same hours — tracking
+    must be null, never a figure from mismatched hours. Staged in the real
+    current UTC day, asked with tz=UTC, no pinned clock."""
+    import sqlite3
+
+    day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    store = SqliteStore(str(tmp_path / "fc2.db"), device=TEST_DEVICE)
+
+    # Forecast only covers hours 4-5 (later in the day).
+    made_at = day_start + timedelta(minutes=5)
+    h4 = day_start + timedelta(hours=4)
+    h5 = day_start + timedelta(hours=5)
+    store.append_forecast(made_at, [(h4, 400.0), (h5, 500.0)])
+
+    # Actuals land in hours 1-2 (earlier, no forecast overlap).
+    h1 = day_start
+    h2 = day_start + timedelta(hours=1)
+    store.append(Sample(timestamp=h1 + timedelta(minutes=30), readings={"pv_total_power_w": 200.0}))
+    store.append(Sample(timestamp=h2 + timedelta(minutes=30), readings={"pv_total_power_w": 300.0}))
+
+    conn = sqlite3.connect(str(tmp_path / "fc2.db"))
+    rebuild_inverter_hourly(
+        conn, int(day_start.timestamp()) - 3600, int((day_start + timedelta(days=1)).timestamp())
+    )
+    conn.commit()
+    conn.close()
+
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "fc2.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        body = c.get("/api/forecast", params={"tz": "UTC"}).json()
+    store.close()
+
+    assert body["configured"] is True
+    assert len(body["actual"]) == 2
+    assert len(body["dawn"]) == 2
+    # The hours carry no overlap: tracking must be absent.
+    assert body["tracking_pct"] is None
+    # actual_so_far counts all actuals regardless of forecast coverage.
+    assert body["actual_so_far_kwh"] is not None
+    assert body["actual_so_far_kwh"] > 0
+
+
+# --- /api/panels: the parsed array, bank, and MPPT guard -----------------------
+
+
+def test_panels_serves_the_parsed_array_with_defaults_named(client: Any, monkeypatch: Any) -> None:
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put(
+        "/api/settings",
+        json={"panels.strings": "East | 1 | 9 | 410 | 25 | 90 | bifacial=9"},
+    )
+    assert r.status_code == 200
+    body = client.get("/api/panels").json()
+    (s,) = body["strings"]
+    assert s["name"] == "East"
+    assert s["watts"] == 410.0
+    assert s["bifacial_pct"] == 9.0
+    assert "temp_coeff" in s["defaulted"] and "bifacial" not in s["defaulted"]
+    assert body["battery"]["round_trip_pct"] == 91.4
+    assert body["declared_mppts"] == 3  # the fake declares pv_strings=3
+
+
+def test_an_unconfigured_array_serves_empty_not_error(client: Any) -> None:
+    body = client.get("/api/panels").json()
+    assert body["strings"] == []
+
+
+def test_a_string_on_an_undeclared_mppt_is_refused_at_the_write(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The parser cannot know the driver (no context in check=), so the write
+    # path enforces it where drivers are already in scope — the same layering
+    # as _reject_unbootable_connection. The fake declares three strings.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put(
+        "/api/settings",
+        json={"panels.strings": "Ghost | 7 | 9 | 410 | 25 | 90"},
+    )
+    assert r.status_code == 400
+    assert "mppt" in r.json()["detail"].lower()
+    values = client.get("/api/settings").json()["values"]
+    assert values["panels.strings"] == "", "a refused write must store nothing"
+
+
+# --- efficiency backfill -------------------------------------------------------
+
+
+def test_backfill_writes_archive_hours_and_reports_progress(client: Any, monkeypatch: Any) -> None:
+    # An owner-triggered range, never an implicit one: nobody's page load
+    # should fire three hundred archive requests.
+    from arraysense.api import routes
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        return [
+            Sample(
+                timestamp=datetime(2026, 8, 1, 12, tzinfo=UTC),
+                readings={"ghi_wm2": 900.0, "wind_speed_ms": 2.0},
+            )
+        ]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["days"] == 1
+    assert body["hours_written"] == 1
+    assert body["last_day"] == "2026-08-01"
+
+
+def test_backfill_without_a_location_is_a_named_refusal(client: Any) -> None:
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 400
+    assert "location" in r.json()["detail"].lower()
+
+
+def test_backfill_refuses_a_backwards_or_huge_range(client: Any, monkeypatch: Any) -> None:
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    back = client.post(
+        "/api/efficiency/backfill", json={"start": "2026-08-05", "end": "2026-08-01"}
+    )
+    assert back.status_code == 400
+    huge = client.post(
+        "/api/efficiency/backfill", json={"start": "2020-01-01", "end": "2026-08-01"}
+    )
+    assert huge.status_code == 400
+
+
+# --- efficiency endpoint -------------------------------------------------------
+
+
+def _efficiency_client(
+    tmp_path: Path,
+    build: Any,
+    *,
+    strings: str | None = "South | 1 | 20 | 400 | 25 | 180",
+) -> Any:
+    """A client with location, strings, stored samples, and a rebuilt hourly tier."""
+    import sqlite3
+
+    store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+    build(store)
+    # Rebuild hourly tier so the efficiency endpoint can read it.
+    conn = sqlite3.connect(str(tmp_path / "eff.db"))
+    lo = int((datetime(2026, 8, 1, tzinfo=UTC) - timedelta(days=1)).timestamp())
+    hi = int((datetime(2026, 8, 11, tzinfo=UTC)).timestamp())
+    rebuild_inverter_hourly(conn, lo, hi)
+    conn.commit()
+    conn.close()
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "eff.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    client = TestClient(create_app(store=store, service=service, config=config))
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    if strings is not None:
+        client.put("/api/settings", json={"panels.strings": strings})
+    return client
+
+
+def test_efficiency_unconfigured_returns_configured_false(tmp_path: Path) -> None:
+    """With no strings every figure is null or empty — never zero."""
+    with _efficiency_client(tmp_path, lambda s: None, strings=None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+    assert body["configured"] is False
+    assert body["summary"] is None
+    assert body["waterfall"] == []
+    assert body["strings"] == []
+    assert body["hours"] is None
+    assert body["worst_hour"] is None
+    assert body["baseline"]["window_start"] is None
+
+
+def test_efficiency_rejects_an_unknown_period(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={"period": "year", "start": "2026-08-10"},
+        )
+    assert r.status_code == 400
+    assert "year" in r.json()["detail"]
+
+
+def test_efficiency_rejects_a_malformed_date(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "not-a-date"},
+        )
+    assert r.status_code == 400
+    assert "YYYY-MM-DD" in r.json()["detail"]
+
+
+def test_efficiency_rejects_an_unknown_timezone(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={
+                "period": "day",
+                "start": "2026-08-10",
+                "tz": "Mars/Olympus_Mons",
+            },
+        )
+    assert r.status_code == 400
+
+
+def test_efficiency_period_day_computes_daily_summary(tmp_path: Path) -> None:
+    """A single day with modelled hours returns a summary and waterfall."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)  # 8am Chicago = 13:00 UTC
+
+    def build(store: SqliteStore) -> None:
+        # One hour at 8am local (13:00 UTC): sun at ~30°, clear sky.
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={
+                "period": "day",
+                "start": "2026-08-10",
+                "tz": "America/Chicago",
+            },
+        ).json()
+
+    assert body["configured"] is True
+    assert body["period"] == "day"
+    assert body["summary"] is not None
+    s = body["summary"]
+    # The day had at least some modelled hours.
+    assert s["expected_kwh"] > 0
+    assert s["actual_kwh"] > 0
+    assert s["pr"] is not None
+    assert s["specific_yield"] is not None
+    assert s["tolerance_pct"] == 3.0
+    # One hour is partial (< 60% of daylight covered).
+    assert s["partial"] is True
+
+
+def test_efficiency_waterfall_reconciles_to_actual(tmp_path: Path) -> None:
+    """The walk from expected to actual must close, in either direction.
+
+    An array can beat its model as easily as fall short of it, and a shortfall
+    clamped at zero cannot express that. If the segments do not sum to what the
+    inverter actually made, the page is drawing a decomposition of a number it
+    does not have.
+    """
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    wf = {seg["name"]: seg["kwh"] for seg in body["waterfall"]}
+    reconciled = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert reconciled == pytest.approx(wf["actual"], abs=0.01), (
+        f"expected({wf['expected']}) - unexplained({wf['unexplained']}) "
+        f"- curtailed({wf['curtailed']}) + gain({wf['unmodelled_gain']}) "
+        f"!= actual({wf['actual']})"
+    )
+    # Only one of the two residual segments can be non-zero: the array either
+    # fell short of the model or beat it, never both at once.
+    assert wf["unexplained"] == 0.0 or wf["unmodelled_gain"] == 0.0
+
+    # And the segment that means "we produced more than predicted" must never
+    # be drawn as a loss.
+    gain = next(s for s in body["waterfall"] if s["name"] == "unmodelled_gain")
+    assert gain["penalised"] is False
+
+
+def test_efficiency_period_day_has_hourly_breakdown(tmp_path: Path) -> None:
+    """period=day must carry the hours array computed from stored inputs."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["hours"] is not None
+    assert len(body["hours"]) > 0
+    hour = body["hours"][0]
+    for key in ("hour", "expected_kwh", "actual_kwh", "curtailed_kwh", "unexplained_kwh"):
+        assert key in hour, key
+
+
+def test_efficiency_period_week_has_no_hours_array(tmp_path: Path) -> None:
+    """Only period=day carries the hours array."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["hours"] is None
+
+
+def test_efficiency_pr_excludes_curtailed_energy(tmp_path: Path) -> None:
+    """PR = actual / (expected - curtailed), null when denominator <= 0."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    s = body["summary"]
+    if s["pr"] is not None:
+        # PR denominator excludes curtailed.
+        denom = s["expected_kwh"] - s["curtailed_kwh"]
+        if denom > 0:
+            assert s["pr"] == pytest.approx(s["actual_kwh"] / denom, abs=0.001)
+
+
+def test_efficiency_curtailed_not_penalised_in_waterfall(tmp_path: Path) -> None:
+    """Curtailed energy carries penalised: false so no page treats it as a loss."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    curtailed_seg = next(s for s in body["waterfall"] if s["name"] == "curtailed")
+    assert curtailed_seg["penalised"] is False
+
+
+def test_efficiency_period_month_spans_calendar_days(tmp_path: Path) -> None:
+    """period=month covers the full calendar month."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "month", "start": "2026-08-01", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["period"] == "month"
+    # August has 31 days.
+    assert body["start"].startswith("2026-08-01")
+    assert body["end"].startswith("2026-09-01")
+
+
+def test_efficiency_missing_hours_marks_partial(tmp_path: Path) -> None:
+    """A day with fewer than 60% of daylight hours modelled is partial."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    # One hour of a summer day is definitely partial.
+    assert body["summary"]["partial"] is True
+
+
+def test_efficiency_with_no_data_is_absent_not_zero(tmp_path: Path) -> None:
+    """A day with no stored row has no summary, not a zeroed one."""
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    # Configured but no data: summary null, not zero.
+    assert body["configured"] is True
+    assert body["summary"] is None
+    assert body["waterfall"] == []
+
+
+def test_efficiency_waterfall_reconciles_across_a_mixed_range(tmp_path: Path) -> None:
+    """A week holding both a short day and a generous one must still add up.
+
+    Each day's unexplained figure is clamped at zero, so summing them counts
+    every day that fell short and ignores every day that ran ahead. A range
+    with one of each then reports a shortfall beside an expected and an actual
+    that are equal, and the walk from expected to actual visibly fails to close
+    in front of the owner. The residual has to come from the totals.
+    """
+
+    def build(store: SqliteStore) -> None:
+        # Two days of the same sun, one producing far less than the other.
+        for day_offset, watts in ((0, 1000.0), (1, 8000.0)):
+            store.append(
+                Sample(
+                    timestamp=datetime(2026, 8, 4 + day_offset, 13, 0, tzinfo=UTC),
+                    readings={
+                        "pv1_power_w": watts,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": watts / 310.0,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    wf = {s["name"]: s["kwh"] for s in body["waterfall"]}
+    closed = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert closed == pytest.approx(wf["actual"], abs=0.01), (
+        f"expected({wf['expected']}) - unexplained({wf['unexplained']}) "
+        f"- curtailed({wf['curtailed']}) + gain({wf['unmodelled_gain']}) "
+        f"!= actual({wf['actual']})"
+    )
+    assert wf["unexplained"] == 0.0 or wf["unmodelled_gain"] == 0.0
+
+
+def test_efficiency_does_not_serve_a_day_scored_against_a_different_array(
+    tmp_path: Path,
+) -> None:
+    """A stored score belongs to the array description it was taken under.
+
+    The maintenance pass rescores today and yesterday, but nothing revisits
+    last month. Without this check, correcting a panel count leaves every
+    older day carrying a score computed for an array that no longer exists,
+    served as though it were current.
+    """
+    from arraysense.efficiency import EfficiencyRow
+
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        # A stored row from an older description of the array, with an
+        # unmistakable figure that must not reach the response.
+        store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+        local_day = datetime(2026, 8, 10, tzinfo=ZoneInfo("America/Chicago"))
+        store.write_efficiency_day(
+            [
+                EfficiencyRow(
+                    day=local_day,
+                    string_name="",
+                    expected_kwh=999.0,
+                    actual_kwh=999.0,
+                    curtailed_kwh=0.0,
+                    unexplained_kwh=0.0,
+                    modelled_hours=24,
+                    partial=False,
+                    pr=1.0,
+                    config_version=-1,
+                )
+            ]
+        )
+        store.close()
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["summary"] is not None
+    assert body["summary"]["expected_kwh"] != 999.0, (
+        "a day scored against a different array was served as current"
+    )
+
+
+def test_efficiency_books_real_curtailment_and_never_penalises_it(tmp_path: Path) -> None:
+    """Staged so curtailment is actually produced, not merely asserted about.
+
+    A test whose fixture yields zero curtailment passes whatever the code does
+    with it -- the segment reads 0.0 and every claim about it is vacuously
+    true. This stages a full bank, a pinched charge limit and a string held
+    near open circuit, so a regression that penalised refused energy or filed
+    it as an unexplained loss turns this red.
+    """
+
+    def build(store: SqliteStore) -> None:
+        base = datetime(2026, 8, 10, tzinfo=UTC)
+        # Ordinary hours give the string an operating point to be judged against.
+        for hour in (13, 14, 15, 16, 17, 19, 20):
+            store.append(
+                Sample(
+                    timestamp=base + timedelta(hours=hour),
+                    readings={
+                        "pv1_power_w": 6000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 19.4,
+                        "ghi_wm2": 800.0,
+                        "dni_wm2": 850.0,
+                        "dhi_wm2": 120.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+        # Then one hour with the bank full, the limit pinched, and the string
+        # walked up toward open circuit while producing almost nothing.
+        store.append(
+            Sample(
+                timestamp=base + timedelta(hours=18),
+                readings={
+                    "pv1_power_w": 400.0,
+                    "pv1_voltage_v": 372.0,
+                    "pv1_current_a": 1.1,
+                    "ghi_wm2": 800.0,
+                    "dni_wm2": 850.0,
+                    "dhi_wm2": 120.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 100.0,
+                    "bms_charge_current_limit_a": 40.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    summary = body["summary"]
+    assert summary["curtailed_kwh"] > 0.0, "the fixture produced no curtailment to test"
+
+    segments = {s["name"]: s for s in body["waterfall"]}
+    assert segments["curtailed"]["kwh"] > 0.0
+    assert segments["curtailed"]["penalised"] is False, "refused energy was drawn as a loss"
+
+    # And it must leave the ratio's denominator, which is the entire point:
+    # a demand-limited hour must not read as a fault.
+    naive = summary["actual_kwh"] / summary["expected_kwh"]
+    assert summary["pr"] > naive, "curtailed energy is still counted against the score"
+
+    wf = {k: v["kwh"] for k, v in segments.items()}
+    closed = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert closed == pytest.approx(wf["actual"], abs=0.01)
+
+
+def test_the_efficiency_page_is_served(client: Any) -> None:
+    """The Efficiency page is a nav destination, and a nav target that answers
+    404 reads as the feature being down rather than a page that was never
+    written. The allow-list test only proves the route exists; this is what
+    proves the file behind it is actually served, which is how a PAGES entry
+    whose page never lands gets noticed at all.
+    """
+    r = client.get("/efficiency")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+
+
+def test_efficiency_week_and_month_carry_a_daily_series(tmp_path: Path) -> None:
+    """A longer period needs something to draw, or the page drops its chart.
+
+    `hours` is a single day's detail and is null for week and month. Without a
+    per-day series beside it the page had a headline figure and nothing under
+    it, which reads as a fault rather than as a period at coarser resolution.
+    """
+
+    def build(store: SqliteStore) -> None:
+        for day in (4, 5, 6):
+            store.append(
+                Sample(
+                    timestamp=datetime(2026, 8, day, 13, 0, tzinfo=UTC),
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        week = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    assert week["hours"] is None, "a week must not ship a full hour-by-hour array"
+    assert len(week["days"]) >= 3, "a week with three scored days must offer three points"
+    for entry in week["days"]:
+        assert entry["day"], "every point needs a stamp for the time axis"
+        assert entry["actual_kwh"] is not None
+    # And the days must be ordered, or the trend line doubles back on itself.
+    stamps = [d["day"] for d in week["days"]]
+    assert stamps == sorted(stamps)
+
+
+def test_efficiency_unconfigured_still_offers_an_empty_daily_series(tmp_path: Path) -> None:
+    # Absent, not missing: the page reads the key unconditionally, and a null
+    # where a list belongs is the shape that throws rather than draws nothing.
+    with _efficiency_client(tmp_path, lambda s: None, strings=None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "month", "start": "2026-08-01", "tz": "America/Chicago"},
+        ).json()
+    assert body["configured"] is False
+    assert body["days"] == []
