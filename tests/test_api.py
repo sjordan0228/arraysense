@@ -3098,3 +3098,408 @@ def test_backfill_refuses_a_backwards_or_huge_range(client: Any, monkeypatch: An
         "/api/efficiency/backfill", json={"start": "2020-01-01", "end": "2026-08-01"}
     )
     assert huge.status_code == 400
+
+
+# --- efficiency endpoint -------------------------------------------------------
+
+
+def _efficiency_client(
+    tmp_path: Path,
+    build: Any,
+    *,
+    strings: str | None = "South | 1 | 20 | 400 | 25 | 180",
+) -> Any:
+    """A client with location, strings, stored samples, and a rebuilt hourly tier."""
+    import sqlite3
+
+    store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+    build(store)
+    # Rebuild hourly tier so the efficiency endpoint can read it.
+    conn = sqlite3.connect(str(tmp_path / "eff.db"))
+    lo = int((datetime(2026, 8, 1, tzinfo=UTC) - timedelta(days=1)).timestamp())
+    hi = int((datetime(2026, 8, 11, tzinfo=UTC)).timestamp())
+    rebuild_inverter_hourly(conn, lo, hi)
+    conn.commit()
+    conn.close()
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "eff.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    client = TestClient(create_app(store=store, service=service, config=config))
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    if strings is not None:
+        client.put("/api/settings", json={"panels.strings": strings})
+    return client
+
+
+def test_efficiency_unconfigured_returns_configured_false(tmp_path: Path) -> None:
+    """With no strings every figure is null or empty — never zero."""
+    with _efficiency_client(tmp_path, lambda s: None, strings=None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+    assert body["configured"] is False
+    assert body["summary"] is None
+    assert body["waterfall"] == []
+    assert body["strings"] == []
+    assert body["hours"] is None
+    assert body["worst_hour"] is None
+    assert body["baseline"]["window_start"] is None
+
+
+def test_efficiency_rejects_an_unknown_period(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={"period": "year", "start": "2026-08-10"},
+        )
+    assert r.status_code == 400
+    assert "year" in r.json()["detail"]
+
+
+def test_efficiency_rejects_a_malformed_date(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "not-a-date"},
+        )
+    assert r.status_code == 400
+    assert "YYYY-MM-DD" in r.json()["detail"]
+
+
+def test_efficiency_rejects_an_unknown_timezone(tmp_path: Path) -> None:
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get(
+            "/api/efficiency",
+            params={
+                "period": "day",
+                "start": "2026-08-10",
+                "tz": "Mars/Olympus_Mons",
+            },
+        )
+    assert r.status_code == 400
+
+
+def test_efficiency_period_day_computes_daily_summary(tmp_path: Path) -> None:
+    """A single day with modelled hours returns a summary and waterfall."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)  # 8am Chicago = 13:00 UTC
+
+    def build(store: SqliteStore) -> None:
+        # One hour at 8am local (13:00 UTC): sun at ~30°, clear sky.
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={
+                "period": "day",
+                "start": "2026-08-10",
+                "tz": "America/Chicago",
+            },
+        ).json()
+
+    assert body["configured"] is True
+    assert body["period"] == "day"
+    assert body["summary"] is not None
+    s = body["summary"]
+    # The day had at least some modelled hours.
+    assert s["expected_kwh"] > 0
+    assert s["actual_kwh"] > 0
+    assert s["pr"] is not None
+    assert s["specific_yield"] is not None
+    assert s["tolerance_pct"] == 3.0
+    # One hour is partial (< 60% of daylight covered).
+    assert s["partial"] is True
+
+
+def test_efficiency_waterfall_reconciles_to_actual(tmp_path: Path) -> None:
+    """The walk from expected to actual must close, in either direction.
+
+    An array can beat its model as easily as fall short of it, and a shortfall
+    clamped at zero cannot express that. If the segments do not sum to what the
+    inverter actually made, the page is drawing a decomposition of a number it
+    does not have.
+    """
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    wf = {seg["name"]: seg["kwh"] for seg in body["waterfall"]}
+    reconciled = wf["expected"] - wf["unexplained"] - wf["curtailed"] + wf["unmodelled_gain"]
+    assert reconciled == pytest.approx(wf["actual"], abs=0.01), (
+        f"expected({wf['expected']}) - unexplained({wf['unexplained']}) "
+        f"- curtailed({wf['curtailed']}) + gain({wf['unmodelled_gain']}) "
+        f"!= actual({wf['actual']})"
+    )
+    # Only one of the two residual segments can be non-zero: the array either
+    # fell short of the model or beat it, never both at once.
+    assert wf["unexplained"] == 0.0 or wf["unmodelled_gain"] == 0.0
+
+    # And the segment that means "we produced more than predicted" must never
+    # be drawn as a loss.
+    gain = next(s for s in body["waterfall"] if s["name"] == "unmodelled_gain")
+    assert gain["penalised"] is False
+
+
+def test_efficiency_period_day_has_hourly_breakdown(tmp_path: Path) -> None:
+    """period=day must carry the hours array computed from stored inputs."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["hours"] is not None
+    assert len(body["hours"]) > 0
+    hour = body["hours"][0]
+    for key in ("hour", "expected_kwh", "actual_kwh", "curtailed_kwh", "unexplained_kwh"):
+        assert key in hour, key
+
+
+def test_efficiency_period_week_has_no_hours_array(tmp_path: Path) -> None:
+    """Only period=day carries the hours array."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["hours"] is None
+
+
+def test_efficiency_pr_excludes_curtailed_energy(tmp_path: Path) -> None:
+    """PR = actual / (expected - curtailed), null when denominator <= 0."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    s = body["summary"]
+    if s["pr"] is not None:
+        # PR denominator excludes curtailed.
+        denom = s["expected_kwh"] - s["curtailed_kwh"]
+        if denom > 0:
+            assert s["pr"] == pytest.approx(s["actual_kwh"] / denom, abs=0.001)
+
+
+def test_efficiency_curtailed_not_penalised_in_waterfall(tmp_path: Path) -> None:
+    """Curtailed energy carries penalised: false so no page treats it as a loss."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    curtailed_seg = next(s for s in body["waterfall"] if s["name"] == "curtailed")
+    assert curtailed_seg["penalised"] is False
+
+
+def test_efficiency_period_month_spans_calendar_days(tmp_path: Path) -> None:
+    """period=month covers the full calendar month."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "month", "start": "2026-08-01", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["period"] == "month"
+    # August has 31 days.
+    assert body["start"].startswith("2026-08-01")
+    assert body["end"].startswith("2026-09-01")
+
+
+def test_efficiency_missing_hours_marks_partial(tmp_path: Path) -> None:
+    """A day with fewer than 60% of daylight hours modelled is partial."""
+    day = datetime(2026, 8, 10, 13, 0, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=day,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    # One hour of a summer day is definitely partial.
+    assert body["summary"]["partial"] is True
+
+
+def test_efficiency_with_no_data_is_absent_not_zero(tmp_path: Path) -> None:
+    """A day with no stored row has no summary, not a zeroed one."""
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    # Configured but no data: summary null, not zero.
+    assert body["configured"] is True
+    assert body["summary"] is None
+    assert body["waterfall"] == []

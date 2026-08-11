@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
@@ -165,77 +166,88 @@ def _hourly_rows(
     return by_hour
 
 
-def compute_day(
+@dataclass(frozen=True)
+class StringHour:
+    """One string's share of one hour."""
+
+    name: str
+    expected_kwh: float
+    actual_kwh: float
+    curtailed_kwh: float
+
+
+@dataclass(frozen=True)
+class HourEfficiency:
+    """What one hour offered, what it delivered, and what was merely refused.
+
+    This is the grain everything else is built from. The daily summary sums
+    these; the endpoint renders them as a day's detail. Both read the same
+    numbers because there is only one place that computes them, which is the
+    rule this project learned the hard way when the Costs page kept its own
+    tariff parser beside the Python one and the two disagreed within a day.
+    Deriving expected production twice would be the same mistake against a
+    harder sum.
+    """
+
+    hour: datetime
+    offset: int
+    strings: tuple[StringHour, ...]
+
+    @property
+    def expected_kwh(self) -> float:
+        return sum(s.expected_kwh for s in self.strings)
+
+    @property
+    def actual_kwh(self) -> float:
+        return sum(s.actual_kwh for s in self.strings)
+
+    @property
+    def curtailed_kwh(self) -> float:
+        return sum(s.curtailed_kwh for s in self.strings)
+
+    @property
+    def unexplained_kwh(self) -> float:
+        """Shortfall this hour with no cause attributed to it."""
+        return max(0.0, self.expected_kwh - self.actual_kwh - self.curtailed_kwh)
+
+
+def compute_hours(
     store: SqliteStore,
     settings: SettingsStore,
-    day_start: datetime,
-    day_end: datetime,
-    strings: tuple[StringSpec, ...],
-    config_version: int,
-) -> list[EfficiencyRow]:
-    """Score one day against the conditions it had.
+    start: datetime,
+    end: datetime,
+    strings: Sequence[StringSpec],
+) -> list[HourEfficiency]:
+    """Score every hour in a range against the sun it was offered.
 
-    Every hour that has both inverter readings and irradiance data contributes
-    to both sides of the comparison. An hour whose inverter was silent — a
-    collector gap — is excluded from expected and actual alike, so downtime
-    never reads as a loss.
+    The single implementation of the model chain -- sun position, transposition,
+    cell temperature, expected watts, then the curtailment rule -- and the only
+    place any of it happens. An hour with no inverter reading or no irradiance
+    is absent from the result rather than present as a zero, because a zero here
+    would say the array produced nothing when the truth is that nobody looked.
 
-    The day is measured in the installation's own timezone. ``day_start`` and
-    ``day_end`` must be aware datetimes in that zone; they are converted to UTC
-    only for querying the store.
-
-    Returns one row per string plus the ``""`` total. Curtailed energy is left
-    at zero — the curtailment detector fills it in a later pass.
+    Baselines are fitted across the whole range rather than per day: a string's
+    ordinary operating voltage is a property of how it is wired, not of the
+    weather on one afternoon, and a single overcast day has too few good hours
+    to fit from.
     """
     latitude = settings.get(SETTING_LATITUDE)
     longitude = settings.get(SETTING_LONGITUDE)
     if not isinstance(latitude, float) or not isinstance(longitude, float):
-        logger.debug("no location set; cannot compute efficiency for %s", day_start.date())
         return []
-
-    tz = day_start.tzinfo
-    if tz is None:
-        raise ValueError("day_start must be timezone-aware")
-
-    # Nothing configured is nothing to score, and a row of zeros would be the
-    # absent-as-zero mistake in its purest form: expected 0.0 and actual 0.0
-    # reads as "the array was meant to make nothing and made nothing", which
-    # is a claim about an array nobody has described.
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be timezone-aware")
     if not strings:
-        logger.debug("no array configured; nothing to score for %s", day_start.date())
         return []
 
-    # What the sun offers this day, hour by hour, for the coverage gate.
-    daylight = _daylight_weights(day_start, latitude, longitude)
-    if not daylight:
-        return []
-    total_daylight = sum(daylight.values())
-
+    tz = start.tzinfo
     mppt_indices = sorted({s.mppt for s in strings})
-    rows_by_hour = _hourly_rows(store, day_start, day_end, mppt_indices, tz)
+    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz)
+    if not rows_by_hour:
+        return []
 
-    # Per-string accumulators, keyed by string name (empty for total)
-    expected: dict[str, float] = {}
-    actual: dict[str, float] = {}
-    modelled: dict[str, int] = {}
-
-    for s in strings:
-        expected[s.name] = 0.0
-        actual[s.name] = 0.0
-        modelled[s.name] = 0
-    expected[""] = 0.0
-    actual[""] = 0.0
-    modelled[""] = 0
-    # Weighted by each hour's energy share; modelled[""] stays an honest count
-    # of hours, because that is what the row reports.
-    modelled_weight = 0.0
-    curtailed: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
-
-    # Each string is judged against its own ordinary operating point, fitted
-    # from this day's readings, and the bank against its own widest charge
-    # limit. Both are per-installation facts that no constant could stand in
-    # for -- see curtailment.py for what a shared threshold would do to a
-    # string that runs at a higher voltage than its neighbours.
+    # Each string against its own operating point, the bank against its own
+    # widest charge limit. See curtailment.py for why neither may be a constant.
     baselines: dict[str, StringBaseline | None] = {}
     for s in strings:
         pairs: list[tuple[float, float]] = []
@@ -245,99 +257,141 @@ def compute_day(
             if isinstance(volts, float) and isinstance(amps, float):
                 pairs.append((volts, amps))
         baselines[s.name] = baseline_for(s.name, pairs)
-    limit_anchor = window_max_limit(
-        [
-            limit
-            if isinstance(limit := candidate.get("bms_charge_current_limit_a"), float)
-            else None
-            for candidate in rows_by_hour.values()
-        ]
-    )
+    seen_limits: list[float | None] = []
+    for candidate in rows_by_hour.values():
+        limit_reading = candidate.get("bms_charge_current_limit_a")
+        seen_limits.append(limit_reading if isinstance(limit_reading, float) else None)
+    limit_anchor = window_max_limit(seen_limits)
 
-    for hour_offset in range(24):
-        when = day_start + timedelta(hours=hour_offset)
+    span = round((end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() / 3600)
+    hours: list[HourEfficiency] = []
+    for offset in range(span):
+        when = start + timedelta(hours=offset)
         elevation, sun_azimuth = solar_position(when.astimezone(UTC), latitude, longitude)
         if elevation <= 0.0:
             continue
-
-        row = rows_by_hour.get(hour_offset)
+        row = rows_by_hour.get(offset)
         if row is None:
             continue
 
         ghi = row.get("ghi_wm2")
         dni = row.get("dni_wm2")
         dhi = row.get("dhi_wm2")
-        wind = row.get("wind_speed_ms")
         air_c = row.get("outside_temperature_c")
-
-        if any(v is None for v in (ghi, dni, dhi, air_c)):
+        if not (
+            isinstance(ghi, float)
+            and isinstance(dni, float)
+            and isinstance(dhi, float)
+            and isinstance(air_c, float)
+        ):
             continue
-
-        assert isinstance(ghi, float)
-        assert isinstance(dni, float)
-        assert isinstance(dhi, float)
-        assert isinstance(air_c, float)
+        wind = row.get("wind_speed_ms")
         wind_val: float = wind if isinstance(wind, float) else 0.0
-
         day_of_year = when.timetuple().tm_yday
 
-        # Each string's share of this hour
-        hour_total_expected = 0.0
-        hour_total_actual = 0.0
+        soc = row.get("battery_soc_pct")
+        limit = row.get("bms_charge_current_limit_a")
+        gate_open = gate_is_open(
+            soc if isinstance(soc, float) else None,
+            limit if isinstance(limit, float) else None,
+            limit_anchor,
+        )
 
+        share: list[StringHour] = []
         for s in strings:
-            # POA per string uses that string's tilt and azimuth
+            act_w = row.get(f"pv{s.mppt}_power_w")
+            if not isinstance(act_w, float):
+                continue
             string_poa = poa_irradiance(
                 ghi, dni, dhi, elevation, sun_azimuth, s.tilt, s.azimuth, day_of_year
             )
             cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting)
-            exp_w = expected_watts(s, string_poa, cell_c, when.astimezone(UTC))
-
-            # Actual: the hourly-tier mean power in watts
-            pv_key = f"pv{s.mppt}_power_w"
-            act_w = row.get(pv_key)
-            if not isinstance(act_w, float):
-                continue
-
-            # kWh from a one-hour bucket: watts / 1000
-            exp_kwh = exp_w / 1000.0
+            exp_kwh = expected_watts(s, string_poa, cell_c, when.astimezone(UTC)) / 1000.0
             act_kwh = act_w / 1000.0
-            expected[s.name] += exp_kwh
-            actual[s.name] += act_kwh
-            hour_total_expected += exp_kwh
-            hour_total_actual += act_kwh
-
-            # Was this hour's shortfall the inverter refusing energy, or the
-            # array losing it? Both halves must agree, or it stays unexplained.
-            soc = row.get("battery_soc_pct")
-            limit = row.get("bms_charge_current_limit_a")
             volts = row.get(f"pv{s.mppt}_voltage_v")
             refused = curtailed_kwh_for_hour(
                 exp_kwh,
                 act_kwh,
-                gate_open=gate_is_open(
-                    soc if isinstance(soc, float) else None,
-                    limit if isinstance(limit, float) else None,
-                    limit_anchor,
-                ),
+                gate_open=gate_open,
                 signature_seen=signature_matches(
-                    volts if isinstance(volts, float) else None,
-                    baselines.get(s.name),
+                    volts if isinstance(volts, float) else None, baselines.get(s.name)
                 ),
             )
-            curtailed[s.name] += refused
-            curtailed[""] += refused
+            share.append(
+                StringHour(
+                    name=s.name,
+                    expected_kwh=exp_kwh,
+                    actual_kwh=act_kwh,
+                    curtailed_kwh=refused,
+                )
+            )
 
-        modelled_hour = hour_total_expected > 0.0 or hour_total_actual > 0.0
-        if modelled_hour:
-            modelled_weight += daylight.get(hour_offset, 0.0)
-            modelled[""] += 1
-            for s in strings:
-                pv_key = f"pv{s.mppt}_power_w"
-                if isinstance(row.get(pv_key), float):
-                    modelled[s.name] += 1
-            expected[""] += hour_total_expected
-            actual[""] += hour_total_actual
+        if not share:
+            continue
+        hours.append(HourEfficiency(hour=when, offset=offset, strings=tuple(share)))
+    return hours
+
+
+def compute_day(
+    store: SqliteStore,
+    settings: SettingsStore,
+    day_start: datetime,
+    day_end: datetime,
+    strings: Sequence[StringSpec],
+    config_version: int,
+) -> list[EfficiencyRow]:
+    """Summarise one day: a row per string, plus a total row named "".
+
+    Aggregation only. Every figure it reports comes from ``compute_hours``,
+    which is the one place the model runs -- the day's totals and the day's
+    hour-by-hour detail are therefore the same arithmetic seen at two
+    resolutions rather than two implementations that agree until they do not.
+
+    Returns nothing at all when there is nothing to say: no array described, no
+    location, a day with no sun, or a day in which not one hour could be
+    modelled. A row of zeros in any of those cases would be a claim that the
+    array was expected to make nothing and made nothing.
+    """
+    latitude = settings.get(SETTING_LATITUDE)
+    longitude = settings.get(SETTING_LONGITUDE)
+    if not isinstance(latitude, float) or not isinstance(longitude, float):
+        logger.debug("no location set; cannot compute efficiency for %s", day_start.date())
+        return []
+    if day_start.tzinfo is None:
+        raise ValueError("day_start must be timezone-aware")
+    if not strings:
+        logger.debug("no array configured; nothing to score for %s", day_start.date())
+        return []
+
+    # What the sun offered this day, hour by hour, for the coverage gate.
+    daylight = _daylight_weights(day_start, latitude, longitude)
+    if not daylight:
+        return []
+    total_daylight = sum(daylight.values())
+
+    hours = compute_hours(store, settings, day_start, day_end, strings)
+    if not hours:
+        return []
+
+    expected: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
+    actual: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
+    curtailed: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
+    modelled: dict[str, int] = dict.fromkeys([s.name for s in strings] + [""], 0)
+    # Weighted by each hour's share of the day's energy; modelled[""] stays an
+    # honest count of hours, because that is what the row reports.
+    modelled_weight = 0.0
+
+    for hour in hours:
+        modelled_weight += daylight.get(hour.offset, 0.0)
+        modelled[""] += 1
+        expected[""] += hour.expected_kwh
+        actual[""] += hour.actual_kwh
+        curtailed[""] += hour.curtailed_kwh
+        for share in hour.strings:
+            expected[share.name] += share.expected_kwh
+            actual[share.name] += share.actual_kwh
+            curtailed[share.name] += share.curtailed_kwh
+            modelled[share.name] += 1
 
     coverage = modelled_weight / total_daylight if total_daylight > 0.0 else 0.0
     partial = coverage < _MIN_COVERAGE
