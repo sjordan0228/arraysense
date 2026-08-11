@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from arraysense.efficiency import CONFIG_VERSION_KEY, compute_day
+from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
 from arraysense.panels import parse_strings
 from arraysense.settings import SettingsStore
 from arraysense.store.sqlite_store import SqliteStore
@@ -422,3 +422,87 @@ class TestCoverageIsMeasuredInEnergy:
         )
         assert rows
         assert not any(r.partial for r in rows)
+
+
+class TestCurtailmentIsWiredIn:
+    """A detector nobody calls is a detector that changes nothing.
+
+    These stage the same shortfall twice and differ only in the electrical
+    evidence, which is the whole rule: refused energy and lost energy look
+    identical in a power reading and are opposite in what they mean.
+    """
+
+    @staticmethod
+    def _hour(
+        conn: sqlite3.Connection,
+        when: datetime,
+        watts: float,
+        volts: float,
+        amps: float,
+        soc: float,
+        limit: float,
+    ) -> None:
+        from arraysense.metrics import lookup
+
+        cols = {
+            "pv1_power_w": watts,
+            "pv1_voltage_v": volts,
+            "pv1_current_a": amps,
+            "battery_soc_pct": soc,
+            "bms_charge_current_limit_a": limit,
+            "ghi_wm2": 800.0,
+            "dni_wm2": 850.0,
+            "dhi_wm2": 120.0,
+            "wind_speed_ms": 2.0,
+            "outside_temperature_c": 30.0,
+        }
+        names = ["timestamp", "device", *cols, "sample_count"]
+        values = [int(when.timestamp()), TEST_DEVICE]
+        values += [round(v * lookup(m).scale) for m, v in cols.items()]
+        values.append(1)
+        conn.execute(
+            f"INSERT OR REPLACE INTO inverter_hourly ({', '.join(names)}) "
+            f"VALUES ({', '.join('?' for _ in names)})",
+            values,
+        )
+
+    def _day(self, tmp_path: Path, name: str, bad_volts: float, bad_amps: float) -> EfficiencyRow:
+        store = _store(str(tmp_path / name))
+        day_start = _summer_day(0)
+        # Ordinary hours establish the string's own operating point, staged at
+        # roughly what the model expects of them: above expectation, the
+        # surplus nets against the bad hour at day level and the shortfall
+        # disappears before anything can name it.
+        for h in range(8, 16):
+            if h == 10:
+                continue
+            self._hour(store._conn, _utc(h), 2830.0, 310.0, 10.3, 60.0, 800.0)
+        # One mid-morning hour producing almost nothing, on a full bank whose
+        # BMS has pinched the current it will accept. Mid-morning because this
+        # string faces east: at four in the afternoon the model rightly expects
+        # little of it, so a bad hour there would be a shortfall of nothing.
+        self._hour(store._conn, _utc(10), 300.0, bad_volts, bad_amps, 100.0, 40.0)
+        rows = compute_day(
+            store, SettingsStore(store), day_start, day_start + timedelta(days=1), _ONE_STRING, 1
+        )
+        store.close()
+        return next(r for r in rows if r.string_name == "East")
+
+    def test_a_throttled_hour_books_as_curtailed_not_as_loss(self, tmp_path: Path) -> None:
+        # Held near open circuit with its current strangled: the inverter
+        # refusing energy it had nowhere to put.
+        row = self._day(tmp_path, "throttled.db", bad_volts=372.8, bad_amps=1.0)
+        assert row.curtailed_kwh > 0.0, "the detector is not reaching compute_day"
+        assert row.unexplained_kwh == pytest.approx(0.0, abs=0.01)
+
+    def test_the_same_shortfall_at_a_normal_voltage_is_never_excused(self, tmp_path: Path) -> None:
+        """The fault case, and the reason the gate alone is not enough.
+
+        Identical hour, identical full bank, identical pinched limit -- but the
+        string sits at its ordinary voltage, so nothing was walking it off the
+        power point. Something is wrong with it, and a gate-only rule would
+        book this as the inverter protecting the battery and say nothing.
+        """
+        row = self._day(tmp_path, "faulty.db", bad_volts=310.0, bad_amps=1.0)
+        assert row.curtailed_kwh == 0.0, "a fault was excused as curtailment"
+        assert row.unexplained_kwh > 0.0, "the shortfall vanished instead of being named"

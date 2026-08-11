@@ -22,6 +22,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
+from arraysense.curtailment import (
+    StringBaseline,
+    baseline_for,
+    curtailed_kwh_for_hour,
+    gate_is_open,
+    signature_matches,
+    window_max_limit,
+)
 from arraysense.panels import StringSpec
 from arraysense.settings import (
     CONFIG_VERSION_KEY,
@@ -130,7 +138,14 @@ def _hourly_rows(
     metrics: list[str] = []
     for idx in mppt_indices:
         metrics.append(f"pv{idx}_power_w")
+        # Voltage and current are the curtailment signature: a throttled string
+        # is held near open circuit while its current is strangled, and power
+        # alone cannot tell that apart from a cloud.
+        metrics.append(f"pv{idx}_voltage_v")
+        metrics.append(f"pv{idx}_current_a")
     metrics.extend(["ghi_wm2", "dni_wm2", "dhi_wm2", "wind_speed_ms", "outside_temperature_c"])
+    # The gate: whether there was anywhere for the power to go.
+    metrics.extend(["battery_soc_pct", "bms_charge_current_limit_a"])
 
     raw = store.query(metrics, utc_start, utc_end, tier="hourly")
 
@@ -214,6 +229,30 @@ def compute_day(
     # Weighted by each hour's energy share; modelled[""] stays an honest count
     # of hours, because that is what the row reports.
     modelled_weight = 0.0
+    curtailed: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
+
+    # Each string is judged against its own ordinary operating point, fitted
+    # from this day's readings, and the bank against its own widest charge
+    # limit. Both are per-installation facts that no constant could stand in
+    # for -- see curtailment.py for what a shared threshold would do to a
+    # string that runs at a higher voltage than its neighbours.
+    baselines: dict[str, StringBaseline | None] = {}
+    for s in strings:
+        pairs: list[tuple[float, float]] = []
+        for candidate in rows_by_hour.values():
+            volts = candidate.get(f"pv{s.mppt}_voltage_v")
+            amps = candidate.get(f"pv{s.mppt}_current_a")
+            if isinstance(volts, float) and isinstance(amps, float):
+                pairs.append((volts, amps))
+        baselines[s.name] = baseline_for(s.name, pairs)
+    limit_anchor = window_max_limit(
+        [
+            limit
+            if isinstance(limit := candidate.get("bms_charge_current_limit_a"), float)
+            else None
+            for candidate in rows_by_hour.values()
+        ]
+    )
 
     for hour_offset in range(24):
         when = day_start + timedelta(hours=hour_offset)
@@ -261,10 +300,35 @@ def compute_day(
                 continue
 
             # kWh from a one-hour bucket: watts / 1000
-            expected[s.name] += exp_w / 1000.0
-            actual[s.name] += act_w / 1000.0
-            hour_total_expected += exp_w / 1000.0
-            hour_total_actual += act_w / 1000.0
+            exp_kwh = exp_w / 1000.0
+            act_kwh = act_w / 1000.0
+            expected[s.name] += exp_kwh
+            actual[s.name] += act_kwh
+            hour_total_expected += exp_kwh
+            hour_total_actual += act_kwh
+
+            # Was this hour's shortfall the inverter refusing energy, or the
+            # array losing it? Both halves must agree, or it stays unexplained.
+            soc = row.get("battery_soc_pct")
+            limit = row.get("bms_charge_current_limit_a")
+            volts = row.get(f"pv{s.mppt}_voltage_v")
+            amps = row.get(f"pv{s.mppt}_current_a")
+            refused = curtailed_kwh_for_hour(
+                exp_kwh,
+                act_kwh,
+                gate_open=gate_is_open(
+                    soc if isinstance(soc, float) else None,
+                    limit if isinstance(limit, float) else None,
+                    limit_anchor,
+                ),
+                signature_seen=signature_matches(
+                    volts if isinstance(volts, float) else None,
+                    amps if isinstance(amps, float) else None,
+                    baselines.get(s.name),
+                ),
+            )
+            curtailed[s.name] += refused
+            curtailed[""] += refused
 
         modelled_hour = hour_total_expected > 0.0 or hour_total_actual > 0.0
         if modelled_hour:
@@ -284,16 +348,19 @@ def compute_day(
     for s in strings:
         exp = expected[s.name]
         act = actual[s.name]
-        curtailed = 0.0  # filled by the curtailment detector in a later task
-        unexplained = max(0.0, exp - act - curtailed)
-        pr = act / (exp - curtailed) if (exp - curtailed) > 0.0 else None
+        refused = curtailed[s.name]
+        # Curtailed energy leaves the comparison on both sides: it was never
+        # lost, so it must not count against the ratio, and the shortfall that
+        # remains claims no cause of its own.
+        unexplained = max(0.0, exp - act - refused)
+        pr = act / (exp - refused) if (exp - refused) > 0.0 else None
         rows.append(
             EfficiencyRow(
                 day=day_start,
                 string_name=s.name,
                 expected_kwh=exp,
                 actual_kwh=act,
-                curtailed_kwh=curtailed,
+                curtailed_kwh=curtailed[s.name],
                 unexplained_kwh=unexplained,
                 modelled_hours=modelled.get(s.name, 0),
                 partial=partial,
@@ -312,7 +379,7 @@ def compute_day(
     # Total row
     total_expected = expected[""]
     total_actual = actual[""]
-    total_curtailed = sum(r.curtailed_kwh for r in rows)
+    total_curtailed = curtailed[""]
     unexplained_total = max(0.0, total_expected - total_actual - total_curtailed)
     total_pr = (
         total_actual / (total_expected - total_curtailed)
