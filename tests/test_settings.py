@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from arraysense.settings import (
+    CONFIG_VERSION_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -511,3 +512,83 @@ def test_the_battery_group_is_registered_with_the_measured_default() -> None:
     heater = lookup_setting("battery.heater_w")
     assert heater.default == 0.0
     assert lookup_setting("battery.min_soc_pct").default == 10.0
+
+
+class TestEfficiencyConfigVersion:
+    """Describing the array differently invalidates what was scored under the old one."""
+
+    @staticmethod
+    def _version(settings: SettingsStore) -> int:
+        value = settings.get(CONFIG_VERSION_KEY)
+        assert isinstance(value, int)
+        return value
+
+    def test_changing_the_array_bumps_the_version(self, tmp_path: Path) -> None:
+        """Without this the invalidation is decorative.
+
+        Days carry the version they were scored under, and the summary pass
+        rescores a day whose version has moved on. If nothing ever moves it,
+        a day scored against ten panels keeps that score after the owner
+        describes twenty, and the record silently describes an array that no
+        longer exists.
+        """
+        store = SqliteStore(str(tmp_path / "v.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set("panels.strings", "East | 1 | 10 | 400 | 25 | 90")
+        after = self._version(settings)
+        store.close()
+        assert after > before
+
+    def test_a_battery_change_counts_as_an_array_change(self, tmp_path: Path) -> None:
+        store = SqliteStore(str(tmp_path / "b.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set("battery.installed", "2024-08")
+        after = self._version(settings)
+        store.close()
+        assert after > before
+
+    def test_an_unrelated_setting_leaves_it_alone(self, tmp_path: Path) -> None:
+        # Every bump costs a rescore of every stored day, so a setting that
+        # does not change what the array should produce must not trigger one.
+        # A contact address is the clearest case of that.
+        store = SqliteStore(str(tmp_path / "u.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set(SETTING_CONTACT_EMAIL, "someone@example.com")
+        after = self._version(settings)
+        store.close()
+        assert after == before
+
+    def test_moving_the_site_invalidates_what_was_scored_there(self, tmp_path: Path) -> None:
+        """Where the array is decides what its sun should have been.
+
+        Latitude and longitude place the sun in the sky; the zone decides where
+        one day stops and the next begins. A day scored before any of the three
+        was corrected was scored against a different sky than the array was
+        actually under, and must not be left standing as though it were current.
+        """
+        for key, value in (
+            (SETTING_LATITUDE, 45.0),
+            (SETTING_LONGITUDE, -93.0),
+            (SETTING_TIMEZONE, "America/Denver"),
+        ):
+            store = SqliteStore(str(tmp_path / f"{key}.db"), device=TEST_DEVICE)
+            settings = SettingsStore(store)
+            before = self._version(settings)
+            settings.set(key, value)
+            after = self._version(settings)
+            store.close()
+            assert after > before, f"{key} left the efficiency version untouched"
+
+    def test_a_batch_write_bumps_once_not_per_key(self, tmp_path: Path) -> None:
+        store = SqliteStore(str(tmp_path / "m.db"), device=TEST_DEVICE)
+        settings = SettingsStore(store)
+        before = self._version(settings)
+        settings.set_many(
+            {"panels.strings": "East | 1 | 10 | 400 | 25 | 90", "battery.installed": "2024-08"}
+        )
+        after = self._version(settings)
+        store.close()
+        assert after == before + 1

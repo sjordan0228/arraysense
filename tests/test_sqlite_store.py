@@ -1256,6 +1256,97 @@ def test_forecast_prune_drops_old_hours(tmp_path: Path) -> None:
     assert len(curves["latest"]) == 1
 
 
+def test_efficiency_days_are_written_and_read_back(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "eff.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    rows = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=32.0,
+            actual_kwh=28.5,
+            curtailed_kwh=1.5,
+            unexplained_kwh=2.0,
+            modelled_hours=10,
+            partial=False,
+            pr=0.89,
+            config_version=1,
+        ),
+        EfficiencyRow(
+            day=day,
+            string_name="",
+            expected_kwh=32.0,
+            actual_kwh=28.5,
+            curtailed_kwh=1.5,
+            unexplained_kwh=2.0,
+            modelled_hours=10,
+            partial=False,
+            pr=0.89,
+            config_version=1,
+        ),
+    ]
+    store.write_efficiency_day(rows)
+
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 2
+    by_name = {r.string_name: r for r in got}
+    assert by_name["East"].expected_kwh == 32.0
+    assert by_name["East"].actual_kwh == 28.5
+    assert by_name["East"].curtailed_kwh == 1.5
+    assert by_name["East"].unexplained_kwh == 2.0
+    assert by_name["East"].modelled_hours == 10
+    assert not by_name["East"].partial
+    assert by_name["East"].pr == 0.89
+    assert by_name["East"].config_version == 1
+    assert by_name[""].string_name == ""
+
+
+def test_efficiency_day_writes_overwrite_by_primary_key(tmp_path: Path) -> None:
+    from arraysense.efficiency import EfficiencyRow
+
+    store = SqliteStore(str(tmp_path / "eff2.db"), device=TEST_DEVICE)
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=UTC)
+    v1 = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=30.0,
+            actual_kwh=25.0,
+            curtailed_kwh=0.0,
+            unexplained_kwh=5.0,
+            modelled_hours=8,
+            partial=False,
+            pr=0.83,
+            config_version=1,
+        )
+    ]
+    store.write_efficiency_day(v1)
+    v2 = [
+        EfficiencyRow(
+            day=day,
+            string_name="East",
+            expected_kwh=31.0,
+            actual_kwh=25.0,
+            curtailed_kwh=0.0,
+            unexplained_kwh=6.0,
+            modelled_hours=8,
+            partial=False,
+            pr=0.81,
+            config_version=2,
+        )
+    ]
+    store.write_efficiency_day(v2)
+
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 1
+    assert got[0].expected_kwh == 31.0
+    assert got[0].config_version == 2
+
+
 def test_peak_reads_the_raw_maximum(tmp_path: Path) -> None:
     # The forecast calibrates on the system's own observed peak — the raw tier,
     # because a coarser tier's mean flattens exactly the peak this is for.
@@ -1280,3 +1371,40 @@ def test_peak_reads_the_raw_maximum(tmp_path: Path) -> None:
     store.close()
     assert peak == 13000.0
     assert empty is None
+
+
+def test_an_efficiency_day_keeps_its_calendar_date_east_of_utc(tmp_path: Path) -> None:
+    """A day is the instant of local midnight, and must read back as that day.
+
+    Returned as UTC, local midnight in any zone east of Greenwich lands on the
+    previous calendar date, so every day would be labelled as the one before.
+    Sydney rather than Chicago on purpose: the reference installation is west
+    of UTC and cannot show this at all.
+    """
+    from zoneinfo import ZoneInfo
+
+    from arraysense.efficiency import EfficiencyRow
+
+    sydney = ZoneInfo("Australia/Sydney")
+    day = datetime(2026, 8, 10, 0, 0, tzinfo=sydney)
+    store = SqliteStore(str(tmp_path / "tz.db"), device=TEST_DEVICE)
+    store.write_efficiency_day(
+        [
+            EfficiencyRow(
+                day=day,
+                string_name="",
+                expected_kwh=10.0,
+                actual_kwh=9.0,
+                curtailed_kwh=0.0,
+                unexplained_kwh=1.0,
+                modelled_hours=8,
+                partial=False,
+                pr=0.9,
+                config_version=1,
+            )
+        ]
+    )
+    got = store.read_efficiency_days(day, day + timedelta(days=1))
+    store.close()
+    assert len(got) == 1
+    assert got[0].day.date() == day.date(), "the day slipped to the one before"

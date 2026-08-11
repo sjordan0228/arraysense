@@ -7,6 +7,11 @@ drivers/ and must never import an inverter library. Issue #5.
 
 from __future__ import annotations
 
-from arraysense.weather.open_meteo import METRICS, fetch_current, fetch_radiation_forecast
+from arraysense.weather.open_meteo import (
+    METRICS,
+    fetch_archive_hours,
+    fetch_current,
+    fetch_radiation_forecast,
+)
 
-__all__ = ["METRICS", "fetch_current", "fetch_radiation_forecast"]
+__all__ = ["METRICS", "fetch_archive_hours", "fetch_current", "fetch_radiation_forecast"]

@@ -47,6 +47,7 @@ import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from arraysense.metrics import lookup
 from arraysense.models import BatteryModuleSample, Sample
@@ -61,6 +62,9 @@ from arraysense.store.schema import (
     module_metric_columns,
     schema_ddl,
 )
+
+if TYPE_CHECKING:
+    from arraysense.efficiency import EfficiencyRow
 
 
 def _is_memory_path(path: str) -> bool:
@@ -754,6 +758,74 @@ class SqliteStore:
         if row is None or row[0] is None:
             return None
         return lookup(name).decode(row[0])
+
+    def write_efficiency_day(self, rows: Sequence[EfficiencyRow]) -> None:
+        """Store one day's expected and actual production, overwriting what exists.
+
+        Keyed on (day, string_name), so re-computing a day after a config change
+        replaces the stale rows rather than duplicating them. One row per string
+        plus a total row whose ``string_name`` is the empty string.
+        """
+        data = [
+            (
+                int(r.day.timestamp()),
+                r.string_name,
+                r.expected_kwh,
+                r.actual_kwh,
+                r.curtailed_kwh,
+                r.unexplained_kwh,
+                r.modelled_hours,
+                1 if r.partial else 0,
+                r.pr,
+                r.config_version,
+            )
+            for r in rows
+        ]
+        with self._conn:
+            self._conn.executemany(
+                "INSERT OR REPLACE INTO efficiency_day "
+                "(day, string_name, expected_kwh, actual_kwh, curtailed_kwh, "
+                "unexplained_kwh, modelled_hours, partial, pr, config_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                data,
+            )
+
+    def read_efficiency_days(self, start: datetime, end: datetime) -> list[EfficiencyRow]:
+        """Return stored efficiency rows, oldest first.
+
+        The half-open range is asked in whatever zone ``start`` carries, and
+        each row's ``day`` comes back in that same zone. That is not a courtesy:
+        a day is stored as the instant of local midnight, and handing it back as
+        UTC moves the calendar date a day earlier everywhere east of Greenwich —
+        a Berlin or Sydney owner would see every day labelled as the one before.
+        The reference installation is west of UTC and would never have shown it.
+
+        Days with no stored row are absent from the result, not zeroed.
+        """
+        from arraysense.efficiency import EfficiencyRow
+
+        zone = start.tzinfo or UTC
+        rows = self._conn.execute(
+            "SELECT day, string_name, expected_kwh, actual_kwh, curtailed_kwh, "
+            "unexplained_kwh, modelled_hours, partial, pr, config_version "
+            "FROM efficiency_day WHERE day >= ? AND day < ? ORDER BY day, string_name",
+            (int(start.timestamp()), int(end.timestamp())),
+        ).fetchall()
+        return [
+            EfficiencyRow(
+                day=datetime.fromtimestamp(r[0], tz=zone),
+                string_name=r[1],
+                expected_kwh=r[2],
+                actual_kwh=r[3],
+                curtailed_kwh=r[4],
+                unexplained_kwh=r[5],
+                modelled_hours=r[6],
+                partial=bool(r[7]),
+                pr=r[8],
+                config_version=r[9],
+            )
+            for r in rows
+        ]
 
     def _check_inverter_names(self, metrics: Sequence[str]) -> list[str]:
         """Return ``metrics`` unchanged, raising if any is not an inverter metric.
