@@ -62,6 +62,7 @@ from arraysense.settings import (
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SETTING_TIMEZONE,
+    WEATHER_INTERVAL_KEY,
     SettingsStore,
     check_serial_device,
     describe,
@@ -173,6 +174,33 @@ def _request_zone(store: SqliteStore, tz: str | None) -> ZoneInfo:
     """
     configured = SettingsStore(store).get(SETTING_TIMEZONE)
     return resolve_zone(tz, configured if isinstance(configured, str) else None)
+
+
+def _weather_interval(store: SqliteStore) -> float:
+    """How often the forecast is re-made, in seconds.
+
+    Served to the page so its caption can say how fresh the prediction is
+    without writing a number into the markup. The interval is a setting with a
+    range of five minutes to a day, so a page that hard-coded fifteen minutes
+    would be wrong for any owner who moved it — the same drift the settings page
+    avoids by rendering itself from the registry.
+
+    A stored value that is not a number falls back to the registry's own
+    default, so the cadence a page shows and the cadence the poller keeps have
+    one home between them.
+
+    The literal behind that is reachable only if the registry itself is edited
+    to declare this setting without a numeric default, which is a programming
+    error. The weather poller stops on exactly that condition, and rightly: its
+    task is restarted and a wrong interval would go unnoticed for hours. This is
+    an HTTP handler, and failing the whole dashboard over a caption's cadence
+    would be the worse trade, so it names a number and carries on.
+    """
+    value = SettingsStore(store).get(WEATHER_INTERVAL_KEY)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    default = lookup_setting(WEATHER_INTERVAL_KEY).default
+    return float(default) if isinstance(default, (int, float)) else 900.0
 
 
 # How old the newest stored reading may be before the reader is warned that the
@@ -1532,17 +1560,21 @@ def forecast(
     store: _ReadStore,
     tz: str | None = None,
 ) -> dict[str, Any]:
-    """The day's forecast curves, measured production, and how reality tracks the plan.
+    """The day's prediction, what the array has actually made, and how often it refreshes.
 
-    The page draws what this serves and computes nothing itself — the tracking
-    figure especially lives here, once, because a page-side copy is the
-    two-parsers drift this project already paid for.
+    One prediction curve, not two. The page used to draw a frozen morning
+    baseline behind the live one and measure the day against it; two prediction
+    curves on one chart read as clutter rather than as insight, so the baseline
+    and the ahead/behind figure went with it. The gap between the prediction and
+    the solid actual line is the same signal, without a number whose reference
+    is not on screen.
 
-    The dawn curve is the earliest prediction made on the day itself for each
-    hour and is the baseline the day is tracked against. The latest curve is the
-    newest revision per hour for drawing ahead of now. Actuals come from the
-    hourly rollup — mean pv_total_power_w per hour, so each hour's energy is
-    that mean multiplied by one hour.
+    ``refresh_seconds`` is the weather poller's own interval, served rather than
+    written into the page, because it is a setting an owner can change and a
+    caption that hard-codes fifteen minutes would be wrong the moment they did.
+
+    Actuals come from the hourly rollup — mean pv_total_power_w per hour, so each
+    hour's energy is that mean multiplied by one hour.
 
     With no forecast rows for today every data field is null or empty: the page
     shows nothing, not zeros.
@@ -1561,20 +1593,19 @@ def forecast(
     day_start = local_midnight.astimezone(UTC)
     day_end = (local_midnight + timedelta(days=1)).astimezone(UTC)
 
-    curves = store.forecast_day(day_start, day_end)
-    configured = bool(curves["first"] or curves["latest"])
+    predicted = store.forecast_day(day_start, day_end)
+    refresh_seconds = _weather_interval(store)
 
-    if not configured:
+    if not predicted:
         return {
             "configured": False,
             "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
             "now": now.isoformat(),
-            "dawn": [],
-            "latest": [],
+            "prediction": [],
             "actual": [],
             "expected_today_kwh": None,
             "actual_so_far_kwh": None,
-            "tracking_pct": None,
+            "refresh_seconds": refresh_seconds,
         }
 
     # Hourly mean pv_total_power_w for the day so far. Each hour's energy is the
@@ -1591,24 +1622,18 @@ def forecast(
         if not row.get("error") and row.get("pv_total_power_w") is not None
     ]
 
-    dawn = [
+    prediction = [
         {
             "hour": cast(datetime, e["hour"]).isoformat(),
             "expected_w": cast(float, e["expected_w"]),
         }
-        for e in curves["first"]
-    ]
-    latest = [
-        {
-            "hour": cast(datetime, e["hour"]).isoformat(),
-            "expected_w": cast(float, e["expected_w"]),
-        }
-        for e in curves["latest"]
+        for e in predicted
     ]
 
-    # Expected today: sum of the latest curve in Wh, divided by 1000 for kWh.
-    latest_sum = sum(cast(float, e["expected_w"]) for e in curves["latest"])
-    expected_today_kwh: float | None = latest_sum / 1000.0 if curves["latest"] else None
+    # Expected today: the prediction summed in Wh, divided by 1000 for kWh.
+    expected_today_kwh: float | None = (
+        sum(cast(float, e["expected_w"]) for e in predicted) / 1000.0 if predicted else None
+    )
 
     # Actual production so far. Null when no hour has a reading yet — a dash,
     # never zero, because zero means the array produced nothing and that is a
@@ -1623,33 +1648,17 @@ def forecast(
             actual_wh += w
     actual_so_far_kwh: float | None = actual_wh / 1000.0 if actual_by_hour else None
 
-    # Tracking: how actual production compares to the dawn plan, over hours that
-    # carry both a dawn expectation and a measurement. Absent before any such
-    # hour exists and absent when the dawn-plan sum over those hours is zero —
-    # never a division by zero, never a figure from mismatched hours.
-    dawn_by_hour: dict[datetime, float] = {
-        cast(datetime, e["hour"]): cast(float, e["expected_w"]) for e in curves["first"]
-    }
-    matched = set(dawn_by_hour) & set(actual_by_hour)
-    tracking_pct: float | None = None
-    if matched:
-        matched_dawn = sum(dawn_by_hour[h] for h in matched)
-        if matched_dawn > 0:
-            matched_actual = sum(actual_by_hour[h] for h in matched)
-            tracking_pct = round((matched_actual / matched_dawn - 1.0) * 100.0, 1)
-
     return {
         "configured": True,
         "day": {"start": day_start.isoformat(), "end": day_end.isoformat()},
         "now": now.isoformat(),
-        "dawn": dawn,
-        "latest": latest,
+        "prediction": prediction,
         "actual": actual,
         "expected_today_kwh": round(expected_today_kwh, 3)
         if expected_today_kwh is not None
         else None,
         "actual_so_far_kwh": round(actual_so_far_kwh, 3) if actual_so_far_kwh is not None else None,
-        "tracking_pct": tracking_pct,
+        "refresh_seconds": refresh_seconds,
     }
 
 

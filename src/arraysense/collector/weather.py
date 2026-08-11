@@ -47,6 +47,7 @@ from arraysense.settings import (
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
+    WEATHER_INTERVAL_KEY,
     SettingsStore,
     lookup_setting,
 )
@@ -54,8 +55,6 @@ from arraysense.store.sqlite_store import SqliteStore
 from arraysense.weather import fetch_conditions_forecast, fetch_current
 
 logger = logging.getLogger(__name__)
-
-_INTERVAL_KEY = "collector.weather_interval"
 
 # The same tuple the inverter collector catches — see service.py:93 for the
 # rationale. Defined here rather than imported so the weather poller stays
@@ -235,13 +234,13 @@ class WeatherPoller:
         registry declares this setting as a float; a non-numeric default is a
         programming error worth stopping on, not a condition to paper over.
         """
-        value = self._settings.get(_INTERVAL_KEY)
+        value = self._settings.get(WEATHER_INTERVAL_KEY)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return float(value)
-        default = lookup_setting(_INTERVAL_KEY).default
+        default = lookup_setting(WEATHER_INTERVAL_KEY).default
         if isinstance(default, (int, float)) and not isinstance(default, bool):
             return float(default)
-        raise AssertionError(f"{_INTERVAL_KEY} is registered without a numeric default")
+        raise AssertionError(f"{WEATHER_INTERVAL_KEY} is registered without a numeric default")
 
     async def _loop(self) -> None:
         while True:
