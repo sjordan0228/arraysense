@@ -85,3 +85,62 @@ def test_split_round_trips_the_composer() -> None:
         "console.log(JSON.stringify(splitStringLine(line)));"
     )
     assert json.loads(out)["advanced"]["mounting"] == "ground"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_editor_defaults_match_the_parsers_defaults() -> None:
+    # The placeholders tell the owner what will be assumed. If they drift from
+    # what the server actually applies, the page shows one number while the
+    # model uses another — the two-places rule, in the one place a comment
+    # claimed a test already covered.
+    from arraysense.panels import _DEFAULT_MOUNTING, _FLOAT_DEFAULTS
+
+    shown = json.loads(_run("console.log(JSON.stringify(PANEL_DEFAULTS));"))
+    for key, value in _FLOAT_DEFAULTS.items():
+        assert float(shown[key]) == value, f"{key}: page shows {shown[key]}, parser uses {value}"
+    assert shown["mounting"] == _DEFAULT_MOUNTING
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_every_positional_field_round_trips_through_the_editor() -> None:
+    # The advanced fields were covered; a transposition in the positional
+    # indices would have gone unnoticed and shown the owner someone else's
+    # tilt.
+    row = {
+        "name": "South",
+        "mppt": 3,
+        "panels": 8,
+        "watts": 405,
+        "tilt": 30,
+        "azimuth": 180,
+        "advanced": {},
+    }
+    out = _run(
+        f"const line = composeStringLine({json.dumps(row)});"
+        "console.log(JSON.stringify(splitStringLine(line)));"
+    )
+    back = json.loads(out)
+    assert back["name"] == "South"
+    assert str(back["mppt"]) == "3"
+    assert str(back["panels"]) == "8"
+    assert str(back["watts"]) == "405"
+    assert str(back["tilt"]) == "30"
+    assert str(back["azimuth"]) == "180"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_quoted_note_survives_compose_and_split() -> None:
+    row = {
+        "name": "East",
+        "mppt": 1,
+        "panels": 9,
+        "watts": 410,
+        "tilt": 25,
+        "azimuth": 90,
+        "advanced": {"note": 'he said "shaded" at 4pm'},
+    }
+    line = _run(f"console.log(composeStringLine({json.dumps(row)}));")
+    (spec,) = parse_strings(line)
+    assert spec.note == 'he said "shaded" at 4pm'
+    back = json.loads(_run(f"console.log(JSON.stringify(splitStringLine({json.dumps(line)})));"))
+    assert back["advanced"]["note"] == 'he said "shaded" at 4pm'

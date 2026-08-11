@@ -1099,7 +1099,11 @@ function composeStringLine(row) {
     if (value === '' || value === null || value === undefined) continue;
     // Quoted so a note with spaces stays as one token.
     if (key === 'note') {
-      parts.push(`note="${value}"`);
+      // Escaped the way panels.py unescapes: backslashes first, then quotes,
+      // so a note that quotes something survives the round trip instead of
+      // being refused at the door.
+      const safe = String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      parts.push(`note="${safe}"`);
     } else {
       parts.push(`${key}=${value}`);
     }
@@ -1127,18 +1131,19 @@ function splitStringLine(line) {
     azimuth: parts[5] || '',
     advanced: {},
   };
-  for (let i = 6; i < parts.length; i += 1) {
-    const token = parts[i];
-    if (!token) continue;
-    const qm = token.match(/^(\w+)="([^"]*)"$/);
-    if (qm) {
-      row.advanced[qm[1]] = qm[2];
-    } else {
-      const eq = token.indexOf('=');
-      if (eq >= 0) {
-        row.advanced[token.slice(0, eq).trim()] = token.slice(eq + 1).trim();
-      }
-    }
+  // The tail is rejoined before its tokens are read, exactly as panels.py
+  // rejoins it: a quoted note may contain the separator, and splitting the
+  // whole line on "|" would tear such a note in half — the editor would then
+  // show a truncated value for a config the server reads correctly.
+  const tail = parts.slice(6).join(' | ');
+  const token = /(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
+  let m = token.exec(tail);
+  while (m !== null) {
+    const raw = m[2] !== undefined
+      ? m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      : m[3];
+    row.advanced[m[1]] = raw;
+    m = token.exec(tail);
   }
   return row;
 }

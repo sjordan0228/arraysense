@@ -40,7 +40,10 @@ _DEFAULTS: dict[str, float | str] = {**_FLOAT_DEFAULTS, "mounting": _DEFAULT_MOU
 
 _INSTALLED = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 # key=value tokens; a quoted value may hold spaces. Built for the tail only.
-_TAIL_TOKEN = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
+# A quoted value may hold spaces and escaped quotes (\"); a bare value may not.
+# The quoted branch accepts any run of non-quote characters and \" pairs, so a
+# note that quotes something round-trips instead of being refused at the door.
+_TAIL_TOKEN = re.compile(r'(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,11 @@ class StringSpec:
     voc: float | None
     note: str
     defaulted: frozenset[str]
+
+
+def _unescape(value: str) -> str:
+    """Undo the composer's escaping of a quoted value."""
+    return value.replace('\\"', '"').replace("\\\\", "\\")
 
 
 def _refuse(line: str, why: str) -> ValueError:
@@ -97,17 +105,23 @@ def _parse_line(line: str) -> StringSpec:
     tail = " | ".join(parts[6:]) if len(parts) > 6 else ""
     keys: dict[str, str] = {}
     if tail:
-        consumed = 0
         for match in _TAIL_TOKEN.finditer(tail):
             key = match.group(1)
-            value = match.group(2) if match.group(2) is not None else match.group(3)
+            quoted = match.group(2)
+            value = _unescape(quoted) if quoted is not None else match.group(3)
             if key in keys:
                 raise _refuse(line, f"{key} is given twice")
             keys[key] = value
-            consumed += len(match.group(0))
-        leftovers = re.sub(_TAIL_TOKEN, "", tail).replace("|", "").strip()
-        if leftovers:
-            raise _refuse(line, f"could not read {leftovers!r}; the tail is key=value pairs")
+        # What the tokens did not consume. Separators BETWEEN tokens are
+        # structural — the composer writes "bifacial=9 | note=..." — so only
+        # text that is not a separator counts as unreadable, and a separator
+        # with nothing after it is the typo worth naming.
+        leftovers = _TAIL_TOKEN.sub("", tail).strip()
+        unreadable = leftovers.replace("|", "").strip()
+        if unreadable:
+            raise _refuse(line, f"could not read {unreadable!r}; the tail is key=value pairs")
+        if leftovers and tail.rstrip().endswith("|"):
+            raise _refuse(line, "the tail ends with a stray separator")
 
     known = {
         "temp_coeff",

@@ -83,3 +83,22 @@ def test_duplicate_names_are_refused() -> None:
 def test_the_example_parses_and_mountings_are_the_grammars() -> None:
     assert len(parse_strings(EXAMPLE_STRINGS)) >= 2
     assert MOUNTINGS == ("open_rack", "close_roof", "ground")
+
+
+def test_a_note_may_quote_something_and_survive_the_round_trip() -> None:
+    # A note is free text the owner writes about a string; refusing it for
+    # containing a quotation mark would be the grammar dictating prose.
+    (s,) = parse_strings('East | 1 | 9 | 410 | 25 | 90 | note="he said \\"shaded\\" at 4pm"')
+    assert s.note == 'he said "shaded" at 4pm'
+
+
+def test_a_quoted_note_may_contain_the_separator() -> None:
+    # The tail is rejoined before its tokens are read, so a note naming two
+    # arrays does not tear the line in half.
+    (s,) = parse_strings('W | 2 | 9 | 410 | 25 | 270 | note="East|West roofline"')
+    assert "East" in s.note and "West" in s.note
+
+
+def test_a_tail_of_unreadable_text_is_still_refused() -> None:
+    with pytest.raises(ValueError, match="could not read"):
+        parse_strings("E | 1 | 9 | 410 | 25 | 90 | garbage here")
