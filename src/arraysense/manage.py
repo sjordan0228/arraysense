@@ -355,25 +355,33 @@ def _incoming_changelog() -> str:
     if start is None:
         return ""
     body = [lines[start]]
+    fenced = False
     for line in lines[start + 1 :]:
-        if line.startswith("## "):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and line.startswith("## "):
             break
         body.append(line)
     return "\n".join(body).strip()
 
 
-def _sync_and_restart(port: int) -> bool:
-    """Reinstall dependencies and restart, returning whether the collector came back.
+def _sync_and_restart(port: int) -> str | None:
+    """Reinstall dependencies and restart; return what went wrong, or None.
 
-    Both the upgrade path and the rollback path run this same pair — uv sync,
-    then a restart that is proven by a live collector — so a failure in either
-    half is treated the same way: the service did not come back.
+    Both the upgrade and the rollback run this same pair, and each of its three
+    steps fails for a different reason — a dependency that would not install,
+    a unit that would not start, and a collector that never answered are three
+    different problems, and telling somebody the third when it was the first
+    sends them to read the wrong log.
     """
-    if run(["uv", "sync", "--project", INSTALL_DIR]).returncode != 0:
-        return False
+    sync = run(["uv", "sync", "--project", INSTALL_DIR])
+    if sync.returncode != 0:
+        return f"dependencies would not install: {sync.stderr.strip()[:200]}"
     if not service("restart"):
-        return False
-    return wait_until_healthy(port) is not None
+        return "systemctl could not restart the service"
+    if wait_until_healthy(port) is None:
+        return f"the collector did not answer within {int(HEALTH_TIMEOUT)}s"
+    return None
 
 
 def cmd_upgrade(argv: list[str]) -> int:
@@ -413,15 +421,25 @@ def cmd_upgrade(argv: list[str]) -> int:
         print("could not fast-forward; upgrade abandoned, nothing changed")
         return 1
 
-    if _sync_and_restart(port):
+    reason = _sync_and_restart(port)
+    if reason is None:
         print("upgraded and collecting")
         return 0
+    print(reason)
+    print(f"rolling back to {previous[:7]}")
 
-    print(f"the collector did not come back; rolling back to {previous[:7]}")
-    run(["git", "-C", INSTALL_DIR, "checkout", "--force", previous])
-    if _sync_and_restart(port):
+    checkout = run(["git", "-C", INSTALL_DIR, "checkout", "--force", previous])
+    if checkout.returncode != 0:
+        print("ROLLBACK FAILED — could not check out the previous commit.")
+        print(checkout.stderr.strip())
+        print("the install is still on the new code. Run: arraysense logs")
+        return 1
+
+    reason = _sync_and_restart(port)
+    if reason is None:
         print(f"rolled back; running {previous[:7]} again (detached HEAD, which is expected)")
     else:
+        print(reason)
         print("ROLLBACK ALSO FAILED — the service is down. Run: arraysense logs")
     return 1
 

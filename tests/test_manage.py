@@ -341,6 +341,67 @@ def test_upgrade_rolls_back_when_the_collector_does_not_return(
     assert "abc1234" in checkouts[-1]
 
 
+def test_upgrade_says_so_when_the_rollback_checkout_itself_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rollback that could not happen must never be reported as one.
+
+    The health check can pass right after a failed checkout, because what is
+    still checked out is the new code that just failed for a different reason.
+    Reporting 'rolled back' there tells the owner they are running the old
+    release when they are not.
+    """
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, "abc1234def\n", "")
+        if "checkout" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "error: pathspec did not match")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    monkeypatch.setattr(manage, "is_dirty", lambda: False)
+    monkeypatch.setattr(manage, "_pending_commits", lambda: ["deadbee a release"])
+    monkeypatch.setattr(manage, "_incoming_changelog", lambda: "")
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    healths = iter([None, {"ok": True}])
+    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: next(healths))
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+    )
+
+    assert manage.cmd_upgrade([]) == 1
+    said = "\n".join(printed)
+    assert "ROLLBACK FAILED" in said
+    assert "rolled back; running" not in said, "it must not claim a rollback that did not happen"
+
+
+def test_a_dependency_failure_is_not_reported_as_a_dead_collector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dependency that will not install must be named, not blamed on the collector.
+
+    The old bool return collapsed 'uv sync failed' and 'collector never answered'
+    into the same message, sending somebody to read the wrong log.
+    """
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv and argv[0] == "uv":
+            return subprocess.CompletedProcess(argv, 1, "", "no solution found")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: {"ok": True})
+    reason = manage._sync_and_restart(8080)
+    assert reason is not None
+    assert "dependencies" in reason
+
+
 def test_upgrade_refuses_a_dirty_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Someone who hand-edited /opt/arraysense finds out now, not mid-merge."""
     monkeypatch.setattr(manage, "is_dirty", lambda: True)
@@ -381,6 +442,29 @@ def test_a_missing_changelog_is_absent_not_invented(
         lambda argv: subprocess.CompletedProcess(argv, 1, "", "no such path"),
     )
     assert manage._incoming_changelog() == ""
+
+
+def test_a_fenced_heading_inside_the_entry_does_not_truncate_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A release note quoting a fenced block must not lose the text after it.
+
+    The truncation bug stops at the first '## ' anywhere, including one inside a
+    ``` fence — and what it loses may be the migration warning.
+    """
+    text = (
+        "# Changelog\n\npreamble\n\n"
+        "## 0.8.0 \u2014 12 August 2026\n\n### Added\n- a thing\n"
+        "```markdown\n"
+        "## this heading is quoted inside the fence, not the next entry\n"
+        "```\n"
+        "- the migration warning\n\n"
+        "## 0.7.3 \u2014 11 August 2026\n\n### Fixed\n- an older thing\n"
+    )
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, text, ""))
+    entry = manage._incoming_changelog()
+    assert "migration warning" in entry
+    assert "0.7.3" not in entry
 
 
 def test_uninstall_never_removes_the_database_without_purge(
