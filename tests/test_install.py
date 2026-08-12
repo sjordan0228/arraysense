@@ -505,9 +505,42 @@ def test_the_handoff_omits_the_ip_line_when_there_is_no_address(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(install, "outbound_ip", lambda: None)
-    text = install.render_handoff(8080, "pi")
+    text = install.render_handoff(8080, "pi", local=True)
     assert "http://pi.local:8080" in text
     assert "None" not in text
+
+
+def test_the_handoff_omits_the_local_line_when_mdns_is_absent() -> None:
+    """A .local name that resolves nowhere is the same kind of guess the handoff
+    refuses to make for the IP line."""
+    text = install.render_handoff(8080, "pi", local=False)
+    assert "pi.local" not in text
+    assert "Open this" in text
+
+
+def test_the_handoff_uses_the_short_hostname() -> None:
+    """An FQDN hostname must not render as box.example.com.local."""
+    text = install.render_handoff(8080, "box.example.com", local=True)
+    assert "http://box.local:8080" in text
+
+
+def test_the_handoff_says_either_only_when_there_are_two_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install, "outbound_ip", lambda: "192.168.1.5")
+    assert "either of these" in install.render_handoff(8080, "pi", local=True)
+    only_ip = install.render_handoff(8080, "pi", local=False)
+    assert "either of these" not in only_ip
+    assert "http://192.168.1.5:8080" in only_ip
+
+
+def test_mdns_active_reports_the_systemctl_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install, "_step", lambda argv, **kw: 0 if "avahi-daemon" in argv else 1)
+    assert install.mdns_active() is True
+    monkeypatch.setattr(install, "_step", lambda argv, **kw: 1)
+    assert install.mdns_active() is False
 
 
 def test_parse_args_reads_the_repository_and_ref() -> None:

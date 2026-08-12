@@ -561,24 +561,41 @@ def outbound_ip() -> str | None:
         probe.close()
 
 
-def render_handoff(port: int, host: str) -> str:
+def mdns_active() -> bool:
+    """Whether this host answers .local names, so the handoff may claim one.
+
+    avahi-daemon is the mDNS responder on Debian and Raspberry Pi OS; without
+    it a .local name resolves nowhere at all, and printing it as an address a
+    person can open sends them chasing a name that does not answer. A host that
+    has no avahi gets only the IP line, never a guessed name.
+    """
+    return _step(["systemctl", "is-active", "--quiet", "avahi-daemon"]) == 0
+
+
+def render_handoff(port: int, host: str, *, local: bool) -> str:
     """The addresses a person opens to reach the wizard.
 
-    The .local name is always shown; the IP line comes from the routing table
-    rather than the hostname lookup, which maps to 127.0.1.1 on Debian. When no
-    route can be determined there is no IP line at all — never a placeholder
-    that looks like an address.
+    The .local name is shown only when the host actually answers mDNS — the
+    same rule that drops the IP line when no route can be determined, never a
+    placeholder that looks like an address. The IP line comes from the routing
+    table rather than the hostname lookup, which maps to 127.0.1.1 on Debian.
+    The hostname is split at the first dot so an FQDN does not become
+    box.example.com.local.
     """
     suffix = "" if port == 80 else f":{port}"
+    short_host = host.split(".")[0]
     ip = outbound_ip()
-    heading = (
-        "Installed. Open either of these to run the setup wizard:"
-        if ip is not None
-        else "Installed. Open this to run the setup wizard:"
-    )
-    lines = ["", heading, f"  http://{host}.local{suffix}"]
+    lines = [""]
+    if local:
+        lines.append(f"  http://{short_host}.local{suffix}")
     if ip is not None:
         lines.append(f"  http://{ip}{suffix}")
+    heading = (
+        "Installed. Open either of these to run the setup wizard:"
+        if len(lines) == 3
+        else "Installed. Open this to run the setup wizard:"
+    )
+    lines.insert(1, heading)
     return "\n".join(lines)
 
 
@@ -720,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Installed, but the service did not come up. Run: arraysense logs")
         return 1
 
-    print(render_handoff(port, socket.gethostname()))
+    print(render_handoff(port, socket.gethostname(), local=mdns_active()))
     return 0
 
 
