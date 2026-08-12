@@ -114,10 +114,89 @@ def test_no_terminal_is_not_consent() -> None:
 
 
 def test_parse_args_reads_the_two_unattended_flags() -> None:
-    assert install.parse_args(["--yes", "--port", "8099"]) == {"yes": True, "port": 8099}
-    assert install.parse_args([]) == {"yes": False, "port": None}
+    assert install.parse_args(["--yes", "--port", "8099"]) == {
+        "yes": True,
+        "port": 8099,
+        "repo": install.REPO_URL,
+        "ref": None,
+    }
+    assert install.parse_args([]) == {
+        "yes": False,
+        "port": None,
+        "repo": install.REPO_URL,
+        "ref": None,
+    }
 
 
 def test_parse_args_refuses_a_port_that_is_not_a_number() -> None:
     with pytest.raises(SystemExit):
         install.parse_args(["--port", "eighty"])
+
+
+def test_unit_text_reads_the_unit_from_the_clone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unit travels with the source, so this checkout is the source."""
+    monkeypatch.setattr(install, "INSTALL_DIR", str(Path(__file__).resolve().parents[1]))
+    text = install.unit_text()
+    assert "[Unit]" in text
+    assert "Solar ArraySense" in text
+
+
+def test_the_dropin_sets_the_port_and_only_the_port() -> None:
+    """ExecStart is cleared then re-set: systemd appends otherwise, and the
+    unit would try to start twice with different arguments."""
+    text = install.dropin_text(8099)
+    assert "ExecStart=\n" in text
+    assert "--port 8099" in text
+
+
+def test_port_80_gets_the_capability_and_other_ports_do_not() -> None:
+    """Without it an unprivileged service cannot bind 80, and the failure
+    reads as nothing to do with permissions."""
+    assert "CAP_NET_BIND_SERVICE" in install.dropin_text(80)
+    assert "CAP_NET_BIND_SERVICE" not in install.dropin_text(8080)
+
+
+def test_the_shim_runs_manage_under_the_system_interpreter() -> None:
+    """Never the virtualenv: upgrade rebuilds it while this is running."""
+    shim = install.shim_text()
+    assert "/opt/arraysense/src/arraysense/manage.py" in shim
+    assert ".venv" not in shim
+
+
+def test_the_handoff_never_prints_a_loopback_address() -> None:
+    """127.0.1.1 is what /etc/hosts says on Debian, and it is useless to
+    somebody opening the dashboard from their laptop."""
+    ip = install.outbound_ip()
+    if ip is not None:
+        assert not ip.startswith("127."), ip
+
+
+def test_the_handoff_omits_the_ip_line_when_there_is_no_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install, "outbound_ip", lambda: None)
+    text = install.render_handoff(8080, "pi")
+    assert "http://pi.local:8080" in text
+    assert "None" not in text
+
+
+def test_parse_args_reads_the_repository_and_ref() -> None:
+    parsed = install.parse_args(["--repo", "/srv/a.git", "--ref", "feat/x"])
+    assert parsed["repo"] == "/srv/a.git"
+    assert parsed["ref"] == "feat/x"
+
+
+def test_the_defaults_are_the_project_and_its_default_branch() -> None:
+    parsed = install.parse_args([])
+    assert parsed["repo"] == install.REPO_URL
+    assert parsed["ref"] is None
+
+
+def test_the_plan_names_a_non_default_repository() -> None:
+    """Installing from somewhere other than the project must be visible in the
+    plan, because the plan is the only thing shown before root acts."""
+    plan = install.render_plan(8080, repo="/srv/a.git", ref="feat/x")
+    assert "/srv/a.git" in plan
+    assert "feat/x" in plan
