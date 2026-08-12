@@ -1803,11 +1803,26 @@ def panels(request: Request, store: _ReadStore) -> dict[str, Any]:
             "battery.installed",
         )
     }
+    from arraysense.panels import PANEL_CATALOGUE
+
     declared = getattr(request.app.state.service.source, "capabilities", None)
     return {
         "strings": [{**asdict(s), "defaulted": sorted(s.defaulted)} for s in strings],
         "battery": battery,
         "declared_mppts": declared.pv_strings if declared is not None else None,
+        "catalogue": [
+            {
+                "name": e.name,
+                "description": e.description,
+                "vmp": e.vmp,
+                "voc": e.voc,
+                "temp_coeff": e.temp_coeff,
+                "noct": e.noct,
+                "degradation": e.degradation,
+                "citation": e.citation,
+            }
+            for e in PANEL_CATALOGUE
+        ],
     }
 
 
