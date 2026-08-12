@@ -76,8 +76,10 @@ STORE_ERRORS = (sqlite3.Error,)
 # is not supposed to be able to end at all — every expected failure is caught
 # inside it — so this covers only what nobody predicted, and it exists because
 # the alternative is a poller that stops for the life of the process with no
-# symptom beyond the sky quietly ceasing to be recorded. A few seconds, so a
-# repeating fault writes a log line every few seconds rather than a wall of them.
+# symptom beyond the sky quietly ceasing to be recorded. A few seconds so a
+# restarted loop is back promptly; this is the supervisor's restart delay, not
+# the poll interval — a tick that fails still waits out the configured cadence
+# rather than hammering the weather service.
 LOOP_RESTART_SECONDS = 5.0
 
 # How many intervals of silence make a poller stalled rather than merely
@@ -278,12 +280,12 @@ class WeatherPoller:
         programming error worth stopping on, not a condition to paper over.
 
         The read itself is a SELECT against a database another writer can hold
-        past the busy timeout — the condition ``STORE_ERRORS`` exists for — and
-        it used to run outside the loop's guard, where one busy moment ended
-        the sky poller for the life of the process with nothing watching to
-        start it again. A failed read is a moment of contention and not a
-        change of cadence, so it takes the registered default and tries again
-        next cycle.
+        past the busy timeout — the condition ``STORE_ERRORS`` exists for. It
+        sits outside the loop's guard (a failed tick must still wait out the
+        configured cadence), so a busy moment here has to be its own defence:
+        it takes the registered default and tries again next cycle, rather
+        than ending the sky poller — which a locked database once did, with
+        nothing watching to start it again.
         """
         try:
             value: object = self._settings.get(WEATHER_INTERVAL_KEY)
@@ -354,15 +356,19 @@ class WeatherPoller:
         while True:
             try:
                 await self.tick()
-                delay = self._interval()
             except asyncio.CancelledError:
                 raise
             # A tick already contains every expected failure; anything else is
             # a bug worth a traceback, but the sky is not worth killing the
-            # loop over — the next tick starts clean. The interval read is
-            # inside the guard for the same reason: it touches the database,
-            # and a cadence nobody could read is not a reason to stop polling.
+            # loop over — the next tick starts clean. The cadence read stays
+            # outside the guard: a fault anywhere in the model chain has
+            # already fetched Open-Meteo twice, and retrying it every few
+            # seconds would hammer a keyless free service, so a failed tick
+            # waits out the configured interval like any other. The read
+            # itself takes the registered default when the database is busy
+            # (see _interval), so it cannot end the loop on its own either;
+            # a cadence that genuinely cannot be read propagates to the
+            # supervisor, which restarts the loop after LOOP_RESTART_SECONDS.
             except Exception:
                 logger.exception("weather cycle failed unexpectedly")
-                delay = LOOP_RESTART_SECONDS
-            await asyncio.sleep(delay)
+            await asyncio.sleep(self._interval())

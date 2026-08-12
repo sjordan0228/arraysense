@@ -415,9 +415,11 @@ async def test_a_locked_database_on_the_interval_read_does_not_end_the_loop(
     store: SqliteStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # The interval is read from the settings table on every cycle, which is a
-    # SELECT another writer can hold past the busy timeout. That read used to
-    # sit outside the loop's guard, so one busy moment ended the sky poller for
-    # the life of the process.
+    # SELECT another writer can hold past the busy timeout. The read sits
+    # outside the loop's guard — a failed tick must still wait out the cadence
+    # — so _interval has to handle the busy database itself, and it does, by
+    # taking the registered default. A locked database once ended the sky
+    # poller for the life of the process.
     _set_location(store)
     ticks = asyncio.Event()
 
@@ -494,6 +496,39 @@ async def test_a_loop_that_dies_is_brought_back(
         assert poller.running is True
     finally:
         await poller.stop()
+
+
+async def test_an_unexpected_tick_failure_keeps_the_configured_cadence(
+    store: SqliteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A fault in the model chain must not turn the loop into a five-second
+    # retry against Open-Meteo. tick() has already made its two HTTPS GETs by
+    # the time _forecast_points runs ordinary Python, so a bug there would
+    # otherwise refetch the weather service ~17,000 times a day instead of
+    # ~96 — the supervisor's restart delay is a different question from the
+    # poll interval.
+    _set_location(store)
+    monkeypatch.setattr(weather_module, "LOOP_RESTART_SECONDS", 0.01)
+    attempts = 0
+
+    def fetch(lat: float, lon: float) -> Sample | None:
+        nonlocal attempts
+        attempts += 1
+        raise TypeError("a bug downstream of the fetch")
+
+    poller = WeatherPoller(store, fetch=fetch)
+    # A short cadence so the test finishes quickly; long enough that a retry
+    # loop at LOOP_RESTART_SECONDS lands an order of magnitude more attempts.
+    monkeypatch.setattr(poller, "_interval", lambda: 0.2)
+
+    await poller.start()
+    try:
+        await asyncio.sleep(0.7)
+    finally:
+        await poller.stop()
+    # ~0.7 s at the 0.2 s cadence is about four attempts; the 0.01 s retry loop
+    # would be roughly seventy.
+    assert attempts <= 12
 
 
 async def test_a_poller_that_has_stopped_ticking_can_be_seen_to_have_stopped(
