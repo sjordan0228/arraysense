@@ -318,6 +318,17 @@ def test_main_turns_an_unanswerable_port_question_into_a_message(
     assert "--port" in out
 
 
+def test_the_backup_unit_makes_no_false_clock_claim() -> None:
+    """After=time-sync.target gave no clock guarantee (the target is passive,
+    and nothing that could order before it is enabled), so the unit must not
+    claim it does; the comment stating it as fact was the defect."""
+    text = (
+        Path(__file__).resolve().parents[1] / "packaging" / "arraysense-backup.service"
+    ).read_text()
+    assert "Wants=time-sync.target" not in text
+    assert "After=arraysense.service time-sync.target" not in text
+
+
 def test_unit_text_reads_the_unit_from_the_clone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
