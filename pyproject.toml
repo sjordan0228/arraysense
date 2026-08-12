@@ -69,7 +69,7 @@ convention = "google"
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests", "tools"]
+files = ["src", "tests", "tools", "install.py"]
 
 [[tool.mypy.overrides]]
 module = "pylxpweb.*"
