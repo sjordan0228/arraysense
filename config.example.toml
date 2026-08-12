@@ -1,5 +1,6 @@
 # Solar ArraySense configuration.
-# Copy to /etc/arraysense/config.toml and fill in your own values.
+# A reference for hand-configuration. Copying it into /etc/arraysense/config.toml
+# skips the first-run setup wizard, so this file is only for configuring by hand.
 # This file identifies your hardware — keep it out of version control.
 
 # Address of the inverter's WiFi dongle. Give it a static DHCP lease.

@@ -322,7 +322,8 @@ def example_toml() -> str:
     """
     return (
         "# Solar ArraySense configuration.\n"
-        "# Copy to /etc/arraysense/config.toml and fill in your own values.\n"
+        "# A reference for hand-configuration. Copying it into /etc/arraysense/config.toml\n"
+        "# skips the first-run setup wizard, so this file is only for configuring by hand.\n"
         "# This file identifies your hardware — keep it out of version control.\n"
         "\n"
         "# Address of the inverter's WiFi dongle. Give it a static DHCP lease.\n"

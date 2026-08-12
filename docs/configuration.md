@@ -1,8 +1,9 @@
 # Configuration
 
-> Solar ArraySense is not yet functional. The settings below are the ones the
-> collector will read. Treat this as a reference for what will be required rather
-> than working instructions.
+> These are working instructions. The collector reads this file at startup, and
+> the installer deliberately writes no configuration — the setup wizard writes the
+> first one on the dashboard's first visit. Once the service is running, most of
+> these settings are edited from the settings page rather than in the file.
 
 Configuration lives in a TOML file, by default at `/etc/arraysense/config.toml`. Pass
 a different path with `--config`.
@@ -48,10 +49,11 @@ and get abandoned.
 ### `driver`
 
 Which family of inverter to read. Defaults to `eg4_luxpower`, which covers the EG4
-and LuxPower hybrids reached over the WiFi dongle — the 18kPV, the 6000XP and the
-12kPV all speak the same register set. There is no reason to set this today; it
-exists so that a second family can be added as a directory rather than as an edit
-to the collector.
+and LuxPower hybrids reached over the WiFi dongle — the 18kPV, the 12kPV and the
+FlexBOSS models. The off-grid 6000XP is offered too, with a caveat: several
+registers mean something different there, so its readings may be wrong rather than
+missing. There is no reason to set this today; it exists so that a second family
+can be added as a directory rather than as an edit to the collector.
 
 An unrecognised name stops the service at startup with the list of names that work.
 

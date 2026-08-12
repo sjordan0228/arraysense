@@ -3,9 +3,14 @@
 Open-source solar and battery monitoring for EG4 and LuxPower inverters — including
 **per-module battery telemetry**, read over your local network.
 
-> **Status: early.** Polling, storage, the HTTP API and the dashboard all work and
-> are exercised against real hardware. It has not yet run unattended for long
-> stretches, and nothing here should be treated as settled.
+> **Status: running unattended.** Polling, storage, the HTTP API and the dashboard
+> run against real hardware: the reference installation has collected 272,789
+> inverter readings over 34.5 continuous days — 99.76 % of that window covered —
+> on top of 668 days of hourly history. The measured record is one model, the EG4
+> 18kPV; the 12kPV, FlexBOSS21 and FlexBOSS18 are supported on upstream evidence
+> rather than measurement. There is no authentication yet
+> ([#34](https://github.com/sjordan0228/arraysense/issues/34)), so keep the
+> service on your own network rather than exposing it to the internet.
 
 ## Why
 
@@ -101,6 +106,8 @@ from it, so adding a metric is a one-line change there.
 ## Documentation
 
 - [docs/installation.md](docs/installation.md) — hardware requirements and setup
+- [docs/raspberry-pi.md](docs/raspberry-pi.md) — running it on a Pi: the SD card,
+  the USB SSD, and reaching the inverter over RS485
 - [docs/configuration.md](docs/configuration.md) — configuration reference
 - [docs/api.md](docs/api.md) — HTTP API reference
 - [docs/troubleshooting.md](docs/troubleshooting.md) — dongle connection problems,
