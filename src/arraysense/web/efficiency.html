@@ -338,6 +338,12 @@ function effPartialReason(summary) {
     return 'only ' + scored + ' of the ' + owed + ' days in this period could be scored, '
       + 'so every total below covers those days alone';
   }
+  const strs = summary.strings_scored;
+  const described = summary.strings_described;
+  if (Number.isFinite(strs) && Number.isFinite(described) && strs < described) {
+    return (described - strs) + ' of the ' + described + ' strings reported nothing at all, '
+      + 'so the totals below are the rest of the array and not the whole of it';
+  }
   return 'not all daylight hours could be modelled, so the performance ratio is drawn '
     + 'from a fraction of the day';
 }

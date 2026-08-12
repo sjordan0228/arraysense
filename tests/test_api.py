@@ -3336,6 +3336,56 @@ def test_efficiency_period_day_computes_daily_summary(tmp_path: Path) -> None:
     assert s["partial"] is True
 
 
+def test_efficiency_does_not_divide_two_strings_output_by_three_strings_kwp(
+    tmp_path: Path,
+) -> None:
+    """A string nobody read leaves the array's yield without a denominator for it.
+
+    On 10 July 2025 the reference installation reported PV1 and PV2 for ninety
+    hourly rows and NULL for PV3 throughout. The endpoint served PV3 as
+    expected 0.0, actual 0.0 and a specific yield of 0.0 kWh/kWp — a string that
+    was never read presented as a string that produced nothing — and divided the
+    two strings that did report by all 14.04 kWp of the array, with partial
+    false. The waterfall reconciled perfectly while a third of the array was
+    unmeasured.
+    """
+    when = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=when,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    two = "South | 1 | 20 | 400 | 25 | 180\nWest | 2 | 20 | 400 | 25 | 270"
+    with _efficiency_client(tmp_path, build, strings=two) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert [s["name"] for s in body["strings"]] == ["South"], "a silent string was scored"
+    one = next(s for s in body["strings"] if s["name"] == "South")
+    summary = body["summary"]
+    assert summary["specific_yield"] == pytest.approx(one["specific_yield"])
+    assert summary["strings_scored"] == 1
+    assert summary["strings_described"] == 2
+    assert summary["partial"] is True
+
+
 def test_efficiency_week_says_how_many_of_its_days_it_scored(tmp_path: Path) -> None:
     """A week totalled over four days must not be presented as a week.
 

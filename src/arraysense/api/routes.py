@@ -2063,7 +2063,16 @@ def efficiency(
     for r in daily_rows:
         by_string.setdefault(r.string_name, []).append(r)
 
-    total_kwp = sum(_string_kwp(s) for s in strings)
+    # The array's yield is its output over the nameplate that produced it, and a
+    # string the inverter never reported produced no part of the numerator — so
+    # it must be no part of the denominator either. Dividing two strings' output
+    # by three strings' kWp understates the array by a third and says nothing:
+    # the reference installation served 3.621 kWh/kWp for a day PV3 was never
+    # read, against 14.04 kWp of which only 9.36 was measured.
+    scored_names = {r.string_name for r in daily_rows if r.string_name}
+    described_names = {s.name for s in strings}
+    total_kwp = sum(_string_kwp(s) for s in strings if s.name in scored_names)
+    strings_missing = bool(described_names - scored_names)
 
     # How much of the period the total was actually totalled over. A day the
     # engine could not model returns no rows at all, so it simply vanishes from
@@ -2101,16 +2110,25 @@ def efficiency(
             "pr": round(pr, 4) if pr is not None else None,
             "specific_yield": round(sy, 3) if sy is not None else None,
             "tolerance_pct": _METER_TOLERANCE_PCT,
-            # Two different incompletenesses, and the flag has to carry both.
-            # ``r.partial`` is a within-day figure — how much of a day's
-            # daylight the engine could model — and it is blind to a day that
-            # produced no row to carry a flag on.
-            "partial": any(r.partial for r in rows) or days_scored < days_expected,
+            # Three different incompletenesses, and the flag has to carry all of
+            # them. ``r.partial`` is a within-day figure — how much of a day's
+            # daylight the engine could model — and it is blind both to a day
+            # that produced no row to carry a flag on and to a string the
+            # inverter was silent about for the whole period.
+            "partial": (
+                any(r.partial for r in rows)
+                or days_scored < days_expected
+                or (name == "" and strings_missing)
+            ),
             "days_scored": days_scored,
             "days_expected": days_expected,
         }
 
-    summary = _summarise("", by_string.get("", []))
+    summary = {
+        **_summarise("", by_string.get("", [])),
+        "strings_scored": len(scored_names),
+        "strings_described": len(described_names),
+    }
 
     # Per-string summaries
     string_summaries: list[dict[str, Any]] = []

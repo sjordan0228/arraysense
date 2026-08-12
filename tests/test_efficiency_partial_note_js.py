@@ -66,6 +66,22 @@ def test_a_complete_set_of_days_falls_back_to_the_hours_wording() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_silent_string_is_named_rather_than_blamed_on_the_hours() -> None:
+    """A day every hour of which was modelled can still be missing a third of the array."""
+    reason = _call(
+        {
+            "partial": True,
+            "days_scored": 1,
+            "days_expected": 1,
+            "strings_scored": 2,
+            "strings_described": 3,
+        }
+    )
+    assert reason is not None
+    assert "1 of the 3 strings" in reason
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_single_partial_day_is_not_described_as_missing_days() -> None:
     """One day scored of one owed cannot be a missing-days problem."""
     reason = _call({"partial": True, "days_scored": 1, "days_expected": 1})
