@@ -498,7 +498,13 @@ class SqliteStore:
             # record of the same instant — and scoped to the metrics this write
             # covers, or a sky reading landing on an inverter's second would
             # erase the inverter's record of a fault it never saw.
-            self._clear_flags(cur, epoch, unit, columns)
+            #
+            # A gap clears nothing. It has no reading to flag, and the flags at
+            # that second describe a reading it is not allowed to replace — so
+            # clearing them would delete the evidence about a measurement that
+            # is still standing right there in the row.
+            if not sample.is_failed:
+                self._clear_flags(cur, epoch, unit, columns)
             for name, value in sample.readings.items():
                 spec = lookup(name)
                 if not spec.within_bounds(value):

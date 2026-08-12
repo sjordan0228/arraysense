@@ -1684,3 +1684,24 @@ def test_a_gap_still_lands_where_nothing_was_read(tmp_path: Path) -> None:
     assert rows[int(empty_second.timestamp())] == "TimeoutError: first"
     assert rows[int(sky_second.timestamp())] == "TimeoutError: second"
     assert ghi is not None, "recording the outage erased the sky reading beside it"
+
+
+def test_a_refused_gap_leaves_the_readings_bounds_flag_alone(tmp_path: Path) -> None:
+    """The evidence about a reading outlives the failure that followed it.
+
+    A flag describes a measurement, and a gap that may not replace that
+    measurement must not delete what was recorded about it either — an
+    implausible reading is kept and flagged precisely so a decode fault can be
+    diagnosed six months later.
+    """
+    path = tmp_path / "flag-survives.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 99000.0}))
+    store.append(Sample.failed(when, "TimeoutError: no reply from inverter"))
+    store.close()
+
+    conn = _open_db(path)
+    flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
+    conn.close()
+    assert flagged == ["pv_total_power_w"], "the refused gap deleted the reading's flag"
