@@ -235,9 +235,12 @@ def _faiman_u0(mounting: str, noct: float) -> tuple[float, float]:
     """
     u0, u1 = _FAIMAN.get(mounting, _FAIMAN["open_rack"])
     rise = _NOCT_IRRADIANCE / (u0 + u1) + (noct - DEFAULT_NOCT)
-    # The grammar bounds NOCT at 20-90, which keeps this comfortably positive on
-    # every mounting; the floor is here so a caller reaching past the grammar
-    # gets a very hot module rather than a division by zero.
+    # The rise can go to zero or below for an extreme NOCT declaration
+    # (the grammar's own minimum of 20 C on an open rack produces 0.13).
+    # The floor exists solely to prevent a division by zero — it is never
+    # reached by a real datasheet value (41-48 C) on any mounting, and
+    # when it is reached it models the module as sitting near air
+    # temperature, not as running hot.
     return _NOCT_IRRADIANCE / max(rise, 1.0) - u1, u1
 
 
