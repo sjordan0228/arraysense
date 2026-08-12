@@ -20,6 +20,20 @@ and, beside it, one normalised row per battery module keyed by an integer id
 into the serials table. A crash can lose the poll in flight but cannot leave a
 timestamp half-written.
 
+The raw tier has two writers and one key, and each of them touches only its own
+columns. The inverter poll writes the driver's metrics and the error reason; the
+weather poller writes ``metrics.SITE_METRICS``, on a clock that shares nothing
+with the poll's, so roughly one tick in ten lands on a second an inverter poll
+already owns. While a write replaced the whole row, whichever arrived second
+blanked the first: an inverter reading erased under a sky reading — the row then
+claiming the inverter reported nothing at an instant where its battery modules
+still hold full readings — and, worse, a recorded gap whose error the sky
+reading cleared, which is an outage smoothed away rather than drawn. Splitting
+the update by writer is what makes the two independent. Within one writer's own
+columns nothing is merged: a poll that reached the inverter and got no value for
+a metric still writes NULL over whatever stood there, because that NULL is a
+measurement and holding the old value would be inventing one.
+
 Every row is stamped with a device — the serial of the inverter that produced
 it. A store is opened for one device and every method defaults to it, so a
 single-inverter installation reads and writes exactly as it always did; a
@@ -42,6 +56,7 @@ the caller both are the same fact: nothing was measured here.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -49,7 +64,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from arraysense.metrics import lookup
+from arraysense.metrics import SITE_METRICS, lookup
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.migrate import needs_device_migration
 from arraysense.store.schema import (
@@ -65,6 +80,8 @@ from arraysense.store.schema import (
 
 if TYPE_CHECKING:
     from arraysense.efficiency import EfficiencyRow
+
+logger = logging.getLogger(__name__)
 
 
 def _is_memory_path(path: str) -> bool:
@@ -203,8 +220,19 @@ class SqliteStore:
         # this driver produce it" — a typo and an undeclared reading both fail
         # loudly, but they are different mistakes and get different messages.
         self._columns = inverter_metric_columns(declared)
-        self._specs = tuple(lookup(name) for name in self._columns)
         self._writable = frozenset(self._columns)
+        # The same columns split by which writer owns them. Two writers share
+        # this tier at one-second resolution and an append must leave the other
+        # one's columns exactly as it found them, so the split is computed once
+        # here rather than per write.
+        self._site_columns = tuple(name for name in self._columns if name in SITE_METRICS)
+        self._inverter_columns = tuple(name for name in self._columns if name not in SITE_METRICS)
+        # What has to be true of a row before a recorded gap may land on it:
+        # that it holds no inverter reading. Built once because it names every
+        # inverter column, and read only when a gap is being written.
+        self._unread_guard = " AND ".join(
+            f"inverter_raw.{name} IS NULL" for name in self._inverter_columns
+        )
         self._module_columns = module_metric_columns(declared)
         self._inverter_names = frozenset(inverter_metric_columns())
         self._module_names = frozenset(module_metric_columns())
@@ -419,13 +447,23 @@ class SqliteStore:
         (timestamp, device, module_id), all inside the one transaction this call
         commits.
 
-        Writing a timestamp that already exists *for the same device* overwrites
-        it in place, later write winning, so a collector retrying after a partial
-        failure repairs its row rather than doubling it — and two inverters
-        polled at the same instant write two rows rather than one overwriting the
-        other. The bounds flags for that timestamp are cleared before being
-        rewritten for the same reason: otherwise a retry would count a fault that
-        happened once as several.
+        Writing a timestamp that already exists *for the same device* updates it
+        in place rather than doubling it — a collector retrying after a partial
+        failure repairs its row — and two inverters polled at the same instant
+        write two rows rather than one overwriting the other. What the update
+        covers is only the writing side's own columns: an inverter poll leaves
+        the site columns alone, and a site reading leaves every inverter column
+        and the error reason alone. Which side a sample is depends on what it
+        carries — see ``_is_site_sample`` — so the weather poller and the
+        archive backfill both take the site path with no argument to pass and
+        none to forget. The bounds flags are cleared the same way, narrowed to
+        the metrics being written: a full clear let one writer erase the other's
+        record of a fault at the same second.
+
+        One write is refused rather than narrowed. A recorded gap lands only on
+        a row that holds no inverter reading — see ``_upsert_inverter_row`` —
+        because a poll that measured nothing must never delete a poll that
+        measured something, and at one-second resolution the two can collide.
 
         The sample's timestamp must be timezone-aware. A naive one is read as local
         time on the way to epoch seconds, which files the row hours from where it
@@ -449,18 +487,24 @@ class SqliteStore:
         epoch = int(sample.timestamp.timestamp())
         unit = self._device(device)
         self._validate_reading_names(sample.readings)
+        site = self._is_site_sample(sample)
+        columns = self._written_columns(sample, site=site)
         with self._conn:
             cur = self._conn.cursor()
             # The row upsert is idempotent, so the flags must be too. Without
             # clearing first, a collector retrying the same timestamp would
             # inflate the failure count for a fault that happened once. Scoped
             # to this device, or one inverter's retry would erase another's
-            # record of the same instant.
-            cur.execute(
-                "DELETE FROM invalid_readings "
-                "WHERE timestamp = ? AND device = ? AND serial IS NULL",
-                (epoch, unit),
-            )
+            # record of the same instant — and scoped to the metrics this write
+            # covers, or a sky reading landing on an inverter's second would
+            # erase the inverter's record of a fault it never saw.
+            #
+            # A gap clears nothing. It has no reading to flag, and the flags at
+            # that second describe a reading it is not allowed to replace — so
+            # clearing them would delete the evidence about a measurement that
+            # is still standing right there in the row.
+            if not sample.is_failed:
+                self._clear_flags(cur, epoch, unit, columns)
             for name, value in sample.readings.items():
                 spec = lookup(name)
                 if not spec.within_bounds(value):
@@ -470,11 +514,20 @@ class SqliteStore:
                         (epoch, unit, name, value),
                     )
             values: list[int | str | None] = [
-                spec.encode(sample.readings[spec.name]) if spec.name in sample.readings else None
-                for spec in self._specs
+                lookup(name).encode(sample.readings[name]) if name in sample.readings else None
+                for name in columns
             ]
-            values.append(sample.error)
-            self._upsert_inverter_row(cur, epoch, unit, self._columns, values)
+            if not site:
+                values.append(sample.error)
+            self._upsert_inverter_row(
+                cur,
+                epoch,
+                unit,
+                columns,
+                values,
+                with_error=not site,
+                protect_readings=sample.is_failed,
+            )
             self._append_modules(cur, epoch, unit, sample.battery_modules)
 
     def query(
@@ -957,6 +1010,76 @@ class SqliteStore:
             raise KeyError(f"unknown metric name: {name!r}")
         raise KeyError(f"metric {name!r} is not among those declared for this store")
 
+    def _is_site_sample(self, sample: Sample) -> bool:
+        """Say whether this sample is the sky rather than the inverter.
+
+        The registry's ``SITE_METRICS`` is the only classification of a metric
+        there is, so the sample is read against it rather than the caller being
+        asked to declare which writer it is. That keeps every site-level source
+        on the site path with nothing to pass and nothing to forget: the weather
+        poller, the archive backfill behind ``POST /api/efficiency/backfill``,
+        and whatever records the sky next all take it by virtue of what they
+        measured.
+
+        A recorded gap is never the sky. The error reason belongs to the
+        inverter — it is that inverter that went quiet — and a sample carrying
+        one takes the inverter path even though it carries no readings at all,
+        which is what lets a gap keep writing NULL over its own columns.
+        """
+        if sample.error is not None or sample.battery_modules:
+            return False
+        return bool(sample.readings) and set(sample.readings) <= SITE_METRICS
+
+    def _written_columns(self, sample: Sample, *, site: bool) -> tuple[str, ...]:
+        """Return the columns this append may write, and no others.
+
+        The two writers are asymmetric, and the asymmetry is the point.
+
+        An inverter poll writes every inverter column this store declares,
+        reported or not, because a poll that reached the inverter and got no
+        value for a metric has measured its absence — NULL there is a reading
+        and keeping the previous value would be inventing one.
+
+        A site append writes only the columns it actually carries. Its readings
+        for one instant arrive in more than one piece: the archive answers a
+        request for a day with the means over each hour just gone and the
+        readings taken at each hour label, and the two land on the same second
+        from different requests, so an hour's irradiance and that same hour's
+        temperature are two writes to one row. Writing the whole site set would
+        make the second of them erase the first — the fault this class had
+        against the inverter, one layer in. Nothing stale can be resurrected
+        that way, because the row *is* the instant: a value left in place was
+        measured at exactly the second being written.
+
+        A sample that is not the sky but carries a site reading anyway — no
+        driver declares one today — writes that column too rather than dropping
+        the measurement silently.
+        """
+        if site:
+            return tuple(name for name in self._site_columns if name in sample.readings)
+        extra = tuple(name for name in self._site_columns if name in sample.readings)
+        return self._inverter_columns + extra
+
+    def _clear_flags(
+        self, cur: sqlite3.Cursor, epoch: int, device: str, columns: tuple[str, ...]
+    ) -> None:
+        """Drop this write's own bounds flags for one instant, before rewriting them.
+
+        Narrowed to the columns being written, so one writer's retry cannot
+        clear the other writer's record of a fault at the same second — the
+        flags table has no notion of which writer filed a row, so the metric
+        name is what separates them. An empty column set has nothing to clear
+        and no valid ``IN ()`` to express it with, so it does nothing at all.
+        """
+        if not columns:
+            return
+        placeholders = ", ".join("?" for _ in columns)
+        cur.execute(
+            "DELETE FROM invalid_readings WHERE timestamp = ? AND device = ? "
+            f"AND serial IS NULL AND metric IN ({placeholders})",
+            (epoch, device, *columns),
+        )
+
     def _upsert_inverter_row(
         self,
         cur: sqlite3.Cursor,
@@ -964,38 +1087,82 @@ class SqliteStore:
         device: str,
         columns: tuple[str, ...],
         values: list[int | str | None],
+        *,
+        with_error: bool,
+        protect_readings: bool = False,
     ) -> None:
-        """Write one wide row to inverter_raw, the later write winning.
+        """Write one wide row to inverter_raw, updating only the writer's own columns.
 
-        ``ON CONFLICT(timestamp, device) DO UPDATE`` is what makes a collector retry
-        after a partial failure idempotent: the row is never duplicated, and the
-        second write's values — NULLs included, for metrics it did not report —
-        replace the first's rather than merging with them. The device is in the
-        conflict target because it is in the key: without it, two inverters polled
-        at the same second would take turns overwriting one row.
+        ``ON CONFLICT(timestamp, device) DO UPDATE`` is what makes a collector
+        retry after a partial failure idempotent: the row is never duplicated,
+        and the second write's values — NULLs included, for metrics it did not
+        report — replace the first's. What it deliberately does not do is touch
+        a column outside ``columns``. This tier has two writers at one-second
+        resolution and updating every column made whichever wrote second erase
+        the other: a sky reading landing on a poll's second blanked ninety-one
+        inverter columns, leaving a row that claimed the inverter said nothing
+        while its own battery modules held full readings at that instant, and
+        landing on a recorded gap it cleared the error and erased the outage
+        altogether. The device is in the conflict target because it is in the
+        key: without it, two inverters polled at the same second would take
+        turns overwriting one row.
+
+        ``with_error`` says whether this writer owns the error reason. The
+        inverter does — a gap is that inverter having gone quiet — and the sky
+        does not, so a weather append leaves the column untouched instead of
+        writing its NULL into it.
 
         ``values`` runs positionally against ``columns``, with the error reason
-        appended as one final extra element. That is why ``append`` builds the pair
-        together straight from the registry: a list assembled any other way is still
-        the right length, so it writes cleanly and files every metric under the
-        wrong column name.
+        appended as one final extra element when ``with_error``. That is why
+        ``append`` builds the pair together straight from the registry: a list
+        assembled any other way is still the right length, so it writes cleanly
+        and files every metric under the wrong column name.
 
-        ``columns`` may be empty — a declaration with no inverter metric is
-        legal, and a gap row has a reason to store regardless — so the update
-        list is joined as one list with ``error`` inside it. Concatenating the
-        error clause onto a joined string put a bare leading comma in the SQL
-        whenever the columns were empty, which broke gap recording for exactly
-        the device class the empty declaration describes.
+        ``protect_readings`` is set when the row being written is a recorded
+        gap, and it adds the one condition an update here may not proceed
+        without: that the stored row holds no inverter reading. A gap is a poll
+        that measured nothing, and it arrives stamped at the moment the failure
+        was seen — which can be the same *second* as the reading the previous
+        poll completed, since the tier's key is whole seconds and the dongle
+        answers an eleven-second interval in twelve to seventeen. Letting the
+        gap through there would delete a measurement to record an outage that
+        did not begin until after it, and the next attempt records its own gap a
+        backoff later at a second of its own, so nothing is lost by standing
+        down. It also holds where ordering cannot: a clock stepped backwards by
+        NTP puts a later failure on an earlier second, and no stamp taken in the
+        collector can defend against that.
+
+        An empty update list becomes DO NOTHING, because ``DO UPDATE SET`` with
+        nothing to set is a syntax error rather than a no-op. Nothing reaches it
+        today: the inverter path always carries ``error``, and a site append
+        always names at least the reading that made it one. It is here so that a
+        site source writing only a key fails at review rather than at the first
+        write, which is the mistake the empty-declaration case made once already
+        on this same statement.
         """
-        all_cols = ("timestamp", "device", *columns, "error")
+        all_cols = ("timestamp", "device", *columns) + (("error",) if with_error else ())
         cols_sql = ", ".join(all_cols)
         placeholders = ", ".join("?" for _ in all_cols)
-        updates = ", ".join([*(f"{c}=excluded.{c}" for c in columns), "error=excluded.error"])
+        updated = [*columns, *(["error"] if with_error else [])]
+        conflict = (
+            f"DO UPDATE SET {', '.join(f'{c}=excluded.{c}' for c in updated)}"
+            if updated
+            else "DO NOTHING"
+        )
+        if protect_readings and updated and self._unread_guard:
+            conflict = f"{conflict} WHERE {self._unread_guard}"
         cur.execute(
             f"INSERT INTO inverter_raw ({cols_sql}) VALUES ({placeholders}) "
-            f"ON CONFLICT(timestamp, device) DO UPDATE SET {updates}",
+            f"ON CONFLICT(timestamp, device) {conflict}",
             (epoch, device, *values),
         )
+        if protect_readings and cur.rowcount == 0:
+            # Not silent: the gap is real and was not recorded, and a collector
+            # that logs nothing here leaves the next reader wondering why an
+            # outage the status page counted has no row behind it.
+            logger.info(
+                "gap at %d not recorded for %s: that second already holds a reading", epoch, device
+            )
 
     def _append_modules(
         self,

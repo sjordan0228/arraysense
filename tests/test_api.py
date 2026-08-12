@@ -3112,6 +3112,40 @@ def test_backfill_writes_archive_hours_and_reports_progress(client: Any, monkeyp
     assert body["last_day"] == "2026-08-01"
 
 
+def test_backfill_keeps_both_halves_of_an_hour_it_writes_twice(
+    client: Any, monkeypatch: Any
+) -> None:
+    """Two archive requests write one hour, and the second must not erase the first.
+
+    ``fetch_archive_hours`` splits every label into the means over the hour
+    just gone and the readings taken at the label itself. A day's request
+    therefore writes the previous day's last hour as well, so an hour's
+    temperature arrives from one request and that same hour's irradiance from
+    the next — and while a site append replaced the whole set, the backfill
+    destroyed the weather it had itself just written.
+    """
+    from arraysense.api import routes
+
+    shared = datetime(2026, 8, 1, 23, tzinfo=UTC)
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        if start.day == 1:
+            return [Sample(timestamp=shared, readings={"outside_temperature_c": 28.5})]
+        return [Sample(timestamp=shared, readings={"ghi_wm2": 120.0})]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-02"})
+    assert r.status_code == 200
+
+    store = client.app.state.store
+    (row,) = store.query(["outside_temperature_c", "ghi_wm2"], shared, shared)
+    assert row["outside_temperature_c"] == 28.5, "the second archive write erased the first"
+    assert row["ghi_wm2"] == 120.0
+
+
 def test_backfill_without_a_location_is_a_named_refusal(client: Any) -> None:
     r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
     assert r.status_code == 400

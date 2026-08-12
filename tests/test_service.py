@@ -7,7 +7,7 @@ tiny so the suite stays fast; nothing sleeps for a real second.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -907,3 +907,52 @@ class TestEfficiencyBackfill:
         rows = store.read_efficiency_days(self._midnight(6), self._midnight(6) + timedelta(days=1))
         store.close()
         assert rows, "a memory-backed pass scored a different, empty database"
+
+
+class _SlowFailing:
+    """A source whose read takes its time and then fails.
+
+    The reference dongle answers an eleven-second interval in twelve to
+    seventeen seconds, so the attempt that fails is long over by the time it
+    fails. Which moment the gap is stamped with decides whether it lands on a
+    second of its own or on the one the previous poll's reading was stamped
+    with.
+    """
+
+    device = TEST_DEVICE
+
+    def __init__(self, delay: float) -> None:
+        """Fail every read, after ``delay`` seconds of pretending to work."""
+        self._delay = delay
+
+    async def connect(self) -> None:
+        """Connect, as the dongle does before it goes quiet mid-read."""
+        return None
+
+    async def disconnect(self) -> None:
+        """Release the slot."""
+        return None
+
+    async def read(self) -> Sample:
+        """Take ``delay`` seconds and then report the inverter gone."""
+        await asyncio.sleep(self._delay)
+        raise TimeoutError("no reply from inverter")
+
+
+async def test_a_gap_is_stamped_when_the_failure_was_seen(tmp_path: Path) -> None:
+    """The stamp belongs to the failure, not to the attempt that led to it.
+
+    Taken before the read, the stamp is up to a whole read older than the
+    failure it records — and since a successful sample is stamped by the driver
+    at read completion, and the cadence is max(interval, read time), that older
+    stamp is exactly the second the previous successful poll was filed under.
+    """
+    delay = 0.05
+    svc, store = _service(tmp_path, source=_SlowFailing(delay))
+    before = datetime.now(UTC)
+    gap = await svc.poll_once()
+    store.close()
+    assert gap is not None and gap.is_failed
+    assert gap.timestamp >= before + timedelta(seconds=delay), (
+        "the gap was stamped before the read it records the failure of"
+    )

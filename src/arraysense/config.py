@@ -14,6 +14,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from arraysense.settings import SETTING_TIMEZONE
+
 if TYPE_CHECKING:
     from arraysense.settings import SettingsStore
 
@@ -138,6 +140,14 @@ class Config:
     synchronous: str = "full"
     model: str = ""
     battery_source: str = ""
+    # The installation's own zone, and the only field here the file does not
+    # set: it is the settings registry's ``site.timezone``, merged in by
+    # ``effective`` so a driver can be told where the inverter stands. A driver
+    # needs that because the inverter's daily kWh counters reset at *local*
+    # midnight, and a driver may not read settings — it is handed a Config and
+    # nothing else. Empty means nobody has said, which is every installation
+    # until the wizard asks, and a driver then falls back to the host's clock.
+    timezone: str = ""
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
@@ -311,6 +321,10 @@ def effective(
         serial_unit_id=round(float(pick("connection.serial_unit_id", config.serial_unit_id))),  # type: ignore[arg-type]
         model=str(pick("connection.model", config.model)),
         battery_source=str(pick("connection.battery_source", config.battery_source)),
+        # Not a connection setting, and here for one reason: a driver holding
+        # counters that reset at local midnight has to know which midnight, and
+        # a driver is handed a Config and never the settings store.
+        timezone=str(pick(SETTING_TIMEZONE, config.timezone)),
     )
 
 

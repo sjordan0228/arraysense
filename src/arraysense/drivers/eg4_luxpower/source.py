@@ -50,8 +50,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pylxpweb.transports.exceptions import TransportError, TransportResponseMismatchError
 from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
@@ -936,6 +937,38 @@ def _module_sample(module: object, timestamp: datetime | None = None) -> Battery
         raise SampleBuildError(f"BatteryModuleSample refused the reply: {exc}") from exc
 
 
+def _site_zone(name: str) -> ZoneInfo | None:
+    """Return the zone the installation stands in, or None to follow the host.
+
+    The inverter's daily counters turn over at the local midnight of the place
+    it is installed in, and this driver is handed a Config rather than the
+    settings store, so the zone arrives as ``Config.timezone`` — the wizard's
+    ``site.timezone``, merged in by ``config.effective``.
+
+    None means "use the host's own clock", which is what an installation that
+    has never been asked gets. That is a live conversion rather than a fixed
+    offset captured now: read once, an offset would be an hour wrong for half
+    the year, which is the same daylight-saving trap that made this guard worth
+    fixing in the first place.
+
+    A zone that does not resolve is warned about and stepped past rather than
+    raised on. It is refused where it is typed, so a value that got past that is
+    a database written by hand, and refusing to poll over it would cost the
+    readings as well as the counters.
+    """
+    if not name.strip():
+        return None
+    try:
+        return ZoneInfo(name.strip())
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning(
+            "configured timezone %r is not a known zone; "
+            "reading the daily counters against the host's clock instead",
+            name,
+        )
+        return None
+
+
 def to_sample(
     runtime: object,
     bank: object | None,
@@ -1103,6 +1136,7 @@ class Eg4LuxPowerSource:
         self._energy_interval = timedelta(seconds=energy_interval)
         self._energy: dict[str, float] = {}
         self._energy_at: datetime | None = None
+        self._zone = _site_zone(config.timezone)
         self._serial: ModbusSerialTransport | None = None
         self._identity_verified = False
         # Choose the transport factory based on config.transport. An explicitly
@@ -1462,6 +1496,25 @@ class Eg4LuxPowerSource:
         # daily metrics roll up with max — so a 23:59 total carried into 00:00
         # becomes the new day's high-water mark and stays there. The lifetime
         # counters are monotonic and cross the boundary safely.
-        if self._energy_at.date() != now.date():
+        if self._local_day(self._energy_at) != self._local_day(now):
             return {k: v for k, v in self._energy.items() if k.endswith("_total_kwh")}
         return self._energy
+
+    def _local_day(self, moment: datetime) -> date:
+        """Which of the owner's days an instant falls in.
+
+        The counters reset at the inverter's midnight, which is a local one.
+        Comparing UTC dates instead made the guard believe it was still
+        yesterday for every hour between the two midnights — five of them on
+        the reference installation, and the five that hold the evening peak, so
+        the cache carried a full day's totals into the new day and every daily
+        metric there rolled up with the old day's high-water mark.
+
+        Both instants that reach here are aware, so this converts rather than
+        attaches: attaching a zone to an aware datetime does nothing at all,
+        which is the trap ``energy.with_zone`` documents and one this project
+        has already paid for twice. Converting is also what makes a 23- or
+        25-hour day come out right, since the zone is asked what the local time
+        was at that instant rather than told what it must have been.
+        """
+        return moment.astimezone(self._zone).date()
