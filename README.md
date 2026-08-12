@@ -101,6 +101,8 @@ from it, so adding a metric is a one-line change there.
 ## Documentation
 
 - [docs/installation.md](docs/installation.md) — hardware requirements and setup
+- [docs/raspberry-pi.md](docs/raspberry-pi.md) — running it on a Pi: the SD card,
+  the USB SSD, and reaching the inverter over RS485
 - [docs/configuration.md](docs/configuration.md) — configuration reference
 - [docs/api.md](docs/api.md) — HTTP API reference
 - [docs/troubleshooting.md](docs/troubleshooting.md) — dongle connection problems,
