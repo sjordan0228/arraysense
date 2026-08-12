@@ -3146,6 +3146,45 @@ def test_backfill_keeps_both_halves_of_an_hour_it_writes_twice(
     assert row["ghi_wm2"] == 120.0
 
 
+def test_backfill_leaves_an_inverter_poll_on_the_hour_alone(client: Any, monkeypatch: Any) -> None:
+    """A poll stored on an exact hour survives the archive landing on that second.
+
+    Archive samples are stamped on exact UTC hour boundaries and the collector
+    stores whenever it manages a read, so roughly three of a day's twenty-four
+    boundaries already hold an inverter poll. While every append rewrote the
+    whole row, one backfill request over a year of history silently deleted
+    thousands of readings from an irreplaceable record — and the endpoint
+    reported the hours it wrote as a success. Nothing about the endpoint says a
+    site writer is at work, so this is guarded here, at the surface anyone on
+    the LAN can reach, as well as in the store.
+    """
+    from arraysense.api import routes
+
+    boundary = datetime(2026, 8, 1, 18, tzinfo=UTC)
+    store = client.app.state.store
+    store.append(
+        Sample(
+            timestamp=boundary,
+            readings={"pv_total_power_w": 10217.0, "battery_soc_pct": 55.0},
+        )
+    )
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        return [Sample(timestamp=boundary, readings={"ghi_wm2": 977.0})]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 200
+
+    (row,) = store.query(["pv_total_power_w", "battery_soc_pct", "ghi_wm2"], boundary, boundary)
+    assert row["pv_total_power_w"] == 10217.0, "the backfill erased an inverter reading"
+    assert row["battery_soc_pct"] == 55.0
+    assert row["ghi_wm2"] == 977.0
+
+
 def test_backfill_without_a_location_is_a_named_refusal(client: Any) -> None:
     r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
     assert r.status_code == 400
