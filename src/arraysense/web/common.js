@@ -1324,18 +1324,42 @@ function ink(name) {
   }
   return inkCache[name];
 }
+
+// The resolved palette is stale: drop it, and repaint what was drawn from it.
+// Two things invalidate it — a change of theme and a change of look — and both
+// go through here rather than each holding its own copy, because a chart left
+// stroking the previous palette is the same bug either way and only one of two
+// copies ever gets fixed.
+function repaintPalette() {
+  for (const key of Object.keys(inkCache)) delete inkCache[key];
+  for (const id of Object.keys(CHARTS)) {
+    const held = CHARTS[id];
+    if (held && held.u) held.u.redraw();
+  }
+}
+
 // Which theme this browser wants: what the device says unless somebody has said
 // otherwise here. Kept per browser on purpose — one household can want the wall
 // tablet dark and the laptop following the room, so this is the override and the
 // installation-wide default belongs in the settings registry beside it.
 const THEME_KEY = 'arraysense-theme';
 const THEME_ORDER = ['system', 'light', 'dark'];
+// What a browser that has never chosen gets, named rather than written out at
+// each fallback below. A control that lists the three choices can then mark the
+// default one by reading this, instead of stating for itself which of them it
+// is — an answer copied into a page is one that stays behind when this moves.
+const THEME_DEFAULT = 'system';
 const THEME_GLYPH = { system: '\u25D1', light: '\u2600', dark: '\u263E' };
 const THEME_SAYS = {
   system: 'Theme: following this device',
   light: 'Theme: light',
   dark: 'Theme: dark',
 };
+// The same three as the words a control names them by, and deliberately not
+// THEME_SAYS: that one states what is in force, for the tooltip on a button
+// whose face is a glyph. A list of choices has to name the choice about to be
+// made, which is a different sentence — "Light", not "Theme: light".
+const THEME_NAMES = { system: 'Follow this device', light: 'Light', dark: 'Dark' };
 
 function themeChoice() {
   let held = null;
@@ -1345,9 +1369,9 @@ function themeChoice() {
     // error inside it came back as a plausible answer instead of a stack trace.
     held = localStorage.getItem(THEME_KEY);
   } catch (e) {
-    return 'system';
+    return THEME_DEFAULT;
   }
-  return THEME_ORDER.includes(held) ? held : 'system';
+  return THEME_ORDER.includes(held) ? held : THEME_DEFAULT;
 }
 
 // Applying a choice is one attribute: the stylesheet keys off it, and its absence
@@ -1367,12 +1391,23 @@ function applyTheme(choice) {
   const root = document.documentElement;
   if (choice === 'system') root.removeAttribute('data-theme');
   else root.setAttribute('data-theme', choice);
-  for (const key of Object.keys(inkCache)) delete inkCache[key];
-  for (const id of Object.keys(CHARTS)) {
-    const held = CHARTS[id];
-    if (held && held.u) held.u.redraw();
-  }
+  repaintPalette();
   document.dispatchEvent(new CustomEvent('themechange', { detail: { choice } }));
+}
+
+// Choosing a theme, as against applying one. The key is written here and
+// nowhere else, because two controls now change the same value — the glyph in
+// every header and the list on the Settings page — and a second writer is how
+// two controls come to hold different answers about one browser. Whatever shows
+// the choice follows the themechange event applyTheme fires rather than
+// remembering what it last did itself.
+function chooseTheme(choice) {
+  try {
+    localStorage.setItem(THEME_KEY, choice);
+  } catch (e) {
+    // Nothing to persist to; the choice still applies for this page.
+  }
+  applyTheme(choice);
 }
 
 // The control itself, put into every page's header from here rather than into
@@ -1392,14 +1427,13 @@ function mountThemeButton() {
   };
   button.addEventListener('click', () => {
     const next = THEME_ORDER[(THEME_ORDER.indexOf(themeChoice()) + 1) % THEME_ORDER.length];
-    try {
-      localStorage.setItem(THEME_KEY, next);
-    } catch (e) {
-      // Nothing to persist to; the choice still applies for this page.
-    }
-    applyTheme(next);
-    paint();
+    chooseTheme(next);
   });
+  // The glyph follows the theme wherever it was changed, not only when this
+  // button was what changed it. The Settings page carries the same choice as a
+  // list, and a header still showing the sun after that list was set to dark is
+  // a control reporting a state that is not the state of anything.
+  document.addEventListener('themechange', paint);
   paint();
   const right = header.lastElementChild;
   if (right && right !== header.firstElementChild) right.appendChild(button);
@@ -1412,6 +1446,163 @@ function mountThemeButton() {
 // answered 'system' — a saved choice silently ignored, with nothing in the
 // console and every test still green.
 applyStoredTheme();
+
+// ---------------------------------------------------------------------------
+// The look, which is a different question from the theme. The theme says
+// whether the lights in the room are on; the look says what the room is made
+// of. They compose: each look states its own light and dark values.
+// ---------------------------------------------------------------------------
+
+// Kept per browser for the reason the theme is, stated above — one household
+// can want the wall tablet one way and the laptop another — and so deliberately
+// not a settings-registry entry, which is one value for the whole installation.
+//
+// Glass is what a browser that has never chosen gets, and every page ships its
+// <link> in the markup for that reason. Classic names no sheet at all, because
+// it is the base styling with nothing layered over it: choosing it takes the
+// link back out, which is what makes Classic the appearance it has always been
+// rather than a re-creation of it.
+const APPEARANCE_KEY = 'arraysense-appearance';
+const APPEARANCE_SHEET = { glass: '/theme-glass.css', classic: null };
+const APPEARANCE_DEFAULT = 'glass';
+// The looks as the words a control names them by. The looks themselves are the
+// keys of APPEARANCE_SHEET above and are not restated here: a control lists
+// those and reads its label from this, so a third look is an entry in each of
+// the two maps rather than an edit to a page that would otherwise go on
+// offering two.
+const APPEARANCE_NAMES = { glass: 'Glass', classic: 'Classic' };
+// The single element this owns, found by id rather than kept in a variable: the
+// page writes it, and a reload starts again from the document.
+const APPEARANCE_LINK_ID = 'appearance-sheet';
+
+function appearanceChoice() {
+  let held = null;
+  try {
+    // Guarded for the reason themeChoice() gives, and guarded no wider: private
+    // browsing refuses localStorage outright, while a programming error below
+    // this line should reach the console as a stack trace rather than come back
+    // as a plausible-looking default.
+    held = localStorage.getItem(APPEARANCE_KEY);
+  } catch (e) {
+    return APPEARANCE_DEFAULT;
+  }
+  // hasOwn rather than `in`: `in` walks the prototype chain, so a stored value
+  // of "toString" or "constructor" would answer yes and be handed on as a look.
+  return Object.hasOwn(APPEARANCE_SHEET, held) ? held : APPEARANCE_DEFAULT;
+}
+
+// Point the document at the chosen look's sheet, or take the last one out.
+//
+// Where the element sits is the whole of how a look works. It states its values
+// at the same specificity as the base styling and wins by coming later, so its
+// <link> has to be after both the <style> common.js injects and the page's own
+// — which is why every page carries the link at the foot of its <head>, and why
+// this is not applied from common.js's top level the way the theme is. Called
+// from there, the link would land while the page's <style> was still unparsed,
+// and the page would then override the look it had just been given.
+//
+// The default look's link is written into the page rather than created here,
+// and that is not tidiness: only a stylesheet the parser finds holds the first
+// paint back. Created here it would arrive after the page had already been
+// painted, so a browser on Glass would see Classic and then watch it restyle
+// underneath it, on every navigation. The same call on a page that already
+// carries the link finds it and changes nothing, which is the path that runs on
+// nearly every load.
+//
+// Classic pays for that and gets nothing back. The link is in the markup before
+// this script, so the sheet is requested whatever this browser has chosen, and
+// a synchronous script cannot run until the stylesheet ahead of it has loaded —
+// so a Classic browser downloads the whole file, waits for it, and then has it
+// removed. There is no revalidation to soften the second visit either: the app
+// sends no-cache and answers the browser's question with the whole file again.
+// The choice would have to live in a cookie for the server to render the right
+// link, which is a larger change than this costs on a home network, so the cost
+// was accepted and a separate issue carries the fix.
+function mountAppearanceSheet(choice) {
+  // hasOwn for the reason appearanceChoice() gives, and here as much as there: a
+  // bracket lookup walks the prototype chain, so a look named "toString" would
+  // resolve to a function and be handed on as an href. Every caller today passes
+  // a value appearanceChoice() has already vetted, which is why it has never
+  // mattered — and why it would go on not mattering until the first caller that
+  // does not.
+  const href = Object.hasOwn(APPEARANCE_SHEET, choice) ? APPEARANCE_SHEET[choice] : null;
+  const held = document.getElementById(APPEARANCE_LINK_ID);
+  if (href === null) {
+    if (held) held.remove();
+    return null;
+  }
+  if (held) {
+    if (held.getAttribute('href') !== href) held.setAttribute('href', href);
+    return held;
+  }
+  const link = document.createElement('link');
+  link.id = APPEARANCE_LINK_ID;
+  link.rel = 'stylesheet';
+  link.href = href;
+  document.head.appendChild(link);
+  return link;
+}
+
+// The look this browser holds, settled at the earliest moment it can be: called
+// from the foot of the head, with no body parsed and so nothing painted yet.
+// Usually it agrees with the link the page already carries and does nothing;
+// on Classic it removes it, still before the first paint. Nothing is
+// invalidated here because nothing has been drawn from the palette yet.
+function applyStoredAppearance() {
+  mountAppearanceSheet(appearanceChoice());
+}
+
+// Changing the look on a page that is already up.
+//
+// A look redefines colour tokens that have already been resolved and handed to
+// a canvas — --grid-line is one of them — so the cache has to be dropped and
+// every chart repainted, exactly as a change of theme does it. The difference
+// is timing, and it is the whole reason this is not two lines: an attribute
+// takes effect in the same tick, while a stylesheet has to arrive first.
+// Repainting before it does reads the palette that is on its way out and leaves
+// the charts holding it until something unrelated happens to redraw them.
+//
+// A sheet that never arrives has to settle it too. If only the load is waited
+// on, a 404 or a dropped connection leaves the cache holding the look that is
+// on its way out and every chart stroked from it — the page in one look with
+// the other's grid lines drawn over it, and nothing said anywhere. Repainting
+// on the error is not recovery: it is the palette agreeing with whatever is
+// actually in force.
+function applyAppearance(choice) {
+  const held = document.getElementById(APPEARANCE_LINK_ID);
+  const was = held ? held.getAttribute('href') : null;
+  const link = mountAppearanceSheet(choice);
+  // Two ways a sheet can still be on its way, and only one of them is visible in
+  // link.sheet. A link that has never loaded has none — that is the easy case.
+  // A link whose href just changed keeps the OUTGOING sheet in link.sheet until
+  // the new one arrives, so the property is truthy and points at exactly the
+  // palette we must not repaint from. Comparing the href against what was there
+  // before is what tells the two apart. With one look shipped this is only
+  // reachable the moment a second is added — which is when a chart drawn in the
+  // old look's colours would be hardest to attribute to this line.
+  const swapped = link !== null && link.getAttribute('href') !== was;
+  if (link && (swapped || !link.sheet)) {
+    link.addEventListener('load', repaintPalette, { once: true });
+    link.addEventListener('error', repaintPalette, { once: true });
+  } else {
+    // No sheet to wait for: either the link was removed for Classic, or it is
+    // already the one asked for and loaded.
+    repaintPalette();
+  }
+}
+
+// Choosing a look, as against applying one — chooseTheme's counterpart, and for
+// the same reason: the key has one writer, so the control that offers the look
+// and the resolver every page runs at load can never be reading and writing
+// different things.
+function chooseAppearance(choice) {
+  try {
+    localStorage.setItem(APPEARANCE_KEY, choice);
+  } catch (e) {
+    // Nothing to persist to; the look still applies for this page.
+  }
+  applyAppearance(choice);
+}
 
 // Whether the light theme is in force, read as a word the stylesheet declares
 // rather than inferred from a colour. Inferring it meant parsing --panel's rgba

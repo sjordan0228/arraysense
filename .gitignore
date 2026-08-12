@@ -2,6 +2,12 @@
 docs/roadmap.md
 docs/design.md
 NOTES.md
+# Scratch working space: drafts, trial stylesheets, transcripts. It was ignored
+# in .git/info/exclude, which lives in one clone and travels nowhere — so a
+# fresh clone or a worktree saw the whole of it as untracked, one `git add -A`
+# from being published. The .venv symlink further down reached the history by
+# exactly that route, which is why this belongs in the tracked file instead.
+.superpowers/
 
 # Local configuration and secrets
 config/
