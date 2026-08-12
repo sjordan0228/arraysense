@@ -3336,6 +3336,53 @@ def test_efficiency_period_day_computes_daily_summary(tmp_path: Path) -> None:
     assert s["partial"] is True
 
 
+def test_efficiency_week_says_how_many_of_its_days_it_scored(tmp_path: Path) -> None:
+    """A week totalled over four days must not be presented as a week.
+
+    compute_day returns nothing at all for a day it cannot model, so a day the
+    collector missed or the weather service was unreachable for simply drops out
+    of the aggregate. The summary then summed whatever was left and set
+    ``partial`` from a per-day within-day coverage flag, which says nothing
+    about whole days that never appeared — and the specific yield came out
+    understated in exact proportion to the days missing. This is the Costs
+    completeness rule again: coverage in what was watched is not coverage in
+    what is being claimed.
+    """
+    hours = [datetime(2026, 8, 3, 13, tzinfo=UTC) + timedelta(days=d) for d in range(4)]
+
+    def build(store: SqliteStore) -> None:
+        for when in hours:
+            store.append(
+                Sample(
+                    timestamp=when,
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    assert len(body["days"]) == 4
+    s = body["summary"]
+    assert s["days_scored"] == 4
+    assert s["days_expected"] == 7
+    assert s["partial"] is True
+
+
 def test_efficiency_waterfall_reconciles_to_actual(tmp_path: Path) -> None:
     """The walk from expected to actual must close, in either direction.
 

@@ -321,11 +321,33 @@ function renderPR(summary) {
   $('syVal').innerHTML = syStr(summary.specific_yield);
 }
 
+// >>> eff-partial-reason
+// Why this period is partial, in the owner's terms, or null when it is not.
+//
+// Two quite different incompletenesses arrive under one flag and they want
+// different sentences. Missing whole days is the one worth naming first and
+// with a count: a week totalled over four days understates its specific yield
+// by nearly half, and "not all daylight hours could be modelled" describes the
+// wrong thing entirely — every hour of every day present may have been
+// modelled perfectly.
+function effPartialReason(summary) {
+  if (!summary || !summary.partial) return null;
+  const scored = summary.days_scored;
+  const owed = summary.days_expected;
+  if (Number.isFinite(scored) && Number.isFinite(owed) && owed > 1 && scored < owed) {
+    return 'only ' + scored + ' of the ' + owed + ' days in this period could be scored, '
+      + 'so every total below covers those days alone';
+  }
+  return 'not all daylight hours could be modelled, so the performance ratio is drawn '
+    + 'from a fraction of the day';
+}
+// <<< eff-partial-reason
+
 function renderPartialNote(summary) {
   const box = $('partialNote');
-  if (summary && summary.partial) {
-    box.innerHTML = '<span class="warn">This is a partial period</span> — not all daylight hours '
-      + 'could be modelled, so the performance ratio is drawn from a fraction of the day. '
+  const reason = effPartialReason(summary);
+  if (reason) {
+    box.innerHTML = '<span class="warn">This is a partial period</span> — ' + reason + '. '
       + 'It is labelled rather than hidden, because a partial measurement is useful; it is '
       + 'only ever wrong when it is presented as a complete one.';
     box.hidden = false;

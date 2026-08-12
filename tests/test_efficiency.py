@@ -576,3 +576,41 @@ def test_a_range_longer_than_a_day_scores_every_day_in_it(tmp_path: Path) -> Non
     assert len(days_seen) == 7, f"only {sorted(days_seen)} was scored of a seven-day range"
     worst = max(hours, key=lambda h: h.unexplained_kwh)
     assert worst.hour.date() == (day_start + timedelta(days=5)).date()
+
+
+def test_a_string_that_never_reported_gets_no_row_at_all(tmp_path: Path) -> None:
+    """A string the inverter was silent about is absent, never a row of zeros.
+
+    compute_day already refuses to emit anything for a day it could not model,
+    on the grounds that "expected nothing and made nothing" is a claim rather
+    than a silence. It seeded every described string's accumulator with 0.0 all
+    the same, so a string whose power reading was NULL for the whole day came
+    back as expected 0.0, actual 0.0, specific yield 0.0 and partial false —
+    which is what the reference installation served for PV3 on 10 July 2025, a
+    day PV3 was never read at all and GHI peaked at 845 W/m2.
+    """
+    two = parse_strings("East | 1 | 10 | 400 | 25 | 90\nWest | 2 | 10 | 400 | 25 | 270")
+    store = _store(str(tmp_path / "silent.db"))
+    SettingsStore(store).set(
+        "panels.strings", "East | 1 | 10 | 400 | 25 | 90\nWest | 2 | 10 | 400 | 25 | 270"
+    )
+    day_start = _summer_day(0)
+    for h in range(8, 16):
+        _insert_hourly(
+            store._conn,
+            _utc(h),
+            pv_power=3200.0,
+            ghi=800.0,
+            dni=850.0,
+            dhi=120.0,
+            wind=2.0,
+            air_c=30.0,
+        )
+    rows = compute_day(
+        store, SettingsStore(store), day_start, day_start + timedelta(days=1), two, 1
+    )
+    store.close()
+
+    names = {r.string_name for r in rows}
+    assert "West" not in names, "a string nobody read was reported as making nothing"
+    assert names == {"East", ""}

@@ -436,6 +436,13 @@ def compute_day(
 
     rows: list[EfficiencyRow] = []
     for s in strings:
+        # A string the inverter never reported has no row, for the same reason
+        # a day nobody watched has none. Zero expected against zero actual is a
+        # claim that this string was meant to make nothing and made nothing,
+        # and the page renders it as a specific yield of 0.0 kWh/kWp — an
+        # unmeasured third of the array presented as a dead one.
+        if modelled[s.name] == 0:
+            continue
         exp = expected[s.name]
         act = actual[s.name]
         refused = curtailed[s.name]

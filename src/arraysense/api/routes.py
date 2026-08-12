@@ -2065,6 +2065,15 @@ def efficiency(
 
     total_kwp = sum(_string_kwp(s) for s in strings)
 
+    # How much of the period the total was actually totalled over. A day the
+    # engine could not model returns no rows at all, so it simply vanishes from
+    # the aggregate: the week of a five-day outage was reported as the week's
+    # figures, with a specific yield understated in exact proportion to the days
+    # missing and nothing in the summary to say so. Only days that have begun
+    # count as owed — a week asked for on its Tuesday is not missing Thursday.
+    days_expected = sum(1 for ds, _ in days if ds <= now)
+    days_scored = len({r.day for r in by_string.get("", [])})
+
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
         expected = sum(r.expected_kwh for r in rows)
         actual = sum(r.actual_kwh for r in rows)
@@ -2092,7 +2101,13 @@ def efficiency(
             "pr": round(pr, 4) if pr is not None else None,
             "specific_yield": round(sy, 3) if sy is not None else None,
             "tolerance_pct": _METER_TOLERANCE_PCT,
-            "partial": any(r.partial for r in rows),
+            # Two different incompletenesses, and the flag has to carry both.
+            # ``r.partial`` is a within-day figure — how much of a day's
+            # daylight the engine could model — and it is blind to a day that
+            # produced no row to carry a flag on.
+            "partial": any(r.partial for r in rows) or days_scored < days_expected,
+            "days_scored": days_scored,
+            "days_expected": days_expected,
         }
 
     summary = _summarise("", by_string.get("", []))
