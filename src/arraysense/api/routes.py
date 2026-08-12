@@ -2330,11 +2330,19 @@ def efficiency(
     if period != "day":
         hours = None
 
-    baseline = _baseline_info(
-        fitted_baselines(store, settings, range_start, range_end, strings),
-        range_start,
-        range_end,
-    )
+    # Baselines are fitted per day by ``compute_hours`` inside ``compute_day``,
+    # so a period longer than a day has no single fit to report — the range-wide
+    # ``fitted_baselines`` can report itself calibrated on a week whose Tuesday
+    # had too few producing hours for its own fit to succeed, and the page would
+    # print a window that was not the evidence any of its numbers rested on.
+    if period == "day":
+        baseline = _baseline_info(
+            fitted_baselines(store, settings, range_start, range_end, strings),
+            range_start,
+            range_end,
+        )
+    else:
+        baseline = dict(_NO_BASELINE)
 
     return {
         "configured": True,
