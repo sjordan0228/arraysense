@@ -35,6 +35,7 @@ def _ok(**over: object) -> dict[str, Any]:
 def _run_main(
     monkeypatch: pytest.MonkeyPatch,
     argv: list[str] | None = None,
+    step_codes: dict[tuple[str, ...], int] | None = None,
 ) -> tuple[int, list[tuple[list[str], dict[str, str] | None]]]:
     """Run main() with the host, filesystem and uv stubbed, recording _step.
 
@@ -48,6 +49,8 @@ def _run_main(
 
     def fake_step(argv: list[str], *, env: dict[str, str] | None = None) -> int:
         calls.append((argv, env))
+        if step_codes and tuple(argv) in step_codes:
+            return step_codes[tuple(argv)]
         return 0
 
     monkeypatch.setattr(install, "observe_host", _ok)
@@ -56,6 +59,7 @@ def _run_main(
     monkeypatch.setattr(install, "find_uv", lambda: "/usr/bin/uv")
     monkeypatch.setattr(install, "resolve_port", lambda **kwargs: 80)
     monkeypatch.setattr(install, "unit_text", lambda: "[Unit]\n")
+    monkeypatch.setattr(install, "_packaging_file", lambda name: f"[{name}]\n")
     monkeypatch.setattr(install, "_write_file", lambda path, text: None)
     monkeypatch.setattr(install, "DROPIN_DIR", "/tmp/arraysense-audit-dropin")
     monkeypatch.setattr(install, "CLI_SHIM", "/tmp/arraysense-audit-cli")
@@ -437,6 +441,56 @@ def test_main_checks_out_a_pinned_ref(
     assert code == 0
     checkouts = [c[0] for c in calls if c[0][:2] == ["git", "-C"]]
     assert checkouts == [["git", "-C", install.INSTALL_DIR, "checkout", "8861c77"]]
+
+
+def test_main_installs_and_enables_the_backup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one-line install must leave a daily backup running, not a promise."""
+    code, calls = _run_main(monkeypatch)
+    assert code == 0
+    enables = [c[0] for c in calls if c[0][:2] == ["systemctl", "enable"]]
+    assert ["systemctl", "enable", "--now", "arraysense"] in enables
+    assert ["systemctl", "enable", "--now", "arraysense-backup.timer"] in enables
+    assert any(c[0][0] == "systemd-tmpfiles" for c in calls)
+
+
+def test_the_backup_fragments_land_in_systemds_directories() -> None:
+    assert install.BACKUP_FILES == (
+        ("arraysense-backup.service", "/etc/systemd/system/arraysense-backup.service"),
+        ("arraysense-backup.timer", "/etc/systemd/system/arraysense-backup.timer"),
+        ("arraysense-backup.tmpfiles.conf", "/etc/tmpfiles.d/arraysense-backup.conf"),
+    )
+
+
+def test_the_plan_names_the_backup_install() -> None:
+    """The plan is the disclosure; a backup that installs unannounced is not."""
+    plan = install.render_plan(8080)
+    assert "backup" in plan
+    assert "start at boot" in plan
+
+
+def test_main_stops_when_enable_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An install that will not survive a reboot must not report success."""
+    code, _ = _run_main(
+        monkeypatch,
+        step_codes={("systemctl", "enable", "--now", "arraysense"): 1},
+    )
+    assert code == 1
+    assert "not enabled for boot" in capsys.readouterr().out
+
+
+def test_main_stops_when_daemon_reload_fails(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _ = _run_main(
+        monkeypatch,
+        step_codes={("systemctl", "daemon-reload"): 1},
+    )
+    assert code == 1
+    assert "daemon-reload" in capsys.readouterr().out
 
 
 def test_the_handoff_never_prints_a_loopback_address() -> None:

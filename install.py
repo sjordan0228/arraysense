@@ -70,6 +70,17 @@ UV_CANDIDATES = ("/root/.local/bin/uv", "/usr/local/bin/uv", "/usr/bin/uv")
 # the production installation also keeps it.
 UV_PYTHON_INSTALL_DIR = "/opt/uv-python"
 
+# The backup is a second unit, a timer and a tmpfiles fragment, each named as
+# it ships in the clone and where it must land. Installing all three is part of
+# the install, not an extra: the management table promises a daily compressed
+# copy, and a promise nothing on the machine keeps is how a database loss stays
+# lost.
+BACKUP_FILES = (
+    ("arraysense-backup.service", "/etc/systemd/system/arraysense-backup.service"),
+    ("arraysense-backup.timer", "/etc/systemd/system/arraysense-backup.timer"),
+    ("arraysense-backup.tmpfiles.conf", "/etc/tmpfiles.d/arraysense-backup.conf"),
+)
+
 
 class Refusal(NamedTuple):
     """Why the installer stopped, and what the operator can do about it."""
@@ -374,6 +385,8 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
         f"  create {CONFIG_DIR} and {DATA_DIR}",
         f"  install a systemd service listening on port {port}",
         f"  install the management command {CLI_SHIM}",
+        "  install the daily backup service and timer (writing /var/backups/arraysense)",
+        "  enable the service and the backup timer to start at boot",
     ]
     if port < 1024:
         lines.append("  grant CAP_NET_BIND_SERVICE so the service can bind a privileged port")
@@ -674,8 +687,25 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         raise SystemExit(f"could not make {CLI_SHIM} executable: {exc}") from None
 
-    _step(["systemctl", "daemon-reload"])
-    _step(["systemctl", "enable", "--now", "arraysense"])
+    # The documented one-line install is the only install, so it installs the
+    # backup too — the management table promises a daily compressed copy, and a
+    # promise nothing on the machine keeps is how a database loss stays lost.
+    for source, dest in BACKUP_FILES:
+        _write_file(dest, _packaging_file(source))
+    if _step(["systemd-tmpfiles", "--create"]) != 0:
+        print("failed: systemd-tmpfiles --create")
+        return 1
+    if _step(["systemctl", "daemon-reload"]) != 0:
+        print("systemctl daemon-reload failed; the units may not be loadable")
+        return 1
+    if _step(["systemctl", "enable", "--now", "arraysense"]) != 0:
+        print("the service is installed but was not enabled for boot:")
+        print("  systemctl enable --now arraysense")
+        return 1
+    if _step(["systemctl", "enable", "--now", "arraysense-backup.timer"]) != 0:
+        print("the backup timer is installed but was not enabled for boot:")
+        print("  systemctl enable --now arraysense-backup.timer")
+        return 1
 
     # The health check has one home, in manage.py, and this is it being used.
     verify = _step(
