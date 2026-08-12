@@ -560,6 +560,14 @@ class SqliteStore:
         Both ends of the range are included and both must be timezone-aware. An
         unknown metric name or tier raises KeyError before any SQL is built; see
         ``store.tiers`` for picking the tier from a range and a pixel width.
+
+        That inclusive end is the one range in this project that is not
+        half-open — ``rollup._bucket_bounds``, ``energy.bucket_edges`` and the
+        efficiency day all are — so two adjacent windows both return the row on
+        the boundary they share. Nothing mis-sums today: the energy path
+        differences counters rather than adding rows, and the efficiency day
+        drops the extra row by hour offset. A caller that adds rows up must
+        read half-open windows itself rather than assume this one is.
         """
         table = _inverter_table(tier)
         names = self._check_inverter_names(metrics)
@@ -598,8 +606,9 @@ class SqliteStore:
 
         Metric names here are the bare module ones, ``soc_pct`` rather than the
         per-slot registry key. As with ``query``, both ends of the range are
-        included, both must be timezone-aware, and an unknown name or tier raises
-        KeyError.
+        included — see there for why that differs from every bucketing rule in
+        the project — both must be timezone-aware, and an unknown name or tier
+        raises KeyError.
         """
         table = _module_table(tier)
         names = self._check_module_names(metrics)
