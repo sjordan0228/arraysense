@@ -133,6 +133,90 @@ def test_parse_args_refuses_a_port_that_is_not_a_number() -> None:
         install.parse_args(["--port", "eighty"])
 
 
+def test_parse_args_accepts_the_equals_form() -> None:
+    """--port=8080 must not be silently dropped, the way "in argv" parsing did."""
+    assert install.parse_args(["--yes", "--port=8080"]) == {
+        "yes": True,
+        "port": 8080,
+        "repo": install.REPO_URL,
+        "ref": None,
+    }
+
+
+def test_parse_args_refuses_a_mistyped_flag() -> None:
+    """A typo is a programming error the operator would never see otherwise."""
+    with pytest.raises(SystemExit):
+        install.parse_args(["--yes", "--prot", "8080"])
+    with pytest.raises(SystemExit):
+        install.parse_args(["--yes", "-p", "8080"])
+
+
+def test_parse_args_refuses_a_unicode_digit_port() -> None:
+    """isdigit() accepts '²' but int() rejects it; the guard must not traceback."""
+
+    def _raises() -> None:
+        install.parse_args(["--port", "²"])
+
+    with pytest.raises(SystemExit):
+        _raises()
+
+
+def test_parse_args_refuses_ports_outside_the_range() -> None:
+    """0 and 99999 pass isdigit() and int(); only the range stops them."""
+    for bad in ("0", "99999", "0000"):
+        with pytest.raises(SystemExit):
+            install.parse_args(["--port", bad])
+    with pytest.raises(SystemExit):
+        install.parse_args(["--port=0"])
+
+
+def test_parse_args_accepts_the_equals_form_for_repo_and_ref() -> None:
+    parsed = install.parse_args(["--repo=/srv/a.git", "--ref=v1.0"])
+    assert parsed["repo"] == "/srv/a.git"
+    assert parsed["ref"] == "v1.0"
+
+
+def test_a_chosen_port_must_be_in_range() -> None:
+    with pytest.raises(SystemExit):
+        install.resolve_port(probe=lambda p: True, chosen=0)
+    with pytest.raises(SystemExit):
+        install.resolve_port(probe=lambda p: True, chosen=99999)
+
+
+def test_a_chosen_port_that_is_in_use_is_refused() -> None:
+    """--port must not land on a busy port and fail 90 seconds later."""
+    with pytest.raises(SystemExit):
+        install.resolve_port(probe=lambda p: False, chosen=8080)
+
+
+def test_enter_at_the_port_prompt_is_probed_before_accepting_8080() -> None:
+    """Entering the offered 8080 must be checked just as typing it would be."""
+    answers = iter(["", "9000"])
+
+    def ask(_prompt: str) -> str:
+        return next(answers)
+
+    assert install.resolve_port(probe=lambda p: p == 9000, ask=ask) == 9000
+
+
+def test_main_turns_an_unanswerable_port_question_into_a_message(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The terminal-less --yes path must refuse, not traceback, when it has to
+    ask about a port nobody chose."""
+    monkeypatch.setattr(install, "observe_host", _ok)
+    monkeypatch.setattr(install, "INSTALL_DIR", "/tmp/arraysense-audit-install")
+
+    def no_tty(**kwargs: object) -> int:
+        raise install.NoTerminal()
+
+    monkeypatch.setattr(install, "resolve_port", no_tty)
+    assert install.main(["--yes"]) == 1
+    out = capsys.readouterr().out
+    assert "no controlling terminal" in out
+    assert "--port" in out
+
+
 def test_unit_text_reads_the_unit_from_the_clone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

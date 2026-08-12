@@ -240,13 +240,20 @@ def resolve_port(
     have one chosen for it.
     """
     if chosen is not None:
+        if not 1 <= chosen <= 65535:
+            raise SystemExit(f"--port must be a number from 1 to 65535, not {chosen}")
+        if not probe(chosen):
+            raise SystemExit(f"port {chosen} is in use or not permitted; pick another with --port")
         return chosen
     if probe(80):
         return 80
     while True:
         answer = ask("Port 80 is in use. Which port should the dashboard use? [8080] ").strip()
         if not answer:
-            return DEFAULT_PORT
+            if probe(DEFAULT_PORT):
+                return DEFAULT_PORT
+            print("  that port is in use or not permitted; pick another")
+            continue
         if not answer.isdigit():
             print("  that is not a port number; pick one like 8080")
             continue
@@ -259,6 +266,33 @@ def resolve_port(
         print("  that port is in use or not permitted; pick another")
 
 
+def _flag_value(argv: list[str], index: int, flag: str, error: str) -> tuple[str, int]:
+    """The value of a space-separated flag, advancing past it.
+
+    A flag at the very end of argv has no value, which is a different mistake
+    from a value that is not a valid choice, and gets its own message.
+    """
+    if index + 1 >= len(argv):
+        raise SystemExit(error)
+    return argv[index + 1], index + 1
+
+
+def _parse_port(text: str) -> int:
+    """A --port value as an integer, or the reason it is not one.
+
+    isdigit() alone is not enough: it accepts superscript digits such as '²'
+    that int() then rejects with ValueError, which would traceback out of a
+    script piped into root. The range check mirrors the interactive prompt.
+    """
+    try:
+        port = int(text)
+    except ValueError:
+        raise SystemExit("--port needs a number, for example: --port 8080") from None
+    if not 1 <= port <= 65535:
+        raise SystemExit("--port must be a number from 1 to 65535")
+    return port
+
+
 def parse_args(argv: list[str]) -> Args:
     """The flags that let this run without a person watching.
 
@@ -266,27 +300,42 @@ def parse_args(argv: list[str]) -> Args:
     pipe; --repo and --ref let the same install target a fork or a pinned
     release instead of whatever sits on the project's default branch. All four
     default to the boring values, so a bare invocation is a normal install.
+    Both the space and the = form are accepted, because the management command
+    accepts both and a typo'd flag has to be refused rather than silently
+    ignored — the previous membership-test parsing did exactly that with
+    --port=8080, landing an install on port 80 while the operator believed
+    they had chosen 8080.
     """
-    assumed_yes = "--yes" in argv
+    yes = False
     port: int | None = None
-    if "--port" in argv:
-        index = argv.index("--port")
-        if index + 1 >= len(argv) or not argv[index + 1].isdigit():
-            raise SystemExit("--port needs a number, for example: --port 8080")
-        port = int(argv[index + 1])
     repo = REPO_URL
-    if "--repo" in argv:
-        index = argv.index("--repo")
-        if index + 1 >= len(argv):
-            raise SystemExit("--repo needs a URL or path")
-        repo = argv[index + 1]
     ref: str | None = None
-    if "--ref" in argv:
-        index = argv.index("--ref")
-        if index + 1 >= len(argv):
-            raise SystemExit("--ref needs a branch, tag or commit")
-        ref = argv[index + 1]
-    return {"yes": assumed_yes, "port": port, "repo": repo, "ref": ref}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--yes":
+            yes = True
+        elif arg == "--port":
+            value, index = _flag_value(
+                argv, index, "--port", "--port needs a number, for example: --port 8080"
+            )
+            port = _parse_port(value)
+        elif arg.startswith("--port="):
+            port = _parse_port(arg.split("=", 1)[1])
+        elif arg == "--repo":
+            value, index = _flag_value(argv, index, "--repo", "--repo needs a URL or path")
+            repo = value
+        elif arg.startswith("--repo="):
+            repo = arg.split("=", 1)[1]
+        elif arg == "--ref":
+            value, index = _flag_value(argv, index, "--ref", "--ref needs a branch, tag or commit")
+            ref = value
+        elif arg.startswith("--ref="):
+            ref = arg.split("=", 1)[1]
+        else:
+            raise SystemExit(f"unrecognized argument: {arg}")
+        index += 1
+    return {"yes": yes, "port": port, "repo": repo, "ref": ref}
 
 
 def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
@@ -465,7 +514,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"To repair this installation, remove {INSTALL_DIR} and run this again.")
         return 1
 
-    port = resolve_port(chosen=args["port"])
+    try:
+        port = resolve_port(chosen=args["port"])
+    except NoTerminal:
+        print("no controlling terminal, so the port cannot be chosen for you.")
+        print("Run this from a terminal, or say which port to use:")
+        print(f"  sudo python3 install.py --yes --port {DEFAULT_PORT}")
+        return 1
     print(render_plan(port, repo=args["repo"], ref=args["ref"]))
     if not args["yes"]:
         try:
