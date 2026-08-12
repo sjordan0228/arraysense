@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,11 +21,47 @@ def _ok(**over: object) -> dict[str, Any]:
         euid=0,
         machine="aarch64",
         has_git=True,
+        has_curl=True,
         free_bytes=8 * 1024**3,
         python_version=(3, 11),
     )
     base.update(over)
     return base
+
+
+def _run_main(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str] | None = None,
+) -> tuple[int, list[tuple[list[str], dict[str, str] | None]]]:
+    """Run main() with the host, filesystem and uv stubbed, recording _step.
+
+    The install flow is long; every external command goes through _step and
+    every file write through _write_file. Stubbing those two plus the host
+    lets a test drive main() from parse_args to the handoff and inspect what
+    it would have run, which is the only way to pin the ordering and the
+    exit codes that no single function owns.
+    """
+    calls: list[tuple[list[str], dict[str, str] | None]] = []
+
+    def fake_step(argv: list[str], *, env: dict[str, str] | None = None) -> int:
+        calls.append((argv, env))
+        return 0
+
+    monkeypatch.setattr(install, "observe_host", _ok)
+    monkeypatch.setattr(install, "INSTALL_DIR", "/tmp/arraysense-audit-install")
+    monkeypatch.setattr(install, "_step", fake_step)
+    monkeypatch.setattr(install, "find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(install, "resolve_port", lambda **kwargs: 80)
+    monkeypatch.setattr(install, "unit_text", lambda: "[Unit]\n")
+    monkeypatch.setattr(install, "_write_file", lambda path, text: None)
+    monkeypatch.setattr(install, "DROPIN_DIR", "/tmp/arraysense-audit-dropin")
+    monkeypatch.setattr(install, "CLI_SHIM", "/tmp/arraysense-audit-cli")
+    monkeypatch.setattr(os, "makedirs", lambda *a, **k: None)
+    monkeypatch.setattr(os, "chmod", lambda *a, **k: None)
+    monkeypatch.setattr(install, "render_plan", lambda *a, **k: "")
+    monkeypatch.setattr(install, "render_handoff", lambda *a, **k: "")
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost")
+    return install.main(["--yes"] if argv is None else argv), calls
 
 
 def test_a_healthy_host_passes() -> None:
@@ -39,6 +76,7 @@ def test_a_healthy_host_passes() -> None:
         ({"euid": 1000}, "root"),
         ({"machine": "armv7l"}, "architecture"),
         ({"has_git": False}, "git"),
+        ({"has_curl": False}, "curl"),
         ({"free_bytes": 512 * 1024**2}, "disk"),
         ({"python_version": (3, 7)}, "Python"),
     ],
@@ -199,6 +237,42 @@ def test_enter_at_the_port_prompt_is_probed_before_accepting_8080() -> None:
     assert install.resolve_port(probe=lambda p: p == 9000, ask=ask) == 9000
 
 
+def test_the_uv_install_step_reports_curl_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pipeline must return curl's status, not sh's: a failed download must
+    read as a failure at this step, not surface four steps later as a missing
+    uv."""
+    code, calls = _run_main(monkeypatch)
+    assert code == 0
+    uv_step = calls[0][0]
+    assert uv_step[0] == "sh"
+    script = uv_step[2]
+    assert "&&" in script
+    assert "| sh" not in script
+    assert "-o /tmp/uv-install.sh" in script
+
+
+def test_the_uv_sync_step_steers_uvs_python_out_of_roots_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uv installs its own Python under $HOME by default — /root for the root
+    running this — and the service unit's ProtectHome=true would mask it. The
+    sync step must point uv elsewhere."""
+    code, calls = _run_main(monkeypatch)
+    assert code == 0
+    sync = next(c for c in calls if c[0][:2] == ["/usr/bin/uv", "sync"])
+    env = sync[1]
+    assert env is not None
+    assert env["UV_PYTHON_INSTALL_DIR"] == install.UV_PYTHON_INSTALL_DIR
+
+
+def test_the_plan_names_where_uvs_python_lands() -> None:
+    """The one line that explains why the sandbox is not weakened is worth
+    putting in front of the operator."""
+    assert "uv-python" in install.render_plan(8080)
+
+
 def test_main_turns_an_unanswerable_port_question_into_a_message(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -225,6 +299,30 @@ def test_unit_text_reads_the_unit_from_the_clone(
     text = install.unit_text()
     assert "[Unit]" in text
     assert "Solar ArraySense" in text
+
+
+def test_a_failed_file_write_is_a_message_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unit and drop-in writes used to be bare open() calls; a read-only
+    /etc or a full disk would traceback at the worst possible point."""
+
+    def refuse(path: str, mode: str = "w") -> Any:
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr("builtins.open", refuse)
+    with pytest.raises(SystemExit) as exc:
+        install._write_file("/etc/systemd/system/arraysense.service", "[Unit]\n")
+    assert "arraysense.service" in str(exc.value)
+
+
+def test_a_missing_packaging_file_is_a_message_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(install, "INSTALL_DIR", "/nonexistent/clone")
+    with pytest.raises(SystemExit) as exc:
+        install._packaging_file("arraysense.service")
+    assert "arraysense.service" in str(exc.value)
 
 
 def test_the_dropin_sets_the_port_and_only_the_port() -> None:

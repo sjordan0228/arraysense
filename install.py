@@ -61,6 +61,14 @@ DROPIN_DIR = "/etc/systemd/system/arraysense.service.d"
 # PATH, in the order a bootstrap actually leaves them.
 UV_CANDIDATES = ("/root/.local/bin/uv", "/usr/local/bin/uv", "/usr/bin/uv")
 
+# uv downloads its own Python when no system interpreter satisfies
+# requires-python, and puts it under the caller's home by default — /root for
+# the root that runs this. The service runs as an unprivileged user under
+# ProtectHome=true, so a Python under /root would be masked and the service
+# could not exec it. Directing it to /opt/uv-python, outside any home, is where
+# the production installation also keeps it.
+UV_PYTHON_INSTALL_DIR = "/opt/uv-python"
+
 
 class Refusal(NamedTuple):
     """Why the installer stopped, and what the operator can do about it."""
@@ -96,6 +104,7 @@ class Host(TypedDict):
     euid: int
     machine: str
     has_git: bool
+    has_curl: bool
     free_bytes: int
     python_version: tuple[int, ...]
 
@@ -123,6 +132,7 @@ def preflight(
     euid: int,
     machine: str,
     has_git: bool,
+    has_curl: bool,
     free_bytes: int,
     python_version: tuple[int, ...],
 ) -> Refusal | None:
@@ -161,6 +171,11 @@ def preflight(
             "git is not installed, and both install and upgrade are a fetch",
             "Install git with your package manager, then run this again.",
         )
+    if not has_curl:
+        return Refusal(
+            "curl is not installed, and the first step downloads uv's installer",
+            "Install curl with your package manager, then run this again.",
+        )
     if free_bytes < MIN_FREE_BYTES:
         return Refusal(
             f"not enough free disk: {free_bytes / 1024**3:.1f} GB, "
@@ -178,6 +193,7 @@ def observe_host() -> Host:
         "euid": os.geteuid(),
         "machine": os.uname().machine,
         "has_git": shutil.which("git") is not None,
+        "has_curl": shutil.which("curl") is not None,
         "free_bytes": shutil.disk_usage(_install_filesystem()).free,
         "python_version": sys.version_info[:2],
     }
@@ -351,7 +367,7 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
     lines = [
         "Solar ArraySense will:",
         "",
-        "  install uv (which brings its own Python 3.12)",
+        "  install uv (its Python 3.12 lands in /opt/uv-python when the system's is older)",
         f"  clone {target} into {INSTALL_DIR}",
         f"  create the system user {SERVICE_USER!r}",
         f"  create {CONFIG_DIR} and {DATA_DIR}",
@@ -386,20 +402,43 @@ def clone_argv(repo: str, ref: str | None) -> list[str]:
     return clone
 
 
-def unit_text() -> str:
-    """The service unit, read from the clone so there is one copy of it.
+def _packaging_file(name: str) -> str:
+    """A file from the clone's packaging directory.
 
-    The unit travels with the source it runs; the drop-in is the right shape
-    for a per-machine tweak, but the unit itself is part of the code. If the
+    The unit and the backup fragments travel with the source they run; if the
     clone did not land, the file cannot be there, so the failure is a sentence
     rather than a traceback.
     """
-    path = os.path.join(INSTALL_DIR, "packaging", "arraysense.service")
+    path = os.path.join(INSTALL_DIR, "packaging", name)
     try:
         with open(path) as handle:
             return handle.read()
     except OSError:
-        raise SystemExit(f"cannot read the service unit {path}; the clone is incomplete") from None
+        raise SystemExit(f"cannot read {path}; the clone is incomplete") from None
+
+
+def _write_file(path: str, text: str) -> None:
+    """Write one file the install leaves behind, with a message on failure.
+
+    Every subprocess step gets its OSError turned into a sentence by _step; the
+    filesystem writes were the only steps that could still traceback. A failed
+    write at this point is a half-install either way, so the message says which
+    file failed rather than pretending nothing did.
+    """
+    try:
+        with open(path, "w") as handle:
+            handle.write(text)
+    except OSError as exc:
+        raise SystemExit(f"could not write {path}: {exc}") from None
+
+
+def unit_text() -> str:
+    """The service unit, read from the clone so there is one copy of it.
+
+    The unit travels with the source it runs; the drop-in is the right shape
+    for a per-machine tweak, but the unit itself is part of the code.
+    """
+    return _packaging_file("arraysense.service")
 
 
 def dropin_text(port: int) -> str:
@@ -449,15 +488,17 @@ def find_uv() -> str | None:
     return None
 
 
-def _step(argv: list[str]) -> int:
+def _step(argv: list[str], *, env: dict[str, str] | None = None) -> int:
     """Run one install step, reporting a missing executable as a failed step.
 
     subprocess raises FileNotFoundError for a command that is not there, and an
     uncaught traceback halfway through a root install tells the operator
-    nothing about which half completed.
+    nothing about which half completed. env is passed through untouched, so the
+    uv sync step can steer uv's own Python out of root's home without weakening
+    the service sandbox.
     """
     try:
-        return subprocess.run(argv, check=False).returncode
+        return subprocess.run(argv, check=False, env=env).returncode
     except OSError as exc:
         print(f"could not run {argv[0]}: {exc}")
         return 127
@@ -542,7 +583,15 @@ def main(argv: list[str] | None = None) -> int:
     # useradd may fail because the user already exists from a previous run;
     # every other step failing means the install is broken and stops here.
     steps = [
-        (["sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"], False),
+        (
+            [
+                "sh",
+                "-c",
+                "curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh "
+                "&& sh /tmp/uv-install.sh; rc=$?; rm -f /tmp/uv-install.sh; exit $rc",
+            ],
+            False,
+        ),
         (clone, False),
         (
             [
@@ -569,23 +618,31 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Install uv and finish by hand with: uv sync --project {INSTALL_DIR}")
         return 1
 
-    for step_argv in [
-        [uv, "sync", "--project", INSTALL_DIR],
-        ["chown", "-R", f"{SERVICE_USER}:{SERVICE_USER}", INSTALL_DIR],
-    ]:
-        if _step(step_argv) != 0:
-            print(f"failed: {' '.join(step_argv)}")
-            return 1
+    if (
+        _step(
+            [uv, "sync", "--project", INSTALL_DIR],
+            env={**os.environ, "UV_PYTHON_INSTALL_DIR": UV_PYTHON_INSTALL_DIR},
+        )
+        != 0
+    ):
+        print(f"failed: {uv} sync --project {INSTALL_DIR}")
+        return 1
+    if _step(["chown", "-R", f"{SERVICE_USER}:{SERVICE_USER}", INSTALL_DIR]) != 0:
+        print("failed: chown the clone to the arraysense user")
+        return 1
 
     unit = unit_text()
-    with open("/etc/systemd/system/arraysense.service", "w") as handle:
-        handle.write(unit)
-    os.makedirs(DROPIN_DIR, exist_ok=True)
-    with open(os.path.join(DROPIN_DIR, "port.conf"), "w") as handle:
-        handle.write(dropin_text(port))
-    with open(CLI_SHIM, "w") as handle:
-        handle.write(shim_text())
-    os.chmod(CLI_SHIM, 0o755)
+    _write_file("/etc/systemd/system/arraysense.service", unit)
+    try:
+        os.makedirs(DROPIN_DIR, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"could not create {DROPIN_DIR}: {exc}") from None
+    _write_file(os.path.join(DROPIN_DIR, "port.conf"), dropin_text(port))
+    _write_file(CLI_SHIM, shim_text())
+    try:
+        os.chmod(CLI_SHIM, 0o755)
+    except OSError as exc:
+        raise SystemExit(f"could not make {CLI_SHIM} executable: {exc}") from None
 
     _step(["systemctl", "daemon-reload"])
     _step(["systemctl", "enable", "--now", "arraysense"])
