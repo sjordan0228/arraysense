@@ -3032,13 +3032,20 @@ def test_forecast_serves_the_newest_revision_and_the_hours_measured(tmp_path: Pa
     # expected_today_kwh: the prediction summed, in kWh
     assert body["expected_today_kwh"] == pytest.approx(1.57, abs=0.01)
 
-    # actual_so_far_kwh: (150 + 600) / 1000, once both staged hours are over.
-    # The suite can be running inside one of them, and an hour in progress is
-    # counted for the part of it that has happened rather than for a whole one.
-    if datetime.now(UTC) >= h3:
-        assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
-    else:
-        assert body["actual_so_far_kwh"] < 0.75
+    # actual_so_far_kwh: the energy from the completed hours plus whatever
+    # fraction of the hour in progress has elapsed.  The staged means are
+    # 150 W at h1 and 600 W at h2; each full hour contributes mean/1000 kWh.
+    # Computing the expected value from ``now`` rather than branching on it
+    # keeps the assertion exact no matter when the suite runs — a value of
+    # 0.0 would be wrong at 01:30 (when h1 is complete) and a value of 0.75
+    # would be wrong at 01:30 (when h2 is still in progress).  The old
+    # ``< 0.75`` branch would have passed for any value below 0.75,
+    # including a wrongly small partial hour.
+    now = datetime.now(UTC)
+    frac_h1 = min(max((now - h1).total_seconds() / 3600.0, 0.0), 1.0)
+    frac_h2 = min(max((now - h2).total_seconds() / 3600.0, 0.0), 1.0)
+    expected_so_far = (150.0 * frac_h1 + 600.0 * frac_h2) / 1000.0
+    assert body["actual_so_far_kwh"] == pytest.approx(expected_so_far, abs=0.02)
 
 
 def test_the_hour_in_progress_is_counted_for_the_part_that_has_happened() -> None:
