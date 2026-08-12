@@ -22,10 +22,14 @@ they remain command-line arguments. Nothing sensitive lives in that set.
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import logging
 import math
+import os
 import re
 import sqlite3
+import tempfile
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -52,6 +56,16 @@ SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
 WEATHER_INTERVAL_KEY = "collector.weather_interval"
+# The daily backup, which used to be compiled into manage.py and overridden only
+# by flags nobody types twice. manage.py cannot import this module — it runs on
+# the distribution's Python 3.8 while the package needs 3.12 — so it reads these
+# over HTTP and keeps its own copy of the defaults; ``tests/test_manage.py``
+# fails if the two ever disagree.
+BACKUP_ENABLED_KEY = "backup.enabled"
+BACKUP_DIRECTORY_KEY = "backup.directory"
+BACKUP_KEEP_KEY = "backup.keep"
+BACKUP_HOUR_KEY = "backup.hour"
+BACKUP_MINUTE_KEY = "backup.minute"
 
 
 # Deliberately loose. The full grammar of an address admits quoted local parts
@@ -91,6 +105,83 @@ def check_serial_device(value: str) -> None:
     """
     if "://" in value:
         raise ValueError("a serial device is a filesystem path, not a URL")
+
+
+# The service account the packaged units run as. Named once so the two remedies
+# below cannot drift from packaging/arraysense-backup.service.
+_SERVICE_USER = "arraysense"
+
+
+def check_backup_directory(value: str) -> str:
+    """Refuse a backup destination the backup would later fail to write.
+
+    A path that only fails at 03:15 fails unattended, and the failure this
+    catches has already happened on a real machine: the destination was
+    outside the unit's writable set, every run died with "Read-only file
+    system" on the lock it could not create, and the CLI reported "another
+    backup is running" — which was false, and sent somebody looking for a
+    process that did not exist. Refusing at the moment the path is typed is
+    the only point where there is a person present to read the remedy.
+
+    The probe is a real file, created and removed, rather than ``os.access``.
+    Permission bits are not the only thing between this service and a write:
+    ``ProtectSystem=strict`` mounts everything outside the unit's declared
+    writable paths read-only, which no bit on the directory records, and the
+    kernel answers that with EROFS whoever asks. Each cause gets its own
+    remedy, because the wrong one is worse than none — a chown will not fix a
+    read-only bind mount, and no amount of ReadWritePaths will fix an owner.
+
+    This is deliberately not the registry's ``check=``. Those are pure
+    functions of the text, the same answer on every machine; this one asks the
+    filesystem, and a form posting an unchanged value back must not be refused
+    for a fault it did not introduce. The API calls it when the value changes.
+    """
+    path = value.strip()
+    if not path:
+        raise ValueError(
+            "a backup destination is needed; leaving it empty would write the archive "
+            "into whatever directory the backup happened to start in"
+        )
+    if not os.path.isabs(path):
+        raise ValueError(
+            f"{path!r} is not an absolute path, and systemd runs the backup with no "
+            "working directory of its own to resolve it against"
+        )
+    if not os.path.isdir(path):
+        if os.path.exists(path):
+            raise ValueError(f"{path} is not a directory")
+        raise ValueError(
+            f"{path} does not exist. Create it with the right owner: "
+            f"sudo install -d -o {_SERVICE_USER} -g {_SERVICE_USER} -m 0750 {path}"
+        )
+    try:
+        handle, probe = tempfile.mkstemp(dir=path, prefix=".arraysense-write-test-")
+    except OSError as exc:
+        raise ValueError(_why_unwritable(path, exc)) from exc
+    os.close(handle)
+    # Leaving it would make the rotation count a file that is not a backup.
+    with contextlib.suppress(OSError):
+        os.remove(probe)
+    return path
+
+
+def _why_unwritable(path: str, exc: OSError) -> str:
+    """Turn a failed write into the one remedy that addresses its actual cause."""
+    if exc.errno == errno.EROFS:
+        return (
+            f"{path} is read-only for this service. The backup runs under "
+            "ProtectSystem=strict, so a directory outside the unit's writable set "
+            "fails with 'Read-only file system' however good the permissions are. "
+            "Give it a drop-in — [Service] then ReadWritePaths=" + path + " — for "
+            "arraysense-backup.service and arraysense.service, then systemctl "
+            "daemon-reload"
+        )
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return (
+            f"{path} exists but this service cannot write there. Hand it to the "
+            f"service account: sudo chown {_SERVICE_USER}:{_SERVICE_USER} {path}"
+        )
+    return f"{path} could not be written to: {exc.strerror or exc}"
 
 
 @dataclass(frozen=True)
@@ -404,6 +495,81 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "conditions about every fifteen minutes, so asking faster stores "
             "near-identical points. Weather is fetched only while a location "
             "is set under This installation."
+        ),
+    ),
+    # --- Backup --------------------------------------------------------------
+    # The daily compressed copy of the database. All five of these were
+    # compiled into manage.py, where changing one meant editing a systemd unit
+    # over SSH — which is the same argument that put every other setting here.
+    # The timer now fires every fifteen minutes and asks these whether there is
+    # anything to do, so the schedule is answered by the installation rather
+    # than by an OnCalendar line only root can edit.
+    SettingSpec(
+        key=BACKUP_ENABLED_KEY,
+        kind="bool",
+        default=True,
+        label="Daily backup",
+        help=(
+            "Whether the timer writes a compressed copy of the database each "
+            "day. Turning it off stops the scheduled run only — "
+            "'arraysense backup' by hand still works, so a backup is always "
+            "one command away."
+        ),
+    ),
+    SettingSpec(
+        key=BACKUP_DIRECTORY_KEY,
+        kind="str",
+        default="/var/backups/arraysense",
+        label="Backup directory",
+        help=(
+            "Where the compressed copies are written. It should be on a "
+            "different disk from the database — a backup on the same disk is "
+            "protection against nothing. The directory has to exist and be "
+            "writable by the service before it can be saved here."
+        ),
+        # Checked when it changes, against the real filesystem, by the API. Not
+        # a registry check=: those answer the same on every machine, and this
+        # one asks the disk in front of it.
+    ),
+    SettingSpec(
+        key=BACKUP_KEEP_KEY,
+        kind="int",
+        default=14,
+        # Never zero: rotation keeps the newest N, so zero deletes every copy
+        # there is immediately after writing one.
+        lower=1,
+        upper=365,
+        unit="copies",
+        label="Backups kept",
+        help=(
+            "How many daily copies to keep. The oldest are removed after a new "
+            "one has been written and verified, never before. Fourteen at "
+            "roughly 23 MB each is about a third of a gigabyte."
+        ),
+    ),
+    SettingSpec(
+        key=BACKUP_HOUR_KEY,
+        kind="int",
+        default=3,
+        lower=0,
+        upper=23,
+        label="Backup hour",
+        help=(
+            "The hour, on the installation's own clock, after which the day's "
+            "backup may run. The timer checks every fifteen minutes, so the "
+            "run starts at the first quarter hour at or after this time."
+        ),
+    ),
+    SettingSpec(
+        key=BACKUP_MINUTE_KEY,
+        kind="int",
+        default=15,
+        lower=0,
+        upper=59,
+        label="Backup minute",
+        help=(
+            "Minutes past the hour. A machine that was asleep at that time "
+            "backs up when it wakes, rather than skipping the day."
         ),
     ),
     # --- Tariff -------------------------------------------------------------
