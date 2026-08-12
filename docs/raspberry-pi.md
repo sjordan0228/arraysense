@@ -133,14 +133,19 @@ night.
 The timer fires at 03:15 and is `Persistent=true`, so a Pi that was off at 03:15
 runs the backup when it comes back rather than skipping a day silently. The
 service runs as the `arraysense` user under `ProtectSystem=strict`, with
-`/var/backups/arraysense` the only writable path. The working copy needs write
-access beside the database itself, so an installation whose database lives
-outside `StateDirectory` — the SSD here, exactly as for the collector — needs
-its own carve-out:
+`/var/backups/arraysense` the only writable path apart from the database's own
+directory — which `StateDirectory=arraysense` covers, exactly as for the
+collector. The working copy and the lock are written beside the database, so an
+installation whose database lives outside that directory — the SSD here — needs
+a carve-out for the backup service as well as for the collector:
 
     # /etc/systemd/system/arraysense-backup.service.d/ssd.conf
     [Service]
     ReadWritePaths=/mnt/ssd/arraysense
+
+Getting this wrong produces a timer that fails every night with `Read-only file
+system` on the lock or the working copy, so that is the phrase to search for
+when a backup reports nothing written.
 
 Run a backup by hand with `sudo arraysense backup` (add `--dir PATH` or
 `--keep N` to override the destination or the number kept). A successful run

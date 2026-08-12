@@ -44,6 +44,10 @@ BACKUP_DIR = "/var/backups/arraysense"
 # point of compressing.
 BACKUP_KEEP = 14
 
+# What a held lock means, in one place so the reason _take_lock reports and the
+# message the caller prints cannot drift apart.
+LOCK_BUSY = "another backup is running"
+
 # "Upgrade" fast-forwards the install to this remote-tracking branch: main is
 # the branch that has run on the reference installation, while dev is where a
 # change proves itself before it is merged to main.
@@ -258,21 +262,24 @@ def database_facts(path: str) -> dict[str, Any]:
     return facts
 
 
-def _take_lock(path: str) -> int | None:
-    """Claim the right to run, so two backups cannot share a working file.
+def _take_lock(path: str) -> tuple[int | None, str]:
+    """Claim the right to run, and say which way it failed if it could not.
 
     Two runs overlapping is not hypothetical — a hand-run backup does not go
     through systemd's serialisation of a oneshot unit. They share a working
     path and a destination name, and interleaved they can publish a verified
-    archive of an empty database while rotating a real backup away.
+    archive of an empty database while rotating a real backup away. And two
+    runs overlapping and a directory that cannot be written are different
+    problems with different remedies, so the caller is told which happened: a
+    backup that blames the first when it was the second sends somebody looking
+    for a process that does not exist.
     """
     try:
-        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        return (os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "")
     except FileExistsError:
-        return None
+        return (None, LOCK_BUSY)
     except OSError as exc:
-        print(f"could not take the backup lock at {path}: {exc}")
-        return None
+        return (None, f"could not create the backup lock at {path}: {exc}")
 
 
 def _verify_working_copy(path: str) -> bool:
@@ -329,9 +336,17 @@ def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
     lock_path = os.path.join(
         os.path.dirname(source) or ".", os.path.basename(source) + ".backup.lock"
     )
-    lock_fd = _take_lock(lock_path)
+    lock_fd, lock_reason = _take_lock(lock_path)
     if lock_fd is None:
-        print("another backup is running; nothing done")
+        print(lock_reason + "; nothing done")
+        if lock_reason != LOCK_BUSY:
+            # The lock and the working copy are written beside the database, and
+            # a directory that cannot be written is the failure the caller has
+            # in front of them — the remedy is not obvious from the error.
+            print("  the backup needs write access beside the database. If the database is not in")
+            print("  /var/lib/arraysense, add a drop-in naming its directory:")
+            print("    [Service]")
+            print("    ReadWritePaths=<that directory>")
         return None
     try:
         try:
