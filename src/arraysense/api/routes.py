@@ -824,7 +824,15 @@ def _reject_unwritable_backup_dir(request: Request, wanted: dict[str, Any]) -> N
     settings = SettingsStore(request.app.state.store)
     if settings.get(BACKUP_DIRECTORY_KEY) == wanted_dir:
         return
-    check_backup_directory(wanted_dir)
+    try:
+        check_backup_directory(wanted_dir)
+    except ValueError as exc:
+        # Named the way the registry names its own failures. The settings page
+        # finds the field a rejection belongs to by looking for the key in the
+        # message, so a bare message lands in the page banner instead of under
+        # the box that caused it — measured in a browser, where a remedy three
+        # sections away from its own control is a remedy nobody reads.
+        raise ValueError(f"{BACKUP_DIRECTORY_KEY}: {exc}") from exc
 
 
 @router.put("/settings")

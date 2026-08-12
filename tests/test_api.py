@@ -934,6 +934,10 @@ def test_a_backup_destination_that_cannot_be_written_is_refused_by_name(
     detail = r.json()["detail"]
     assert str(missing) in detail, "the rejection has to name the path that was refused"
     assert "install -d" in detail, "and the command that fixes it"
+    # And the key, because that is how the settings page decides which field a
+    # rejection belongs to. Without it the remedy lands in the page banner
+    # rather than under the box somebody just typed into.
+    assert "backup.directory" in detail
     # Nothing was stored, so the backup still writes where it did before.
     assert (
         client.get("/api/settings").json()["values"]["backup.directory"]
