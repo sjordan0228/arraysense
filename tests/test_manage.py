@@ -512,6 +512,42 @@ def test_upgrade_stops_when_there_is_nothing_new(monkeypatch: pytest.MonkeyPatch
     assert manage.cmd_upgrade([]) == 0
 
 
+def test_a_shallow_clone_is_unshallowed_before_comparing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shallow clone cannot fast-forward: git calls the histories unrelated.
+
+    Installs made with --depth 1 could never be upgraded at all, which was
+    measured on a real machine before this existed.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if "--is-shallow-repository" in argv:
+            return subprocess.CompletedProcess(argv, 0, "true\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    manage._pending_commits()
+    assert any("--unshallow" in c for c in calls), "a shallow clone must be repaired"
+
+
+def test_a_complete_clone_is_not_refetched(monkeypatch: pytest.MonkeyPatch) -> None:
+    """--unshallow on a complete clone is a wasted download every upgrade."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if "--is-shallow-repository" in argv:
+            return subprocess.CompletedProcess(argv, 0, "false\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    manage._pending_commits()
+    assert not any("--unshallow" in c for c in calls)
+
+
 def test_the_changelog_entry_shown_is_the_incoming_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -316,6 +316,23 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def clone_argv(repo: str, ref: str | None) -> list[str]:
+    """The git clone command, exposed so a test can pin its shape.
+
+    Deliberately no --depth: a shallow clone holds a single commit and git then
+    refuses to fast-forward it onto the fetched branch — it cannot see the
+    common ancestor, so it calls the histories unrelated. That made every
+    installation this installer created unable to upgrade at all, which is the
+    one thing the lifecycle CLI exists for; the saving is small and the cost is
+    the whole upgrade path.
+    """
+    clone = ["git", "clone"]
+    if ref:
+        clone += ["--branch", str(ref)]
+    clone += [repo, INSTALL_DIR]
+    return clone
+
+
 def unit_text() -> str:
     """The service unit, read from the clone so there is one copy of it.
 
@@ -461,10 +478,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  sudo python3 install.py --yes --port {port}")
             return 1
 
-    clone = ["git", "clone", "--depth", "1"]
-    if args["ref"]:
-        clone += ["--branch", str(args["ref"])]
-    clone += [str(args["repo"]), INSTALL_DIR]
+    clone = clone_argv(repo=args["repo"], ref=args["ref"])
 
     # useradd may fail because the user already exists from a previous run;
     # every other step failing means the install is broken and stops here.

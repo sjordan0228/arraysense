@@ -200,3 +200,22 @@ def test_the_plan_names_a_non_default_repository() -> None:
     plan = install.render_plan(8080, repo="/srv/a.git", ref="feat/x")
     assert "/srv/a.git" in plan
     assert "feat/x" in plan
+
+
+def test_the_clone_step_keeps_history() -> None:
+    """--depth 1 is what broke every upgrade; it must not come back."""
+    plan = install.clone_argv(repo="https://example.invalid/a.git", ref=None)
+    assert "--depth" not in plan
+
+
+def test_the_clone_step_still_pins_a_ref_when_one_is_given() -> None:
+    """A pinned ref travels on the command just as it did before the depth went."""
+    argv = install.clone_argv(repo="https://example.invalid/a.git", ref="v1.0.0")
+    assert argv == [
+        "git",
+        "clone",
+        "--branch",
+        "v1.0.0",
+        "https://example.invalid/a.git",
+        install.INSTALL_DIR,
+    ]

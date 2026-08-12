@@ -368,6 +368,25 @@ def is_dirty() -> bool:
     return bool(run(["git", "-C", INSTALL_DIR, "status", "--porcelain"]).stdout.strip())
 
 
+def _unshallow_if_needed() -> None:
+    """Give a shallow clone its history back, so a fast-forward is possible.
+
+    Installs made by earlier versions of the installer were cloned with
+    --depth 1, and git refuses to fast-forward a shallow clone onto a fetched
+    branch — it cannot see the common ancestor, so it calls the histories
+    unrelated. Without this those installations could never be upgraded at all,
+    which is the one thing this command exists to do.
+    """
+    shallow = run(["git", "-C", INSTALL_DIR, "rev-parse", "--is-shallow-repository"])
+    if shallow.stdout.strip() != "true":
+        return
+    print("this installation was cloned without history; fetching it now")
+    result = run(["git", "-C", INSTALL_DIR, "fetch", "--unshallow", "origin"])
+    if result.returncode != 0:
+        print("could not fetch the full history:")
+        print(result.stderr.strip())
+
+
 def _pending_commits() -> list[str]:
     """Subjects between here and the tracking branch, newest last.
 
@@ -375,6 +394,7 @@ def _pending_commits() -> list[str]:
     before agreeing to it. Fetched first so the comparison is against what the
     remote actually holds rather than a stale local view.
     """
+    _unshallow_if_needed()
     run(["git", "-C", INSTALL_DIR, "fetch", "--quiet", "origin"])
     out = run(
         [
