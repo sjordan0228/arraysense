@@ -9,7 +9,10 @@ counts, not just presence.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+
+import pytest
 
 from arraysense.metrics import INVERTER_METRICS, lookup
 from arraysense.store.rollup import (
@@ -890,6 +893,23 @@ def test_a_queued_hour_is_promoted_once_and_then_forgotten() -> None:
     assert conn.execute("SELECT COUNT(*) FROM rollup_pending").fetchone()[0] == 0
     assert promote_pending_hours(conn) == 0
     conn.close()
+
+
+def test_the_promotion_log_names_the_rows_actually_touched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The queue can claim an hour nothing promotes — a queued hour whose raw
+    # row is gone, or duplicates of an hour already merged. The log line is the
+    # operator's only evidence a backfill landed, so it has to count the
+    # hourly rows actually touched, not the queue rows claimed.
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute("INSERT INTO rollup_pending (hour) VALUES (?)", (hour,))
+    conn.commit()
+    with caplog.at_level(logging.INFO, logger="arraysense.store.rollup"):
+        assert promote_pending_hours(conn) == 0
+    conn.close()
+    assert "promoted 0 backfilled hour(s)" in caplog.text
 
 
 def test_the_late_write_threshold_sits_inside_the_rebuild_window() -> None:

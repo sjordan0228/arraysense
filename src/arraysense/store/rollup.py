@@ -671,5 +671,5 @@ def promote_pending_hours(conn: sqlite3.Connection, limit: int = PROMOTE_BATCH) 
             f"DELETE FROM {PENDING_TABLE} WHERE rowid IN ({', '.join('?' for _ in ids)})",
             ids,
         )
-    logger.info("promoted %d backfilled hour(s) into the hourly tier", len(ids))
+    logger.info("promoted %d backfilled hour(s) into the hourly tier", merged)
     return merged
