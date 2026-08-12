@@ -60,6 +60,7 @@ from pylxpweb.transports.modbus_serial import ModbusSerialTransport
 from arraysense.config import Config
 from arraysense.drivers.base import (
     Capabilities,
+    ConversionSpec,
     DeviceIdentity,
     DeviceIdentityError,
     EnergyReporting,
@@ -462,7 +463,22 @@ CAPABILITIES = Capabilities(
 # it, and labelled, because a machine whose generator power is a seconds
 # counter must not be presented as supported. See issue #122.
 MODELS: tuple[ModelSpec, ...] = (
-    ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation"),
+    ModelSpec(
+        name="18kPV",
+        pv_strings=3,
+        citation="measured on the reference installation",
+        conversion=ConversionSpec(
+            cec_pct=96.9,
+            max_pv_to_grid_pct=97.5,
+            max_battery_to_grid_pct=94.0,
+            max_pv_to_battery_pct=99.9,
+            idle_normal_w=70.0,
+            idle_standby_w=18.0,
+            approximate=("idle_normal_w", "idle_standby_w"),
+            citation="EG4 18kPV spec sheet, model 18KPV-12LV, version 1.4.3, "
+            "efficiency table; manufacturer's figures, read 2026-08-12",
+        ),
+    ),
     ModelSpec(
         name="12kPV",
         pv_strings=3,

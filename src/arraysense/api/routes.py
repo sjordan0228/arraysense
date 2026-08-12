@@ -593,21 +593,31 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "battery_module_metrics": None,
         }
         if declared is not None:
-            entry.update(
-                {
-                    "pv_strings": declared.pv_strings,
-                    "energy": declared.energy.value,
-                    "backup_output": declared.backup_output,
-                    "generator_input": declared.generator_input,
-                    "split_phase": declared.split_phase,
-                    "three_phase": declared.three_phase,
-                    "parallel_capable": declared.parallel_capable,
-                    "per_module_battery": declared.per_module_battery,
-                    "transport": declared.transport,
-                    "metrics": list(inverter_metric_columns(declared.metrics)),
-                    "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            capabilities_update: dict[str, Any] = {
+                "pv_strings": declared.pv_strings,
+                "energy": declared.energy.value,
+                "backup_output": declared.backup_output,
+                "generator_input": declared.generator_input,
+                "split_phase": declared.split_phase,
+                "three_phase": declared.three_phase,
+                "parallel_capable": declared.parallel_capable,
+                "per_module_battery": declared.per_module_battery,
+                "transport": declared.transport,
+                "metrics": list(inverter_metric_columns(declared.metrics)),
+                "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            }
+            if declared.conversion is not None:
+                capabilities_update["conversion"] = {
+                    "cec_pct": declared.conversion.cec_pct,
+                    "max_pv_to_grid_pct": declared.conversion.max_pv_to_grid_pct,
+                    "max_battery_to_grid_pct": declared.conversion.max_battery_to_grid_pct,
+                    "max_pv_to_battery_pct": declared.conversion.max_pv_to_battery_pct,
+                    "idle_normal_w": declared.conversion.idle_normal_w,
+                    "idle_standby_w": declared.conversion.idle_standby_w,
+                    "approximate": list(declared.conversion.approximate),
+                    "citation": declared.conversion.citation,
                 }
-            )
+            entry.update(capabilities_update)
         devices.append(entry)
     return {"devices": devices}
 

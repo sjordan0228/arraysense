@@ -102,6 +102,10 @@
     border-bottom:1px solid var(--grid-line);padding-bottom:5px}
   .facts .row u{text-decoration:none;color:var(--ink3)}
   .facts .row b{font-weight:500;text-align:right}
+  .facts .facts-rule{grid-column:1/-1;border:none;border-top:1px solid var(--panel-b);
+    margin:4px 0}
+  .facts .conv-head{grid-column:1/-1;font-size:12px;font-weight:600;color:var(--ink2);
+    margin-top:4px}
 </style>
 </head>
 <body>
@@ -1879,6 +1883,33 @@ function drawFacts(status, caps) {
     rows.push(factRow(`${prefix}per-module battery`, flagWords(d.per_module_battery)));
     rows.push(factRow(`${prefix}metrics produced`, countWords(d.metrics)));
     rows.push(factRow(`${prefix}per-module metrics`, countWords(d.battery_module_metrics)));
+    // Manufacturer's conversion figures, where the model's spec sheet carries
+    // them. Rendered as fact, never as a setting — nothing computes with them.
+    if (d.conversion) {
+      rows.push('<hr class="facts-rule">');
+      rows.push('<div class="conv-head">What this model is rated at</div>');
+      const c = d.conversion;
+      // Array.includes rather than a Set, because the band-editor test
+      // forbids constructing one in the wiring section below //SLICE_TO.
+      const approx = Array.isArray(c.approximate) ? c.approximate : [];
+      const isApprox = (key) => approx.includes(key);
+      const fmt = (val, key) => isApprox(key) ? `~${val}` : String(val);
+      rows.push(factRow('CEC efficiency',
+        `${fmt(c.cec_pct, 'cec_pct')}%`));
+      rows.push(factRow('PV to grid',
+        `${fmt(c.max_pv_to_grid_pct, 'max_pv_to_grid_pct')}%`));
+      rows.push(factRow('Battery to grid',
+        `${fmt(c.max_battery_to_grid_pct, 'max_battery_to_grid_pct')}%`));
+      rows.push(factRow('PV to battery',
+        `${fmt(c.max_pv_to_battery_pct, 'max_pv_to_battery_pct')}%`));
+      rows.push(factRow('Idle draw normal',
+        `${fmt(c.idle_normal_w, 'idle_normal_w')} W`));
+      rows.push(factRow('Idle draw standby',
+        `${fmt(c.idle_standby_w, 'idle_standby_w')} W`));
+      if (c.citation) {
+        rows.push(factRow('Source', esc(c.citation)));
+      }
+    }
   });
   $('facts').innerHTML = rows.join('');
 }
