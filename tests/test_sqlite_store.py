@@ -12,6 +12,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -938,6 +939,89 @@ def test_a_pack_serial_belongs_to_its_own_inverter(tmp_path: Path) -> None:
     store.close()
     assert [(r["serial"], r["soc_pct"]) for r in mine] == [("P1", 40.0)]
     assert [(r["serial"], r["soc_pct"]) for r in theirs] == [("P1", 90.0)]
+
+
+def test_latest_modules_holds_a_silent_pack_and_excludes_other_banks(tmp_path: Path) -> None:
+    # A pack that fell off the CAN bus keeps its final reading standing, with no
+    # time bound; a second inverter's packs are a second bank and never appear
+    # beside this one; a pack that never reported (EEE here) is absent rather
+    # than present with zeroes.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    for serial in ("AAA", "BBB", "CCC", "DDD"):
+        store.append(
+            Sample(
+                timestamp=_ts() - timedelta(days=7),
+                readings={},
+                battery_modules=(BatteryModuleSample(serial=serial, slot=1, soc_pct=50.0),),
+            )
+        )
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="BBB", slot=2, soc_pct=91.0),
+                BatteryModuleSample(serial="CCC", slot=3, soc_pct=92.0),
+                BatteryModuleSample(serial="DDD", slot=4, soc_pct=93.0),
+            ),
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=_ts() + timedelta(seconds=1),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="X1", slot=1, soc_pct=1.0),
+                BatteryModuleSample(serial="X2", slot=2, soc_pct=2.0),
+            ),
+        ),
+        device=OTHER_DEVICE,
+    )
+    rows = store.latest_modules(["soc_pct"])
+    store.close()
+    assert [(r["serial"], r["soc_pct"]) for r in rows] == [
+        ("AAA", 50.0),  # silent for a week; its last reading still stands
+        ("BBB", 91.0),
+        ("CCC", 92.0),
+        ("DDD", 93.0),
+    ]
+    assert rows[0]["timestamp"] == _ts() - timedelta(days=7)
+
+
+def test_latest_modules_plan_does_not_scan_the_module_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The live view asks for this on every refresh, and module_raw grows by four
+    # rows every poll while the answer stays one row per pack. A plan that scans
+    # the module table makes the endpoint cost grow with the history; each
+    # pack's newest row has to be reached through the indexes alone. The query
+    # is captured from the store itself, so this pins the shape the method runs
+    # rather than a copy of it that could drift.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="AAA", slot=1, soc_pct=50.0),
+                BatteryModuleSample(serial="BBB", slot=2, soc_pct=60.0),
+            ),
+        )
+    )
+    real_execute = store._conn.execute
+    captured: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture(sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
+        captured.append((sql, params))
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(store, "_conn", SimpleNamespace(execute=capture, close=store._conn.close))
+    store.latest_modules(["soc_pct"])
+    (sql, params) = captured[0]
+    plan = real_execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    store.close()
+    text = " ".join(str(r[-1]) for r in plan).upper()
+    assert "SCAN" not in text, plan
 
 
 def test_a_flagged_reading_is_attributed_to_the_inverter_that_produced_it(
