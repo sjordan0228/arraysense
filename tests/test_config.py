@@ -386,3 +386,22 @@ def test_effective_overlays_the_setup_settings(tmp_path: Path) -> None:
     assert merged.serial_device == "/dev/rs485"
     assert merged.model == "18kPV"
     assert merged.battery_source == "relayed"
+
+
+def test_the_sites_timezone_reaches_the_config_a_driver_is_built_from(tmp_path: Path) -> None:
+    # A driver is handed a Config and never the settings store, and the daily
+    # kWh counters it caches reset at the inverter's *local* midnight. Without
+    # this overlay the zone the wizard asked for cannot reach the one place
+    # that has to cut the day on it.
+    from arraysense.config import effective
+    from arraysense.settings import SETTING_TIMEZONE, SettingsStore
+    from arraysense.store.sqlite_store import SqliteStore
+
+    store = SqliteStore(str(tmp_path / "tz.db"), device=TEST_DEVICE)
+    settings = SettingsStore(store)
+    p = tmp_path / "c.toml"
+    p.write_text(GOOD)
+    assert effective(load(p), settings).timezone == "", "an unconfigured site claims a zone"
+    settings.set(SETTING_TIMEZONE, "America/Chicago")
+    assert effective(load(p), settings).timezone == "America/Chicago"
+    store.close()

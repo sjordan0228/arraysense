@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -169,3 +170,102 @@ async def test_a_counter_cached_earlier_the_same_day_is_still_used() -> None:
     await s._read_energy(datetime(2026, 8, 6, 14, 0, tzinfo=tz))
     carried = await s._read_energy(datetime(2026, 8, 6, 14, 30, tzinfo=tz))
     assert carried["pv_energy_today_kwh"] == 75.6
+
+
+# --- The day the counters reset on -----------------------------------------
+#
+# Every instant below is UTC, because that is what the poll loop hands the
+# driver. The tests above that pass an already-local datetime cannot see this
+# fault at all: .date() on a Chicago-zoned datetime is the Chicago date whether
+# the guard converts or not.
+
+_CHICAGO = replace(CFG, timezone="America/Chicago")
+
+
+async def test_a_counter_cached_before_local_midnight_is_dropped_after_it() -> None:
+    """The counters reset at the inverter's midnight, five hours before UTC's.
+
+    Between the two midnights a guard comparing UTC dates believes it is still
+    yesterday, so the cache carries the old day's totals into the new day —
+    and the daily metrics roll up with max, so that stale high-water mark
+    stands for the rest of the day.
+    """
+    t = FakeTransport(energy=_energy())
+    s = Eg4LuxPowerSource(_CHICAGO, transport=t, energy_interval=3600.0)
+    before = datetime(2026, 8, 7, 4, 59, tzinfo=UTC)  # 23:59 the previous day, in Chicago
+    after = datetime(2026, 8, 7, 5, 1, tzinfo=UTC)  # 00:01, the new day
+    assert await s._read_energy(before)
+    carried = await s._read_energy(after)
+    assert "pv_energy_today_kwh" not in carried, "yesterday's daily total crossed local midnight"
+    assert carried["pv_energy_total_kwh"] == 36246.4
+
+
+async def test_a_counter_cached_before_utc_midnight_survives_it() -> None:
+    """UTC's midnight is not the owner's, and must not drop a live cache.
+
+    The mirror of the fault above: an evening in Chicago spans UTC midnight, so
+    a UTC comparison throws away counters that are still today's.
+    """
+    t = FakeTransport(energy=_energy())
+    s = Eg4LuxPowerSource(_CHICAGO, transport=t, energy_interval=10800.0)
+    evening = datetime(2026, 8, 7, 23, 0, tzinfo=UTC)  # 18:00 in Chicago
+    later = datetime(2026, 8, 8, 1, 0, tzinfo=UTC)  # 20:00, the same Chicago day
+    assert await s._read_energy(evening)
+    carried = await s._read_energy(later)
+    assert carried["pv_energy_today_kwh"] == 75.6, "the cache was dropped at UTC's midnight"
+
+
+async def test_the_boundary_follows_a_23_hour_day() -> None:
+    """Spring forward: the owner's midnight arrives an hour earlier in UTC.
+
+    8 March 2026 is 23 hours long in Chicago. Its midnight is 06:00 UTC, and
+    the guard has to cut there rather than at a fixed offset held from the day
+    before.
+    """
+    t = FakeTransport(energy=_energy())
+    s = Eg4LuxPowerSource(_CHICAGO, transport=t, energy_interval=3600.0)
+    before = datetime(2026, 3, 8, 5, 59, tzinfo=UTC)  # 23:59 on the 7th, CST
+    after = datetime(2026, 3, 8, 6, 1, tzinfo=UTC)  # 00:01 on the 8th, CST
+    assert await s._read_energy(before)
+    carried = await s._read_energy(after)
+    assert "pv_energy_today_kwh" not in carried, "the 23-hour day's midnight was missed"
+
+
+async def test_the_boundary_follows_a_25_hour_day() -> None:
+    """Fall back: the same day holds 01:30 twice, and ends an hour later in UTC.
+
+    1 November 2026 is 25 hours long in Chicago. The repeated hour is still the
+    same local day — the cache must survive it — and the day does not end until
+    06:00 UTC on the 2nd.
+    """
+    # Three hours of cache lifetime, so an hour's gap neither refreshes the
+    # read nor expires it: what is under test is the boundary, not the clock.
+    t = FakeTransport(energy=_energy())
+    s = Eg4LuxPowerSource(_CHICAGO, transport=t, energy_interval=10800.0)
+    first = datetime(2026, 11, 1, 6, 30, tzinfo=UTC)  # 01:30 CDT
+    repeated = datetime(2026, 11, 1, 7, 30, tzinfo=UTC)  # 01:30 again, CST
+    assert await s._read_energy(first)
+    assert (await s._read_energy(repeated))["pv_energy_today_kwh"] == 75.6, (
+        "the repeated hour was read as a new day"
+    )
+
+    t2 = FakeTransport(energy=_energy())
+    s2 = Eg4LuxPowerSource(_CHICAGO, transport=t2, energy_interval=10800.0)
+    late = datetime(2026, 11, 2, 5, 30, tzinfo=UTC)  # 23:30 on the 1st, CST
+    next_day = datetime(2026, 11, 2, 6, 30, tzinfo=UTC)  # 00:30 on the 2nd
+    assert await s2._read_energy(late)
+    carried = await s2._read_energy(next_day)
+    assert "pv_energy_today_kwh" not in carried, "the 25-hour day's midnight was missed"
+
+
+async def test_an_unconfigured_installation_follows_the_hosts_clock() -> None:
+    """With no zone stated, the day is the one the machine itself keeps.
+
+    Every installation is unconfigured until the wizard asks, and the collector
+    runs at the site — on the reference Pi the two agree. Read live rather than
+    captured as an offset, so it stays right across a daylight-saving change.
+    """
+    t = FakeTransport(energy=_energy())
+    s = Eg4LuxPowerSource(CFG, transport=t, energy_interval=3600.0)
+    moment = datetime(2026, 8, 7, 4, 59, tzinfo=UTC)
+    assert s._local_day(moment) == moment.astimezone().date()
