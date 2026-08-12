@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import glob
 import os
+import shutil
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -378,6 +381,64 @@ def test_the_shim_runs_manage_under_the_system_interpreter() -> None:
     assert ".venv" not in shim
 
 
+def test_the_shim_finds_uv_before_running_manage() -> None:
+    """sudo runs `arraysense upgrade` with a PATH that has no uv, and the
+    upgrade needs uv; the shim must put uv's directory in front."""
+    shim = install.shim_text()
+    assert "for d in /root/.local/bin" in shim
+    assert 'PATH="$d:$PATH"' in shim
+    assert "manage.py" in shim
+
+
+def test_find_uv_checks_the_candidate_list(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(install, "UV_CANDIDATES", (str(uv),))
+    assert install.find_uv() == str(uv)
+
+
+def test_find_uv_checks_a_non_root_users_local_bin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The production install's uv lives under /home/*/.local/bin; the
+    installer running as root must still find it."""
+    uv = tmp_path / "uv"
+    uv.write_text("#!/bin/sh\n")
+    uv.chmod(0o755)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(install, "UV_CANDIDATES", ())
+
+    def fake_glob(pattern: str) -> list[str]:
+        return [str(uv)] if "/home/" in pattern else []
+
+    monkeypatch.setattr(glob, "glob", fake_glob)
+    assert install.find_uv() == str(uv)
+
+
+def test_main_refuses_a_repeat_run_with_the_repair_remedy_first(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run over an existing clone points at the remedy that exists in that
+    state — removing the clone — before it suggests the command that may not."""
+    monkeypatch.setattr(install, "observe_host", _ok)
+    monkeypatch.setattr(install, "INSTALL_DIR", "/tmp/arraysense-audit-install")
+    monkeypatch.setattr(os.path, "isdir", lambda p: True)
+    assert install.main(["--yes"]) == 1
+    out = capsys.readouterr().out
+    assert out.index("remove") < out.index("arraysense upgrade")
+
+
+def test_main_checks_out_a_pinned_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    code, calls = _run_main(monkeypatch, ["--yes", "--ref", "8861c77"])
+    assert code == 0
+    checkouts = [c[0] for c in calls if c[0][:2] == ["git", "-C"]]
+    assert checkouts == [["git", "-C", install.INSTALL_DIR, "checkout", "8861c77"]]
+
+
 def test_the_handoff_never_prints_a_loopback_address() -> None:
     """127.0.1.1 is what /etc/hosts says on Debian, and it is useless to
     somebody opening the dashboard from their laptop."""
@@ -417,18 +478,46 @@ def test_the_plan_names_a_non_default_repository() -> None:
 
 def test_the_clone_step_keeps_history() -> None:
     """--depth 1 is what broke every upgrade; it must not come back."""
-    plan = install.clone_argv(repo="https://example.invalid/a.git", ref=None)
+    plan = install.clone_argv(repo="https://example.invalid/a.git")
     assert "--depth" not in plan
 
 
-def test_the_clone_step_still_pins_a_ref_when_one_is_given() -> None:
-    """A pinned ref travels on the command just as it did before the depth went."""
-    argv = install.clone_argv(repo="https://example.invalid/a.git", ref="v1.0.0")
-    assert argv == [
+def test_the_clone_step_does_not_branch_and_the_checkout_pins_the_ref() -> None:
+    """--ref may name a commit, which git clone --branch refuses; the ref is
+    applied with a checkout in the clone instead, which takes all three."""
+    clone = install.clone_argv(repo="https://example.invalid/a.git")
+    assert "--branch" not in clone
+    assert install.checkout_argv("8861c77") == [
         "git",
-        "clone",
-        "--branch",
-        "v1.0.0",
-        "https://example.invalid/a.git",
+        "-C",
         install.INSTALL_DIR,
+        "checkout",
+        "8861c77",
     ]
+
+
+def test_a_pinned_commit_clones_and_checks_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The documented --ref COMMIT form, end to end against a real repository:
+    git clone --branch refuses a bare commit, so the installer clones and then
+    checks out, and that must actually pin the earlier commit."""
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "file.txt").write_text("one\n")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.invalid"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=source, check=True)
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "one"], cwd=source, check=True)
+    first = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True, text=True
+    ).stdout.strip()
+    (source / "file.txt").write_text("two\n")
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-qm", "two"], cwd=source, check=True)
+
+    monkeypatch.setattr(install, "INSTALL_DIR", str(tmp_path / "target"))
+    assert subprocess.run(install.clone_argv(repo=str(source)), check=True).returncode == 0
+    assert subprocess.run(install.checkout_argv(first), check=True).returncode == 0
+    assert (tmp_path / "target" / "file.txt").read_text() == "one\n"

@@ -18,6 +18,7 @@ nesting inside f-strings.
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import socket
@@ -385,7 +386,7 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def clone_argv(repo: str, ref: str | None) -> list[str]:
+def clone_argv(repo: str) -> list[str]:
     """The git clone command, exposed so a test can pin its shape.
 
     Deliberately no --depth: a shallow clone holds a single commit and git then
@@ -394,12 +395,23 @@ def clone_argv(repo: str, ref: str | None) -> list[str]:
     installation this installer created unable to upgrade at all, which is the
     one thing the lifecycle CLI exists for; the saving is small and the cost is
     the whole upgrade path.
+
+    The pinned ref is not on this command: git clone --branch takes a branch or
+    tag and refuses a bare commit, and --ref is documented as pinning a commit
+    too. checkout_argv applies the ref in the clone instead, where git accepts
+    branch, tag and commit alike.
     """
-    clone = ["git", "clone"]
-    if ref:
-        clone += ["--branch", str(ref)]
-    clone += [repo, INSTALL_DIR]
-    return clone
+    return ["git", "clone", repo, INSTALL_DIR]
+
+
+def checkout_argv(ref: str) -> list[str]:
+    """Check out the pinned ref in the fresh clone.
+
+    A full clone carries every branch's history, so any commit reachable from a
+    branch or tag is present to check out; git itself disambiguates a seven-hex
+    name between a branch and a shortened sha.
+    """
+    return ["git", "-C", INSTALL_DIR, "checkout", ref]
 
 
 def _packaging_file(name: str) -> str:
@@ -467,7 +479,19 @@ def shim_text() -> str:
     virtualenv while it is running, and a CLI living inside it would be pulling
     the floor up behind itself.
     """
-    return f'#!/bin/sh\nexec /usr/bin/env python3 {INSTALL_DIR}/src/arraysense/manage.py "$@"\n'
+    return (
+        "#!/bin/sh\n"
+        "# sudo runs this with a PATH that does not include uv, and the upgrade\n"
+        "# command needs uv; put the directory it lands in first.\n"
+        "for d in /root/.local/bin /home/*/.local/bin /usr/local/bin /usr/bin; do\n"
+        '  if [ -x "$d/uv" ]; then\n'
+        '    PATH="$d:$PATH"\n'
+        "    export PATH\n"
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        f'exec /usr/bin/env python3 {INSTALL_DIR}/src/arraysense/manage.py "$@"\n'
+    )
 
 
 def find_uv() -> str | None:
@@ -476,12 +500,14 @@ def find_uv() -> str | None:
     Its installer puts it in ~/.local/bin, which is not on the PATH of the
     process that just ran that installer — so looking it up by name finds
     nothing and raises FileNotFoundError halfway through an install that has
-    already cloned the repository.
+    already cloned the repository. A uv a non-root user installed in their own
+    home is found the same way.
     """
     found = shutil.which("uv")
     if found:
         return found
-    for candidate in UV_CANDIDATES:
+    candidates = list(UV_CANDIDATES) + sorted(glob.glob("/home/*/.local/bin/uv"))
+    for candidate in candidates:
         expanded = os.path.expanduser(candidate)
         if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
             return expanded
@@ -555,8 +581,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if os.path.isdir(os.path.join(INSTALL_DIR, ".git")):
         print(f"{INSTALL_DIR} already exists.")
-        print("To update, run: arraysense upgrade")
-        print(f"To repair this installation, remove {INSTALL_DIR} and run this again.")
+        print(f"To repair a half-installed machine, remove {INSTALL_DIR} and run this again.")
+        print("If the install completed, update it with: arraysense upgrade")
         return 1
 
     try:
@@ -578,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  sudo python3 install.py --yes --port {port}")
             return 1
 
-    clone = clone_argv(repo=args["repo"], ref=args["ref"])
+    clone = clone_argv(repo=args["repo"])
 
     # useradd may fail because the user already exists from a previous run;
     # every other step failing means the install is broken and stops here.
@@ -593,6 +619,10 @@ def main(argv: list[str] | None = None) -> int:
             False,
         ),
         (clone, False),
+    ]
+    if args["ref"] is not None:
+        steps.append((checkout_argv(args["ref"]), False))
+    steps += [
         (
             [
                 "useradd",
@@ -615,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     uv = find_uv()
     if uv is None:
         print("uv did not land where this process can find it.")
-        print(f"Install uv and finish by hand with: uv sync --project {INSTALL_DIR}")
+        print(f"Install uv, remove {INSTALL_DIR}, and run this again.")
         return 1
 
     if (
