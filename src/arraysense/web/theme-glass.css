@@ -1,0 +1,620 @@
+/* theme-glass.css — "Glass and glow": the alternative look, chosen per browser.
+ *
+ * Appended after common.js's injected BASE_CSS and after the page's own <style>,
+ * so everything here wins by cascade order at equal specificity. Nothing below
+ * changes what a number means: the five data hues keep their jobs, an absent
+ * reading still reads as an em dash, and the theme still switches on the
+ * :root / :root[data-theme="light"] / prefers-color-scheme mechanism the base
+ * sheet already established. Only the room the numbers sit in changes.
+ *
+ * The four summary cards each take a soft bloom of their own series colour, so
+ * a pane reads as the solar one (or the home, battery or grid one) at a glance
+ * rather than only after reading its label — the accent identifies the pane
+ * from across the room without ever becoming a stripe.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Fonts, vendored under /vendor/ for the same reason uPlot is: this runs on
+ * home networks with no route to a CDN, and a font that silently fails to load
+ * is a page that silently changes shape.
+ *
+ * Space Grotesk carries the chrome and JetBrains Mono every figure, and the two
+ * upstream releases ship in different shapes — which is why the declarations
+ * below do not match each other. Space Grotesk 2.0.0 publishes one variable
+ * woff2 with a wght axis running 300 to 700, so one face covers every weight
+ * this sheet asks for. JetBrains Mono 2.304 publishes no variable woff2 at all,
+ * only one static file per weight, so each weight used here is declared as its
+ * own face at its own single weight. Declaring a range over a static file is
+ * not free: the browser stops looking for a better match and synthesises the
+ * difference instead, which on the hero figure means a faked 300 that is really
+ * a smeared 400. Both fall back to a system stack that keeps the layout
+ * deliberate rather than merely different.
+ *
+ * The four mono weights are the ones the rules below actually use: 300 on the
+ * hero figure and the module state of charge, 400 on the flow values, 500 on
+ * the key-value bolds, and 700 on the bold cells in the Costs tables. No italic
+ * face is vendored because the one <em> on a mono element is set upright.
+ *
+ * Provenance, written down because a binary in a public repository with no
+ * stated origin is a licence question nobody can answer. Each file below is
+ * byte for byte the upstream file named beside it, and each sha256 is of the
+ * file as it sits in web/ — `shasum -a 256 src/arraysense/web/*.woff2` is the
+ * whole check. Neither family's filenames carry a version: they are upstream's
+ * own names, with Space Grotesk's square brackets flattened into a hyphen so
+ * the name survives a URL. So a newer release does not overwrite one of these;
+ * it arrives under a name of its own, for the reason app.py's VENDORED comment
+ * gives.
+ *
+ *   Space Grotesk — github.com/floriankarsten/space-grotesk at tag 2.0.0,
+ *   fonts/woff2/SpaceGrotesk[wght].woff2 (that release also offers the whole
+ *   family as SpaceGrotesk-2.0.0.zip)
+ *     SpaceGrotesk-wght.woff2
+ *       8e085aa438094f11487a836652edd5c054fa6a96f63fc7c282105ee3a4b08c07
+ *
+ *   JetBrains Mono — github.com/JetBrains/JetBrainsMono at tag v2.304,
+ *   fonts/webfonts/ (that release also offers JetBrainsMono-2.304.zip)
+ *     JetBrainsMono-Light.woff2
+ *       43eb798d59b557c3d87c1402ce684b3fda1ad66bf7ec8021b0a43dc31ad9c572
+ *     JetBrainsMono-Regular.woff2
+ *       a9cb1cd82332b23a47e3a1239d25d13c86d16c4220695e34b243effa999f45f2
+ *     JetBrainsMono-Medium.woff2
+ *       086c48dfbea9ddaff1320f7e09399b8e2924e88ce67453721255db3bdbb5a353
+ *     JetBrainsMono-Bold.woff2
+ *       c503cc5ec5f8b2c7666b7ecda1adf44bd45f2e6579b2eba0fc292150416588a2
+ *
+ * SpaceGrotesk.LICENSE and JetBrainsMono.LICENSE are the OFL.txt of those same
+ * two tags, unaltered and renamed only to sit beside the fonts they cover.
+ * ------------------------------------------------------------------------- */
+
+@font-face {
+  font-family: "Space Grotesk";
+  src: url("/vendor/SpaceGrotesk-wght.woff2") format("woff2");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/vendor/JetBrainsMono-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/vendor/JetBrainsMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/vendor/JetBrainsMono-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("/vendor/JetBrainsMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ---------------------------------------------------------------------------
+ * Which theme is in force. The base sheet decides this with three selectors —
+ * bare :root for dark, [data-theme="light"] for an explicit choice, and the
+ * media query for the device's preference — and the only thing repeated here is
+ * that decision, as one declaration each. Every token below then states both of
+ * its values once, in light-dark(), so a palette this file owns cannot drift
+ * between the two themes the way two pasted blocks eventually do.
+ *
+ * Setting color-scheme is also what makes the native <select> menus on this
+ * page open in the same theme as the page they were opened from.
+ * ------------------------------------------------------------------------- */
+
+:root { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) { color-scheme: light; }
+}
+
+/* The selector list is not decoration. Several of the tokens below already
+ * exist in the base sheet, where they are re-declared under
+ * :root[data-theme="light"] and under :root:not([data-theme]) inside a media
+ * query — both of which out-specify a bare :root, so a bare :root here would be
+ * silently ignored in exactly the light theme it was meant to fix. Matching
+ * those three shapes puts this file's values at equal specificity and later in
+ * the cascade, which is all it takes to win without an !important anywhere.
+ */
+:root,
+:root:not([data-theme]),
+:root[data-theme="light"],
+:root[data-theme="dark"] {
+  --font-ui: "Space Grotesk", "Segoe UI Variable Display", system-ui,
+             -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono",
+               Menlo, Consolas, monospace;
+
+  /* Glass. A panel is a pane of smoked quartz: two stops of its own, a brighter
+     top edge where the ambient light lands, and a shadow long enough to say it
+     is floating rather than printed. */
+  --glass-top: light-dark(oklch(100% 0 0 / 0.72), oklch(24% 0.035 268 / 0.62));
+  --glass-bot: light-dark(oklch(97% 0.01 265 / 0.58), oklch(17% 0.030 272 / 0.52));
+  --edge: light-dark(oklch(45% 0.03 265 / 0.16), oklch(78% 0.03 265 / 0.22));
+  --edge-hi: light-dark(oklch(100% 0 0 / 0.90), oklch(96% 0.02 90 / 0.42));
+  --blur: 22px;
+  --radius: 20px;
+  --shadow-lift:
+    0 1px 0 0 light-dark(oklch(100% 0 0 / 0.70), oklch(100% 0 0 / 0.06)) inset,
+    0 24px 58px -28px light-dark(oklch(45% 0.06 265 / 0.42), oklch(6% 0.04 268 / 0.85)),
+    0 4px 14px -8px light-dark(oklch(45% 0.06 265 / 0.28), oklch(6% 0.04 268 / 0.55));
+
+  /* How much of its own series colour a summary card's bloom carries. One knob
+     for all four cards, substituted into the color-mix() percentage further
+     down. It cannot be a light-dark(): that function is defined over two
+     colours, and this is a percentage — so the two light selectors below are
+     the only form available, and both are needed or an explicit light choice
+     and the device default disagree.
+
+     The light value is raised on the owner's report that the light pane read as
+     almost untinted at the shared figure, NOT on a colour-difference argument —
+     and the distinction matters, because the measurement says the opposite.
+     Composited the way the browser actually does it (alpha-compositing happens
+     in gamma-encoded sRGB, not linear light — verified in Chrome by difference
+     blend, where 50% black over white lands on exactly #7f7f7f), the two themes
+     were already close to level at a shared 15%: mean CIEDE2000 against the
+     untinted card of about 7.0 in dark and about 7.0 in light. 28% takes light
+     to about 12.3, which is roughly 1.7x the step the dark pane carries.
+
+     That is deliberate. CIEDE2000 is a small-patch metric and says little about
+     a large diffuse wash seen against a bright surround, where apparent
+     saturation is suppressed. The eye on a real screen is the authority here;
+     these figures are recorded so the next person knows the number is a
+     judgement rather than a derivation.
+
+     One more trap for anyone re-measuring: the gradient's centre sits at 108%
+     of the card's height, below its bottom edge, and fades to transparent at
+     55%. The strongest tint anywhere ON the card is therefore about 85% of this
+     value, never the value itself. */
+  --bloom: 15%;
+
+  /* How hard a series stroke burns on the canvas — applied as a drop-shadow to
+     uPlot's own canvas, so it lifts the lines off the surface without touching
+     the validated hues themselves. Nearly nothing in light, where a bloom on a
+     white ground reads as a printing fault rather than as light. */
+  --stroke-glow: light-dark(oklch(70% 0.09 70 / 0.16), oklch(88% 0.10 70 / 0.30));
+
+  /* The page and its ambient light. Deeper than the base sheet's so the
+     translucent panels have something to be translucent against, and warmest at
+     the top right — the glow belongs to the room the numbers describe. */
+  --sky-1: light-dark(#eef1f9, #0b1226);
+  --sky-2: light-dark(#e6ebf6, #141c3c);
+  --sky-3: light-dark(#efe7f4, #2a2450);
+  --sky-4: light-dark(#faeee3, #5c3a44);
+  --sky-5: light-dark(#fdf5e9, #8a5330);
+  --sun: light-dark(oklch(88% 0.12 74 / 0.34), oklch(82% 0.15 72 / 0.34));
+  --dusk: light-dark(oklch(80% 0.09 268 / 0.28), oklch(62% 0.14 268 / 0.30));
+  --page:
+    radial-gradient(120% 90% at 82% -10%, var(--sun), transparent 58%),
+    linear-gradient(168deg, var(--sky-1) 0%, var(--sky-2) 32%, var(--sky-3) 58%,
+                    var(--sky-4) 84%, var(--sky-5) 100%);
+  --glow: radial-gradient(circle, var(--sun), transparent 68%);
+  --glow-cool: radial-gradient(circle, var(--dusk), transparent 70%);
+
+  /* The chart grid recedes to a whisper. The zero rule and the crosshair are
+     deliberately left as the base sheet set them: a signed reading is signed
+     against that line, and it is not scenery. */
+  /* NOT light-dark(): common.js reads this token with getComputedStyle and hands
+     the raw string to canvas as a stroke colour. Canvas cannot parse light-dark(),
+     ignores it, and keeps whatever colour was stroked last — which drew every
+     gridline in the home-series blue. A plain colour per theme block is the fix. */
+  --grid-line: rgba(214, 218, 232, 0.055);
+  --tint: light-dark(oklch(30% 0.02 265 / 0.05), oklch(95% 0.02 265 / 0.06));
+  --tint-2: light-dark(oklch(30% 0.02 265 / 0.09), oklch(95% 0.02 265 / 0.11));
+  --tint-3: light-dark(oklch(30% 0.02 265 / 0.15), oklch(95% 0.02 265 / 0.18));
+  --tip: light-dark(oklch(100% 0 0 / 0.94), oklch(16% 0.03 268 / 0.88));
+  --tip-shadow: 0 18px 44px -18px light-dark(oklch(45% 0.05 265 / 0.35), oklch(4% 0.03 268 / 0.90));
+}
+
+/* The light counterpart of --grid-line, kept out of light-dark() for the reason
+   given above. Both light selectors, so an explicit choice and the device
+   default agree. */
+:root[data-theme="light"] { --grid-line: rgba(38, 42, 58, 0.08); }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) { --grid-line: rgba(38, 42, 58, 0.08); }
+}
+
+/* The light bloom, in the same two selectors and for a different reason:
+   light-dark() carries a pair of colours, and this is a percentage, so there is
+   no one-declaration form of it to reach for. Stating it in both light
+   selectors is what stops an explicit choice of light and the device's own
+   preference from disagreeing about how strong the tint is. */
+:root[data-theme="light"] { --bloom: 28%; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) { --bloom: 28%; }
+}
+
+/* ---------------------------------------------------------------------------
+ * The ambient light. The existing .sunglow div is the warm sun in the top-right
+ * corner and is simply made larger and softer; a second, cooler pool is added
+ * on body::before at the opposite corner so the page has a direction of light
+ * rather than a single lamp. Both are fixed, so scrolling moves the panels
+ * through the light instead of dragging the light along.
+ * ------------------------------------------------------------------------- */
+
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sunglow {
+  width: min(62vw, 720px);
+  height: min(62vw, 720px);
+  right: -16vw;
+  top: -22vw;
+  filter: blur(40px);
+  opacity: 0.95;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    var(--glow-cool) -18vw 62vh / min(70vw, 780px) min(70vw, 780px) no-repeat;
+  filter: blur(50px);
+}
+
+main { z-index: 1; }
+
+/* ---------------------------------------------------------------------------
+ * Panels. One rule does most of the work of this direction: a two-stop
+ * translucent fill, a heavy blur behind it, generous rounding, and a hairline
+ * that is brighter along the top edge than the bottom — which is what makes a
+ * pane look like it is catching light rather than merely being outlined.
+ * ------------------------------------------------------------------------- */
+
+.p {
+  position: relative;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  background:
+    linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+  backdrop-filter: blur(var(--blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(150%);
+  box-shadow: var(--shadow-lift);
+}
+
+/* The hairline itself, drawn as a masked gradient ring so it can fade around
+   the panel instead of being one flat colour. Absolutely positioned, so it
+   never becomes a flex item on the panels that are flex containers. */
+.p::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(155deg, var(--edge-hi), var(--edge) 38%, transparent 78%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* The advisory strips keep their coloured rule — it is the one piece of chrome
+   that carries a severity — but it becomes an inset bar so the panel's rounding
+   survives it. */
+.cal, .stale { border-left: 0; overflow: hidden; }
+.cal::after, .stale::after {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: var(--ink3);
+}
+.cal.sev-warning::after, .cal.sev-elevated::after, .stale.tone-warn::after { background: var(--warn); }
+.cal.sev-alert::after, .stale.tone-bad::after { background: var(--bad); width: 5px; }
+
+/* ---------------------------------------------------------------------------
+ * Header and the status pill. The app name is set in the geometric sans at a
+ * confident size; the connection readout becomes a floating pill, because it is
+ * a state and not a sentence.
+ * ------------------------------------------------------------------------- */
+
+header { align-items: center; margin-bottom: 20px; }
+
+h1 {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+  color: var(--ink2);
+  background: linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 0 0 1px var(--edge) inset, 0 8px 20px -14px oklch(6% 0.04 268 / 0.8);
+}
+
+/* The live dot is a lamp behind the glass. Its colour is written inline by the
+   page — good, amber or bad — so nothing here may restate it; the ring is
+   neutral and only the size of the lamp changes. */
+.conn .dot { width: 9px; height: 9px; outline: 3px solid var(--tint-2); }
+
+.iconbtn, .themebtn {
+  border: 0;
+  border-radius: 12px;
+  background: var(--tint);
+  box-shadow: 0 0 0 1px var(--edge) inset;
+  transition: background 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+}
+.iconbtn:hover, .themebtn:hover { background: var(--tint-3); transform: translateY(-1px); }
+
+/* ---------------------------------------------------------------------------
+ * Tabs. Pills that sit in the light, with the current view lit from within —
+ * a warm inner wash plus a soft outer glow, so "where am I" survives a glance
+ * from across the room.
+ * ------------------------------------------------------------------------- */
+
+.nav { gap: 6px; margin-bottom: 18px; }
+
+.nav a {
+  border: 0;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+  background: var(--tint);
+  box-shadow: 0 0 0 1px var(--edge) inset;
+  transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+.nav a:hover { background: var(--tint-2); }
+
+.nav a[aria-current="page"] {
+  color: var(--ink);
+  font-weight: 500;
+  background: linear-gradient(150deg,
+    color-mix(in oklab, var(--pv) 26%, transparent),
+    color-mix(in oklab, var(--pv) 8%, transparent));
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--pv) 45%, transparent) inset,
+    0 8px 22px -12px color-mix(in oklab, var(--pv) 70%, transparent);
+}
+
+/* ---------------------------------------------------------------------------
+ * Type: labels, headings, and the figures.
+ *
+ * Every readout — kW, kWh, V, A, %, money — is set in the mono with tabular
+ * figures, so a column of them does not shimmer as the values move. The em
+ * dash inherits all of it and stays at full ink: an absent reading is a
+ * reading, and this direction must not let atmosphere swallow it.
+ * ------------------------------------------------------------------------- */
+
+.lbl {
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.19em;
+  color: color-mix(in oklab, var(--ink3) 88%, var(--ink));
+}
+
+.chead h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.02em; }
+.chead { margin-bottom: 12px; }
+
+.hero .v,
+.flow b,
+.mod .soc,
+.agree .v,
+.kv b,
+.tip .row,
+.dtl .delta em,
+.dtl .leg,
+.dtl .bar span,
+.dtl .sublab,
+table td,
+.hero .today b,
+.flow .sub,
+#modeBatt {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "zero" 1;
+}
+
+/* The headline figure. Large, light, and tightly tracked — the number is the
+   object on the shelf and everything else is its label. */
+.hero .v {
+  font-size: clamp(46px, 5.6vw, 66px);
+  font-weight: 300;
+  letter-spacing: -0.045em;
+  line-height: 1;
+  margin-top: 8px;
+  color: var(--ink);
+  text-shadow: 0 0 34px color-mix(in oklab, var(--pv) 38%, transparent);
+}
+.hero .v span {
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  opacity: 0.6;
+  margin-left: 4px;
+}
+
+/* The four summary cards each admit which series they are about: a bloom of
+   their own hue bleeding up from the lower-left edge, under the glass. This is
+   the hero's original solar wash, now shared by the three flow cards — keyed by
+   the swatch already in their markup (:has over the .sq's inline style) rather
+   than by position, so the cards can be reordered without the accent lying
+   about which is which. The strength is the --bloom token above — 15% in dark,
+   28% in light, and see that token for why the two differ. The tint identifies
+   the pane from across the room while staying a soft radial patch that reads as
+   light through frosted glass rather than a stripe. */
+.hero {
+  background:
+    radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--pv) var(--bloom), transparent), transparent 55%),
+    linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+}
+.flow .p:has(.sq[style*="--load"]) {
+  background:
+    radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--load) var(--bloom), transparent), transparent 55%),
+    linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+}
+.flow .p:has(.sq[style*="--batt"]) {
+  background:
+    radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--batt) var(--bloom), transparent), transparent 55%),
+    linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+}
+.flow .p:has(.sq[style*="--grid"]) {
+  background:
+    radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--grid) var(--bloom), transparent), transparent 55%),
+    linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+}
+
+.hero .today { border-top: 1px solid var(--edge); margin-top: 14px; padding-top: 11px; }
+.hero .today b { font-size: 16px; font-weight: 500; }
+
+.flow b { font-size: 22px; font-weight: 400; letter-spacing: -0.02em; margin-top: 6px; }
+.flow .sub { font-size: 11.5px; opacity: 0.75; }
+.flow .sub .lbl { font-family: var(--font-ui); }
+
+/* The little square that names a series. Its hue arrives inline from the
+   palette, so it is left alone and only the shape changes — a rounded chip with
+   a ring, which reads as the same material as everything else on the page. */
+.sq {
+  width: 9px; height: 9px;
+  border-radius: 3px;
+  outline: 2px solid var(--tint);
+}
+
+.mod .soc { font-size: 24px; font-weight: 300; letter-spacing: -0.03em; }
+.mod .sn { font-family: var(--font-mono); font-size: 8.5px; }
+.kv b { font-weight: 500; }
+.mode { font-size: 14.5px; }
+.mode b { font-weight: 600; letter-spacing: -0.01em; }
+/* The mode dot takes its hue from a class, so here the glow can name the same
+   colour the fill does and stay correct in all three states. */
+.mode .dot { width: 10px; height: 10px; }
+.mode.pv .dot { box-shadow: 0 0 12px -1px var(--pv); }
+.mode.batt .dot { box-shadow: 0 0 12px -1px var(--batt); }
+.mode.grid .dot { box-shadow: 0 0 12px -1px var(--grid); }
+
+/* ---------------------------------------------------------------------------
+ * Charts. The grid is already a whisper by token; here the canvas itself gets a
+ * soft bloom so the series strokes glow rather than sit flat, and the range
+ * buttons become one segmented control instead of four separate chips.
+ * ------------------------------------------------------------------------- */
+
+.chart .uplot canvas {
+  filter: drop-shadow(0 0 6px var(--stroke-glow));
+}
+
+.u-select {
+  background: color-mix(in oklab, var(--pv) 16%, transparent);
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--pv) 35%, transparent) inset;
+}
+
+.u-hz .u-cursor-x { border-right: 1px dashed var(--cursor-x); }
+
+.tip {
+  border: 0;
+  border-radius: 14px;
+  padding: 10px 12px;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: var(--tip-shadow), 0 0 0 1px var(--edge) inset;
+}
+
+/* The range picker as one object. The buttons lose their own borders and share
+   a single frosted track, which reads as a control rather than as four. */
+.rng {
+  gap: 2px;
+  padding: 3px;
+  border-radius: 999px;
+  background: var(--tint);
+  box-shadow: 0 0 0 1px var(--edge) inset;
+}
+.rng button {
+  border: 0;
+  background: transparent;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 11px;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+.rng button:hover { color: var(--ink); }
+.rng button[aria-pressed="true"] {
+  background: linear-gradient(150deg, var(--tint-3), var(--tint-2));
+  box-shadow: 0 1px 0 oklch(100% 0 0 / 0.14) inset;
+}
+
+.chartbar button, .cal .calhide {
+  border: 0;
+  border-radius: 999px;
+  background: var(--tint);
+  box-shadow: 0 0 0 1px var(--edge) inset;
+}
+
+/* Bars and tracks. Rounded to the full pill and sunk slightly into the panel,
+   so a nearly-empty track still reads as a track rather than as a hairline.
+   The fills are left their own colours: they are written from the data, and a
+   glow restated here would have to guess at which one it was glowing. */
+.track, .agree .bar, .dtl .bar {
+  border-radius: 999px;
+  box-shadow: 0 1px 2px oklch(0% 0 0 / 0.18) inset;
+}
+.track i, .agree .bar i { border-radius: 999px; }
+.track { height: 6px; }
+
+/* Absent data, stated last so nothing above can quietly dim it. An em dash is a
+ * reading — it says a value was not measured — and it keeps the full ink and
+ * weight of a number, atmosphere or no atmosphere. The hatched "unknown" fills
+ * keep their texture too, so the inset shadow above cannot flatten them into
+ * something that could be mistaken for an empty bar. */
+.hero .v, .flow b, .mod .soc, .kv b, .agree .v, .dtl .delta em {
+  color: var(--ink);
+  opacity: 1;
+}
+.track.unknown, .agree .bar.none, .dtl .bar.none, .dtl .pairbar div.none {
+  box-shadow: inset 0 0 0 1px var(--tint-3);
+}
+
+/* Focus stays visible against the glass, and motion is opt-out. */
+:where(a, button, select, input):focus-visible {
+  outline: 2px solid var(--pv);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .iconbtn, .themebtn, .nav a, .rng button { transition: none; }
+  .iconbtn:hover, .themebtn:hover { transform: none; }
+}
+
+/* Small screens get the same material with less of it: the blur is expensive on
+   a phone GPU and the corner radius has to shrink with the card. */
+@media (max-width: 620px) {
+  :root { --radius: 16px; --blur: 16px; }
+  .p { padding: 14px 15px; }
+  .hero .v { font-size: clamp(40px, 13vw, 52px); }
+}

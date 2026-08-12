@@ -10,6 +10,7 @@ always agrees.
 from __future__ import annotations
 
 import itertools
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,7 +21,14 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from arraysense.api.app import PAGES, SHARED_SCRIPT, _file_route, create_app
+from arraysense.api.app import (
+    PAGES,
+    SHARED_SCRIPT,
+    THEME_SHEETS,
+    VENDORED,
+    _file_route,
+    create_app,
+)
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
@@ -1031,6 +1039,60 @@ def test_every_page_in_the_allow_list_has_a_route(client: Any) -> None:
     routed = {getattr(route, "path", None) for route in client.app.routes}
     assert set(PAGES) <= routed
     assert f"/{SHARED_SCRIPT}" in routed
+    assert {f"/{sheet}" for sheet in THEME_SHEETS} <= routed
+
+
+@pytest.mark.parametrize("sheet", THEME_SHEETS)
+def test_a_theme_sheet_is_served_as_a_stylesheet(client: Any, sheet: str) -> None:
+    # An appearance is layered over the base styling common.js injects, so it
+    # has to arrive as CSS. Served as text/plain a browser ignores the link
+    # entirely and the page renders Classic while claiming to be something else.
+    r = client.get(f"/{sheet}")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/css")
+    assert "@font-face" in r.text
+
+
+def test_every_page_carries_the_default_look_and_settles_it_before_the_body() -> None:
+    # Three things about one pair of lines, and each of them has a failure of
+    # its own. The <link> has to be written in the markup, because a stylesheet
+    # the parser finds holds the first paint back and one a script inserts does
+    # not — a page that created it would paint in the wrong look and restyle
+    # under the reader on every navigation. It has to sit below the page's own
+    # <style>, or the page overrides the look it was given.
+    # And the call has to follow it inside <head>, so a browser holding Classic
+    # has the link removed before there is a body to paint. A page that omits
+    # either shows a different look from its neighbours, which reads as a broken
+    # page rather than as a missing line.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    for filename in PAGES.values():
+        head = (web / filename).read_text().split("</head>", 1)[0]
+        link = re.search(r'<link id="appearance-sheet" rel="stylesheet" href="/([^"]+)">', head)
+        assert link, f"{filename} carries no default look"
+        assert link.group(1) in THEME_SHEETS, f"{filename} links a sheet the app does not serve"
+        call = head.find("applyStoredAppearance()")
+        assert call != -1, f"{filename} never settles the stored look"
+        assert link.start() > head.rindex("</style>"), f"{filename} links the look above its styles"
+        assert call > link.start(), f"{filename} settles the look before the link exists"
+
+
+def test_the_sheet_common_js_links_is_the_one_the_pages_and_the_app_name() -> None:
+    # Three places name one file: the pages' <link>, the look's href in
+    # common.js, and the routed set in app.py. A rename that touches two of them
+    # leaves a browser asking for a URL that 404s, and a stylesheet that never
+    # arrives is not an error a page can show — it is Classic, silently, on a
+    # browser that asked for Glass.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    common = (web / "common.js").read_text()
+    start = common.index("const APPEARANCE_SHEET")
+    linked = re.findall(r"'/([A-Za-z0-9._-]+\.css)'", common[start : common.index("\n", start)])
+    assert linked, "common.js links no appearance sheet at all"
+    for name in linked:
+        assert name in THEME_SHEETS, name
+    for filename in PAGES.values():
+        head = (web / filename).read_text().split("</head>", 1)[0]
+        page_sheet = re.search(r'id="appearance-sheet" rel="stylesheet" href="/([^"]+)"', head)
+        assert page_sheet and page_sheet.group(1) in linked, filename
 
 
 @pytest.mark.parametrize("path", ["/graphs", "/history", "/costs"])
@@ -1103,6 +1165,58 @@ def test_the_vendored_licence_ships_with_it(client: Any) -> None:
 
 def test_an_unknown_vendored_name_is_a_404(client: Any) -> None:
     assert client.get("/vendor/anything.js").status_code == 404
+
+
+@pytest.mark.parametrize("name", [n for n in VENDORED if n.endswith(".woff2")])
+def test_a_vendored_font_is_served_as_a_font(client: Any, name: str) -> None:
+    # The service runs on home networks with no route to a CDN, so the fonts are
+    # vendored for the same reason uPlot is. wOF2 is the file's magic number:
+    # served as anything the browser does not recognise as a font, the page
+    # silently falls back to the system stack and changes shape.
+    r = client.get(f"/vendor/{name}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "font/woff2"
+    assert r.content[:4] == b"wOF2"
+
+
+def _font_licences() -> dict[str, str]:
+    """Each vendored font paired with the licence file it must ship beside.
+
+    Derived from the font's own name — the family, then ``.LICENSE`` — rather
+    than listed, because a list is exactly what a third family added later slips
+    past: the font appears, nothing names its notice, and every assertion here
+    goes on passing.
+    """
+    return {
+        name: f"{name.removesuffix('.woff2').split('-')[0]}.LICENSE"
+        for name in VENDORED
+        if name.endswith(".woff2")
+    }
+
+
+@pytest.mark.parametrize(("font", "licence"), sorted(_font_licences().items()))
+def test_a_vendored_font_ships_with_its_licence(client: Any, font: str, licence: str) -> None:
+    # These fonts are under the SIL Open Font License, which requires the notice
+    # to travel with the font. A binary whose licence stayed behind is the one
+    # way vendoring becomes a problem — and this repository is public, so the
+    # binary travels.
+    assert licence in VENDORED, f"{font} is served with no licence beside it"
+    r = client.get(f"/vendor/{licence}")
+    assert r.status_code == 200
+    assert "SIL Open Font License" in r.text
+
+
+def test_every_vendored_font_declares_a_face_in_the_theme_sheet() -> None:
+    # The allow-list and the stylesheet have to name the same files: a font in
+    # VENDORED that nothing asks for is dead weight in a public repository, and
+    # one the sheet asks for that is not in the allow-list is a 404 the page
+    # answers by quietly using a different typeface.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    css = (web / "theme-glass.css").read_text()
+    for name in (n for n in VENDORED if n.endswith(".woff2")):
+        assert f"/vendor/{name}" in css, name
+    for url in re.findall(r'url\("(/vendor/[^"]+)"\)', css):
+        assert url.removeprefix("/vendor/") in VENDORED, url
 
 
 def test_a_path_traversal_cannot_reach_the_configuration(client: Any) -> None:
@@ -1773,7 +1887,9 @@ def test_pages_and_the_shared_script_are_revalidated(client: Any) -> None:
     # yesterday's script. When that happened the page called a helper that did
     # not exist yet, the chart threw, and the failure surfaced as "history
     # unavailable" — pointing at the network for a fault in the cache.
-    for path in ("/", "/graphs", "/history", "/costs", "/settings", "/common.js"):
+    paths = ["/", "/graphs", "/history", "/costs", "/settings", "/common.js"]
+    paths += [f"/{sheet}" for sheet in THEME_SHEETS]
+    for path in paths:
         r = client.get(path)
         assert r.status_code == 200, path
         assert "no-cache" in r.headers.get("cache-control", ""), path
@@ -1783,6 +1899,19 @@ def test_the_vendored_library_is_still_cacheable(client: Any) -> None:
     # It is versioned by its filename and never changes under the same name, so
     # revalidating it every load would buy nothing and cost a request.
     r = client.get("/vendor/uPlot.min.css")
+    assert r.status_code == 200
+    assert "no-cache" not in r.headers.get("cache-control", "")
+
+
+@pytest.mark.parametrize("name", [n for n in VENDORED if n.endswith(".woff2")])
+def test_a_vendored_font_is_cacheable(client: Any, name: str) -> None:
+    # A font is a released binary, replaced by shipping a different file rather
+    # than by editing this one, so asking again on every page load would buy
+    # nothing. Nothing mechanical enforces that — these names carry no version,
+    # as the note beside VENDORED says — it is a convention this test pins the
+    # caching half of. The theme sheet is the other way round: it is edited
+    # under its own name, so it revalidates above.
+    r = client.get(f"/vendor/{name}")
     assert r.status_code == 200
     assert "no-cache" not in r.headers.get("cache-control", "")
 

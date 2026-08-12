@@ -13,7 +13,10 @@
 <script src="/common.js"></script>
 <style>
   .grp{margin-bottom:12px}
-  .grp .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;margin:0 0 14px}
+  /* The Theme area takes the same introduction as a settings group without
+     being one — see the comment on #lookSec in the body. */
+  .grp .intro,#lookSec .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
+    margin:0 0 14px}
   .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
   @media(max-width:760px){.fields{grid-template-columns:1fr}}
   /* A field whose value is long prose — the rate bands — needs the row to
@@ -112,6 +115,31 @@
   .facts .conv-head{grid-column:1/-1;font-size:12px;font-weight:600;color:var(--ink2);
     margin-top:4px}
 
+  /* --- Theme ------------------------------------------------------------- */
+  /* The two per-browser choices. They share none of the .f rules above and that
+     is deliberate: those are written for a box holding a value on its way to
+     the service, and these are closed lists of choices with nothing to send.
+     A fieldset and a legend rather than a div and a heading, so the group is a
+     group to a screen reader as well as to the eye. */
+  .looks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
+  @media(max-width:760px){.looks{grid-template-columns:1fr}}
+  .look{border:1px solid var(--panel-b);border-radius:10px;background:var(--tint);
+    padding:8px 12px 11px;margin:0;min-width:0}
+  .look legend{font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;color:var(--ink3);
+    padding:0 5px}
+  .look .opt{display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:1.9;
+    cursor:pointer}
+  /* Sized to itself, for the reason the checkbox rule above gives: everything
+     else here stretches to the column and a stretched radio is a lozenge. */
+  .look input[type=radio]{width:15px;height:15px;margin:0;flex:0 0 auto;accent-color:var(--pv);
+    cursor:pointer;align-self:center}
+  /* The focus ring the tab bar uses, restated for these because the glass sheet
+     rings inputs in --pv at zero specificity; matching the tabs keeps one page
+     to one focus colour whichever look is on. */
+  .look input[type=radio]:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  .look .opt .was{font-size:11px;color:var(--ink3)}
+  .look .help{font-size:11px;color:var(--ink3);line-height:1.55;margin:6px 0 0}
+
   /* --- Tabs --------------------------------------------------------------- */
   .tabs{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
   .tabs button{background:var(--tint);border:1px solid var(--panel-b);
@@ -126,6 +154,18 @@
   /* The empty-tab note, rendered when a tab with no settings is deep-linked. */
   .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:8px 0}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
@@ -155,6 +195,38 @@
       <span class="muted grow" style="font-size:11px">
         Stored in the database on the service, not in this browser.
       </span>
+    </div>
+  </section>
+
+  <!-- Not settings, and not an oversight to be tidied into the registry later.
+       Everything else on this page is described by settings.py and stored in
+       the service's database, which is one value for the whole installation.
+       These two are per browser, held in localStorage beside the theme the
+       header glyph switches, and that is the point: one household can want the
+       wall tablet dark and glassy and the laptop following the room, and a
+       registry entry would force whichever was saved last onto both. So there
+       is no spec behind these controls, no PUT to /api/settings and no Save
+       button — the choice is the browser's own and takes effect as it is made,
+       which is also why the section sits below the save bar rather than above
+       it, where its note about the database would read as covering this too. -->
+  <section class="p" id="lookSec" hidden>
+    <div class="chead"><h2>Theme</h2></div>
+    <p class="intro">These two belong to this browser alone. They take effect as soon as they
+      are chosen, are remembered here rather than by the service, and change nothing for
+      anybody else who opens this installation.</p>
+    <div class="looks">
+      <fieldset class="look">
+        <legend>Appearance</legend>
+        <div id="lookAppearance"></div>
+        <p class="help">What the pages are made of. Glass frosts the panels and sets the
+          numbers in their own typeface; Classic is the flat look the pages had before it.</p>
+      </fieldset>
+      <fieldset class="look">
+        <legend>Colour mode</legend>
+        <div id="lookTheme"></div>
+        <p class="help">The same choice the ◑ button in the header cycles through, and the
+          same value behind it — changing either moves the other.</p>
+      </fieldset>
     </div>
   </section>
 
@@ -539,6 +611,13 @@ function render() {
 // Separate from the TABS array so the tab-defs slice stays pure for testing.
 const OTHER_TAB_ID = 'other';
 
+// Where the Theme area appears. It is on a tab rather than on its own because
+// it is one more thing about how this installation is shown, next to the
+// temperature unit and the refresh interval it sits with — and General is the
+// tab those are on. Named here because two things need the answer: the tab has
+// to be offered, and the section has to be shown with it.
+const LOOK_TAB_ID = 'general';
+
 // Which tabs actually have content, computed after the form is populated.
 // The About tab always appears; settings tabs only appear if at least one
 // group section bears their data-tab.
@@ -547,6 +626,11 @@ function visibleTabIds() {
   for (const el of $('form').querySelectorAll('.grp[data-tab]')) {
     ids.add(el.dataset.tab);
   }
+  // The tab holding the Theme area is offered whatever the registry describes.
+  // Those two controls are this browser's own and exist even if the service
+  // answers with nothing for the prefixes this tab claims — and a tab that
+  // disappears takes the only way to reach them with it.
+  ids.add(LOOK_TAB_ID);
   // The "other" catch-all only shows when there are unclaimed prefixes.
   // About always shows — it is not driven by form content.
   const order = [];
@@ -592,6 +676,11 @@ function selectTab(id) {
   // The About section is only its own tab.
   const aboutSec = $('aboutSec');
   if (aboutSec) aboutSec.hidden = !isAbout;
+  // The Theme area is neither part of the form nor part of About, so it is
+  // shown by name rather than by the loop above: it belongs to one tab and
+  // appears with it.
+  const lookSec = $('lookSec');
+  if (lookSec) lookSec.hidden = id !== LOOK_TAB_ID;
   // The "Where these live" details stay visible regardless.
 
   // Persist the choice and update the URL without a page reload.
@@ -2099,6 +2188,12 @@ async function load() {
   } catch (e) {
     pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
       + 'service answers.');
+    // No registry means no tab bar, and the Theme area is shown by whichever
+    // tab is current. It answers out of this browser and has nothing to do with
+    // the service, so it stays reachable on the one visit where the page is
+    // otherwise empty rather than disappearing along with the settings.
+    const lookSec = $('lookSec');
+    if (lookSec) lookSec.hidden = false;
     return;
   }
   // Best-effort: the Connection group renders through the wizard picker when the
@@ -2229,10 +2324,89 @@ async function loadFacts() {
       + 'capability nothing declared is shown as undeclared, not as absent.';
 }
 
+// ---------------------------------------------------------------------------
+// Theme: the two choices on this page the registry knows nothing about.
+//
+// Why they are not settings is written beside the section itself. What matters
+// here is that neither control owns its answer — common.js holds the key, the
+// resolver and the writer for both, so the theme glyph in the header and the
+// list below are two views of one value rather than two values that agree
+// until they do not. Choosing here fires themechange and the glyph follows;
+// clicking the glyph fires it and the list follows.
+//
+// Radios rather than a row of pressed buttons, because a radio group already
+// is what this needs: one answer out of a named set, reachable with the arrow
+// keys, and readable by anything that asks the document what is checked. A
+// button styled to look chosen has none of that until it is told each part
+// separately, and the parts that get forgotten are the ones nobody can see.
+// ---------------------------------------------------------------------------
+
+// One group's worth of radios. `named` turns a stored value into the word for
+// it and falls back to the value itself, so a look or a theme added to
+// common.js arrives here labelled by its own name rather than not at all.
+//
+// Which one is the default is inside the label rather than beside it, because a
+// label is what a screen reader reads out for the control: "Glass — the
+// default" is the same sentence the eye gets, where a marker parked outside the
+// label is a fact only sighted readers are told.
+function lookRadios(group, choices, current, named, fallback) {
+  return choices.map((choice) => {
+    const id = `look_${group}_${choice}`;
+    return `<label class="opt" for="${esc(id)}">
+        <input type="radio" id="${esc(id)}" name="${esc(group)}" value="${esc(choice)}"
+          ${choice === current ? 'checked' : ''}>
+        <span>${esc(named[choice] || choice)}</span>
+        ${choice === fallback ? '<span class="was">— the default</span>' : ''}
+      </label>`;
+  }).join('');
+}
+
+// The check is on `el.checked` so only the radio that ended up selected acts;
+// the choice is then handed straight to common.js, which persists it and
+// applies it. Nothing is remembered here — this page is a view of the value and
+// never a second copy of it.
+function wireLook(host, choose) {
+  for (const el of host.querySelectorAll('input')) {
+    el.addEventListener('change', () => { if (el.checked) choose(el.value); });
+  }
+}
+
+function drawLook() {
+  const looks = $('lookAppearance');
+  const modes = $('lookTheme');
+  if (!looks || !modes) return;
+  // The looks are read off the sheet map itself rather than listed again here:
+  // a look this page had not been told about would be a look nobody can pick,
+  // on the one page whose whole job is picking it.
+  looks.innerHTML = lookRadios('appearance', Object.keys(APPEARANCE_SHEET),
+    appearanceChoice(), APPEARANCE_NAMES, APPEARANCE_DEFAULT);
+  modes.innerHTML = lookRadios('colour-mode', THEME_ORDER,
+    themeChoice(), THEME_NAMES, THEME_DEFAULT);
+  wireLook(looks, chooseAppearance);
+  wireLook(modes, chooseTheme);
+}
+
+// The glyph in the header changes the same theme this list does, so the list
+// follows it. Only the checked flag moves: redrawing the group would take the
+// focus with it, and in a radio group the arrow keys move focus and selection
+// together — so redrawing on the change an arrow key just caused would strand
+// the reader somewhere they never arrowed to.
+document.addEventListener('themechange', (event) => {
+  const modes = $('lookTheme');
+  if (!modes) return;
+  for (const el of modes.querySelectorAll('input')) {
+    el.checked = el.value === event.detail.choice;
+  }
+});
+
 // Boot. Everything above is definitions; nothing runs until here. This page
 // does not poll: settings change when somebody changes them, and a background
 // refresh would overwrite a half-typed form.
 drawNav('settings');
+// Drawn before the settings arrive and never again: these two controls are
+// answered by this browser, so they do not wait on the service and a reply that
+// never comes must not take them down with it.
+drawLook();
 $('save').onclick = save;
 $('revert').onclick = () => { render(); clearErrors(); say('', ''); };
 // The form is never submitted: every write goes through save() as JSON. Enter
