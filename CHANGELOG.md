@@ -7,6 +7,95 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.9.0 — 12 August 2026
+
+The setup wizard learns what an installation is, a first-visit tour explains the
+pages, the backup becomes something you configure rather than something fixed,
+and the settings page stops being one long scroll. Behind that, an audit of the
+data path — the collector, the store, the API and the modelled figures — and the
+defects it found.
+
+### Added
+
+- **The wizard asks where the installation is.** One optional postcode, resolved
+  through Open-Meteo's keyless geocoder, shown back as the town it found so it
+  can be checked before it is accepted. Coordinates remain for the countries the
+  geocoder does not cover, and nothing calls them more accurate: moving 4.6 km
+  changes modelled plane-of-array irradiance by 0.006 %, against a forecast grid
+  of about 11 km. Location is the one thing the service never reconstructs for
+  itself afterwards.
+- **The inverter's conversion figures are carried as cited fact.** CEC 96.9 %,
+  PV to grid 97.5 %, battery to grid 94 %, PV to battery 99.9 %, idle around
+  70 W and 18 W, from the EG4 18kPV spec sheet version 1.4.3, labelled a
+  manufacturer's claim rather than a measurement. They are shown, not used: both
+  sides of the performance comparison are DC, so putting a conversion figure in
+  it would lift every installation's ratio by about three per cent for no
+  physical reason.
+- **A panel catalogue**, each entry cited, with a warning when a generic module
+  is chosen — a generic is a guess, and it should not be indistinguishable from
+  a measured panel.
+- **A guided tour of the pages**, offered by a dismissible banner rather than
+  interrupting, and dismissed per browser: a tour is shown to a person, and one
+  household member silencing it on the kitchen tablet should not silence it on
+  somebody else's phone. It skips what an installation does not have, and never
+  restates a number, so it cannot drift from the cards it describes.
+- **`arraysense restore`**, replacing a printed shell recipe that could destroy
+  the database it was restoring. It unpacks beside the live database, proves the
+  result is a database with rows in it, and only then stops the service, clears
+  the write-ahead log and moves the file into place.
+- **The backup is configured, not fixed.** Destination, retention, schedule and
+  whether it runs at all are settings. The timer fires every fifteen minutes and
+  the command decides whether a backup is due, so systemd keeps reliable wakeups
+  and catch-up after downtime while the installation owns the time. A
+  destination is checked before it is accepted, and the three ways it can fail —
+  missing, not writable, outside the unit's writable set — are told apart.
+- **Tabs on the settings page**, in the order an installation is configured. A
+  prefix no tab claims still appears, so a setting added to the registry
+  tomorrow cannot vanish behind a layout.
+- **Troubleshooting for the backup**, including the trap that a hand-run backup
+  succeeds while the scheduled one fails, because they run as different users
+  under different sandboxes.
+
+### Fixed
+
+- **A week or a month was scored from its first day.** The hourly rows were
+  truncated at 24 offsets. On the reference installation the worst hour of the
+  week of 3 August moves from 1.708 to 6.322 kWh.
+- **A total no longer hides how much of its period it covers.** It carries the
+  days scored against the days expected, and says which incompleteness it is.
+- **A string the inverter never reported is absent, not zero.** It no longer
+  produced a row claiming expected 0.0, actual 0.0 and a specific yield of 0.0.
+  Days stored under the old logic present a zero as a measurement, so the
+  efficiency config version moves and history is scored again.
+- **The peak-scaled forecast is gone rather than labelled.** It over-called by
+  43 to 63 per cent on twelve consecutive days, and for an installation with no
+  array described it was not a first-week measure but the permanent answer.
+  Below five scored days there is now no forecast.
+- **The sky poller could stop without saying so.** One failed interval read
+  ended the loop for good; nothing watched it, and the only symptom was that
+  recorded conditions stopped.
+- **A tier that could not answer a range said so**, rather than returning
+  nothing or a silently truncated answer.
+- **A date typed off the end of the calendar** answered 500 on several
+  endpoints. It is a bad request, on all of them.
+- **"Calibrated from" was printed whenever any daily row existed**, whether or
+  not anything had been fitted.
+- **The efficiency backfill shared the collector's transaction.** A backfill
+  failing part-way rolled back a poll that had succeeded, taking its readings,
+  its battery rows and its device registration with it. It has its own
+  connection now, as the rollup already had.
+- Also: a sub-second poll interval is a configuration error rather than a 500;
+  the hour in progress is no longer extrapolated to a whole one; the declared
+  NOCT is read by the cell-temperature model; and `peak()` answers absent for a
+  column the database does not have.
+
+### Known
+
+Declared tier retention is still not enforced and the database grows about
+5 MB a day (#135). Two strings on one MPPT are still double-counted (#133).
+There is still no authentication (#34), so this should not be exposed to the
+internet.
+
 ## 0.8.1 — 12 August 2026
 
 ### Fixed
