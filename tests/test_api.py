@@ -406,6 +406,44 @@ def test_history_picks_a_coarser_tier_for_a_longer_span(client: Any) -> None:
     assert long["tier"] == "hourly"
 
 
+def test_a_sub_second_poll_interval_still_draws_a_chart(tmp_path: Path) -> None:
+    """A legal config file must not turn every chart into a server fault.
+
+    Config accepts any poll_interval above zero and only the settings overlay is
+    bounded at a second, so `poll_interval = 0.5` in config.toml passes straight
+    through. Truncated to a whole number it became a cadence of zero, which
+    select_tier is right to refuse — and nothing caught the refusal, so the
+    Graphs page and the battery history answered 500 with nothing anywhere
+    naming the interval as the cause. A sub-second poll is a plausible thing to
+    try on RS485.
+    """
+    store = SqliteStore(str(tmp_path / "fast.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=T0, readings={"pv_total_power_w": 1000.0}))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "fast.db"),
+        poll_interval=0.5,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    with TestClient(create_app(store=store, service=service, config=config)) as c:
+        params = {
+            "start": T0.isoformat(),
+            "end": (T0 + timedelta(hours=1)).isoformat(),
+            "metrics": "pv_total_power_w",
+        }
+        assert c.get("/api/history", params=params).status_code == 200
+        assert (
+            c.get(
+                "/api/battery/history",
+                params={**params, "metrics": "soc_pct"},
+            ).status_code
+            == 200
+        )
+    store.close()
+
+
 def test_history_rejects_an_unknown_metric(client: Any) -> None:
     r = client.get(
         "/api/history",

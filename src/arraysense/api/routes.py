@@ -288,6 +288,21 @@ def _check_range(start: datetime, end: datetime) -> None:
         raise HTTPException(status_code=400, detail="end must be after start")
 
 
+def _cadence_seconds(poll_interval: float) -> int:
+    """The poll interval as whole seconds, never zero.
+
+    ``select_tier`` is right to call a cadence of zero a programming error — it
+    divides by it — but a sub-second interval is a legal file config: Config
+    accepts anything above zero and only the settings overlay is bounded at one
+    second, so ``poll_interval = 0.5`` in config.toml reached ``int()``, came out
+    zero, and turned every chart on the Graphs page and the whole of the battery
+    history into a 500 with nothing in it naming the interval. A poll faster
+    than the tier resolution can express is one second's worth of cadence for
+    the purpose of choosing a tier.
+    """
+    return max(1, int(poll_interval))
+
+
 def _row_time(row: Mapping[str, Any] | None) -> datetime | None:
     """The timestamp of a stored row, or None if there is no row."""
     if row is None:
@@ -1123,7 +1138,7 @@ def history(
     """
     _check_range(start, end)
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
-    cadence = int(request.app.state.config.poll_interval)
+    cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
     rows = store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
@@ -1150,7 +1165,7 @@ def battery_history(
     """
     _check_range(start, end)
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
-    cadence = int(request.app.state.config.poll_interval)
+    cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
     rows = store.query_modules(names, start, end, tier=tier, serial=serial, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
