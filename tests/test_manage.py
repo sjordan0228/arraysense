@@ -1477,6 +1477,52 @@ def test_an_out_of_range_hour_is_refused_rather_than_believed(
     assert "backup.hour" in reason
 
 
+def test_the_timezone_is_read_from_the_database_when_the_service_is_down(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the service is unreachable, the configured timezone must be read
+    directly from the database. Silently using the machine's clock when a
+    different zone is configured would name archives for the wrong calendar
+    day — a three-day outage would write an archive named for a day that has
+    not yet begun, holding the previous day's data."""
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)",
+        ("site.timezone", "America/Los_Angeles"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+
+    conf, reason = manage.backup_settings(8080)
+    # The configured timezone survived the outage
+    assert conf["site.timezone"] == "America/Los_Angeles"
+    # It was read from the database, so no warning about it
+    assert "could not be read" not in reason
+
+
+def test_the_machine_clock_is_used_when_neither_service_nor_database_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both the service and the database are unreachable, the machine's
+    clock is the only clock available — but the output must say so rather than
+    silently implying the configured zone was used."""
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/nonexistent/db.db")
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+
+    conf, reason = manage.backup_settings(8080)
+    assert conf["site.timezone"] == ""
+    assert "timezone" in reason.lower()
+    assert "machine" in reason.lower()
+
+
 def test_the_day_is_the_installations_own_day(monkeypatch: pytest.MonkeyPatch) -> None:
     """Half past eleven on the twelfth in New York is the thirteenth in UTC.
     The date the archive is named for, and the date checked for "has today

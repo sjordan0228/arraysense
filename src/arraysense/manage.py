@@ -72,9 +72,11 @@ BACKUP_FALLBACK = {
     "backup.hour": BACKUP_HOUR,
     "backup.minute": BACKUP_MINUTE,
 }
-# Not in the fallback map: an unset zone is the registry's own default and means
-# "follow the machine's clock", which is a decision rather than a gap, so it is
-# never reported as one.
+# Not in the fallback map: the timezone does not depend on the service answering
+# — it is read straight from the database when the service is down, because
+# silently using the machine's clock when a different zone is configured would
+# name archives for the wrong calendar day. Only when the database is also
+# unreachable does the machine's clock apply, and the output says so.
 TIMEZONE_KEY = "site.timezone"
 
 # What a held lock means, in one place so the reason _take_lock reports and the
@@ -516,6 +518,33 @@ def _read_backup_value(key: str, raw: object) -> object:
     return None
 
 
+def _read_timezone_from_database() -> str | None:
+    """The configured timezone read directly from the database, or None on failure.
+
+    Asked when the service is unreachable — which is exactly when a backup matters
+    most — because the zone does not depend on the HTTP API to answer. It lives in
+    the settings table of the same database the backup is about to copy, and
+    reading it here avoids silently naming an archive for the wrong calendar day.
+
+    None means the database could not be opened or the settings table does not
+    exist yet. An empty string means the stored value is empty, which is the
+    registry's default meaning "follow the machine's clock" — a legitimate
+    configuration, and one that is indistinguishable from an unreadable database.
+    The caller must tell those apart.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{_database_path()}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return None
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (TIMEZONE_KEY,)).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return row[0] if row else ""
+
+
 def backup_settings(port: int, timeout: float = 5.0) -> tuple[dict[str, Any], str]:
     """What the service says the backup should do, and what was not answered.
 
@@ -536,12 +565,19 @@ def backup_settings(port: int, timeout: float = 5.0) -> tuple[dict[str, Any], st
     conf: dict[str, Any] = {}
     if not isinstance(values, dict):
         conf.update(BACKUP_FALLBACK)
-        conf[TIMEZONE_KEY] = ""
-        return (
-            conf,
+        # The timezone does not depend on the service answering — it lives in the
+        # same database the backup is about to copy. Reading it here keeps the
+        # archive name on the configured calendar rather than silently drifting
+        # to the machine's own clock.
+        zone = _read_timezone_from_database()
+        conf[TIMEZONE_KEY] = "" if zone is None else zone
+        reason = (
             f"the service is not answering on port {port}, so the built-in backup "
-            "defaults are being used rather than the stored settings",
+            "defaults are being used rather than the stored settings"
         )
+        if zone is None:
+            reason += "; the configured timezone could not be read, so the machine's clock applies"
+        return (conf, reason)
     unanswered = []
     for key in sorted(BACKUP_FALLBACK):
         value = _read_backup_value(key, values.get(key))
