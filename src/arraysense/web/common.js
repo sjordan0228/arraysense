@@ -2208,3 +2208,569 @@ function mountSetup(host, payload, opts) {
   render();
   return { read: () => ({ ...state }), status };
 }
+
+// ---------------------------------------------------------------------------
+// The guided tour.
+//
+// A first-visit walkthrough, offered as a dismissible strip rather than
+// imposed, state-aware enough to skip what an installation does not have, and
+// persisted per browser because a tour is shown to a person and an installation
+// is read by several — one household member waving it away on the kitchen
+// tablet must not silence it on somebody else's phone. The owner's decision on
+// 12 August 2026 is that dismissal is a localStorage fact under the existing
+// as.* scheme (as.tourStep), not a registered setting: every write path
+// through SettingsStore raises KeyError for a key outside the SETTINGS tuple,
+// and a per-browser interface state is exactly what as.calDismissed and as.tab
+// already are. The design this implements is
+// docs/superpowers/specs/2026-08-12-guided-tour-design.md.
+//
+// The tour is not a running script that survives navigation. Now, Energy flow
+// and Inverter are three hash views of one document, while Graphs, History,
+// Costs, Efficiency and Settings are separate documents reached by full page
+// loads — so a cross-page tour cannot hold its position in memory. It is a
+// short sequence, resumed from a stored step at the top of every page, that
+// either has a next step on this page (show it) or does not (stay quiet,
+// having recorded nothing).
+//
+// The step list and its gates are pure and DOM-free so node can hold them to
+// the same capability, status and settings payloads the pages already read
+// (tests/test_tour_js.py), the same way test_dashboard_caps_js.py slices the
+// caps-logic markers. Everything that touches the document sits below the
+// markers.
+// ---------------------------------------------------------------------------
+
+// >>> tour-logic
+// The terminal value of as.tourStep. Absent means "never offered" (the offer
+// may show); a step id means "resume here"; this means the tour was finished
+// or declined. Finished and declined are deliberately the same state: a
+// completed tour and a skipped one must not be told apart, or a returning
+// visitor who waved the offer away once would be asked again.
+const TOUR_DONE = 'done';
+
+// Every step in tour order. `page` is one of the NAV keys — the hash views
+// (now, flow, inverter) are one document, the rest are separate documents.
+// `selector` anchors the popover to an element present in the page's static
+// markup, never one injected after a fetch. `gate` is a pure function of
+// (caps, status, settings) deciding whether this step runs at all; a step's
+// copy never states a number, a threshold or a capability value, because it
+// must stay true whatever the cards beside it read.
+const TOUR_STEPS = [
+  {
+    id: 'now-live',
+    page: 'now',
+    selector: '#pv',
+    title: 'The live cards',
+    body: 'These cards are the live reading of the installation — what the panels are making, '
+      + 'what the house is drawing, and which way the battery is moving. The line above them '
+      + 'says what mode the system is running in.',
+    gate: null,
+  },
+  {
+    id: 'now-modules',
+    page: 'now',
+    selector: '#mods',
+    title: 'One card per battery pack',
+    body: 'Each battery pack gets a card of its own here — its charge, voltage and temperature — '
+      + 'so a pack running differently shows up as itself rather than hiding inside the bank total.',
+    gate: tourHasModules,
+  },
+  {
+    id: 'inverter-legs',
+    page: 'inverter',
+    selector: '#dtl',
+    title: 'The comparisons that diagnose',
+    body: 'This panel compares the readings that diagnose the system: each string against the '
+      + 'others, the backup output leg by leg, and the BMS\'s word against the inverter\'s.',
+    gate: tourHasBackup,
+  },
+  {
+    id: 'flow-sankey',
+    page: 'flow',
+    selector: '#sankey',
+    title: 'Where today\'s energy went',
+    body: 'Each stream is one path the day\'s energy took — from the panels to the house, the '
+      + 'battery or the grid. The wider a stream, the more energy it carries.',
+    gate: null,
+  },
+  {
+    id: 'graphs-bands',
+    page: 'graphs',
+    selector: '#solarBands',
+    title: 'One small chart per reading',
+    body: 'Every chart on this page is one reading drawn over the range you pick, so a change in '
+      + 'one thing is never hidden by the scale of another.',
+    gate: null,
+  },
+  {
+    id: 'graphs-strings',
+    page: 'graphs',
+    selector: '#solarBands',
+    title: 'Each string on its own',
+    body: 'Every string of the array gets its own power, voltage and current here, so a weak '
+      + 'string shows up as itself rather than being averaged into the total.',
+    gate: tourHasStrings,
+  },
+  {
+    id: 'costs-priced',
+    page: 'costs',
+    selector: '#cards',
+    title: 'What this month costs',
+    body: 'These cards price the month\'s energy against the tariff you entered — what it has '
+      + 'cost so far, what the bill looks like at this pace, and what the solar and battery have saved.',
+    gate: tourHasTariff,
+  },
+];
+
+// A gate is a function of (caps, status, settings) — the three payloads every
+// page fetches for itself — and a missing gate means the step always runs.
+function tourGatePasses(step, caps, status, settings) {
+  return typeof step.gate === 'function'
+    ? step.gate(caps, status, settings) !== false
+    : true;
+}
+
+// Whether the device reports per-pack battery data. An explicit yes only: null
+// is a bare source that has not declared, and the step must fail closed (skip)
+// rather than describe module cards an undeclared installation may not have.
+function tourHasModules(caps, status, settings) {
+  return !!(caps && caps.per_module_battery === true);
+}
+
+// Whether the backup-output panels exist. This is index.html's own rendering
+// rule (caps.backup_output !== false) read from the same place: only an
+// explicit "no" suppresses, and null keeps the step because the page still
+// draws the panel while the declaration is unknown.
+function tourHasBackup(caps, status, settings) {
+  return !caps || caps.backup_output !== false;
+}
+
+// Whether strings are declared at all. capStrings already treats null as
+// "unknown, never zero"; this reuses that rule so an undeclared source fails
+// closed instead of walking somebody through string bands that may not exist.
+function tourHasStrings(caps, status, settings) {
+  const n = capStrings(caps);
+  return n !== null && n >= 1;
+}
+
+// Whether a tariff is entered, read from /api/settings and not from
+// /api/costs. The Costs page gates itself on this same value rendered from
+// the same endpoint; asking /api/costs and inferring absence from missing
+// money would conflate "nothing entered" with "the month has not started".
+function tourHasTariff(caps, status, settings) {
+  return !!(settings && settings.values && String(settings.values['tariff.bands'] || '').trim());
+}
+
+// The steps whose gates pass for this installation, in tour order. Boot
+// filters every page against this list; a step whose gate no longer passes (a
+// string removed between visits, say) is silently skipped rather than
+// stranding the tour pointing at something no longer there.
+function tourPassingSteps(caps, status, settings) {
+  return TOUR_STEPS.filter((s) => tourGatePasses(s, caps, status, settings));
+}
+
+// The one condition that suppresses the tour outright rather than running it
+// against a broken installation: the collector is not running at all, which is
+// the stale banner's job to say loudly. "No data yet" is not a suppression —
+// seconds after setup it is the normal state, and the tour runs against the
+// skeleton.
+function tourSuppressed(status) {
+  if (!status || typeof status !== 'object') return false;
+  if (status.running === false) return true;
+  const verdict = status.staleness && status.staleness.verdict;
+  return verdict === 'not_running';
+}
+// <<< tour-logic
+
+// ---------------------------------------------------------------------------
+// Rendering. Everything below touches the document and is deliberately outside
+// the node-extracted slice above.
+// ---------------------------------------------------------------------------
+
+const TOUR_KEY = 'as.tourStep';
+const TOUR_INDEX_KEYS = ['now', 'flow', 'inverter'];
+const TOUR_UNSUPPORTED = '\u0000unsupported';
+
+// The popover reuses the hover readout's --tip / --tip-shadow tokens, so it
+// inherits the palette's validated light/dark contrast without introducing a
+// colour of its own — the tour has no series to represent and must not add a
+// hue nobody checked. The buttons copy .calhide's look.
+const TOUR_CSS = `
+  .tourpop{position:fixed;z-index:60;max-width:290px;background:var(--tip);
+    border:1px solid var(--panel-b);border-radius:11px;box-shadow:var(--tip-shadow);
+    padding:11px 13px;font-size:12.5px;line-height:1.5;text-align:left}
+  .tourpop[hidden]{display:none}
+  .tourpop .tourhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .tourpop h2{margin:0 0 4px;font-size:13px;font-weight:600;letter-spacing:-.01em;color:var(--ink)}
+  .tourpop p{margin:0 0 10px;color:var(--ink2);max-width:52ch}
+  .tourpop .tourx{background:none;border:0;color:var(--ink3);cursor:pointer;font-size:12px;
+    padding:2px 4px;font-family:inherit;line-height:1}
+  .tourpop .tourx:hover{color:var(--ink)}
+  .tourpop .tourbar{display:flex;align-items:center;gap:8px;justify-content:space-between;margin-top:2px}
+  .tourpop .tourbar button{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink2);border-radius:7px;padding:3px 11px;font:inherit;font-size:11px;cursor:pointer;font-family:inherit}
+  .tourpop .tourbar button:hover{background:var(--tint-3);color:var(--ink)}
+  .tourpop .tourbar button[hidden]{display:none}
+  .tourpop .tourbar .tournext{background:var(--tint-3);color:var(--ink);font-weight:600}
+  .tourpop .tourcount{font-size:10px;color:var(--ink3);letter-spacing:.03em}
+`;
+document.head.appendChild(Object.assign(document.createElement('style'), { textContent: TOUR_CSS }));
+
+let tourData = null;
+let tourDataPromise = null;
+let tourCurrentStep = null;
+let tourPopPoll = null;
+let tourRepositionQueued = false;
+
+function tourIsIndexDocument() {
+  const p = location.pathname;
+  return p === '/' || p.endsWith('/index.html');
+}
+
+function tourCurrentPage() {
+  if (tourIsIndexDocument()) {
+    const hash = location.hash.replace('#', '');
+    return TOUR_INDEX_KEYS.includes(hash) ? hash : 'now';
+  }
+  const base = location.pathname.replace(/^\//, '').replace(/\.html$/, '');
+  return base || 'now';
+}
+
+function tourSameDocument(page) {
+  return TOUR_INDEX_KEYS.includes(page);
+}
+
+function tourHref(page) {
+  const entry = NAV.find((n) => n.key === page);
+  return entry ? entry.href : '/' + page;
+}
+
+function tourRead() {
+  try {
+    return localStorage.getItem(TOUR_KEY);
+  } catch (e) {
+    // Private browsing refuses localStorage outright; a tour that cannot
+    // persist its position would restart on every page, so it is not offered.
+    return TOUR_UNSUPPORTED;
+  }
+}
+
+function tourWrite(value) {
+  try {
+    localStorage.setItem(TOUR_KEY, value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function tourFetchData() {
+  const [setupRes, capsRes, statusRes, settingsRes] = await Promise.allSettled([
+    fetchTimeout('/api/setup', {}, 6000),
+    fetchTimeout('/api/capabilities', {}, 6000),
+    fetchTimeout('/api/status', {}, 6000),
+    fetchTimeout('/api/settings', {}, 6000),
+  ]);
+  const json = async (r) => (
+    r.status === 'fulfilled' && r.value.ok ? r.value.json().catch(() => null) : null
+  );
+  const setup = await json(setupRes);
+  const capsRaw = await json(capsRes);
+  const status = await json(statusRes);
+  const settings = await json(settingsRes);
+  return {
+    // The wizard owns index.html while the service is unconfigured; the tour
+    // has nothing to point at and the offer would sit over the setup form.
+    firstRun: !!(setup && setup.first_run === true),
+    caps: capsRaw && Array.isArray(capsRaw.devices) ? capsRaw.devices[0] || null : null,
+    status,
+    settings,
+  };
+}
+
+function tourEnsureData() {
+  if (tourData) return Promise.resolve(tourData);
+  if (!tourDataPromise) {
+    tourDataPromise = tourFetchData().then((d) => { tourData = d; return d; });
+  }
+  return tourDataPromise;
+}
+
+function tourStepAfter(eff, id) {
+  const idx = eff.findIndex((s) => s.id === id);
+  return idx >= 0 && idx + 1 < eff.length ? eff[idx + 1] : null;
+}
+
+function renderPop(step, eff, next) {
+  const pop = $('tourPop');
+  if (!pop) return;
+  const idx = eff.findIndex((s) => s.id === step.id);
+  $('tourTitle').textContent = step.title;
+  $('tourBody').textContent = step.body;
+  $('tourBack').hidden = idx <= 0;
+  $('tourNext').textContent = next ? 'Next' : 'Done';
+  $('tourCount').textContent = `${idx + 1} of ${eff.length}`;
+  pop.hidden = false;
+}
+
+function positionPop(step) {
+  const pop = $('tourPop');
+  if (!pop || pop.hidden) return;
+  const target = document.querySelector(step.selector);
+  const rect = target ? target.getBoundingClientRect() : null;
+  const offscreen = !target || !rect
+    || (rect.width === 0 && rect.height === 0)
+    || target.hidden === true;
+  if (offscreen) {
+    // The anchor is not on screen yet — a section still waiting on its fetch,
+    // or a view being switched to. Park the popover at the top of the page;
+    // the poll below moves it once the anchor actually appears.
+    pop.style.left = '50%';
+    pop.style.top = '70px';
+    pop.style.transform = 'translateX(-50%)';
+    return;
+  }
+  pop.style.transform = '';
+  const pw = pop.offsetWidth || 280;
+  const ph = pop.offsetHeight || 120;
+  const gap = 10;
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+  let top = rect.top - ph - gap;
+  let left = rect.left + rect.width / 2 - pw / 2;
+  if (top < 8) top = rect.bottom + gap;
+  left = Math.max(8, Math.min(left, vw - pw - 8));
+  top = Math.max(8, Math.min(top, vh - ph - 8));
+  pop.style.left = `${left}px`;
+  pop.style.top = `${top}px`;
+}
+
+function startPopPoll() {
+  stopPopPoll();
+  // A late-rendered anchor (the Costs cards appear only after /api/costs
+  // resolves) needs the popover to move once it does. This only runs while a
+  // step is open and costs one layout read per tick.
+  tourPopPoll = setInterval(() => {
+    if (!tourCurrentStep) { stopPopPoll(); return; }
+    const pop = $('tourPop');
+    if (!pop || pop.hidden) { stopPopPoll(); return; }
+    positionPop(tourCurrentStep);
+  }, 400);
+}
+
+function stopPopPoll() {
+  if (tourPopPoll) { clearInterval(tourPopPoll); tourPopPoll = null; }
+}
+
+function hidePop() {
+  const pop = $('tourPop');
+  if (pop) pop.hidden = true;
+  tourCurrentStep = null;
+  stopPopPoll();
+}
+
+function onTourReposition() {
+  if (!tourCurrentStep || tourRepositionQueued) return;
+  tourRepositionQueued = true;
+  requestAnimationFrame(() => {
+    tourRepositionQueued = false;
+    if (tourCurrentStep) positionPop(tourCurrentStep);
+  });
+}
+
+function onTourHashChange() {
+  // The dashboard's three views share one document. If the visitor navigates
+  // away from the step's view, the popover must not keep floating over a view
+  // it does not describe; it hides, and the stored step resumes on the next
+  // page load.
+  if (tourCurrentStep && tourCurrentPage() !== tourCurrentStep.page) hidePop();
+}
+
+function buildPop() {
+  if ($('tourPop')) return;
+  const pop = document.createElement('div');
+  pop.className = 'tourpop';
+  pop.id = 'tourPop';
+  pop.hidden = true;
+  pop.setAttribute('role', 'region');
+  pop.setAttribute('aria-label', 'Tour step');
+  pop.innerHTML = `
+    <div class="tourhead">
+      <h2 id="tourTitle"></h2>
+      <button type="button" class="tourx" id="tourClose" title="Stop for now">✕</button>
+    </div>
+    <p id="tourBody"></p>
+    <div class="tourbar">
+      <button type="button" id="tourBack">Back</button>
+      <span class="tourcount" id="tourCount"></span>
+      <button type="button" class="tournext" id="tourNext">Next</button>
+    </div>`;
+  document.body.appendChild(pop);
+  $('tourClose').addEventListener('click', () => { tourWrite(TOUR_DONE); hidePop(); });
+  $('tourBack').addEventListener('click', () => { if (tourCurrentStep) tourBack(tourCurrentStep); });
+  $('tourNext').addEventListener('click', () => { if (tourCurrentStep) tourAdvance(tourCurrentStep); });
+  window.addEventListener('scroll', onTourReposition, { passive: true });
+  window.addEventListener('resize', onTourReposition);
+  window.addEventListener('hashchange', onTourHashChange);
+}
+
+function tourShow(step) {
+  if (!tourData) return;
+  const eff = tourPassingSteps(tourData.caps, tourData.status, tourData.settings);
+  const next = tourStepAfter(eff, step.id);
+  // While a step is showing, the stored value is the NEXT step to show, so a
+  // page reload resumes past the step already seen. The last step stores the
+  // terminal value.
+  tourWrite(next ? next.id : TOUR_DONE);
+  hideOffer();
+  tourCurrentStep = step;
+  renderPop(step, eff, next);
+  // Within the dashboard document the step may live on a different hash view;
+  // drive wireTabs()'s own routing rather than reimplementing it.
+  if (tourSameDocument(step.page)) {
+    const hash = '#' + step.page;
+    if (location.hash !== hash) {
+      location.hash = hash;
+      requestAnimationFrame(() => requestAnimationFrame(() => positionPop(step)));
+    } else {
+      positionPop(step);
+    }
+  } else {
+    positionPop(step);
+  }
+  startPopPoll();
+}
+
+function tourAdvance(step) {
+  if (!tourData) return;
+  const eff = tourPassingSteps(tourData.caps, tourData.status, tourData.settings);
+  const next = tourStepAfter(eff, step.id);
+  if (!next) {
+    tourWrite(TOUR_DONE);
+    hidePop();
+    return;
+  }
+  if (tourSameDocument(next.page)) {
+    tourShow(next);
+  } else {
+    // The next step is a separate document. Persist it and let that page's own
+    // boot pick it up — the same path a full page navigation always takes.
+    tourWrite(next.id);
+    location.href = tourHref(next.page);
+  }
+}
+
+function tourBack(step) {
+  if (!tourData) return;
+  const eff = tourPassingSteps(tourData.caps, tourData.status, tourData.settings);
+  const idx = eff.findIndex((s) => s.id === step.id);
+  if (idx <= 0) return;
+  const prev = eff[idx - 1];
+  if (tourSameDocument(prev.page)) {
+    tourShow(prev);
+  } else {
+    tourWrite(prev.id);
+    location.href = tourHref(prev.page);
+  }
+}
+
+function showOffer() {
+  if ($('tourOffer')) return;
+  const nav = $('nav');
+  if (!nav || !nav.parentNode) return;
+  const box = document.createElement('div');
+  box.className = 'p cal tour-offer';
+  box.id = 'tourOffer';
+  box.setAttribute('role', 'region');
+  box.setAttribute('aria-label', 'Tour offer');
+  box.innerHTML = `
+    <div class="calmark" aria-hidden="true">?</div>
+    <div class="calbody">
+      <h2>Take a quick tour</h2>
+      <p>A short walkthrough of the pages — what each card is for and where the numbers come
+        from. You can stop it at any point, and this browser won't be asked again.</p>
+    </div>
+    <button class="calhide" id="tourOfferGo" type="button">See what's on this page</button>
+    <button class="calhide" id="tourOfferClose" type="button"
+      title="Don't show the tour on this browser again">Not now</button>`;
+  nav.parentNode.insertBefore(box, nav.nextSibling);
+  $('tourOfferGo').addEventListener('click', tourStart);
+  $('tourOfferClose').addEventListener('click', () => { tourWrite(TOUR_DONE); hideOffer(); });
+}
+
+function hideOffer() {
+  const box = $('tourOffer');
+  if (box) box.remove();
+}
+
+function mountTourButton() {
+  const header = document.querySelector('header');
+  if (!header || header.querySelector('.tourbtn')) return;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'iconbtn tourbtn';
+  button.textContent = 'Show me around';
+  button.title = 'Start the guided tour from the beginning';
+  button.setAttribute('aria-label', 'Start the guided tour from the beginning');
+  button.addEventListener('click', () => { hideOffer(); tourStart(); });
+  const theme = header.querySelector('.themebtn');
+  if (theme && theme.parentNode) {
+    theme.parentNode.insertBefore(button, theme.nextSibling);
+  } else {
+    const right = header.lastElementChild;
+    if (right && right !== header.firstElementChild) right.appendChild(button);
+    else header.appendChild(button);
+  }
+}
+
+async function tourStart() {
+  const data = await tourEnsureData();
+  if (!data || data.firstRun) return;
+  if (tourSuppressed(data.status)) return;
+  const eff = tourPassingSteps(data.caps, data.status, data.settings);
+  if (!eff.length) return;
+  const first = eff[0];
+  hideOffer();
+  if (tourSameDocument(first.page)) {
+    tourShow(first);
+  } else {
+    // A deliberate restart begins at the very first step, wherever it lives.
+    tourWrite(first.id);
+    location.href = tourHref(first.page);
+  }
+}
+
+async function tourBoot() {
+  mountTourButton();
+  const stored = tourRead();
+  if (stored === TOUR_UNSUPPORTED || stored === TOUR_DONE) return;
+  const data = await tourEnsureData();
+  if (!data || data.firstRun) return;
+  if (tourSuppressed(data.status)) return;
+  const page = tourCurrentPage();
+  if (stored === null) {
+    if (tourIsIndexDocument()) showOffer();
+    return;
+  }
+  // Resume from the stored step: walk the tour in order to the first step that
+  // still passes its gate, and show it if this is its page. A step whose gate
+  // no longer passes is silently skipped, and if nothing after the stored step
+  // passes any more the tour is over.
+  const eff = tourPassingSteps(data.caps, data.status, data.settings);
+  const start = TOUR_STEPS.findIndex((s) => s.id === stored);
+  if (start === -1) return;
+  for (let i = start; i < TOUR_STEPS.length; i++) {
+    const s = TOUR_STEPS[i];
+    if (eff.includes(s)) {
+      if (s.page === page) tourShow(s);
+      return;
+    }
+  }
+  tourWrite(TOUR_DONE);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => { buildPop(); tourBoot(); });
+} else {
+  buildPop();
+  tourBoot();
+}
