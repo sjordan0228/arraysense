@@ -1802,3 +1802,25 @@ def test_the_hourly_span_is_the_tier_span(tmp_path: Path) -> None:
     spans = store.tier_spans()
     store.close()
     assert span == spans["hourly"]
+
+
+def test_site_only_rows_do_not_stretch_the_claimed_span(tmp_path: Path) -> None:
+    # The archive backfill writes one sky reading per past hour into raw, and
+    # merge_site_hours folds those into hourly. A site-only row can land years
+    # before any inverter history, and it must not stretch what the tier claims
+    # to hold for an inverter chart: the tier cannot answer an inverter query
+    # with it. Coverage measured from the outermost row would hand the raw tier
+    # a floor that holds nothing but sky, and the minute tier's span reads as
+    # covering years of inverter history the backfill never wrote.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    sky_at = datetime(2024, 11, 1, 15, 0, tzinfo=UTC)
+    inverter_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=sky_at, readings={"outside_temperature_c": 15.0}))
+    store.append(Sample(timestamp=inverter_at, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(
+        store._conn, int(sky_at.timestamp()) - 3600, int(inverter_at.timestamp()) + 3600
+    )
+    spans = store.tier_spans()
+    store.close()
+    assert spans["full"] == (inverter_at, inverter_at)
+    assert spans["hourly"] == (inverter_at, inverter_at)

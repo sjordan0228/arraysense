@@ -875,8 +875,13 @@ class SqliteStore:
         the tier name and the device narrowing in the one file that owns them.
         Both bounds come back as aware UTC instants, because every timestamp
         that leaves this class does.
+
+        Site-only rows count here, unlike ``tier_spans``: the efficiency engine
+        reads irradiance — a site metric — from the hourly tier, so a sky
+        reading is exactly what the backfill is asking whether this database
+        holds.
         """
-        return self._table_span("inverter_hourly", self._device(device))
+        return self._table_span("inverter_hourly", self._device(device), exclude_site_only=False)
 
     def tier_spans(
         self, module: bool = False, device: str | None = None
@@ -895,6 +900,13 @@ class SqliteStore:
         exists. ``store.tiers.select_tier_for_range`` is where that judgement
         is made, and this is the fact it needs.
 
+        An inverter tier's span counts only rows that can answer an inverter
+        chart — rows carrying at least one non-site reading. The weather poller
+        and the archive backfill write site-only rows into the same raw tier,
+        and one backfilled sky hour would otherwise stretch the raw floor back
+        by however far the owner backfilled, handing ``select_tier_for_range``
+        years the tier holds no inverter reading for.
+
         The bounds are read as two ordered lookups rather than MIN/MAX over the
         table. It is the same shape ``latest`` uses and for the same reason:
         the primary key leads on timestamp, so walking it from either end stops
@@ -907,14 +919,39 @@ class SqliteStore:
         """
         unit = self._device(device)
         tiers = MODULE_TIERS if module else INVERTER_TIERS
-        return {tier.name: self._table_span(tier.table, unit) for tier in tiers}
+        return {
+            tier.name: self._table_span(tier.table, unit, exclude_site_only=not module)
+            for tier in tiers
+        }
 
-    def _table_span(self, table: str, device: str) -> tuple[datetime, datetime] | None:
-        """The first and last timestamp one device has in ``table``, or None."""
+    def _table_span(
+        self,
+        table: str,
+        device: str,
+        *,
+        exclude_site_only: bool,
+    ) -> tuple[datetime, datetime] | None:
+        """The first and last timestamp one device has in ``table``, or None.
+
+        ``exclude_site_only`` drops rows whose only readings are site metrics,
+        so the span reports what the tier can answer an inverter chart with
+        rather than whatever its outermost row happens to be. Without it, one
+        backfilled sky reading would stretch the raw tier's floor across years
+        that hold no inverter reading at all. ``hourly_span`` deliberately
+        passes False — the efficiency engine reads irradiance, a site metric,
+        from the hourly tier, so there a sky reading is exactly what the span
+        is for.
+        """
+        filter_sql = ""
+        if exclude_site_only:
+            answerable = sorted((self._present[table] & self._inverter_names) - SITE_METRICS)
+            if not answerable:
+                return None
+            filter_sql = " AND (" + " OR ".join(f"{name} IS NOT NULL" for name in answerable) + ")"
         bounds: list[int] = []
         for direction in ("ASC", "DESC"):
             row = self._conn.execute(
-                f"SELECT timestamp FROM {table} WHERE device = ? "
+                f"SELECT timestamp FROM {table} WHERE device = ?{filter_sql} "
                 f"ORDER BY timestamp {direction} LIMIT 1",
                 (device,),
             ).fetchone()
