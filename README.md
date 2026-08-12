@@ -95,7 +95,8 @@ All four checks must pass before a change is complete.
 | `src/arraysense/metrics.py` | metric registry — names, units, integer scaling, plausible bounds |
 | `src/arraysense/models.py` | wire-independent sample model |
 | `src/arraysense/calibration.py` | state-of-charge drift detection from stored history |
-| `src/arraysense/collector/` | inverter transports and the polling service |
+| `src/arraysense/drivers/` | inverter transports — one directory per family |
+| `src/arraysense/collector/` | poll loop, backoff, gap recording, and weather |
 | `src/arraysense/store/` | tiered SQLite storage and rollups |
 | `src/arraysense/api/` | HTTP API |
 | `src/arraysense/web/` | the single-page dashboard |

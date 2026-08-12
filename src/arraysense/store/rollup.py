@@ -1,9 +1,14 @@
 """rollup.py — collapse full-cadence readings into the coarse tiers, from raw only.
 
-The full-cadence tier is kept for 30 days and the coarse tiers far longer —
-hourly indefinitely — so a rollup mistake is permanent in a way a mistake in
-the raw tier is not. These functions rebuild a destination tier from the raw
-tier over a time range, reading each metric's collapse policy from
+``Tier.keep_days`` declares 30 days for the full-cadence tier and a year for
+the minute tier, and nothing enforces either today — no tier is pruned, and the
+database grows about 5 MB a day. That is tracked in issue #135. What is true
+regardless is the asymmetry this file turns on: the coarse tiers are the ones
+kept longest, hourly indefinitely, so a rollup mistake outlives the raw rows it
+was derived from in a way a mistake in the raw tier does not.
+
+These functions rebuild a destination tier from the raw tier over a time range,
+reading each metric's collapse policy from
 ``collapse_policy`` rather than inferring it from a name: most measurements
 average, a bitfield takes its maximum, an extreme stays an extreme, and a cell
 *number* field takes the latest value because the average of two cell numbers
