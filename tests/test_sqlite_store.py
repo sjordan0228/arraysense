@@ -1458,3 +1458,174 @@ def test_an_efficiency_day_keeps_its_calendar_date_east_of_utc(tmp_path: Path) -
     store.close()
     assert len(got) == 1
     assert got[0].day.date() == day.date(), "the day slipped to the one before"
+
+
+# --- Two writers, one key -------------------------------------------------
+#
+# The raw tier is keyed (timestamp, device) at one-second resolution and has two
+# writers: the inverter poll loop, and the weather poller on its own fifteen-
+# minute clock. Nothing coordinates the two clocks, so a sky reading lands on a
+# second an inverter poll already owns often enough to matter — measured at
+# roughly one tick in ten. Each of these tests replays one of those collisions.
+
+
+def _sky() -> dict[str, float]:
+    """One tick of the site metrics, as the weather poller reports them."""
+    return {
+        "outside_temperature_c": 31.5,
+        "cloud_cover_pct": 40.0,
+        "ghi_wm2": 812.0,
+        "dni_wm2": 640.0,
+        "dhi_wm2": 190.0,
+        "wind_speed_ms": 4.5,
+    }
+
+
+def _module() -> BatteryModuleSample:
+    return BatteryModuleSample(serial="BA00000001", slot=1, soc_pct=64.0, voltage_v=53.2)
+
+
+def _row(conn: sqlite3.Connection, *columns: str) -> tuple[object, ...]:
+    return conn.execute(f"SELECT {', '.join(columns)} FROM inverter_raw").fetchone()  # type: ignore[no-any-return]
+
+
+def test_a_sky_reading_on_a_polls_second_leaves_the_poll_intact(tmp_path: Path) -> None:
+    """The weather tick landing on an inverter's second must not blank the poll.
+
+    While the upsert replaced every column, the sky reading's NULLs overwrote
+    ninety-one inverter columns and left a row claiming the inverter reported
+    nothing at an instant where its own battery modules still held full
+    readings.
+    """
+    path = tmp_path / "collide.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={"pv_total_power_w": 9000.0, "battery_soc_pct": 64.0},
+            battery_modules=(_module(),),
+        )
+    )
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    pv, soc, ghi, temperature = _row(
+        conn, "pv_total_power_w", "battery_soc_pct", "ghi_wm2", "outside_temperature_c"
+    )
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    conn.close()
+    assert pv is not None, "the sky reading erased the inverter's own reading"
+    assert soc is not None
+    assert ghi is not None, "the sky reading did not land"
+    assert temperature is not None
+    assert modules == 1, "the module rows were orphaned from their inverter row"
+
+
+def test_a_poll_on_the_skys_second_leaves_the_sky_intact(tmp_path: Path) -> None:
+    """The same collision the other way round: the poll must not blank the sky."""
+    path = tmp_path / "collide-reverse.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 9000.0}))
+    store.close()
+
+    conn = _open_db(path)
+    pv, ghi, wind = _row(conn, "pv_total_power_w", "ghi_wm2", "wind_speed_ms")
+    conn.close()
+    assert pv is not None
+    assert ghi is not None, "the poll erased the sky reading"
+    assert wind is not None
+
+
+def test_a_sky_reading_does_not_erase_a_recorded_gap(tmp_path: Path) -> None:
+    """The one that matters most: an outage must survive the weather.
+
+    A gap row is the only record that the inverter went quiet. The sky reading
+    used to clear the error along with everything else, which turns a recorded
+    outage into an ordinary row with an irradiance value beside it — an outage
+    smoothed into a straight segment is an outage nobody ever notices.
+    """
+    path = tmp_path / "gap.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    reason = "TimeoutError: no reply from inverter"
+    store.append(Sample.failed(when, reason))
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    error, ghi = _row(conn, "error", "ghi_wm2")
+    conn.close()
+    assert error == reason, "the outage was erased by a weather tick"
+    assert ghi is not None, "the sky reading did not land"
+
+
+def test_a_gap_still_writes_null_over_its_own_readings(tmp_path: Path) -> None:
+    """Within one writer's columns, replace still means replace.
+
+    A poll that reached the inverter and got nothing is a measurement of
+    absence, so it must be able to write NULL over what stood there. Merging
+    inverter columns would resurrect a reading that is no longer true — the
+    same class of lie as rendering absent data as zero.
+    """
+    path = tmp_path / "replace.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 9000.0}))
+    store.append(Sample(timestamp=when, readings={"battery_soc_pct": 64.0}))
+    store.close()
+
+    conn = _open_db(path)
+    pv, soc = _row(conn, "pv_total_power_w", "battery_soc_pct")
+    conn.close()
+    assert pv is None, "an inverter write merged rather than replaced its own columns"
+    assert soc is not None
+
+
+def test_two_site_writes_at_one_instant_merge(tmp_path: Path) -> None:
+    """The archive answers one hour in two pieces, and both must survive.
+
+    ``fetch_archive_hours`` splits each label into the means over the hour just
+    gone and the readings taken at the label itself, and the two land on the
+    same second from different requests — one day's request writes the hour's
+    temperature, the next day's writes that same hour's irradiance. Replacing
+    the whole site set would make the second erase the first, which is how the
+    backfill destroyed the weather it had just written.
+    """
+    path = tmp_path / "archive.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(timestamp=when, readings={"outside_temperature_c": 31.5, "cloud_cover_pct": 40.0})
+    )
+    store.append(Sample(timestamp=when, readings={"ghi_wm2": 812.0, "dni_wm2": 640.0}))
+    store.close()
+
+    conn = _open_db(path)
+    temperature, ghi = _row(conn, "outside_temperature_c", "ghi_wm2")
+    conn.close()
+    assert temperature is not None, "the second archive write erased the first"
+    assert ghi is not None
+
+
+def test_a_sky_reading_does_not_clear_the_inverters_bounds_flags(tmp_path: Path) -> None:
+    """One writer's retry must not erase the other's record of a fault.
+
+    ``invalid_readings`` records nothing about which writer filed a row, so the
+    metric name is the only thing that keeps the two apart. Clearing every flag
+    for the instant let a weather tick delete an inverter fault it never saw.
+    """
+    path = tmp_path / "flags.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 99000.0}))
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
+    conn.close()
+    assert flagged == ["pv_total_power_w"], "the weather tick cleared the inverter's flag"
