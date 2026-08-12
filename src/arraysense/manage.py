@@ -60,6 +60,34 @@ TRACKING_BRANCH = "origin/main"
 HEALTH_TIMEOUT = 90.0
 
 
+# uv's installer puts the binary in ~/.local/bin — for the root that runs this,
+# /root/.local/bin — which is not on sudo's secure_path. A bare "uv" lookup fails
+# there, and the failure is an uncaught FileNotFoundError halfway through an
+# upgrade that has already fast-forwarded the code. Searching these places after
+# PATH, in the order a bootstrap leaves them, matches what install.py does.
+UV_CANDIDATES = ("/root/.local/bin/uv", "/usr/local/bin/uv", "/usr/bin/uv")
+
+
+def find_uv() -> str | None:
+    """Where uv actually landed, or None so the caller can say why it cannot proceed.
+
+    uv's installer puts it in ~/.local/bin, which is not on sudo's secure_path
+    and therefore not on the PATH of this process when invoked as
+    ``sudo arraysense upgrade``. A bare name lookup fails there, and the
+    failure is an uncaught FileNotFoundError after git has already
+    fast-forwarded the install to the new commit — leaving new code with old
+    dependencies and no rollback.
+    """
+    found = shutil.which("uv")
+    if found:
+        return found
+    for candidate in UV_CANDIDATES:
+        expanded = os.path.expanduser(candidate)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    return None
+
+
 def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
     """One subprocess call, captured, so callers can report what failed."""
     return subprocess.run(argv, capture_output=True, text=True, check=False)
@@ -111,10 +139,18 @@ def service_state(port: int, timeout: float = 5.0) -> tuple[str, dict[str, Any] 
     /api/setup and nothing else, so a check that only knows /api/status reads a
     perfectly healthy new installation as a dead one — which is what the
     installer told every new user before this existed.
+
+    "collecting" means the service answered /api/status AND reports its
+    collector running. An HTTP reply from a process whose collector loop is
+    dead is not "collecting" — calling it that printed "restarted and
+    collecting" over a dead collector, and let an upgrade rollback skip its
+    one job.
     """
     body = _probe(status_url(port), timeout=timeout)
     if body is not None:
-        return ("collecting", body)
+        if body.get("running"):
+            return ("collecting", body)
+        return ("answering", body)
     body = _probe(setup_url(port), timeout=timeout)
     if body is not None:
         return ("setup", body)
@@ -159,29 +195,37 @@ def wait_until_up(
 def configured_port() -> int:
     """The port the unit was installed with, or the default.
 
-    Read from the drop-in rather than remembered anywhere else: the drop-in is
-    what systemd actually obeys, so anything else would be a second answer that
-    can disagree with the running service. The LAST ExecStart= wins, which is
-    how systemd itself resolves a drop-in — each assignment replaces the
-    previous one.
+    Read from every drop-in in lexicographic order, because systemd merges all
+    ``*.conf`` files in the drop-in directory and the last ``ExecStart=`` in
+    the merged set wins. Reading only ``port.conf`` missed a port set in any
+    other drop-in, and then every command probed a port the service was not
+    listening on — reporting a healthy service as down.
     """
     port = DEFAULT_PORT
+    dropins: list[str] = []
     try:
-        with open(PORT_DROPIN) as handle:
-            text = handle.read()
+        dropins = sorted(os.listdir(DROPIN_DIR))
     except OSError:
         return port
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#") or stripped.startswith(";"):
+    for name in dropins:
+        if not name.endswith(".conf"):
             continue
-        if not stripped.startswith("ExecStart="):
+        try:
+            with open(os.path.join(DROPIN_DIR, name)) as handle:
+                text = handle.read()
+        except OSError:
             continue
-        if "--port" not in stripped:
-            continue
-        parts = stripped.split("--port", 1)[1].split()
-        if parts and parts[0].isdigit():
-            port = int(parts[0])
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith(";"):
+                continue
+            if not stripped.startswith("ExecStart="):
+                continue
+            if "--port" not in stripped:
+                continue
+            parts = stripped.split("--port", 1)[1].split()
+            if parts and parts[0].isdigit():
+                port = int(parts[0])
     return port
 
 
@@ -209,12 +253,20 @@ def _database_path() -> str:
 
     Parsed with a plain scan rather than a TOML library because this file runs
     on the distribution's Python 3.8, which has no tomllib.
+
+    A line starting ``database_path`` with no ``=`` on it would crash every
+    command that resolves the database path with an uncaught IndexError —
+    including uninstall before its first confirmation prompt, making the
+    software un-uninstallable through its own CLI.
     """
     try:
         with open(CONFIG_PATH) as handle:
             for line in handle:
                 if line.strip().startswith("database_path"):
-                    value = _cut_inline_comment(line.split("=", 1)[1])
+                    parts = line.split("=", 1)
+                    if len(parts) < 2:
+                        continue
+                    value = _cut_inline_comment(parts[1])
                     return value.strip().strip('"').strip("'")
     except OSError:
         pass
@@ -233,19 +285,34 @@ def database_facts(path: str) -> dict[str, Any]:
     an empty database, and printing it as one told a real owner their 668 days
     of history were gone. The default is False because every early return here
     is a thing that was not read.
+
+    ``bytes`` is None when the file was not measured — printing 0.0 MB for a
+    file nothing stat'ed is the same class of bug as printing "empty" for a
+    database nothing opened. ``reason`` says which step failed, so the caller
+    can print the right remedy instead of blaming permissions for an absent
+    file or a file that opened but had the wrong schema.
     """
-    facts: dict[str, Any] = {"bytes": 0, "first": None, "last": None, "readable": False}
+    facts: dict[str, Any] = {
+        "bytes": None,
+        "first": None,
+        "last": None,
+        "readable": False,
+        "reason": None,
+    }
     try:
         facts["bytes"] = os.path.getsize(path)
-    except OSError:
+    except OSError as exc:
+        facts["reason"] = f"could not stat {path}: {exc}"
         return facts
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        facts["reason"] = f"could not open {path}: {exc}"
         return facts
     try:
         row = conn.execute("SELECT MIN(timestamp), MAX(timestamp) FROM inverter_raw").fetchone()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        facts["reason"] = f"could not read from {path}: {exc}"
         return facts
     finally:
         conn.close()
@@ -273,13 +340,79 @@ def _take_lock(path: str) -> tuple[int | None, str]:
     problems with different remedies, so the caller is told which happened: a
     backup that blames the first when it was the second sends somebody looking
     for a process that does not exist.
+
+    A lock left behind by a SIGKILL, an OOM kill or a power cut during a
+    backup is not a running backup — but without a staleness check every
+    subsequent nightly run sees FileExistsError and prints "another backup is
+    running" forever. The lock records the holder's PID so staleness can be
+    detected: if the process is gone the lock is stale and is removed, letting
+    the next backup proceed rather than failing silently every night.
     """
     try:
-        return (os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "")
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        return (None, LOCK_BUSY)
+        return _check_stale_lock(path)
     except OSError as exc:
         return (None, f"could not create the backup lock at {path}: {exc}")
+    try:
+        os.write(fd, f"{os.getpid()}\n{time.time()}\n".encode())
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return (None, f"could not write the lock at {path}")
+    return (fd, "")
+
+
+def _check_stale_lock(path: str) -> tuple[int | None, str]:
+    """Read a lock file and decide whether its holder is still alive.
+
+    A lock whose PID is gone is stale and is removed, so the next attempt
+    proceeds rather than printing "another backup is running" forever.
+    A lock that cannot be read at all is treated as live — the directory
+    may be unwritable, and the caller's existing message for that is clearer.
+    """
+    try:
+        with open(path) as handle:
+            lines = handle.readlines()
+    except OSError:
+        return (None, LOCK_BUSY)
+    if len(lines) < 2:
+        # Lock written by an older version that did not record a PID — treat
+        # it as live because we cannot establish staleness.
+        return (None, LOCK_BUSY)
+    try:
+        pid = int(lines[0].strip())
+    except (ValueError, IndexError):
+        return (None, LOCK_BUSY)
+    if _pid_is_alive(pid):
+        return (None, LOCK_BUSY)
+    # The holder is gone; remove the stale lock and try again.
+    with contextlib.suppress(OSError):
+        os.remove(path)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except (FileExistsError, OSError) as exc:
+        if isinstance(exc, FileExistsError):
+            return (None, LOCK_BUSY)
+        return (None, f"could not create the backup lock at {path}: {exc}")
+    try:
+        os.write(fd, f"{os.getpid()}\n{time.time()}\n".encode())
+    except OSError:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        return (None, f"could not write the lock at {path}")
+    return (fd, "")
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """True when a process with the given PID exists and can be signalled."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def _verify_working_copy(path: str) -> bool:
@@ -303,15 +436,18 @@ def _check_backup_dir(path: str) -> bool:
     hand-run backup, arraysense on a timer — and the one that runs second
     finds a directory owned by the wrong user. The tmpfiles.d fragment in
     packaging/ sets the right owner once, regardless of who runs first.
+
+    The two failures need different remedies. A directory that does not exist
+    needs the tmpfiles fragment applied. A directory that exists with the
+    right owner but is not writable by this caller needs sudo — the directory
+    is already correct; the caller lacks the privilege to write there.
     """
-    remedy = f"  sudo install -d -o arraysense -g arraysense -m 0750 {path}"
     if not os.path.isdir(path):
         print(f"{path} does not exist.")
-        print(remedy)
+        print(f"  sudo install -d -o arraysense -g arraysense -m 0750 {path}")
         return False
     if not os.access(path, os.W_OK):
-        print(f"{path} is not writable by this user.")
-        print(remedy)
+        print(f"{path} is not writable by this user; run with sudo")
         return False
     return True
 
@@ -329,7 +465,20 @@ def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
     into data loss. Returns the path written, or None when nothing was written
     — in which case no existing backup has been touched.
     """
-    if not os.path.isfile(source):
+    # os.path.isfile swallows PermissionError and returns False, so an
+    # unreadable database is reported as absent — the same defect that once
+    # told an owner their 668 days of history were gone. os.path.exists has
+    # the same flaw. Use os.stat, which raises on any failure, so a
+    # permission problem is caught and an inaccessible file is not reported
+    # as a missing one.
+    try:
+        st = os.stat(source)
+    except OSError as exc:
+        print(f"could not read the database at {source}: {exc}; nothing to back up")
+        return None
+    import stat as _stat
+
+    if not _stat.S_ISREG(st.st_mode):
         print(f"no database file at {source}; nothing to back up")
         return None
 
@@ -443,10 +592,17 @@ def driver_line(body: dict[str, Any] | None) -> str:
     nullable at the source, and one that was never declared prints as a dash:
     printing a plausible default would be the absent-data rule broken in the
     place it is most likely to be believed.
+
+    A missing ``devices`` key means the reply was not the shape this CLI
+    understands — not the same as an explicit empty list, which means the
+    source cannot name a device. Conflating them printed "none declared" for
+    a body nobody declared, asserting a statement that was never made.
     """
     if body is None:
         return "driver:    unavailable"
-    devices = body.get("devices") or []
+    devices = body.get("devices")
+    if devices is None:
+        return "driver:    unknown (no devices key in response)"
     if not devices:
         return "driver:    none declared"
     first = devices[0]
@@ -483,19 +639,27 @@ def cmd_status(argv: list[str]) -> int:
         print("           no configuration yet — open the dashboard to run the wizard")
         print(f"version:   {body.get('version')}")
         return 0
-    print(f"version:   {body.get('version')}")
-    staleness = (body.get("staleness") or {}).get("verdict")
-    print(
-        f"collector: running={body.get('running')} connected={body.get('connected')} "
-        f"staleness={staleness}"
-    )
+    if state == "answering":
+        print("service:   the HTTP server is answering but the collector is not running")
+        print(f"version:   {body.get('version')}")
+        print("  try: arraysense logs")
+    else:
+        print(f"version:   {body.get('version')}")
+        staleness = (body.get("staleness") or {}).get("verdict")
+        print(
+            f"collector: running={body.get('running')} connected={body.get('connected')} "
+            f"staleness={staleness}"
+        )
     print(driver_line(_probe(capabilities_url(port), timeout=5.0)))
     facts = database_facts(_database_path())
-    size = f"{facts['bytes'] / 1_048_576:.1f} MB"
+    size = f"{facts['bytes'] / 1_048_576:.1f} MB" if facts["bytes"] is not None else "unknown size"
     if not facts["readable"]:
-        # The database is owned by the service user by design; reading it is a
-        # privileged act, so the remedy is sudo rather than a repair.
-        span = "unreadable — run with sudo to see the date range"
+        # Say why it could not be read rather than naming sudo for four
+        # different causes, three of which sudo cannot fix. The file-missing
+        # case on the reference box means the SSD did not mount, which is an
+        # urgent fault reported as a permissions nuisance.
+        reason = facts.get("reason", "")
+        span = f"unreadable — {reason}" if reason else "unreadable"
     elif facts["first"] is None:
         span = "empty"
     else:
@@ -532,12 +696,16 @@ def cmd_restart(argv: list[str]) -> int:
     port = configured_port()
     state, _body = wait_until_up(port)
     if state == "down":
-        print("restarted, but the collector did not come back within 90s")
+        print(f"restarted, but the service did not answer within {int(HEALTH_TIMEOUT)}s")
         print("  try: arraysense logs")
         return 1
     if state == "setup":
         print("restarted; waiting for setup — open the dashboard to run the wizard")
         return 0
+    if state == "answering":
+        print("restarted, but the collector is not running")
+        print("  try: arraysense logs")
+        return 1
     print("restarted and collecting")
     return 0
 
@@ -546,14 +714,18 @@ def cmd_version(argv: list[str]) -> int:
     """Name the installed code and what the running service reports."""
     commit = run(["git", "-C", INSTALL_DIR, "rev-parse", "--short", "HEAD"]).stdout.strip()
     state, body = service_state(configured_port())
-    version = body.get("version") if body else None
+    version: str | None = None
+    if body is not None:
+        version = body.get("version")
+    ok = True
     if state == "down":
         version = "not answering"
+        ok = False
     elif version is None:
         version = "unknown"
     print(f"version: {version}")
     print(f"commit:  {commit or 'unknown'}")
-    return 0
+    return 0 if ok else 1
 
 
 def current_commit() -> str:
@@ -571,8 +743,15 @@ def is_dirty() -> bool:
     A local modification would be silently overwritten by the merge, so the
     refusal has to happen before anything is fetched or applied — the file
     being replaced is the very code running this command.
+
+    A non-repo directory (git status exits non-zero) is not "clean" — it is
+    an install that cannot be upgraded at all, and returning False here printed
+    "already up to date" for a checkout that was not one.
     """
-    return bool(run(["git", "-C", INSTALL_DIR, "status", "--porcelain"]).stdout.strip())
+    result = run(["git", "-C", INSTALL_DIR, "status", "--porcelain"])
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
 
 
 def _unshallow_if_needed() -> None:
@@ -594,16 +773,26 @@ def _unshallow_if_needed() -> None:
         print(result.stderr.strip())
 
 
-def _pending_commits() -> list[str]:
-    """Subjects between here and the tracking branch, newest last.
+def _pending_commits() -> list[str] | None:
+    """Subjects between here and the tracking branch, newest last; None on failure.
 
     Shown before anything is applied so an owner can see what an upgrade means
     before agreeing to it. Fetched first so the comparison is against what the
     remote actually holds rather than a stale local view.
+
+    An empty list means there are no commits to apply. None means the
+    comparison could not run — the remote was unreachable, the branch does not
+    exist, or the directory is not a git repo at all. The caller must
+    distinguish them because telling an offline owner they are "already up to
+    date" hides a release they need.
     """
     _unshallow_if_needed()
-    run(["git", "-C", INSTALL_DIR, "fetch", "--quiet", "origin"])
-    out = run(
+    fetch = run(["git", "-C", INSTALL_DIR, "fetch", "--quiet", "origin"])
+    if fetch.returncode != 0:
+        print("could not fetch from origin; the remote may be unreachable")
+        print(fetch.stderr.strip()[:200])
+        return None
+    log = run(
         [
             "git",
             "-C",
@@ -613,8 +802,12 @@ def _pending_commits() -> list[str]:
             "--no-merges",
             f"HEAD..{TRACKING_BRANCH}",
         ]
-    ).stdout.strip()
-    return [line for line in out.splitlines() if line]
+    )
+    if log.returncode != 0:
+        print("could not compare against the tracking branch")
+        print(log.stderr.strip()[:200])
+        return None
+    return [line for line in log.stdout.strip().splitlines() if line]
 
 
 def _confirm(prompt: str) -> bool:
@@ -673,7 +866,16 @@ def _sync_and_restart(port: int) -> str | None:
     as long as the check runs — and rolling back a release because of that
     undoes an upgrade that worked. Connectivity is a note, not a verdict.
     """
-    sync = run(["uv", "sync", "--project", INSTALL_DIR])
+    uv = find_uv()
+    if uv is None:
+        return (
+            "uv was not found on PATH or in the usual locations; "
+            + "the upgrade cannot install dependencies"
+        )
+    try:
+        sync = run([uv, "sync", "--project", INSTALL_DIR])
+    except OSError as exc:
+        return f"could not run uv: {exc}"
     if sync.returncode != 0:
         return f"dependencies would not install: {sync.stderr.strip()[:200]}"
     if not service("restart"):
@@ -681,6 +883,8 @@ def _sync_and_restart(port: int) -> str | None:
     state, body = wait_until_up(port)
     if state == "down":
         return f"the service did not answer within {int(HEALTH_TIMEOUT)}s"
+    if state == "answering":
+        return "the service answered but the collector is not running"
     if body is not None and body.get("connected") is False:
         print("  the service is up; the inverter is not answering yet")
     return None
@@ -700,6 +904,9 @@ def cmd_upgrade(argv: list[str]) -> int:
         return 1
 
     pending = _pending_commits()
+    if pending is None:
+        print("upgrade abandoned — could not determine what is available")
+        return 1
     if not pending:
         print("already up to date")
         return 0
@@ -725,7 +932,15 @@ def cmd_upgrade(argv: list[str]) -> int:
 
     reason = _sync_and_restart(port)
     if reason is None:
-        print("upgraded and collecting")
+        state, _body = service_state(port)
+        if state == "collecting":
+            print("upgraded and collecting")
+        elif state == "answering":
+            print("upgraded, but the collector is not running")
+        elif state == "setup":
+            print("upgraded; waiting for setup — open the dashboard to run the wizard")
+        else:
+            print("upgraded, but the service did not answer after restart")
         return 0
     print(reason)
     print(f"rolling back to {previous[:7]}")
@@ -737,12 +952,12 @@ def cmd_upgrade(argv: list[str]) -> int:
         print("the install is still on the new code. Run: arraysense logs")
         return 1
 
-    reason = _sync_and_restart(port)
-    if reason is None:
+    rollback_reason = _sync_and_restart(port)
+    if rollback_reason is None:
         print(f"rolled back; running {previous[:7]} again (detached HEAD, which is expected)")
     else:
-        print(reason)
-        print("ROLLBACK ALSO FAILED — the service is down. Run: arraysense logs")
+        print(rollback_reason)
+        print("ROLLBACK ALSO FAILED. Run: arraysense logs")
     return 1
 
 
@@ -796,13 +1011,19 @@ def cmd_uninstall(argv: list[str]) -> int:
     """Remove the software. The database survives unless --purge is given.
 
     Two confirmations rather than one when purging, because the second act
-    destroys something no reinstall can bring back.
+    destroys something no reinstall can bring back. The backup units and
+    their tmpfiles fragment are also removed — an uninstall that prints
+    "removed" while leaving an enabled timer that fails every night forever
+    is not an uninstall.
     """
     purge = "--purge" in argv
     db = _database_path()
     print(f"This removes the service, the code at {INSTALL_DIR}, and {CLI_SHIM}.")
     if purge:
         print(f"--purge given: {db} and /etc/arraysense WILL ALSO BE DELETED.")
+        print(
+            f"  compressed backups in {BACKUP_DIR} are not removed by --purge; delete them by hand"
+        )
     else:
         print("The database and config are kept. Pass --purge to remove them too.")
     if not _confirm("Continue?"):
@@ -819,8 +1040,21 @@ def cmd_uninstall(argv: list[str]) -> int:
     # disable may fail for a unit that was never enabled, and that is not a
     # reason to abandon the uninstall.
     service("disable")
+    # Stop and disable the backup timer so it does not fire every night
+    # pointing at an ExecStart that no longer exists.
+    run(["systemctl", "stop", "arraysense-backup.timer"])
+    run(["systemctl", "disable", "arraysense-backup.timer"])
     ok = True
-    for path in (UNIT_PATH, DROPIN_DIR, CLI_SHIM, INSTALL_DIR):
+    for path in (
+        UNIT_PATH,
+        DROPIN_DIR,
+        CLI_SHIM,
+        INSTALL_DIR,
+        "/etc/systemd/system/arraysense-backup.service",
+        "/etc/systemd/system/arraysense-backup.timer",
+        "/etc/systemd/system/arraysense-backup.service.d",
+        "/etc/tmpfiles.d/arraysense-backup.conf",
+    ):
         ok = _remove_path(path) and ok
     if purge:
         ok = _remove_database(db) and ok
@@ -903,15 +1137,203 @@ def cmd_backup(argv: list[str]) -> int:
         size_text = "size unavailable"
     kept = len(glob.glob(os.path.join(dest_dir, "arraysense-*.db.gz")))
     print(f"backup: {written} ({size_text}), keeping {kept}")
-    print("restore with:")
-    print(f"  sudo systemctl stop {SERVICE}")
-    print(f"  sudo -u arraysense gunzip -c {written} > {source}.restore")
-    print(f"  sudo -u arraysense sqlite3 {source}.restore 'PRAGMA quick_check'   # must print ok")
-    print(f"  sudo rm -f {source}-wal {source}-shm")
-    print(f"  sudo -u arraysense mv {source}.restore {source}")
-    print(f"  sudo systemctl start {SERVICE}")
-    print("  (the rm is not optional: a stale write-ahead log left by a crash")
-    print("   is replayed over the restored file and silently undoes it)")
+    print(f"restore with: arraysense restore {written}")
+    return 0
+
+
+def cmd_restore(argv: list[str]) -> int:
+    """Restore the database from a compressed archive, safely.
+
+    The shell recipe this replaced could destroy a live database in five
+    keystrokes: gunzip writes nothing on a corrupt archive, the shell redirect
+    creates a zero-byte file, PRAGMA quick_check prints "ok" on zero bytes,
+    and the mv overwrites the live database with an empty file. sqlite3 is
+    not installed on the reference Pi, so the step that should have caught
+    this silently did nothing.
+
+    This command, in order:
+      1. refuses if the archive does not exist or cannot be read
+      2. unpacks to a temporary file beside the live database
+      3. verifies the unpacked file has content — page count, expected
+         tables present, inverter_raw has rows — naming which check failed
+      4. only then stops the service, removes the -wal and -shm sidecars,
+         renames the old database to .prev, and moves the new one in
+      5. starts the service and waits for it to answer
+      6. deletes the .prev only after the service has started
+
+    The live database is never overwritten until every check above has
+    passed, and a pre-restore copy is kept until the new file is proven
+    to start. Use --yes for unattended restores.
+    """
+    yes = False
+    archive: str | None = None
+    for arg in argv:
+        if arg == "--yes":
+            yes = True
+        elif not arg.startswith("-"):
+            archive = arg
+        else:
+            print("usage: arraysense restore [--yes] <archive.db.gz>")
+            return 1
+    if archive is None:
+        print("usage: arraysense restore [--yes] <archive.db.gz>")
+        return 1
+
+    # Step 1: refuse if the archive does not exist or cannot be read.
+    try:
+        st = os.stat(archive)
+    except OSError as exc:
+        print(f"cannot read the archive at {archive}: {exc}")
+        return 1
+    import stat as _stat
+
+    if not _stat.S_ISREG(st.st_mode):
+        print(f"{archive} is not a regular file")
+        return 1
+    if st.st_size == 0:
+        print(f"{archive} is empty; nothing to restore")
+        return 1
+
+    db_path = _database_path()
+    db_dir = os.path.dirname(db_path) or "."
+    db_name = os.path.basename(db_path)
+    restore_path = os.path.join(db_dir, db_name + ".restore")
+
+    # Step 2: unpack to a temporary file beside the live database.
+    try:
+        with gzip.open(archive, "rb") as src, open(restore_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst.fileno())
+    except (gzip.BadGzipFile, OSError) as exc:
+        print(f"could not unpack {archive}: {exc}")
+        _remove_path(restore_path)
+        return 1
+
+    # Step 3: verify the unpacked file is a real database with content.
+    try:
+        if not _verify_working_copy(restore_path):
+            print("the unpacked file is empty; the archive contained no data")
+            _remove_path(restore_path)
+            return 1
+    except OSError as exc:
+        print(f"could not check the unpacked file at {restore_path}: {exc}")
+        _remove_path(restore_path)
+        return 1
+
+    try:
+        check_conn = sqlite3.connect(f"file:{restore_path}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"the unpacked file at {restore_path} is not a valid database: {exc}")
+        _remove_path(restore_path)
+        return 1
+    try:
+        try:
+            page_row = check_conn.execute("PRAGMA page_count").fetchone()
+        except sqlite3.Error as exc:
+            print(f"the unpacked file at {restore_path} is not a valid database: {exc}")
+            _remove_path(restore_path)
+            return 1
+        if page_row is None or page_row[0] == 0:
+            print("the unpacked database has no pages; the archive contained an empty file")
+            _remove_path(restore_path)
+            return 1
+        integrity = check_conn.execute("PRAGMA quick_check").fetchone()
+        if integrity is None or integrity[0] != "ok":
+            print(f"the unpacked database failed its integrity check: {integrity}")
+            _remove_path(restore_path)
+            return 1
+        tables = check_conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='inverter_raw'"
+        ).fetchone()
+        if tables is None:
+            print(
+                "the unpacked database has no inverter_raw table; it is not an ArraySense database"
+            )
+            _remove_path(restore_path)
+            return 1
+        row_count = check_conn.execute("SELECT COUNT(*) FROM inverter_raw").fetchone()
+        if row_count is None or row_count[0] == 0:
+            print(
+                "the unpacked database has an inverter_raw table with no rows; nothing to restore"
+            )
+            _remove_path(restore_path)
+            return 1
+    finally:
+        check_conn.close()
+
+    # The file passes every check. Show what will happen and confirm.
+    print(f"archive:       {archive}")
+    print(f"database:      {db_path}")
+    print(f"rows to restore: {row_count[0]}")
+    if not yes and not _confirm("Restore this archive over the live database?"):
+        print("nothing done")
+        _remove_path(restore_path)
+        return 0
+
+    # Step 4: stop the service, preserve the old database, remove sidecars,
+    # and move the new file into place.
+    if not service("stop"):
+        print("could not stop the service; restore abandoned")
+        _remove_path(restore_path)
+        return 1
+
+    prev_path = db_path + ".prev"
+    _remove_path(prev_path)
+    try:
+        os.rename(db_path, prev_path)
+    except OSError as exc:
+        print(f"could not preserve the current database at {prev_path}: {exc}")
+        print("restore abandoned; the live database is untouched")
+        _remove_path(restore_path)
+        service("start")
+        return 1
+
+    for suffix in ("-wal", "-shm"):
+        _remove_path(db_path + suffix)
+
+    try:
+        st_prev = os.stat(prev_path)
+        os.chown(restore_path, st_prev.st_uid, st_prev.st_gid)
+    except OSError:
+        # chown failed — the file will be owned by whoever is running this,
+        # which is ordinarily root. The service runs as arraysense and needs
+        # write access, so this matters.
+        pass
+    try:
+        os.rename(restore_path, db_path)
+    except OSError as exc:
+        print(f"could not move the restored file into place: {exc}")
+        print("the pre-restore database is at " + prev_path)
+        service("start")
+        return 1
+
+    # Step 5: start the service and wait for it to answer.
+    if not service("start"):
+        print("the database was restored but the service did not start")
+        print("  the pre-restore database is at " + prev_path)
+        print("  try: arraysense logs")
+        return 1
+
+    port = configured_port()
+    state, _body = wait_until_up(port)
+    if state == "down":
+        print(f"restore complete, but the service did not answer within {int(HEALTH_TIMEOUT)}s")
+        print("  the pre-restore database is at " + prev_path)
+        print("  try: arraysense logs")
+        return 1
+    if state == "setup":
+        print("restore complete; the service is in setup mode")
+        print("  the pre-restore database is at " + prev_path)
+        _remove_path(prev_path)
+        return 0
+    if state == "answering":
+        print("restore complete; the service is up but the collector is not running")
+        print("  the pre-restore database is at " + prev_path)
+        _remove_path(prev_path)
+        return 1
+    print("restore complete; the service is collecting")
+    _remove_path(prev_path)
     return 0
 
 
@@ -921,6 +1343,7 @@ COMMANDS = {
     "restart": cmd_restart,
     "version": cmd_version,
     "backup": cmd_backup,
+    "restore": cmd_restore,
 }
 COMMANDS["upgrade"] = cmd_upgrade
 COMMANDS["uninstall"] = cmd_uninstall
