@@ -1,0 +1,16 @@
+# systemd timer for the daily database backup.
+#
+# Persistent=true matters: a Pi that was off at 03:15 runs the backup when it
+# comes back rather than skipping a day silently. Without it a missed firing is
+# simply lost, and the first sign of trouble would be a gap in the backups.
+
+[Unit]
+Description=Daily Solar ArraySense database backup
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

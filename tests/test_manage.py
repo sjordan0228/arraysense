@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gzip
 import os
+import shutil
 import sqlite3
 import subprocess
 from typing import Any
@@ -11,6 +13,108 @@ import pytest
 
 from arraysense import manage
 from arraysense.store import schema
+
+
+def test_a_backup_round_trips_every_row(tmp_path: Any) -> None:
+    """The point of the whole thing: what comes back must be what went in."""
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(1783512004, 1783512004 + 50):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)", (ts, "CE12345678")
+        )
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    written = manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    assert written is not None
+
+    restored = tmp_path / "restored.db"
+    with gzip.open(written, "rb") as src, open(restored, "wb") as out:
+        shutil.copyfileobj(src, out)
+    conn = sqlite3.connect(str(restored))
+    assert conn.execute("SELECT COUNT(*) FROM inverter_raw").fetchone()[0] == 50
+    conn.close()
+
+
+def test_an_unreadable_source_writes_nothing_and_deletes_nothing(tmp_path: Any) -> None:
+    """A run that could not read the database must not be mistaken for one that
+    found nothing — and must never rotate a good backup away."""
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    keeper = dest / "arraysense-2026-08-01.db.gz"
+    keeper.write_bytes(b"older backup")
+
+    assert (
+        manage.backup_now(str(tmp_path / "missing.db"), str(dest), keep=1, stamp="2026-08-12")
+        is None
+    )
+    assert keeper.exists(), "an old backup must survive a failed run"
+
+
+def test_rotation_keeps_the_newest_and_only_after_success(tmp_path: Any) -> None:
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    for day in ("2026-08-01", "2026-08-02", "2026-08-03"):
+        (dest / f"arraysense-{day}.db.gz").write_bytes(b"x")
+
+    manage.backup_now(str(source), str(dest), keep=2, stamp="2026-08-12")
+    names = sorted(p.name for p in dest.glob("arraysense-*.db.gz"))
+    assert names == ["arraysense-2026-08-03.db.gz", "arraysense-2026-08-12.db.gz"]
+
+
+def test_no_half_written_backup_is_left_behind(tmp_path: Any) -> None:
+    """The compressed file is renamed into place, so an interrupted run cannot
+    leave something that looks finished."""
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    assert list(dest.glob("*.part")) == []
+
+
+def test_the_working_copy_is_made_beside_the_source_not_the_destination(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination is an SD card on the reference installation, and the
+    uncompressed copy is six times the size of the compressed one. Writing it
+    to the card would undo the reason the database lives on a separate disk."""
+    source_dir = tmp_path / "ssd"
+    source_dir.mkdir()
+    source = source_dir / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "card"
+    dest.mkdir()
+    seen: list[str] = []
+    real_connect: Any = sqlite3.connect
+
+    def watching_connect(target: str, *a: Any, **k: Any) -> Any:
+        seen.append(str(target))
+        return real_connect(target, *a, **k)
+
+    # manage.sqlite3 is the same module object as sqlite3 here, so patching the
+    # module patches what backup_now sees.
+    monkeypatch.setattr(sqlite3, "connect", watching_connect)
+    manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    working = [s for s in seen if s.endswith(".tmp") or "backup" in os.path.basename(s)]
+    assert all(not s.startswith(str(dest)) for s in working), seen
 
 
 def test_health_returns_the_body_once_the_collector_is_live(

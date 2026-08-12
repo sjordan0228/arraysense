@@ -82,6 +82,68 @@ and the "put the database on an SSD" advice elsewhere in these docs is exactly
 what a reader follows straight into this error. Only the named path becomes
 writable; the rest of the sandbox is untouched.
 
+## A daily backup, on the card that is not the database
+
+The SSD holds the only copy of the database, and an SSD can fail like anything
+else. `arraysense backup` writes a compressed copy of the database every day to
+`/var/backups/arraysense` — a directory on the SD card, which is precisely where
+the database itself does not live, and that is the whole point: a backup on the
+same disk as the original is protection against nothing.
+
+Measured on the real 264 MB database:
+
+| step | size |
+| --- | --- |
+| live database | 277,057,536 B |
+| after a compacting copy | 136,523,776 B — half of it was free pages |
+| gzipped | **21,196,829 B** |
+
+So a compressed daily copy writes about **7.2 GB a year** to the card, against
+96 GB a year for a naive `cp` of the raw file — the difference between 1.8% and
+24% of the write load the database was moved off the card to escape. The card
+only ever receives the compressed file.
+
+The uncompressed working copy is never written to the card. It is made beside
+the database itself with SQLite's own online backup API — the only correct way
+to copy a live database that is being written to, in WAL mode, where a plain
+file copy of the `.db` alone would miss the `-wal` and produce a torn snapshot —
+then verified with `PRAGMA quick_check` before it is trusted, and only then
+compressed and renamed into place on the card. A run interrupted halfway leaves
+a `.part` file, never something that looks like a finished backup. Fourteen
+daily copies are kept; the oldest are rotated away, and only after a new one has
+been written and verified — never before, because a rotation that runs first
+turns a failed backup into data loss.
+
+Install it:
+
+    sudo cp packaging/arraysense-backup.service packaging/arraysense-backup.timer /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now arraysense-backup.timer
+
+The timer fires at 03:15 and is `Persistent=true`, so a Pi that was off at 03:15
+runs the backup when it comes back rather than skipping a day silently. The
+service runs as the `arraysense` user under `ProtectSystem=strict`, with
+`/var/backups/arraysense` the only writable path. The working copy needs write
+access beside the database itself, so an installation whose database lives
+outside `StateDirectory` — the SSD here, exactly as for the collector — needs
+its own carve-out:
+
+    # /etc/systemd/system/arraysense-backup.service.d/ssd.conf
+    [Service]
+    ReadWritePaths=/mnt/ssd/arraysense
+
+Run a backup by hand with `sudo arraysense backup` (add `--dir PATH` or
+`--keep N` to override the destination or the number kept). A successful run
+prints the exact restore recipe:
+
+    restore with:
+      sudo systemctl stop arraysense
+      sudo gunzip -c /var/backups/arraysense/arraysense-2026-08-12.db.gz | sudo -u arraysense tee /mnt/ssd/arraysense/arraysense.db >/dev/null
+      sudo systemctl start arraysense
+
+The recipe is printed rather than left to the documentation because a backup
+nobody knows how to restore is not a backup.
+
 ## The USB enclosure: `usb-storage.quirks`
 
 The reference SSD is a USB enclosure, and under sustained writes it dropped off

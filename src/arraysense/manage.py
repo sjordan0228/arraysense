@@ -11,6 +11,8 @@ interpreter is what runs this — uv's 3.12 belongs to the service, not here.
 from __future__ import annotations
 
 import datetime
+import glob
+import gzip
 import json
 import os
 import shutil
@@ -30,6 +32,16 @@ DEFAULT_PORT = 8080
 CLI_SHIM = "/usr/local/bin/arraysense"
 UNIT_PATH = "/etc/systemd/system/arraysense.service"
 DROPIN_DIR = "/etc/systemd/system/arraysense.service.d"
+
+# The backup lands on a different disk — the SD card on the reference
+# installation, which is exactly where the database does not live because a card
+# wears out under sustained writes. Only the compressed file is written there;
+# the working copy stays beside the database.
+BACKUP_DIR = "/var/backups/arraysense"
+# How many compressed daily copies to keep. 14 of them at ~21 MB each is under
+# half a gigabyte, and the measured 7.2 GB a year of card writes is the whole
+# point of compressing.
+BACKUP_KEEP = 14
 
 # "Upgrade" fast-forwards the install to this remote-tracking branch: main is
 # the branch that has run on the reference installation, while dev is where a
@@ -243,6 +255,86 @@ def database_facts(path: str) -> dict[str, Any]:
         facts["first"] = datetime.datetime.fromtimestamp(row[0]).date().isoformat()
         facts["last"] = datetime.datetime.fromtimestamp(row[1]).date().isoformat()
     return facts
+
+
+def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
+    """Write one verified, compressed copy of the database, then rotate.
+
+    The uncompressed working copy is made beside the source with SQLite's own
+    backup API, because the database lives in WAL mode and a plain file copy of
+    the .db alone would miss the -wal and produce a torn snapshot. Nothing is
+    trusted until PRAGMA quick_check says ok, and nothing is renamed into place
+    until the gzip write has completed, so an interrupted run never leaves a
+    file that looks finished. Rotation comes last, and only on success: deleting
+    an old backup before the new one is written and verified turns a failed run
+    into data loss. Returns the path written, or None when nothing was written
+    — in which case no existing backup has been touched.
+    """
+    if not os.path.isfile(source):
+        print(f"no database file at {source}; nothing to back up")
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        print(f"could not read the database at {source}: {exc}")
+        return None
+    work_path = os.path.join(
+        os.path.dirname(source) or ".", os.path.basename(source) + ".backup.tmp"
+    )
+    try:
+        # A temp file a crashed run left behind would otherwise fail the next
+        # backup before it starts.
+        _remove_path(work_path)
+        work = sqlite3.connect(work_path)
+        try:
+            conn.backup(work)
+        finally:
+            work.close()
+    except sqlite3.Error as exc:
+        print(f"could not copy the database to {work_path}: {exc}")
+        _remove_path(work_path)
+        return None
+    finally:
+        conn.close()
+
+    try:
+        check = sqlite3.connect(work_path)
+        try:
+            row = check.execute("PRAGMA quick_check").fetchone()
+        finally:
+            check.close()
+    except sqlite3.Error as exc:
+        print(f"could not verify the copy at {work_path}: {exc}")
+        _remove_path(work_path)
+        return None
+    if row is None or row[0] != "ok":
+        print("the copy failed its integrity check; no backup written")
+        _remove_path(work_path)
+        return None
+
+    dest_path = os.path.join(dest_dir, f"arraysense-{stamp}.db.gz")
+    part_path = dest_path + ".part"
+    try:
+        with open(work_path, "rb") as src, gzip.open(part_path, "wb") as out:
+            shutil.copyfileobj(src, out)
+    except OSError as exc:
+        print(f"could not compress the backup to {part_path}: {exc}")
+        _remove_path(part_path)
+        return None
+    try:
+        os.replace(part_path, dest_path)
+    except OSError as exc:
+        print(f"could not move the finished backup into place at {dest_path}: {exc}")
+        _remove_path(part_path)
+        return None
+    _remove_path(work_path)
+
+    for stale in sorted(glob.glob(os.path.join(dest_dir, "arraysense-*.db.gz")))[:-keep]:
+        try:
+            os.remove(stale)
+        except OSError as exc:
+            print(f"could not remove the old backup {stale}: {exc}")
+    return dest_path
 
 
 def driver_line(body: dict[str, Any] | None) -> str:
@@ -647,11 +739,88 @@ def cmd_uninstall(argv: list[str]) -> int:
     return 0
 
 
+def _backup_keep(raw: str) -> int | None:
+    """Parse a --keep argument, or None after printing why it is refused."""
+    try:
+        keep = int(raw)
+    except ValueError:
+        print(f"--keep wants a number, not {raw!r}")
+        return None
+    if keep < 1:
+        print("--keep must be at least 1, or rotation would delete every backup")
+        return None
+    return keep
+
+
+def cmd_backup(argv: list[str]) -> int:
+    """Write a compressed daily backup to a different disk, then rotate.
+
+    The destination is the SD card on the reference installation, and the rule
+    that shapes everything is that only the compressed file ever lands there:
+    the uncompressed working copy is written beside the database itself, because
+    a 264 MB copy gzips to 21 MB and writing the larger figure to the card would
+    undo the reason the database was moved off it. The restore recipe is printed
+    after a successful run because a backup nobody knows how to restore is not a
+    backup.
+    """
+    dest_dir = BACKUP_DIR
+    keep = BACKUP_KEEP
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ("--dir", "--keep"):
+            index += 1
+            if index >= len(argv):
+                print(f"{arg} needs a value")
+                return 1
+            value = argv[index]
+            if arg == "--dir":
+                dest_dir = value
+            else:
+                parsed = _backup_keep(value)
+                if parsed is None:
+                    return 1
+                keep = parsed
+        elif arg.startswith("--dir="):
+            dest_dir = arg.split("=", 1)[1]
+        elif arg.startswith("--keep="):
+            parsed = _backup_keep(arg.split("=", 1)[1])
+            if parsed is None:
+                return 1
+            keep = parsed
+        else:
+            print("usage: arraysense backup [--dir PATH] [--keep N]")
+            return 1
+        index += 1
+
+    source = _database_path()
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"could not create {dest_dir}: {exc}")
+        return 1
+    written = backup_now(source, dest_dir, keep, datetime.date.today().isoformat())
+    if written is None:
+        return 1
+    try:
+        size_text = f"{os.path.getsize(written) / 1_048_576:.1f} MB"
+    except OSError:
+        size_text = "size unavailable"
+    kept = len(glob.glob(os.path.join(dest_dir, "arraysense-*.db.gz")))
+    print(f"backup: {written} ({size_text}), keeping {kept}")
+    print("restore with:")
+    print(f"  sudo systemctl stop {SERVICE}")
+    print(f"  sudo gunzip -c {written} | sudo -u arraysense tee {source} >/dev/null")
+    print(f"  sudo systemctl start {SERVICE}")
+    return 0
+
+
 COMMANDS = {
     "status": cmd_status,
     "logs": cmd_logs,
     "restart": cmd_restart,
     "version": cmd_version,
+    "backup": cmd_backup,
 }
 COMMANDS["upgrade"] = cmd_upgrade
 COMMANDS["uninstall"] = cmd_uninstall
