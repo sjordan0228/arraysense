@@ -302,3 +302,129 @@ async def test_a_memory_backed_store_still_builds_its_tiers(tmp_path: Path) -> N
     minute = store.query(["battery_voltage_v"], now - timedelta(days=1), now, tier="minute")
     assert minute, "the pass reported success but rolled up a different database"
     store.close()
+
+
+# --- archive weather written for a past hour ----------------------------------
+#
+# POST /api/efficiency/backfill fetches past conditions from the weather archive
+# and appends one sample per past hour, which lands in the raw tier alone. The
+# efficiency engine reads irradiance from the hourly tier and nothing else, and
+# maintenance rebuilds only the last three hours, so every backfilled hour older
+# than that was invisible to the feature the backfill exists to feed — while the
+# route reported the hours as written.
+#
+# Promotion cannot be a rebuild of those hours. A rebuild deletes the
+# destination buckets and refills them from raw, and raw keeps thirty days
+# against an hourly tier kept forever: rebuilding an hour from 2024 would delete
+# a year of the inverter's own history to write one temperature into it.
+
+
+def _archive_hour(when: datetime, ghi: float, air_c: float) -> Sample:
+    """One hour as the weather archive answers it: site readings, no inverter."""
+    return Sample(
+        timestamp=when,
+        readings={"ghi_wm2": ghi, "outside_temperature_c": air_c},
+    )
+
+
+async def test_archive_weather_for_a_past_hour_reaches_the_tier_that_reads_it(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
+    five_days_back = now - timedelta(days=5)
+    for hour in range(24):
+        store.append(_archive_hour(five_days_back + timedelta(hours=hour), 400.0, 30.0))
+
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    await service.maintain_rollups(now=now)
+
+    rows = store.query(
+        ["ghi_wm2", "outside_temperature_c"],
+        five_days_back,
+        five_days_back + timedelta(hours=23),
+        tier="hourly",
+    )
+    store.close()
+    assert len(rows) == 24
+    assert all(r["ghi_wm2"] == 400.0 for r in rows)
+    assert all(r["outside_temperature_c"] == 30.0 for r in rows)
+
+
+async def test_promoting_a_backfilled_hour_keeps_the_inverter_history_beside_it(
+    tmp_path: Path,
+) -> None:
+    # The hazard the promotion is shaped around. An hourly row from before the
+    # raw tier's retention window holds readings raw can no longer supply;
+    # writing an hour's weather into it must leave every one of them standing.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
+    long_ago = now - timedelta(days=400)
+    conn = store._conn
+    with conn:
+        conn.execute(
+            "INSERT INTO inverter_hourly (timestamp, device, sample_count, pv_total_power_w) "
+            "VALUES (?, ?, ?, ?)",
+            (int(long_ago.timestamp()), TEST_DEVICE, 300, 8000),
+        )
+    store.append(_archive_hour(long_ago, 550.0, 25.0))
+
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    await service.maintain_rollups(now=now)
+
+    rows = store.query(
+        ["pv_total_power_w", "ghi_wm2"],
+        long_ago,
+        long_ago + timedelta(minutes=30),
+        tier="hourly",
+    )
+    store.close()
+    assert len(rows) == 1
+    assert rows[0]["pv_total_power_w"] == 8000.0
+    assert rows[0]["ghi_wm2"] == 550.0
+    assert rows[0]["sample_count"] == 300
+
+
+async def test_a_second_pass_has_nothing_left_to_promote(tmp_path: Path) -> None:
+    # The queue is drained, not re-read forever: a backfill of two years must
+    # not leave every later pass rebuilding the same eighteen thousand hours.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
+    store.append(_archive_hour(now - timedelta(days=9), 300.0, 20.0))
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    await service.maintain_rollups(now=now)
+    pending = store._conn.execute("SELECT COUNT(*) FROM rollup_pending").fetchone()[0]
+    store.close()
+    assert pending == 0
+
+
+async def test_a_live_weather_tick_is_not_queued_for_promotion(tmp_path: Path) -> None:
+    # The ordinary path already covers it: maintenance rebuilds the last three
+    # hours from raw on every pass, so queueing a fresh sky reading would be
+    # work for nothing on every tick forever.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    store.append(_archive_hour(now, 700.0, 33.0))
+    pending = store._conn.execute("SELECT COUNT(*) FROM rollup_pending").fetchone()[0]
+    store.close()
+    assert pending == 0
+
+
+async def test_an_hour_written_through_a_read_view_is_promoted_too(tmp_path: Path) -> None:
+    # The backfill route holds a read view, not the primary connection, so the
+    # queue has to be written by the append itself rather than by whichever
+    # connection the collector happens to own.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
+    when = now - timedelta(days=6)
+    with store.read_view() as view:
+        view.append(_archive_hour(when, 250.0, 18.0))
+
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    await service.maintain_rollups(now=now)
+
+    rows = store.query(["ghi_wm2"], when, when + timedelta(minutes=30), tier="hourly")
+    store.close()
+    assert len(rows) == 1
+    assert rows[0]["ghi_wm2"] == 250.0

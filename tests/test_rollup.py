@@ -9,13 +9,19 @@ counts, not just presence.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+
+import pytest
 
 from arraysense.metrics import INVERTER_METRICS, lookup
 from arraysense.store.rollup import (
+    LATE_APPEND_SECONDS,
     collapse_policy,
     is_energy_counter,
+    merge_site_hours,
     pack_scale,
+    promote_pending_hours,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -785,3 +791,131 @@ def test_a_declaration_with_no_inverter_metrics_rolls_up_without_error() -> None
     conn.close()
     assert module == (3600, 60)
     assert inverter == 0
+
+
+# --- folding a backfilled hour into a tier that outlives its source -----------
+
+
+def test_merging_site_hours_writes_only_the_sky_columns() -> None:
+    # An hourly row from before the raw tier's retention window holds readings
+    # raw can no longer supply. Writing an hour's weather into it must leave
+    # every one of them exactly as it stands, or a backfill would trade a year
+    # of production history for one temperature.
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute(
+        f"INSERT INTO inverter_hourly (timestamp, device, sample_count, pv_total_power_w) "
+        f"VALUES (?, '{TEST_DEVICE}', 300, 8000)",
+        (hour,),
+    )
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device, ghi_wm2) VALUES (?, '{TEST_DEVICE}', 500)",
+        (hour,),
+    )
+    merge_site_hours(conn, [hour])
+    row = conn.execute(
+        "SELECT pv_total_power_w, ghi_wm2, sample_count FROM inverter_hourly"
+    ).fetchone()
+    conn.close()
+    assert row == (8000, 500, 300)
+
+
+def test_merging_does_not_erase_a_sky_column_raw_cannot_answer() -> None:
+    # The archive answers one hour in two pieces — the means over the hour and
+    # the readings at its label — and they arrive as separate requests. The
+    # second must not blank what the first recorded, so a metric no raw row in
+    # the hour carries leaves the stored value alone. Raw is a thirty-day
+    # window; absence in it says nothing about an hour outside it.
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute(
+        f"INSERT INTO inverter_hourly (timestamp, device, sample_count, ghi_wm2) "
+        f"VALUES (?, '{TEST_DEVICE}', 1, 500)",
+        (hour,),
+    )
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device, outside_temperature_c) "
+        f"VALUES (?, '{TEST_DEVICE}', 250)",
+        (hour,),
+    )
+    merge_site_hours(conn, [hour])
+    row = conn.execute("SELECT ghi_wm2, outside_temperature_c FROM inverter_hourly").fetchone()
+    conn.close()
+    assert row == (500, 250)
+
+
+def test_merging_leaves_an_hour_with_no_sky_reading_untouched() -> None:
+    # An hour holding nothing but inverter polls must not be rewritten at all —
+    # not even to the same values — because the row may be older than every raw
+    # row that built it.
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute(
+        f"INSERT INTO inverter_hourly (timestamp, device, sample_count, ghi_wm2) "
+        f"VALUES (?, '{TEST_DEVICE}', 300, 700)",
+        (hour,),
+    )
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) "
+        f"VALUES (?, '{TEST_DEVICE}', 9000)",
+        (hour,),
+    )
+    merge_site_hours(conn, [hour])
+    row = conn.execute("SELECT ghi_wm2, sample_count FROM inverter_hourly").fetchone()
+    conn.close()
+    assert row == (700, 300)
+
+
+def test_merging_averages_the_hour_and_stamps_the_bucket_start() -> None:
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    for offset, ghi in ((0, 400), (1800, 600)):
+        conn.execute(
+            f"INSERT INTO inverter_raw (timestamp, device, ghi_wm2) VALUES (?, '{TEST_DEVICE}', ?)",
+            (hour + offset, ghi),
+        )
+    merge_site_hours(conn, [hour + 1800])
+    row = conn.execute("SELECT timestamp, ghi_wm2, sample_count FROM inverter_hourly").fetchone()
+    conn.close()
+    assert row == (hour, 500, 2)
+
+
+def test_a_queued_hour_is_promoted_once_and_then_forgotten() -> None:
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute(
+        f"INSERT INTO inverter_raw (timestamp, device, ghi_wm2) VALUES (?, '{TEST_DEVICE}', 300)",
+        (hour,),
+    )
+    conn.execute("INSERT INTO rollup_pending (hour) VALUES (?)", (hour,))
+    conn.commit()
+    assert promote_pending_hours(conn) == 1
+    assert conn.execute("SELECT COUNT(*) FROM rollup_pending").fetchone()[0] == 0
+    assert promote_pending_hours(conn) == 0
+    conn.close()
+
+
+def test_the_promotion_log_names_the_rows_actually_touched(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The queue can claim an hour nothing promotes — a queued hour whose raw
+    # row is gone, or duplicates of an hour already merged. The log line is the
+    # operator's only evidence a backfill landed, so it has to count the
+    # hourly rows actually touched, not the queue rows claimed.
+    conn = _open()
+    hour = 1_700_000_000 // 3600 * 3600
+    conn.execute("INSERT INTO rollup_pending (hour) VALUES (?)", (hour,))
+    conn.commit()
+    with caplog.at_level(logging.INFO, logger="arraysense.store.rollup"):
+        assert promote_pending_hours(conn) == 0
+    conn.close()
+    assert "promoted 0 backfilled hour(s)" in caplog.text
+
+
+def test_the_late_write_threshold_sits_inside_the_rebuild_window() -> None:
+    # The queue covers exactly what the maintenance rebuild does not reach. If
+    # the threshold ever grew past the window, hours between the two would be
+    # promoted by neither and the archive backfill would go quiet again.
+    from arraysense.collector.service import HOURLY_REBUILD_WINDOW
+
+    assert LATE_APPEND_SECONDS < HOURLY_REBUILD_WINDOW

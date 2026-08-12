@@ -67,10 +67,12 @@ from typing import TYPE_CHECKING
 from arraysense.metrics import SITE_METRICS, lookup
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.migrate import needs_device_migration
+from arraysense.store.rollup import LATE_APPEND_SECONDS
 from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
     MODULE_TIERS,
+    PENDING_TABLE,
     expected_columns,
     inverter_metric_columns,
     migration_ddl,
@@ -529,6 +531,8 @@ class SqliteStore:
                 protect_readings=sample.is_failed,
             )
             self._append_modules(cur, epoch, unit, sample.battery_modules)
+            if site:
+                self._queue_late_hour(cur, epoch)
 
     def query(
         self,
@@ -556,6 +560,14 @@ class SqliteStore:
         Both ends of the range are included and both must be timezone-aware. An
         unknown metric name or tier raises KeyError before any SQL is built; see
         ``store.tiers`` for picking the tier from a range and a pixel width.
+
+        That inclusive end is the one range in this project that is not
+        half-open — ``rollup._bucket_bounds``, ``energy.bucket_edges`` and the
+        efficiency day all are — so two adjacent windows both return the row on
+        the boundary they share. Nothing mis-sums today: the energy path
+        differences counters rather than adding rows, and the efficiency day
+        drops the extra row by hour offset. A caller that adds rows up must
+        read half-open windows itself rather than assume this one is.
         """
         table = _inverter_table(tier)
         names = self._check_inverter_names(metrics)
@@ -594,8 +606,9 @@ class SqliteStore:
 
         Metric names here are the bare module ones, ``soc_pct`` rather than the
         per-slot registry key. As with ``query``, both ends of the range are
-        included, both must be timezone-aware, and an unknown name or tier raises
-        KeyError.
+        included — see there for why that differs from every bucketing rule in
+        the project — both must be timezone-aware, and an unknown name or tier
+        raises KeyError.
         """
         table = _module_table(tier)
         names = self._check_module_names(metrics)
@@ -796,12 +809,19 @@ class SqliteStore:
     ) -> float | None:
         """The highest raw reading of one metric in a window, or None if nothing.
 
-        This is what calibrates the forecast: the system's own observed peak is
-        the honest measure of what the array can do, where a nameplate rating
-        would be an assumption. Reads the raw tier because a coarser tier's
-        mean flattens exactly the peak this is for.
+        Reads the raw tier because a coarser tier's mean flattens exactly the
+        peak a caller is asking for.
+
+        A registry metric this database has no column for answers None, the
+        same way ``query`` and ``latest`` do through ``_selected``: the driver
+        never declared it, so nothing was ever recorded, and that is a reading
+        nobody took rather than an error. It has to be checked here instead of
+        deferred to ``_selected``, whose ``NULL AS name`` is not something
+        MAX() can be wrapped around.
         """
         (name,) = self._check_inverter_names([metric])
+        if name not in self._present["inverter_raw"]:
+            return None
         row = self._conn.execute(
             f"SELECT MAX({name}) FROM inverter_raw "
             "WHERE device = ? AND timestamp >= ? AND timestamp < ?",
@@ -850,16 +870,92 @@ class SqliteStore:
         the tier name and the device narrowing in the one file that owns them.
         Both bounds come back as aware UTC instants, because every timestamp
         that leaves this class does.
+
+        Site-only rows count here, unlike ``tier_spans``: the efficiency engine
+        reads irradiance — a site metric — from the hourly tier, so a sky
+        reading is exactly what the backfill is asking whether this database
+        holds.
         """
-        row = self._conn.execute(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM inverter_hourly WHERE device = ?",
-            (self._device(device),),
-        ).fetchone()
-        if row is None or row[0] is None or row[1] is None:
-            return None
+        return self._table_span("inverter_hourly", self._device(device), exclude_site_only=False)
+
+    def tier_spans(
+        self, module: bool = False, device: str | None = None
+    ) -> dict[str, tuple[datetime, datetime] | None]:
+        """What each tier actually holds for one inverter, by tier name.
+
+        A tier that holds nothing maps to None rather than to an empty span, so
+        "this tier has no rows" and "this tier covers an instant" stay
+        different answers.
+
+        This exists because tier selection used to be blind to it. Scored on
+        point count alone, a six-hour window from two months ago picks the raw
+        tier — whose floor is thirty days back — and comes back empty, while
+        the minute tier holds every minute of it; a window straddling that
+        floor comes back half its length with nothing saying the other half
+        exists. ``store.tiers.select_tier_for_range`` is where that judgement
+        is made, and this is the fact it needs.
+
+        An inverter tier's span counts only rows that can answer an inverter
+        chart — rows carrying at least one non-site reading. The weather poller
+        and the archive backfill write site-only rows into the same raw tier,
+        and one backfilled sky hour would otherwise stretch the raw floor back
+        by however far the owner backfilled, handing ``select_tier_for_range``
+        years the tier holds no inverter reading for.
+
+        The bounds are read as two ordered lookups rather than MIN/MAX over the
+        table. It is the same shape ``latest`` uses and for the same reason:
+        the primary key leads on timestamp, so walking it from either end stops
+        at the first row, while an aggregate with a device filter scans the
+        whole tier — measured on a copy of the reference database at 63 ms for
+        the raw tier and 195 ms for the minute tier against 0.2 ms here, on a
+        query a page load makes. The cost this shape carries instead is a
+        device that has never recorded anything: that walks the tier once and
+        finds nothing, 32 ms on the same data.
+        """
+        unit = self._device(device)
+        tiers = MODULE_TIERS if module else INVERTER_TIERS
+        return {
+            tier.name: self._table_span(tier.table, unit, exclude_site_only=not module)
+            for tier in tiers
+        }
+
+    def _table_span(
+        self,
+        table: str,
+        device: str,
+        *,
+        exclude_site_only: bool,
+    ) -> tuple[datetime, datetime] | None:
+        """The first and last timestamp one device has in ``table``, or None.
+
+        ``exclude_site_only`` drops rows whose only readings are site metrics,
+        so the span reports what the tier can answer an inverter chart with
+        rather than whatever its outermost row happens to be. Without it, one
+        backfilled sky reading would stretch the raw tier's floor across years
+        that hold no inverter reading at all. ``hourly_span`` deliberately
+        passes False — the efficiency engine reads irradiance, a site metric,
+        from the hourly tier, so there a sky reading is exactly what the span
+        is for.
+        """
+        filter_sql = ""
+        if exclude_site_only:
+            answerable = sorted((self._present[table] & self._inverter_names) - SITE_METRICS)
+            if not answerable:
+                return None
+            filter_sql = " AND (" + " OR ".join(f"{name} IS NOT NULL" for name in answerable) + ")"
+        bounds: list[int] = []
+        for direction in ("ASC", "DESC"):
+            row = self._conn.execute(
+                f"SELECT timestamp FROM {table} WHERE device = ?{filter_sql} "
+                f"ORDER BY timestamp {direction} LIMIT 1",
+                (device,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            bounds.append(int(row[0]))
         return (
-            datetime.fromtimestamp(int(row[0]), tz=UTC),
-            datetime.fromtimestamp(int(row[1]), tz=UTC),
+            datetime.fromtimestamp(bounds[0], tz=UTC),
+            datetime.fromtimestamp(bounds[1], tz=UTC),
         )
 
     def scored_days(self, config_version: int) -> set[int]:
@@ -1029,6 +1125,29 @@ class SqliteStore:
         if sample.error is not None or sample.battery_modules:
             return False
         return bool(sample.readings) and set(sample.readings) <= SITE_METRICS
+
+    def _queue_late_hour(self, cur: sqlite3.Cursor, epoch: int) -> None:
+        """Record that an old hour has new sky readings and needs promoting.
+
+        The rollup follows the raw tier's recent end: maintenance rebuilds the
+        last three hours on every pass, which covers every writer that stamps a
+        row at the moment it writes it. The archive backfill does not — it
+        writes one sample per past hour, up to two years of them — and those
+        rows sat in the raw tier where nothing promoted them, invisible to the
+        efficiency engine, which reads irradiance from the hourly tier and
+        nowhere else, while the route that wrote them reported them as written.
+
+        Queued inside the append's own transaction, so an hour is queued if and
+        only if its reading was stored. A fresh reading queues nothing: the
+        maintenance rebuild already covers it, and a row a tick would be a
+        queue that never emptied.
+        """
+        if epoch >= int(datetime.now(tz=UTC).timestamp()) - LATE_APPEND_SECONDS:
+            return
+        cur.execute(
+            f"INSERT INTO {PENDING_TABLE} (hour) VALUES (?)",
+            (epoch // 3600 * 3600,),
+        )
 
     def _written_columns(self, sample: Sample, *, site: bool) -> tuple[str, ...]:
         """Return the columns this append may write, and no others.
