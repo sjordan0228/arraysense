@@ -411,15 +411,15 @@ async def test_a_live_weather_tick_is_not_queued_for_promotion(tmp_path: Path) -
     assert pending == 0
 
 
-async def test_an_hour_written_through_a_read_view_is_promoted_too(tmp_path: Path) -> None:
-    # The backfill route holds a read view, not the primary connection, so the
+async def test_an_hour_written_through_a_write_connection_is_promoted_too(tmp_path: Path) -> None:
+    # The backfill route holds its own write connection, not the primary, so the
     # queue has to be written by the append itself rather than by whichever
     # connection the collector happens to own.
     store = _store(tmp_path)
     now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
     when = now - timedelta(days=6)
-    with store.read_view() as view:
-        view.append(_archive_hour(when, 250.0, 18.0))
+    with store.write_connection() as writer:
+        writer.append(_archive_hour(when, 250.0, 18.0))
 
     service = CollectorService(source=FakeSource(), store=store, interval=3600)
     await service.maintain_rollups(now=now)

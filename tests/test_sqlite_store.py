@@ -144,6 +144,141 @@ def test_maintenance_connection_keeps_per_connection_safety_pragmas(tmp_path: Pa
     assert maintenance_pragmas["busy_timeout"] == (5000,)
 
 
+def _poll_in_flight(cur: sqlite3.Cursor, epoch: int, device: str) -> None:
+    """Write the three parts of one poll — inverter row, serials, module row.
+
+    The collector's append is all three inside one transaction; replaying them
+    through a cursor keeps the transaction open so a second writer can
+    interleave with a poll mid-flight.
+    """
+    cur.execute(
+        "INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) VALUES (?, ?, ?)",
+        (epoch, device, 9000),
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO serials (device, serial) VALUES (?, ?)", (device, "BA00000001")
+    )
+    cur.execute("SELECT id FROM serials WHERE device = ? AND serial = ?", (device, "BA00000001"))
+    row = cur.fetchone()
+    assert row is not None
+    cur.execute(
+        "INSERT INTO module_raw (timestamp, device, module_id, soc_pct) VALUES (?, ?, ?, ?)",
+        (epoch, device, row[0], 64),
+    )
+
+
+def test_a_failed_backfill_on_the_shared_connection_rolls_back_the_poll(tmp_path: Path) -> None:
+    """Pin the failure the write connection exists to prevent, so it cannot return unseen.
+
+    The collector appends on the event loop while the backfill appends on
+    FastAPI's threadpool. On one sqlite3.Connection ``with conn:`` is
+    transaction state rather than a lock, so a backfill transaction that
+    raised part-way — a busy backup or a full disk raises ``database is
+    locked``; this replay fails it at its last statement instead — rolled the
+    collector's in-flight poll back with it: the inverter row, the module rows
+    and the serials registration all vanished together. The test beside this
+    one asserts the same failure on ``write_connection`` leaves the poll
+    intact; this test pins what the shared connection actually did.
+    """
+    path = tmp_path / "shared.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    # The failure the production defect arrives as: the append dies part-way —
+    # here at its last statement, queueing the hour for promotion — after its
+    # row has already been written inside the transaction.
+    store._conn.execute(
+        "CREATE TRIGGER reject_pending BEFORE INSERT ON rollup_pending "
+        "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+    )
+    with store._conn:  # the collector's poll, in flight
+        _poll_in_flight(store._conn.cursor(), int(when.timestamp()), TEST_DEVICE)
+        # The backfill, on the same connection: its failure is the poll's.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append(
+                Sample(
+                    timestamp=datetime(2020, 1, 1, 12, 0, tzinfo=UTC),
+                    readings={"ghi_wm2": 900.0},
+                )
+            )
+
+    conn = _open_db(path)
+    polls = conn.execute(
+        "SELECT COUNT(*) FROM inverter_raw WHERE pv_total_power_w IS NOT NULL"
+    ).fetchone()[0]
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    serials = conn.execute("SELECT COUNT(*) FROM serials").fetchone()[0]
+    conn.close()
+    store.close()
+    assert polls == 0, "a shared rollback no longer destroys the poll — the pinned hazard changed"
+    assert modules == 0
+    assert serials == 0
+
+
+def test_a_failed_backfill_on_its_own_connection_leaves_the_poll_in_flight_intact(
+    tmp_path: Path,
+) -> None:
+    """A backfill that fails mid-transaction must roll back nothing but itself.
+
+    The same failure replayed with the backfill on ``write_connection`` — its
+    own connection, so its commit and its rollback are its own. The writer
+    blocks behind the collector's open transaction until the commit, exactly
+    as the two contend in production, and then dies part-way on the trigger;
+    the poll it rode alongside must come through whole, inverter row, module
+    rows and serials registration together.
+    """
+    import threading
+
+    path = tmp_path / "isolated.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store._conn.execute(
+        "CREATE TRIGGER reject_pending BEFORE INSERT ON rollup_pending "
+        "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+    )
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_backfill() -> None:
+        started.set()
+        try:
+            with store.write_connection() as writer:
+                writer.append(
+                    Sample(
+                        timestamp=datetime(2020, 1, 1, 12, 0, tzinfo=UTC),
+                        readings={"ghi_wm2": 900.0},
+                    )
+                )
+        except sqlite3.IntegrityError as exc:
+            errors.append(exc)
+
+    with store._conn:  # the collector's poll, in flight on the primary connection
+        _poll_in_flight(store._conn.cursor(), int(when.timestamp()), TEST_DEVICE)
+        thread = threading.Thread(target=run_backfill)
+        thread.start()
+        started.wait(timeout=5)
+        # The poll commits while the backfill is blocked mid-append on the
+        # write lock — the interleaving that used to cost the whole poll.
+    thread.join(timeout=10)
+
+    conn = _open_db(path)
+    poll = conn.execute(
+        "SELECT pv_total_power_w FROM inverter_raw WHERE timestamp = ? AND device = ?",
+        (int(when.timestamp()), TEST_DEVICE),
+    ).fetchone()
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    serials = conn.execute("SELECT COUNT(*) FROM serials").fetchone()[0]
+    site = conn.execute("SELECT COUNT(*) FROM inverter_raw WHERE ghi_wm2 IS NOT NULL").fetchone()[0]
+    conn.close()
+    store.close()
+    assert [type(e).__name__ for e in errors] == ["IntegrityError"], (
+        f"the backfill did not fail as designed: {[type(e).__name__ for e in errors]}"
+    )
+    assert poll == (9000,), "the backfill's rollback erased the inverter row"
+    assert modules == 1, "the backfill's rollback erased the module rows"
+    assert serials == 1, "the backfill's rollback erased the serials registration"
+    assert site == 0, "the failed site append left half of itself behind"
+
+
 def test_appended_reading_is_stored_scaled(tmp_path: Path) -> None:
     # battery_voltage_v has scale 10 — the resolution the register carries:
     # 51.9 V must land on disk as the integer 519, not as a float.

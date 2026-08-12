@@ -1864,6 +1864,13 @@ def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict
     Resumable by construction — rows are keyed by timestamp, so re-running a
     range rewrites the same hours rather than duplicating them, and a failure
     reports the last day that landed so the next run can carry on from there.
+
+    The appends run on FastAPI's threadpool while the collector appends on
+    the event loop, so they take ``write_connection`` — a store bound to its
+    own connection — rather than the primary one, or the read view above,
+    whose contract forbids writers. On one connection ``with conn:`` is
+    transaction state rather than a lock, and an append that failed here
+    would roll the collector's in-flight poll back with it.
     """
     settings = SettingsStore(store)
     latitude = settings.get(SETTING_LATITUDE)
@@ -1890,29 +1897,30 @@ def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict
     days = 0
     last_day: str | None = None
     current = start
-    while current <= end:
-        samples = fetch_archive_hours(latitude, longitude, current, current)
-        if samples is None:
-            # The fetch failed. Stop here and report where, rather than
-            # marching on and leaving holes nobody can see.
-            break
-        if not samples:
-            # The archive simply had nothing for this day. Step over it.
-            logger.info("archive holds no readings for %s; skipping", current)
+    with request.app.state.store.write_connection() as writer:
+        while current <= end:
+            samples = fetch_archive_hours(latitude, longitude, current, current)
+            if samples is None:
+                # The fetch failed. Stop here and report where, rather than
+                # marching on and leaving holes nobody can see.
+                break
+            if not samples:
+                # The archive simply had nothing for this day. Step over it.
+                logger.info("archive holds no readings for %s; skipping", current)
+                days += 1
+                last_day = current.isoformat()
+                current += timedelta(days=1)
+                continue
+            for sample in samples:
+                try:
+                    writer.append(sample)
+                except sqlite3.Error as exc:
+                    logger.warning("backfill could not store an hour: %s", exc)
+                    break
+                written += 1
             days += 1
             last_day = current.isoformat()
             current += timedelta(days=1)
-            continue
-        for sample in samples:
-            try:
-                store.append(sample)
-            except sqlite3.Error as exc:
-                logger.warning("backfill could not store an hour: %s", exc)
-                break
-            written += 1
-        days += 1
-        last_day = current.isoformat()
-        current += timedelta(days=1)
     return {"days": days, "hours_written": written, "last_day": last_day}
 
 
