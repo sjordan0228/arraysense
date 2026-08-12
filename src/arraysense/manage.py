@@ -385,6 +385,10 @@ def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
                 shutil.copyfileobj(src, out)
                 out.flush()
                 os.fsync(out.fileno())
+            # GzipFile.close writes the CRC footer after any fsync taken inside the
+            # block, so the finished file is synced again before it is published.
+            with open(part_path, "rb") as synced:
+                os.fsync(synced.fileno())
         except OSError as exc:
             print(f"could not compress the backup to {part_path}: {exc}")
             _remove_path(part_path)
