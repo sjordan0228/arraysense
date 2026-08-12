@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import os
 import shutil
@@ -1018,4 +1019,106 @@ def test_the_restore_recipe_removes_the_write_ahead_log(
     assert manage.cmd_backup(["--dir", str(dest)]) == 0
     out = capsys.readouterr().out
     assert f"rm -f {source}-wal {source}-shm" in out
-    assert out.index("systemctl stop") < out.index("rm -f") < out.index("gunzip")
+    # The archive is unpacked beside the database and verified before the live
+    # file is touched, so a corrupt or truncated archive is discovered rather than
+    # restored.
+    assert "PRAGMA quick_check" in out
+    assert out.index("systemctl stop") < out.index("gunzip") < out.index("quick_check")
+    assert out.index("quick_check") < out.index("rm -f") < out.index("mv ")
+    assert out.index("mv ") < out.index("systemctl start")
+
+
+# --- Lock ---
+
+
+def test_lock_refuses_a_second_run(tmp_path: Any) -> None:
+    """Two overlapping runs share a working path and a destination name.
+
+    A hand-run backup does not go through systemd's serialisation of a oneshot
+    unit. Interleaved, two runs can publish a verified archive of an empty
+    database while rotating a real backup away.
+    """
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+
+    lock_path = str(source) + ".backup.lock"
+    lock_fd = manage._take_lock(lock_path)
+    assert lock_fd is not None
+
+    try:
+        written = manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+        assert written is None
+        # Nothing was written — no backup, no .part, no .tmp
+        assert list(dest.glob("arraysense-*.db.gz")) == []
+        assert list(dest.glob("*.part")) == []
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            os.remove(lock_path)
+
+
+def test_a_zero_length_working_copy_is_rejected(tmp_path: Any) -> None:
+    """sqlite3.connect creates a new file when the path does not exist, and
+    quick_check on an empty database returns 'ok' — so a missing or empty
+    working copy must be caught before the file is opened, not after."""
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    assert manage._verify_working_copy(str(empty)) is False
+
+    missing = str(tmp_path / "nonexistent.db")
+    assert manage._verify_working_copy(missing) is False
+
+    real = tmp_path / "real.db"
+    real.write_bytes(b"SQLite format 3\0...")
+    assert manage._verify_working_copy(str(real)) is True
+
+
+def test_sqlite_connect_creates_an_empty_database_that_passes_quick_check(
+    tmp_path: Any,
+) -> None:
+    """Prove the threat the zero-length guard exists for.
+
+    sqlite3.connect creates a new file when the path does not exist, and
+    quick_check on an empty database returns 'ok' — which is how two
+    overlapping runs can publish a verified-looking archive of nothing.
+    """
+    missing = str(tmp_path / "nonexistent.db")
+    conn = sqlite3.connect(missing)
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        assert row[0] == "ok"
+        assert os.path.getsize(missing) == 0
+    finally:
+        conn.close()
+
+
+# --- Destination directory check ---
+
+
+def test_check_backup_dir_refuses_a_missing_directory(tmp_path: Any) -> None:
+    """A backup that silently invents its own destination with the wrong owner
+    is how this failed in the first place."""
+    assert manage._check_backup_dir(str(tmp_path / "does_not_exist")) is False
+
+
+def test_check_backup_dir_refuses_an_unwritable_directory(tmp_path: Any) -> None:
+    """root running first creates the directory root:root; the service running
+    as arraysense then cannot write there and fails silently every night."""
+    if os.geteuid() == 0:
+        pytest.skip("root can write to a 0500 directory")
+    unwritable = tmp_path / "unwritable"
+    unwritable.mkdir(mode=0o500)
+    assert manage._check_backup_dir(str(unwritable)) is False
+
+
+def test_check_backup_dir_accepts_a_writable_directory(tmp_path: Any) -> None:
+    """The happy path must be confirmed, because a false refusal would stop a
+    working installation from running its daily backup."""
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    assert manage._check_backup_dir(str(writable)) is True

@@ -10,6 +10,7 @@ interpreter is what runs this — uv's 3.12 belongs to the service, not here.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import glob
 import gzip
@@ -257,6 +258,57 @@ def database_facts(path: str) -> dict[str, Any]:
     return facts
 
 
+def _take_lock(path: str) -> int | None:
+    """Claim the right to run, so two backups cannot share a working file.
+
+    Two runs overlapping is not hypothetical — a hand-run backup does not go
+    through systemd's serialisation of a oneshot unit. They share a working
+    path and a destination name, and interleaved they can publish a verified
+    archive of an empty database while rotating a real backup away.
+    """
+    try:
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    except OSError as exc:
+        print(f"could not take the backup lock at {path}: {exc}")
+        return None
+
+
+def _verify_working_copy(path: str) -> bool:
+    """A working copy must exist and be non-empty before it is trusted.
+
+    sqlite3.connect creates a new file when the path does not exist, and
+    quick_check on an empty database returns ok. Two overlapping runs, one
+    deletes the other's copy, the survivor opens a path that is now absent
+    and gets an empty database passing — this guard catches that path.
+    """
+    try:
+        return os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _check_backup_dir(path: str) -> bool:
+    """Verify the backup destination exists and is writable by this user.
+
+    Creating it here would bake in whatever user happens to run — root on a
+    hand-run backup, arraysense on a timer — and the one that runs second
+    finds a directory owned by the wrong user. The tmpfiles.d fragment in
+    packaging/ sets the right owner once, regardless of who runs first.
+    """
+    remedy = f"  sudo install -d -o arraysense -g arraysense -m 0750 {path}"
+    if not os.path.isdir(path):
+        print(f"{path} does not exist.")
+        print(remedy)
+        return False
+    if not os.access(path, os.W_OK):
+        print(f"{path} is not writable by this user.")
+        print(remedy)
+        return False
+    return True
+
+
 def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
     """Write one verified, compressed copy of the database, then rotate.
 
@@ -273,68 +325,95 @@ def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
     if not os.path.isfile(source):
         print(f"no database file at {source}; nothing to back up")
         return None
-    try:
-        conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-    except sqlite3.Error as exc:
-        print(f"could not read the database at {source}: {exc}")
-        return None
-    work_path = os.path.join(
-        os.path.dirname(source) or ".", os.path.basename(source) + ".backup.tmp"
+
+    lock_path = os.path.join(
+        os.path.dirname(source) or ".", os.path.basename(source) + ".backup.lock"
     )
+    lock_fd = _take_lock(lock_path)
+    if lock_fd is None:
+        print("another backup is running; nothing done")
+        return None
     try:
-        # A temp file a crashed run left behind would otherwise fail the next
-        # backup before it starts.
-        _remove_path(work_path)
-        work = sqlite3.connect(work_path)
         try:
-            conn.backup(work)
+            conn = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            print(f"could not read the database at {source}: {exc}")
+            return None
+        work_path = os.path.join(
+            os.path.dirname(source) or ".", os.path.basename(source) + ".backup.tmp"
+        )
+        try:
+            # A temp file a crashed run left behind would otherwise fail the next
+            # backup before it starts.
+            _remove_path(work_path)
+            work = sqlite3.connect(work_path)
+            try:
+                conn.backup(work)
+            finally:
+                work.close()
+        except sqlite3.Error as exc:
+            print(f"could not copy the database to {work_path}: {exc}")
+            _remove_path(work_path)
+            return None
         finally:
-            work.close()
-    except sqlite3.Error as exc:
-        print(f"could not copy the database to {work_path}: {exc}")
-        _remove_path(work_path)
-        return None
-    finally:
-        conn.close()
+            conn.close()
 
-    try:
-        check = sqlite3.connect(work_path)
+        if not _verify_working_copy(work_path):
+            print("the working copy is missing or empty; no backup written")
+            _remove_path(work_path)
+            return None
+
         try:
-            row = check.execute("PRAGMA quick_check").fetchone()
-        finally:
-            check.close()
-    except sqlite3.Error as exc:
-        print(f"could not verify the copy at {work_path}: {exc}")
-        _remove_path(work_path)
-        return None
-    if row is None or row[0] != "ok":
-        print("the copy failed its integrity check; no backup written")
-        _remove_path(work_path)
-        return None
+            check = sqlite3.connect(work_path)
+            try:
+                row = check.execute("PRAGMA quick_check").fetchone()
+            finally:
+                check.close()
+        except sqlite3.Error as exc:
+            print(f"could not verify the copy at {work_path}: {exc}")
+            _remove_path(work_path)
+            return None
+        if row is None or row[0] != "ok":
+            print("the copy failed its integrity check; no backup written")
+            _remove_path(work_path)
+            return None
 
-    dest_path = os.path.join(dest_dir, f"arraysense-{stamp}.db.gz")
-    part_path = dest_path + ".part"
-    try:
-        with open(work_path, "rb") as src, gzip.open(part_path, "wb") as out:
-            shutil.copyfileobj(src, out)
-    except OSError as exc:
-        print(f"could not compress the backup to {part_path}: {exc}")
-        _remove_path(part_path)
-        return None
-    try:
-        os.replace(part_path, dest_path)
-    except OSError as exc:
-        print(f"could not move the finished backup into place at {dest_path}: {exc}")
-        _remove_path(part_path)
-        return None
-    _remove_path(work_path)
-
-    for stale in sorted(glob.glob(os.path.join(dest_dir, "arraysense-*.db.gz")))[:-keep]:
+        dest_path = os.path.join(dest_dir, f"arraysense-{stamp}.db.gz")
+        part_path = dest_path + ".part"
         try:
-            os.remove(stale)
+            with open(work_path, "rb") as src, gzip.open(part_path, "wb") as out:
+                shutil.copyfileobj(src, out)
+                out.flush()
+                os.fsync(out.fileno())
         except OSError as exc:
-            print(f"could not remove the old backup {stale}: {exc}")
-    return dest_path
+            print(f"could not compress the backup to {part_path}: {exc}")
+            _remove_path(part_path)
+            return None
+        try:
+            os.replace(part_path, dest_path)
+        except OSError as exc:
+            print(f"could not move the finished backup into place at {dest_path}: {exc}")
+            _remove_path(part_path)
+            return None
+        # Flush the directory entry so a power cut after rename cannot lose it.
+        dir_fd = os.open(dest_dir, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+        _remove_path(work_path)
+
+        for stale in sorted(glob.glob(os.path.join(dest_dir, "arraysense-*.db.gz")))[:-keep]:
+            try:
+                os.remove(stale)
+            except OSError as exc:
+                print(f"could not remove the old backup {stale}: {exc}")
+        return dest_path
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            os.remove(lock_path)
 
 
 def driver_line(body: dict[str, Any] | None) -> str:
@@ -794,10 +873,7 @@ def cmd_backup(argv: list[str]) -> int:
         index += 1
 
     source = _database_path()
-    try:
-        os.makedirs(dest_dir, exist_ok=True)
-    except OSError as exc:
-        print(f"could not create {dest_dir}: {exc}")
+    if not _check_backup_dir(dest_dir):
         return 1
     written = backup_now(source, dest_dir, keep, datetime.date.today().isoformat())
     if written is None:
@@ -810,8 +886,10 @@ def cmd_backup(argv: list[str]) -> int:
     print(f"backup: {written} ({size_text}), keeping {kept}")
     print("restore with:")
     print(f"  sudo systemctl stop {SERVICE}")
+    print(f"  sudo -u arraysense gunzip -c {written} > {source}.restore")
+    print(f"  sudo -u arraysense sqlite3 {source}.restore 'PRAGMA quick_check'   # must print ok")
     print(f"  sudo rm -f {source}-wal {source}-shm")
-    print(f"  sudo gunzip -c {written} | sudo -u arraysense tee {source} >/dev/null")
+    print(f"  sudo -u arraysense mv {source}.restore {source}")
     print(f"  sudo systemctl start {SERVICE}")
     print("  (the rm is not optional: a stale write-ahead log left by a crash")
     print("   is replayed over the restored file and silently undoes it)")

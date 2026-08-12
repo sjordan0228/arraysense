@@ -19,7 +19,11 @@
 [Unit]
 Description=Solar ArraySense database backup
 Documentation=https://github.com/sjordan0228/arraysense
-After=arraysense.service
+After=arraysense.service time-sync.target
+# Wants time-sync.target so the first backup after a cold boot is not stamped
+# with yesterday's date: a Raspberry Pi has no real-time clock, and without this
+# a catch-up run can fire before NTP corrects fake-hwclock's stale time.
+Wants=time-sync.target
 
 [Service]
 Type=oneshot
