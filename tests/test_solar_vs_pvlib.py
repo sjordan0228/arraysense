@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from arraysense.solar import cell_temperature, poa_irradiance, solar_position
+from arraysense.solar import _faiman_u0, cell_temperature, poa_irradiance, solar_position
 
 pvlib = pytest.importorskip("pvlib")
 pd = pytest.importorskip("pandas")
@@ -172,3 +172,25 @@ def test_cell_temperature_matches_pvlib_faiman() -> None:
                 ours = cell_temperature(poa, air, wind, "open_rack")
                 theirs = float(pvlib.temperature.faiman(poa, air, wind))
                 assert ours == pytest.approx(theirs, abs=0.01), f"{poa} {air} {wind}"
+
+
+def test_a_declared_noct_is_still_faiman_with_shifted_coefficients() -> None:
+    """The NOCT adjustment must move the coefficients, never the model.
+
+    A declaration is read as a difference from the grammar's default and turned
+    back into a Faiman pair, so the referee is pvlib's own faiman with that pair
+    handed to it. What this holds is the arithmetic; that the pair is the right
+    one is the definition of NOCT, which the sibling test in test_solar.py reads
+    back at the conditions NOCT is stated under.
+    """
+    for mounting in ("open_rack", "close_roof"):
+        for declared in (30.0, 45.0, 62.0, 85.0):
+            u0, u1 = _faiman_u0(mounting, declared)
+            for poa in (0.0, 400.0, 1000.0):
+                for air in (-5.0, 25.0, 40.0):
+                    for wind in (0.0, 2.0, 9.0):
+                        ours = cell_temperature(poa, air, wind, mounting, noct=declared)
+                        theirs = float(pvlib.temperature.faiman(poa, air, wind, u0=u0, u1=u1))
+                        assert ours == pytest.approx(theirs, abs=0.01), (
+                            f"{mounting} noct={declared} {poa} {air} {wind}"
+                        )

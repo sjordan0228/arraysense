@@ -390,7 +390,7 @@ def compute_hours(
             string_poa = poa_irradiance(
                 ghi, dni, dhi, elevation, sun_azimuth, s.tilt, s.azimuth, day_of_year
             )
-            cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting)
+            cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting, s.noct)
             exp_kwh = expected_watts(s, string_poa, cell_c, when.astimezone(UTC)) / 1000.0
             act_kwh = act_w / 1000.0
             volts = row.get(f"pv{s.mppt}_voltage_v")

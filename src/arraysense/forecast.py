@@ -143,7 +143,7 @@ def modelled_watts(
             spec.azimuth,
             day_of_year,
         )
-        cell_c = cell_temperature(poa, hour.air_c, hour.wind_ms, spec.mounting)
+        cell_c = cell_temperature(poa, hour.air_c, hour.wind_ms, spec.mounting, spec.noct)
         total += expected_watts(spec, poa, cell_c, hour.when)
     return total
 
