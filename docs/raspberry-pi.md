@@ -138,10 +138,13 @@ prints the exact restore recipe:
 
     restore with:
       sudo systemctl stop arraysense
+      sudo rm -f /mnt/ssd/arraysense/arraysense.db-wal /mnt/ssd/arraysense/arraysense.db-shm
       sudo gunzip -c /var/backups/arraysense/arraysense-2026-08-12.db.gz | sudo -u arraysense tee /mnt/ssd/arraysense/arraysense.db >/dev/null
       sudo systemctl start arraysense
 
-The recipe is printed rather than left to the documentation because a backup
+The rm is not optional: a stale write-ahead log left by a crash is replayed
+over the restored file and silently undoes it. The recipe is printed rather
+than left to the documentation because a backup
 nobody knows how to restore is not a backup.
 
 ## The USB enclosure: `usb-storage.quirks`

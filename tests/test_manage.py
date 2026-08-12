@@ -995,3 +995,27 @@ def test_uninstall_says_so_when_daemon_reload_fails(
     assert manage.cmd_uninstall([]) == 1
     said = "\n".join(printed)
     assert "reload" in said.lower()
+
+
+def test_the_restore_recipe_removes_the_write_ahead_log(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A stale -wal is replayed over the restored file and silently undoes it.
+
+    Measured: restoring over a database that still had a hot -wal produced the
+    pre-restore content, 2000 rows where the backup held 10, and quick_check
+    reported ok.
+    """
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    assert manage.cmd_backup(["--dir", str(dest)]) == 0
+    out = capsys.readouterr().out
+    assert f"rm -f {source}-wal {source}-shm" in out
+    assert out.index("systemctl stop") < out.index("rm -f") < out.index("gunzip")

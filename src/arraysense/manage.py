@@ -810,8 +810,11 @@ def cmd_backup(argv: list[str]) -> int:
     print(f"backup: {written} ({size_text}), keeping {kept}")
     print("restore with:")
     print(f"  sudo systemctl stop {SERVICE}")
+    print(f"  sudo rm -f {source}-wal {source}-shm")
     print(f"  sudo gunzip -c {written} | sudo -u arraysense tee {source} >/dev/null")
     print(f"  sudo systemctl start {SERVICE}")
+    print("  (the rm is not optional: a stale write-ahead log left by a crash")
+    print("   is replayed over the restored file and silently undoes it)")
     return 0
 
 
