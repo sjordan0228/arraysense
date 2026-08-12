@@ -464,6 +464,32 @@ def _remove_path(path: str) -> bool:
     return True
 
 
+def _remove_database(path: str) -> bool:
+    """Remove the database and its sidecars, and only ever regular files.
+
+    The purge is authorised against one file. If the configured path names a
+    directory — or nothing at all, which a malformed config produces — then
+    what was authorised and what would be deleted are not the same thing, and
+    this runs as root. A path that is not an ordinary file is refused rather
+    than interpreted.
+    """
+    if not os.path.isabs(path):
+        print(f"configured database path is not absolute: {path!r}; nothing deleted")
+        return False
+    if os.path.isdir(path):
+        print(f"configured database path is a directory: {path}; nothing deleted")
+        return False
+    ok = True
+    for suffix in ("", "-wal", "-shm"):
+        target = path + suffix
+        if os.path.exists(target) and not os.path.isfile(target):
+            print(f"{target} is not an ordinary file; left alone")
+            ok = False
+            continue
+        ok = _remove_path(target) and ok
+    return ok
+
+
 def cmd_uninstall(argv: list[str]) -> int:
     """Remove the software. The database survives unless --purge is given.
 
@@ -484,18 +510,26 @@ def cmd_uninstall(argv: list[str]) -> int:
         print("nothing done")
         return 0
 
-    service("stop")
+    if not service("stop"):
+        print("could not stop the service; refusing to remove anything")
+        print("  try: systemctl status arraysense")
+        return 1
+    # disable may fail for a unit that was never enabled, and that is not a
+    # reason to abandon the uninstall.
     service("disable")
     ok = True
     for path in (UNIT_PATH, DROPIN_DIR, CLI_SHIM, INSTALL_DIR):
         ok = _remove_path(path) and ok
     if purge:
-        for suffix in ("", "-wal", "-shm"):
-            ok = _remove_path(db + suffix) and ok
+        ok = _remove_database(db) and ok
         ok = _remove_path("/etc/arraysense") and ok
-    run(["systemctl", "daemon-reload"])
+    reload = run(["systemctl", "daemon-reload"])
     if not ok:
         print("some paths could not be removed; see above")
+        return 1
+    if reload.returncode != 0:
+        print("removed, but systemd did not reload; a stale unit reference may remain")
+        print(f"  systemctl daemon-reload: {reload.stderr.strip()[:200]}")
         return 1
     print("removed")
     return 0

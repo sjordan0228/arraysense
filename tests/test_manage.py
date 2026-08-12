@@ -567,3 +567,105 @@ def test_uninstall_declined_does_nothing_at_all(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(manage, "_confirm", lambda _p: False)
     assert manage.cmd_uninstall([]) == 0
     assert touched == []
+
+
+def test_purge_refuses_a_database_path_that_is_a_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A purge is authorised against one file. A directory there would turn it
+    into a recursive delete running as root."""
+    removed: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        removed.append(path)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    assert manage._remove_database(str(tmp_path)) is False
+    assert removed == []
+
+
+def test_purge_refuses_an_empty_or_relative_database_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed config yields an empty string, and -wal would then resolve
+    against the working directory."""
+    removed: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        removed.append(path)
+        return True
+
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    assert manage._remove_database("") is False
+    assert manage._remove_database("relative/a.db") is False
+    assert removed == []
+
+
+def test_purge_removes_the_database_and_both_sidecars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """A purge that leaves a sidecar behind has left readings in a file the
+    owner believes is gone."""
+    db = tmp_path / "a.db"
+    for name in ("a.db", "a.db-wal", "a.db-shm"):
+        (tmp_path / name).write_bytes(b"x")
+    assert manage._remove_database(str(db)) is True
+    assert not (tmp_path / "a.db").exists()
+    assert not (tmp_path / "a.db-wal").exists()
+    assert not (tmp_path / "a.db-shm").exists()
+
+
+def test_uninstall_refuses_to_remove_anything_when_the_stop_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A still-writing collector is the one thing a purge must not race.
+
+    If the stop fails, the collector may still be appending when the purge
+    deletes the database and its WAL — the one moment in this program where a
+    still-running writer matters — so nothing at all is removed."""
+    touched: list[str] = []
+
+    def fake_remove(path: str) -> bool:
+        touched.append(path)
+        return True
+
+    def fake_service(action: str) -> bool:
+        return action != "stop"
+
+    monkeypatch.setattr(manage, "service", fake_service)
+    monkeypatch.setattr(manage, "_remove_path", fake_remove)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/db/a.db")
+
+    assert manage.cmd_uninstall(["--purge"]) == 1
+    assert touched == []
+
+
+def test_uninstall_says_so_when_daemon_reload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reload that fails leaves systemd holding a stale unit reference.
+
+    The uninstall must say so rather than print the success line, or the owner
+    leaves satisfied with a unit systemd still knows by name."""
+
+    def fake_run(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        if argv == ["systemctl", "daemon-reload"]:
+            return subprocess.CompletedProcess(argv, 1, "", "Unit arraysense.service not found")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(manage, "run", fake_run)
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "_confirm", lambda _p: True)
+    monkeypatch.setattr(manage, "_remove_path", lambda p: True)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/db/a.db")
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+    )
+
+    assert manage.cmd_uninstall([]) == 1
+    said = "\n".join(printed)
+    assert "reload" in said.lower()
