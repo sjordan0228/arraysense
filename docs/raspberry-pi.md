@@ -149,22 +149,26 @@ when a backup reports nothing written.
 
 Run a backup by hand with `sudo arraysense backup` (add `--dir PATH` or
 `--keep N` to override the destination or the number kept). A successful run
-prints the exact restore recipe:
+prints the path written and the restore command to use:
 
-    restore with:
-      sudo systemctl stop arraysense
-      sudo -u arraysense gunzip -c /var/backups/arraysense/arraysense-2026-08-12.db.gz > /mnt/ssd/arraysense/arraysense.db.restore
-      sudo -u arraysense sqlite3 /mnt/ssd/arraysense/arraysense.db.restore "PRAGMA quick_check"   # must print ok
-      sudo rm -f /mnt/ssd/arraysense/arraysense.db-wal /mnt/ssd/arraysense/arraysense.db-shm
-      sudo -u arraysense mv /mnt/ssd/arraysense/arraysense.db.restore /mnt/ssd/arraysense/arraysense.db
-      sudo systemctl start arraysense
+    restore with: arraysense restore /var/backups/arraysense/arraysense-2026-08-12.db.gz
 
-The archive is unpacked beside the database and verified before the live file
-is touched, so a corrupt or truncated archive is discovered rather than restored.
-The rm is not optional: a stale write-ahead log left by a crash is replayed
-over the restored file and silently undoes it. The recipe is printed rather
-than left to the documentation because a backup
-nobody knows how to restore is not a backup.
+`arraysense restore` unpacks the archive beside the live database, verifies it
+thoroughly — the file is non-empty, has database pages, contains the expected
+tables, and has rows — and only then stops the service, preserves the current
+database as a `.prev`, removes the stale write-ahead log and shared-memory
+sidecars, moves the restored file into place preserving the service user's
+ownership, starts the service, and waits for it to answer. The live database
+is never overwritten until every check above has passed. Add `--yes` for
+unattended restores.
+
+The old shell recipe that this replaces could destroy a live database in five
+keystrokes. `gunzip` writes nothing on a corrupt archive, the shell redirect
+creates a zero-byte file, `PRAGMA quick_check` prints "ok" on zero bytes, and
+the `mv` overwrites the live database with an empty file. `sqlite3` was not
+installed on the reference Pi, so the step that should have caught this
+silently did nothing. A command is not an incantation; every guard a shell
+line cannot carry is straightforward in Python.
 
 ## The USB enclosure: `usb-storage.quirks`
 

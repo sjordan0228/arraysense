@@ -267,14 +267,22 @@ def test_status_says_unreadable_rather_than_empty(
     """A database that could not be read must say so, not claim it is empty."""
     monkeypatch.setattr(manage, "configured_port", lambda: 8080)
     monkeypatch.setattr(
-        manage, "service_state", lambda port, timeout=5.0: ("collecting", {"version": "0.7.3"})
+        manage,
+        "service_state",
+        lambda port, timeout=5.0: ("collecting", {"version": "0.7.3", "running": True}),
     )
     monkeypatch.setattr(manage, "_probe", lambda url, timeout=5.0: None)
     monkeypatch.setattr(manage, "_database_path", lambda: "/nope/a.db")
     monkeypatch.setattr(
         manage,
         "database_facts",
-        lambda path: {"bytes": 277057536, "first": None, "last": None, "readable": False},
+        lambda path: {
+            "bytes": 277057536,
+            "first": None,
+            "last": None,
+            "readable": False,
+            "reason": "could not stat /nope/a.db",
+        },
     )
     manage.cmd_status([])
     out = capsys.readouterr().out
@@ -323,12 +331,14 @@ def test_status_reads_the_port_from_the_unit_drop_in(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The port lives in the drop-in the installer wrote, so status finds it there."""
-    drop = tmp_path / "port.conf"
+    drop_dir = tmp_path / "dropins"
+    drop_dir.mkdir()
+    drop = drop_dir / "port.conf"
     drop.write_text(
         "[Service]\nExecStart=\n"
         "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8099\n"
     )
-    monkeypatch.setattr(manage, "PORT_DROPIN", str(drop))
+    monkeypatch.setattr(manage, "DROPIN_DIR", str(drop_dir))
     assert manage.configured_port() == 8099
 
 
@@ -341,14 +351,16 @@ def test_status_ignores_a_commented_port_line(
     'Was: ExecStart=... --port 8080' beat the live '--port 8099' and status
     probed a port nothing listened on.
     """
-    drop = tmp_path / "port.conf"
+    drop_dir = tmp_path / "dropins"
+    drop_dir.mkdir()
+    drop = drop_dir / "port.conf"
     drop.write_text(
         "[Service]\n"
         "# Was: ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8080\n"
         "ExecStart=\n"
         "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8099\n"
     )
-    monkeypatch.setattr(manage, "PORT_DROPIN", str(drop))
+    monkeypatch.setattr(manage, "DROPIN_DIR", str(drop_dir))
     assert manage.configured_port() == 8099
 
 
@@ -360,18 +372,20 @@ def test_status_takes_the_last_execstart_line(
     Each assignment replaces the previous one, so status must probe the port on
     the last line, not the first.
     """
-    drop = tmp_path / "port.conf"
+    drop_dir = tmp_path / "dropins"
+    drop_dir.mkdir()
+    drop = drop_dir / "port.conf"
     drop.write_text(
         "[Service]\n"
         "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8080\n"
         "ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --port 8099\n"
     )
-    monkeypatch.setattr(manage, "PORT_DROPIN", str(drop))
+    monkeypatch.setattr(manage, "DROPIN_DIR", str(drop_dir))
     assert manage.configured_port() == 8099
 
 
 def test_status_defaults_the_port_when_no_drop_in_exists(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(manage, "PORT_DROPIN", "/nonexistent/port.conf")
+    monkeypatch.setattr(manage, "DROPIN_DIR", "/nonexistent/dropins")
     assert manage.configured_port() == 8080
 
 
@@ -591,6 +605,7 @@ def test_upgrade_rolls_back_when_the_service_does_not_return(
         out = "abc1234" if "rev-parse" in argv else ""
         return subprocess.CompletedProcess(argv, 0, out, "")
 
+    monkeypatch.setattr(manage, "find_uv", lambda: "uv")
     monkeypatch.setattr(manage, "run", fake_run)
     monkeypatch.setattr(manage, "is_dirty", lambda: False)
     monkeypatch.setattr(manage, "_pending_commits", lambda: ["deadbee new thing"])
@@ -609,6 +624,7 @@ def test_an_upgrade_is_not_rolled_back_because_the_inverter_is_unreachable(
 ) -> None:
     """The dongle takes one client, so an owner opening the EG4 app during an
     upgrade must not cause a rollback of a release that works."""
+    monkeypatch.setattr(manage, "find_uv", lambda: "uv")
     monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
     monkeypatch.setattr(manage, "service", lambda action: True)
     monkeypatch.setattr(
@@ -624,6 +640,7 @@ def test_a_service_that_never_answers_is_still_a_failure(
 ) -> None:
     """A service that never comes back is still the failure the rollback exists
     for; only an unreachable inverter was wrongly being treated as that failure."""
+    monkeypatch.setattr(manage, "find_uv", lambda: "uv")
     monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
     monkeypatch.setattr(manage, "service", lambda action: True)
     monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("down", None))
@@ -649,6 +666,7 @@ def test_upgrade_says_so_when_the_rollback_checkout_itself_fails(
             return subprocess.CompletedProcess(argv, 1, "", "error: pathspec did not match")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
+    monkeypatch.setattr(manage, "find_uv", lambda: "uv")
     monkeypatch.setattr(manage, "run", fake_run)
     monkeypatch.setattr(manage, "is_dirty", lambda: False)
     monkeypatch.setattr(manage, "_pending_commits", lambda: ["deadbee a release"])
@@ -683,6 +701,7 @@ def test_a_dependency_failure_is_not_reported_as_a_dead_collector(
             return subprocess.CompletedProcess(argv, 1, "", "no solution found")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
+    monkeypatch.setattr(manage, "find_uv", lambda: "uv")
     monkeypatch.setattr(manage, "run", fake_run)
     monkeypatch.setattr(manage, "service", lambda action: True)
     monkeypatch.setattr(
@@ -998,15 +1017,10 @@ def test_uninstall_says_so_when_daemon_reload_fails(
     assert "reload" in said.lower()
 
 
-def test_the_restore_recipe_removes_the_write_ahead_log(
+def test_backup_prints_a_pointer_to_the_restore_command(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
-    """A stale -wal is replayed over the restored file and silently undoes it.
-
-    Measured: restoring over a database that still had a hot -wal produced the
-    pre-restore content, 2000 rows where the backup held 10, and quick_check
-    reported ok.
-    """
+    """After writing a backup, tell the operator to use the restore command."""
     source = tmp_path / "live.db"
     conn = sqlite3.connect(str(source))
     conn.execute(schema.ddl_for("inverter_raw"))
@@ -1018,14 +1032,201 @@ def test_the_restore_recipe_removes_the_write_ahead_log(
     monkeypatch.setattr(manage, "_database_path", lambda: str(source))
     assert manage.cmd_backup(["--dir", str(dest)]) == 0
     out = capsys.readouterr().out
-    assert f"rm -f {source}-wal {source}-shm" in out
-    # The archive is unpacked beside the database and verified before the live
-    # file is touched, so a corrupt or truncated archive is discovered rather than
-    # restored.
-    assert "PRAGMA quick_check" in out
-    assert out.index("systemctl stop") < out.index("gunzip") < out.index("quick_check")
-    assert out.index("quick_check") < out.index("rm -f") < out.index("mv ")
-    assert out.index("mv ") < out.index("systemctl start")
+    assert "arraysense restore" in out
+    assert "PRAGMA quick_check" not in out
+
+
+def test_restore_returns_the_same_rows_as_were_backed_up(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point: what comes out of restore matches what went into the backup."""
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(1783512004, 1783512004 + 100):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)", (ts, "CE12345678")
+        )
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(
+        manage,
+        "wait_until_up",
+        lambda port, **kw: ("collecting", {"running": True, "connected": True}),
+    )
+    assert manage.cmd_backup(["--dir", str(dest)]) == 0
+    archives = sorted(dest.glob("arraysense-*.db.gz"))
+    assert len(archives) == 1
+
+    # Restore into a fresh database — the target must exist because the
+    # restore command renames it to .prev before placing the new file.
+    restored = tmp_path / "restored.db"
+    restored.write_bytes(b"old database placeholder")
+    monkeypatch.setattr(manage, "_database_path", lambda: str(restored))
+    result = manage.cmd_restore([str(archives[0]), "--yes"])
+    assert result == 0
+
+    conn = sqlite3.connect(str(restored))
+    count = conn.execute("SELECT COUNT(*) FROM inverter_raw").fetchone()[0]
+    assert count == 100
+    conn.close()
+
+
+def test_restore_refuses_a_corrupt_archive_and_preserves_the_live_database(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shell recipe's data-loss chain, proved impossible.
+
+    gunzip exits 1 on a corrupt archive, the shell redirect creates a zero-byte
+    file, PRAGMA quick_check prints "ok" on zero bytes, and the mv destroys the
+    live database — 1000 rows replaced by an empty file. The restore command
+    must refuse the archive before the live database is ever touched.
+    """
+    # Create a live database with 1000 rows
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(1000):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
+            (1783512004 + ts * 60, "CE12345678"),
+        )
+    conn.commit()
+    conn.close()
+
+    # Create a corrupt archive — not gzip at all
+    archive = tmp_path / "corrupt.db.gz"
+    archive.write_bytes(b"this is not a gzip file")
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    result = manage.cmd_restore([str(archive), "--yes"])
+    assert result == 1, "restore must refuse a corrupt archive"
+
+    # The live database must still have every row
+    conn = sqlite3.connect(str(db))
+    count = conn.execute("SELECT COUNT(*) FROM inverter_raw").fetchone()[0]
+    assert count == 1000, f"live database was destroyed: {count} rows instead of 1000"
+    conn.close()
+
+
+def test_restore_refuses_an_archive_that_is_not_an_arraysense_database(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gzip file containing random bytes is not a database and must be refused."""
+    db = tmp_path / "live.db"
+    db.write_bytes(b"SQLite format 3\0...")
+    archive = tmp_path / "random.db.gz"
+    with gzip.open(archive, "wb") as fh:
+        fh.write(b"not a sqlite database at all")
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    result = manage.cmd_restore([str(archive), "--yes"])
+    assert result == 1
+
+
+def test_restore_refuses_an_empty_archive(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An archive that unpacks to zero bytes must be refused."""
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    archive = tmp_path / "empty.db.gz"
+    with gzip.open(archive, "wb"):
+        pass  # write nothing
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    result = manage.cmd_restore([str(archive), "--yes"])
+    assert result == 1
+
+
+def test_restore_refuses_an_archive_that_does_not_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A path to nothing must be refused, not create a zero-byte file."""
+    monkeypatch.setattr(manage, "_database_path", lambda: "/tmp/nonexistent-db.db")
+    result = manage.cmd_restore(["/tmp/no-such-archive.db.gz", "--yes"])
+    assert result == 1
+
+
+def test_restore_asks_confirmation_unless_yes_is_given(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """Without --yes, the command must confirm before touching the live database."""
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(10):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
+            (1783512004 + ts * 60, "CE12345678"),
+        )
+    conn.commit()
+    conn.close()
+
+    archive = tmp_path / "test.db.gz"
+    with gzip.open(archive, "wb") as fh:
+        fh.write(db.read_bytes())
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    # Decline confirmation
+    monkeypatch.setattr(manage, "_confirm", lambda _p: False)
+    result = manage.cmd_restore([str(archive)])
+    assert result == 0, "a declined restore is not an error"
+    assert "nothing done" in capsys.readouterr().out
+
+
+def test_restore_removes_the_write_ahead_log_and_shm_sidecars(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale -wal is replayed over the restored file and silently undoes it.
+    The restore command must remove both sidecars before placing the new file."""
+    target = tmp_path / "restore_target.db"
+    target.write_bytes(b"old database placeholder - will be replaced")
+
+    # Create stale sidecars
+    (tmp_path / "restore_target.db-wal").write_bytes(b"stale wal content")
+    (tmp_path / "restore_target.db-shm").write_bytes(b"stale shm content")
+
+    # Create a valid archive with 50 rows
+    source = tmp_path / "source.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(50):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)",
+            (1783512004 + ts * 60, "CE12345678"),
+        )
+    conn.commit()
+    conn.close()
+
+    archive = tmp_path / "test.db.gz"
+    with gzip.open(archive, "wb") as fh:
+        fh.write(source.read_bytes())
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(target))
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(
+        manage,
+        "wait_until_up",
+        lambda port, **kw: ("collecting", {"running": True, "connected": True}),
+    )
+    result = manage.cmd_restore([str(archive), "--yes"])
+    assert result == 0
+
+    # Sidecars must be gone
+    assert not (tmp_path / "restore_target.db-wal").exists(), (
+        "the -wal sidecar survived the restore"
+    )
+    assert not (tmp_path / "restore_target.db-shm").exists(), (
+        "the -shm sidecar survived the restore"
+    )
 
 
 # --- Lock ---
