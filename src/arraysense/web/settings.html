@@ -53,6 +53,11 @@
      unit renders exactly as it did before. */
   .f .ctl{display:flex;align-items:center;gap:8px;min-width:0}
   .f .ctl .u{font-size:11.5px;color:var(--ink3);white-space:nowrap}
+  /* A yes/no setting, sized to itself. Everything else in `.f input` is
+     written for a box you type into, and a checkbox stretched to the column
+     width is a hundred-pixel tick. */
+  .f input[type=checkbox]{width:17px;height:17px;padding:0;margin:3px 0;flex:0 0 auto;
+    accent-color:var(--pv)}
 
   /* --- The location helper --------------------------------------------- */
   .geo{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -240,6 +245,14 @@ const suggestionsOf = (spec) => (Array.isArray(spec.suggestions) ? spec.suggesti
 function control(spec, value) {
   const id = `f_${spec.key.replace(/\W/g, '_')}`;
   const shown = value === null || value === undefined ? '' : String(value);
+  // A setting the registry declares as a boolean gets the one control that
+  // cannot express anything else. Without this it fell through to a text box
+  // holding the word "true", which the service refuses — it wants a JSON
+  // boolean — so the setting was visible, editable, and unsaveable.
+  if (spec.kind === 'bool') {
+    return `<input id="${id}" data-key="${esc(spec.key)}" type="checkbox"`
+      + `${value === true ? ' checked' : ''}>`;
+  }
   if (spec.choices && spec.choices.length) {
     const options = spec.choices.map((c) =>
       `<option value="${esc(c)}"${c === shown ? ' selected' : ''}>${esc(c)}</option>`).join('');
@@ -1651,6 +1664,9 @@ async function mountExtras() {
 function currentValue(spec) {
   const el = document.querySelector(`[data-key="${CSS.escape(spec.key)}"]`);
   if (!el) return undefined;
+  // A checkbox holds its answer in `checked`; its `value` is the string "on"
+  // whether it is ticked or not, which would post the same value both ways.
+  if (spec.kind === 'bool') return el.checked;
   const text = el.value;
   if (spec.kind === 'int' || spec.kind === 'float') {
     if (String(text).trim() === '') return isOptional(spec) ? null : undefined;

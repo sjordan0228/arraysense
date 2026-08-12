@@ -914,6 +914,54 @@ def test_an_unset_coordinate_arrives_as_null_and_the_equator_as_zero(client: Any
     assert client.get("/api/settings").json()["values"]["site.latitude"] is None
 
 
+def test_a_backup_destination_is_accepted_only_if_it_can_be_written(
+    client: Any, tmp_path: Path
+) -> None:
+    # A destination that only fails at 03:15 fails unattended. The check runs
+    # where there is still a person present to read the remedy.
+    good = tmp_path / "backups"
+    good.mkdir()
+    assert client.put("/api/settings", json={"backup.directory": str(good)}).status_code == 200
+    assert client.get("/api/settings").json()["values"]["backup.directory"] == str(good)
+
+
+def test_a_backup_destination_that_cannot_be_written_is_refused_by_name(
+    client: Any, tmp_path: Path
+) -> None:
+    missing = tmp_path / "not_there"
+    r = client.put("/api/settings", json={"backup.directory": str(missing)})
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert str(missing) in detail, "the rejection has to name the path that was refused"
+    assert "install -d" in detail, "and the command that fixes it"
+    # And the key, because that is how the settings page decides which field a
+    # rejection belongs to. Without it the remedy lands in the page banner
+    # rather than under the box somebody just typed into.
+    assert "backup.directory" in detail
+    # Nothing was stored, so the backup still writes where it did before.
+    assert (
+        client.get("/api/settings").json()["values"]["backup.directory"]
+        == "/var/backups/arraysense"
+    )
+
+
+def test_an_unchanged_backup_destination_is_not_re_checked(client: Any, tmp_path: Path) -> None:
+    # The page posts what changed, but nothing stops a client posting the whole
+    # form. An installation whose backup disk has gone missing must still be
+    # able to change its tariff — refusing every save over a fault the save did
+    # not introduce would lock the settings page over a broken backup.
+    from arraysense.settings import SettingsStore
+
+    gone = str(tmp_path / "unplugged")
+    SettingsStore(client.app.state.store).set("backup.directory", gone)
+    r = client.put(
+        "/api/settings",
+        json={"backup.directory": gone, "display.temperature_unit": "C"},
+    )
+    assert r.status_code == 200
+    assert r.json()["changed"] == ["display.temperature_unit"]
+
+
 def test_an_unparseable_timezone_is_a_400_at_the_settings_endpoint(client: Any) -> None:
     r = client.put("/api/settings", json={"site.timezone": "Mars/Olympus_Mons"})
     assert r.status_code == 400

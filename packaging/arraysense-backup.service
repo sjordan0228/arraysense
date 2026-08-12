@@ -1,7 +1,13 @@
-# systemd unit for the daily database backup.
+# systemd unit for the database backup.
 #
 # Install to /etc/systemd/system/arraysense-backup.service together with
 # arraysense-backup.timer, then `systemctl enable --now arraysense-backup.timer`.
+#
+# The timer fires every fifteen minutes and this decides whether there is
+# anything to do: --scheduled reads the stored settings and returns silently
+# unless the backup is enabled, its configured time has passed on the
+# installation's own clock, and today's archive is missing. Without that flag
+# the unit would write a backup every fifteen minutes.
 #
 # Type=oneshot: the backup runs once per timer firing, not as a daemon. Nice and
 # IOSchedulingClass=idle are there because this reads 264 MB and gzips it on a
@@ -9,7 +15,10 @@
 # the collector cannot.
 #
 # ReadWritePaths names the destination directory, which is the only place this
-# unit writes the compressed file. The working copy and the lock are written
+# unit writes the compressed file. A destination changed on the settings page
+# to somewhere outside it needs the same drop-in here as on the collector, and
+# the page says so when it refuses one — the check it runs is a real write, so
+# it catches this before 03:15 does. The working copy and the lock are written
 # beside the database itself, and StateDirectory=arraysense makes
 # /var/lib/arraysense — the default database location — writable by the same
 # user the collector uses. An installation keeping its database elsewhere, on a
@@ -40,7 +49,7 @@ Group=arraysense
 # must own the default database directory just as the collector does — see the
 # comment at the top for what an installation with the database elsewhere needs.
 StateDirectory=arraysense
-ExecStart=/usr/bin/env python3 /opt/arraysense/src/arraysense/manage.py backup
+ExecStart=/usr/bin/env python3 /opt/arraysense/src/arraysense/manage.py backup --scheduled
 Nice=10
 IOSchedulingClass=idle
 ProtectSystem=strict
