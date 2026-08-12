@@ -1,0 +1,50 @@
+# systemd unit for the daily database backup.
+#
+# Install to /etc/systemd/system/arraysense-backup.service together with
+# arraysense-backup.timer, then `systemctl enable --now arraysense-backup.timer`.
+#
+# Type=oneshot: the backup runs once per timer firing, not as a daemon. Nice and
+# IOSchedulingClass=idle are there because this reads 264 MB and gzips it on a
+# Raspberry Pi while the collector is polling; the backup can afford to wait and
+# the collector cannot.
+#
+# ReadWritePaths names the destination directory, which is the only place this
+# unit writes the compressed file. The working copy and the lock are written
+# beside the database itself, and StateDirectory=arraysense makes
+# /var/lib/arraysense — the default database location — writable by the same
+# user the collector uses. An installation keeping its database elsewhere, on a
+# USB SSD, must add its own ReadWritePaths line in a drop-in naming that
+# directory, exactly as ssd.conf already does for the collector service.
+# Without it, ProtectSystem=strict makes the database's own directory read-only
+# and the backup fails every night with "Read-only file system" on the lock or
+# the working copy.
+
+[Unit]
+Description=Solar ArraySense database backup
+Documentation=https://github.com/sjordan0228/arraysense
+After=arraysense.service
+# No clock-sync guarantee is claimed here. time-sync.target is passive unless
+# something pulls it in, and systemd-time-wait-sync, the one unit that orders
+# itself before it, is disabled on the reference install — so ordering after it
+# cannot stop a Persistent catch-up run after a cold boot on a Pi (no real-time
+# clock) from firing before NTP corrects the clock and stamping the backup with
+# the previous day's date, overwriting that day's archive. systemd has no wait
+# that works before NTP has synced once, so the limitation is stated rather
+# than papered over.
+
+[Service]
+Type=oneshot
+User=arraysense
+Group=arraysense
+# The working copy and the lock are written beside the database, so the unit
+# must own the default database directory just as the collector does — see the
+# comment at the top for what an installation with the database elsewhere needs.
+StateDirectory=arraysense
+ExecStart=/usr/bin/env python3 /opt/arraysense/src/arraysense/manage.py backup
+Nice=10
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/backups/arraysense

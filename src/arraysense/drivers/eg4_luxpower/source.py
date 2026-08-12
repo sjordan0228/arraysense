@@ -436,15 +436,66 @@ CAPABILITIES = Capabilities(
 )
 
 
-# The models this family covers. Only the 18kPV carries deltas, because only
-# the 18kPV has been measured: it is the reference installation. The others
-# inherit the family declaration until a citation exists — a conservative
-# default is honest, an invented spec is not. When a 6000XP fact arrives
-# (vendor document or a user's measurement), it lands here with its source.
+# The models this family covers, and how much is actually known about each.
+#
+# Two groups sit behind one protocol, and the difference matters more than the
+# shared register map suggests. The hybrids — 18kPV, 12kPV, FlexBOSS21,
+# FlexBOSS18 — are one device-type family in pylxpweb (EG4_HYBRID) and agree
+# about what their registers hold. The off-grid machines (6000XP, 12000XP;
+# EG4_OFFGRID) answer at the same addresses with different meanings.
+#
+# Where to check that, because the obvious place says otherwise and a reviewer
+# has already been misled by it: the register DEFINITION for 123 carries
+# models=ALL and reads "Generator power" for every family. The divergence is
+# recorded one layer up, in the docstring of the ac_couple_power property at
+# pylxpweb/devices/inverters/_runtime_properties.py — "On EG4_OFFGRID
+# (12000XP/6000XP), register 123 is a seconds counter — only register 153 is
+# correct." Registers 124-126 do carry their caveat on the definition itself.
+#
+# That split is the whole problem. The library keeps its family-aware knowledge
+# in the device property layer, and this driver reads the transport's register
+# decode directly through _reading(), so none of it runs. A wrong meaning would
+# be stored as a reading rather than caught.
+#
+# So an off-grid model carries a caveat rather than a citation. It is offered,
+# because refusing it outright would break an installation that already chose
+# it, and labelled, because a machine whose generator power is a seconds
+# counter must not be presented as supported. See issue #122.
 MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(name="18kPV", pv_strings=3, citation="measured on the reference installation"),
-    ModelSpec(name="6000XP"),
-    ModelSpec(name="12kPV"),
+    ModelSpec(
+        name="12kPV",
+        pv_strings=3,
+        citation=(
+            "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
+            "code 2092, which covers the 18kPV and the 12kPV"
+        ),
+    ),
+    ModelSpec(
+        name="FlexBOSS21",
+        pv_strings=3,
+        citation=(
+            "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
+            "code 10284, which covers FlexBOSS21 and FlexBOSS18"
+        ),
+    ),
+    ModelSpec(
+        name="FlexBOSS18",
+        pv_strings=3,
+        citation=(
+            "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
+            "code 10284, which covers FlexBOSS21 and FlexBOSS18"
+        ),
+    ),
+    ModelSpec(
+        name="6000XP",
+        caveat=(
+            "Off-grid family: several registers this driver reads mean something "
+            "different here than on the hybrids, and its PV string count is "
+            "unconfirmed upstream. Readings may be wrong rather than missing. "
+            "See issue #122."
+        ),
+    ),
 )
 
 
@@ -1092,12 +1143,12 @@ class Eg4LuxPowerSource:
         setting: the store files rows under one of them, and two spellings of
         one inverter would be two inverters as far as it is concerned.
 
-        The model is left absent. pylxpweb detects the family from the
-        device-type holding register and this driver reads no holding registers,
-        so naming the 18kPV here would be the model we develop against dressed
-        up as something the inverter said.
+        The model is what this installation is configured as, ``None`` when
+        nothing configured one. Nobody has asked the inverter — the driver reads
+        no holding registers — so a configured model that is wrong will not be
+        caught here.
         """
-        return DeviceIdentity(driver=NAME, serial=self.device)
+        return DeviceIdentity(driver=NAME, serial=self.device, model=self._config.model or None)
 
     @property
     def capabilities(self) -> Capabilities:

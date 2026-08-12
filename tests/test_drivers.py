@@ -15,7 +15,7 @@ counts its own energy, and the whole energy model reads those counters.
 
 from __future__ import annotations
 
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
@@ -253,11 +253,18 @@ def test_identity_carries_the_driver_name_and_the_serial() -> None:
     assert source.identity.serial == source.device
 
 
-def test_the_model_is_absent_rather_than_guessed() -> None:
-    # pylxpweb detects the family from a device-type holding register, and this
-    # collector reads no holding registers at all. Absent is the honest answer
-    # until it does; "18kPV" would be a guess that happens to be right here.
+def test_the_model_is_absent_when_nothing_configured_one() -> None:
+    # Absent because this configuration names no model, not because the driver
+    # refuses to report one — a configured model flows straight through.
     assert drivers.create(_config()).identity.model is None
+
+
+def test_the_identity_reports_the_model_the_installation_is_configured_as() -> None:
+    # capabilities already resolves this same setting into pv_strings, energy
+    # and the rest, so withholding the name handed a page every consequence of
+    # the model without the model.
+    config = replace(_config(), model="FlexBOSS21")
+    assert drivers.create(config).identity.model == "FlexBOSS21"
 
 
 # --- connect: a bad connection is a gap, not a crash ------------------------

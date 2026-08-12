@@ -264,11 +264,10 @@ class DeviceIdentity:
     be the same string the source reports as ``device``; two spellings of one
     inverter is two inverters as far as the store is concerned.
 
-    ``model`` is None when it has not been established rather than filled with
-    the model we happen to be developing against. pylxpweb detects the family
-    from a device-type holding register and this collector reads no holding
-    registers at all, so on the reference system the honest answer today is
-    "the driver knows the family, nobody has asked the inverter".
+    ``model`` is the model the installation is configured as, ``None`` when no
+    model was configured. It is not a detected value: no driver reads the
+    device-type holding register today, so this reports what was declared rather
+    than what was measured.
     """
 
     driver: str
@@ -394,6 +393,14 @@ class ModelSpec:
     pv_strings: int | None = None
     battery_module_slots: int | None = None
     citation: str = ""
+    # What is known to be wrong or unproven about this model, in a sentence a
+    # page can show. A model reaches the wizard because the family's protocol
+    # covers it, which is not the same as the family's *readings* having been
+    # proven to mean the same thing on it — the EG4 off-grid machines share
+    # every register address with the hybrids and disagree about what several
+    # of them hold. Offering such a model silently is the failure this field
+    # exists to prevent; offering it labelled is a decision the owner can make.
+    caveat: str = ""
 
     def __post_init__(self) -> None:
         """Refuse a delta that cites nothing."""

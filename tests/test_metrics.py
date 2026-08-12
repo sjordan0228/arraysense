@@ -249,3 +249,46 @@ def test_the_new_inputs_are_site_metrics_not_the_inverters() -> None:
     from arraysense.metrics import SITE_METRICS
 
     assert {"ghi_wm2", "dni_wm2", "dhi_wm2", "wind_speed_ms"} <= SITE_METRICS
+
+
+def test_whole_machine_power_bounds_clear_the_largest_model_in_the_family() -> None:
+    """A ceiling has to hold for the biggest inverter supported, not the reference one.
+
+    One registry serves every driver and model, so these are not the 18kPV's
+    bounds — they are the family's. The reference machine has recorded 18,550 W
+    of grid power and 17,644 W of house load against ceilings of 20,000, and a
+    FlexBOSS21 is a 21 kW machine against the 18kPV's 18. Projecting those
+    maxima by the ratio of the ratings puts grid power at about 21,600 W, over
+    the old ceiling.
+
+    Asserted against the projected figure rather than a copied constant, so this
+    fails if somebody lowers a ceiling back under what the family can produce.
+    """
+    from arraysense.metrics import lookup
+
+    projected = {
+        "grid_power_w": 18550 * 21 / 18,
+        "load_power_w": 17644 * 21 / 18,
+        "pv_total_power_w": 14983 * 21 / 18,
+        "eps_power_w": 14356 * 21 / 18,
+    }
+    for name, watts in projected.items():
+        spec = lookup(name)
+        assert spec.upper > watts, (
+            f"{name} ceiling {spec.upper} is under {watts:.0f} W, "
+            "which the largest model in this family can reach"
+        )
+
+
+def test_battery_power_still_catches_the_reading_these_bounds_exist_for() -> None:
+    """25,583 W is the misreading the module docstring quotes, and it must fail.
+
+    The reference product recorded it as fact — about double what an 18kPV can
+    put into a 48 V bank. When the whole-machine ceilings were raised for the
+    larger models in the family, this one was deliberately left alone: the
+    reference machine has only ever reached 12,044 W, so nothing in the family
+    needs the headroom, and raising it would let the motivating example through.
+    """
+    from arraysense.metrics import lookup
+
+    assert not lookup("battery_power_w").within_bounds(25583.0)

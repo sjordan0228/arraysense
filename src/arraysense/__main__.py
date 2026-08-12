@@ -355,6 +355,11 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         )
         payload = describe_setup(placeholder)
         payload["first_run"] = True
+        # Setup mode serves only this endpoint, and the lifecycle CLI reads the
+        # running version from whichever endpoint the service serves. Without it
+        # here, `arraysense version` and `arraysense status` call a service that
+        # is up and waiting for its wizard "not answering".
+        payload["version"] = __version__
         return payload
 
     @app.post("/api/setup/detect")
@@ -395,7 +400,17 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
             body.setdefault("database_path", str(DEFAULT_DATABASE_PATH))
             text = render_config(body)
             target.parent.mkdir(parents=True, exist_ok=True)
-            probe.write_text(text)
+            # Created 0600 before a byte is written, not chmod'd afterwards.
+            # This file carries the dongle and inverter serials, which the
+            # dongle protocol authenticates with, and the installation docs have
+            # always told a hand-installer to chmod 600 for exactly that reason
+            # — the wizard was writing 644 and quietly making the guided path
+            # the less careful one. Opening with the mode rather than fixing it
+            # after leaves no window in which the serials are world-readable,
+            # and replace() carries the probe's mode onto the target.
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(text)
             candidate = load(probe)
             drivers.validate(candidate)
             # A serial device pyserial would read as a URL parses fine here but

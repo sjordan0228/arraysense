@@ -1,5 +1,6 @@
 # Solar ArraySense configuration.
-# Copy to /etc/arraysense/config.toml and fill in your own values.
+# A reference for hand-configuration. Copying it into /etc/arraysense/config.toml
+# skips the first-run setup wizard, so this file is only for configuring by hand.
 # This file identifies your hardware — keep it out of version control.
 
 # Address of the inverter's WiFi dongle. Give it a static DHCP lease.
@@ -8,6 +9,11 @@ dongle_host = "192.168.1.50"
 # The dongle's 10-character serial. On its label, in your router's DHCP
 # list, or broadcast as the dongle's WiFi access point name.
 dongle_serial = "BA12345678"
+
+# The dongle's TCP port. Newer firmware removes port 8000 and Ethernet
+# dongles never had it, so this may need to change when you switch to
+# a different dongle or after a firmware update.
+dongle_port = 8000
 
 # The inverter's 10-character serial. Read it from the inverter itself:
 # other tools have been observed reporting a different value, and a
@@ -23,6 +29,18 @@ poll_interval = 11.0
 # the WiFi dongle. A wrong name is reported at startup along with the list
 # of names that work.
 driver = "eg4_luxpower"
+
+# Which model within the driver family. The wizard sets this from the
+# model you choose; a blank value means the driver will try to identify
+# the model from the inverter's own reply. Set it explicitly to skip
+# that detection or to pin a model the driver does not recognise.
+model = ""
+
+# Where battery module data comes from. A blank value derives the source
+# from the driver: relayed from the BMS when the inverter family carries
+# that, none otherwise. 'relayed' and 'none' are the explicit forms of
+# those two choices. 'direct' is reserved for a future battery driver.
+battery_source = ""
 
 # Where the database is written. Prefer an SSD over a Pi's SD card.
 database_path = "/var/lib/arraysense/arraysense.db"

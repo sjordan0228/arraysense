@@ -322,7 +322,8 @@ def example_toml() -> str:
     """
     return (
         "# Solar ArraySense configuration.\n"
-        "# Copy to /etc/arraysense/config.toml and fill in your own values.\n"
+        "# A reference for hand-configuration. Copying it into /etc/arraysense/config.toml\n"
+        "# skips the first-run setup wizard, so this file is only for configuring by hand.\n"
         "# This file identifies your hardware — keep it out of version control.\n"
         "\n"
         "# Address of the inverter's WiFi dongle. Give it a static DHCP lease.\n"
@@ -331,6 +332,11 @@ def example_toml() -> str:
         "# The dongle's 10-character serial. On its label, in your router's DHCP\n"
         "# list, or broadcast as the dongle's WiFi access point name.\n"
         'dongle_serial = "BA12345678"\n'
+        "\n"
+        "# The dongle's TCP port. Newer firmware removes port 8000 and Ethernet\n"
+        "# dongles never had it, so this may need to change when you switch to\n"
+        "# a different dongle or after a firmware update.\n"
+        f"dongle_port = {DEFAULT_DONGLE_PORT}\n"
         "\n"
         "# The inverter's 10-character serial. Read it from the inverter itself:\n"
         "# other tools have been observed reporting a different value, and a\n"
@@ -346,6 +352,18 @@ def example_toml() -> str:
         "# the WiFi dongle. A wrong name is reported at startup along with the list\n"
         "# of names that work.\n"
         f'driver = "{DEFAULT_DRIVER}"\n'
+        "\n"
+        "# Which model within the driver family. The wizard sets this from the\n"
+        "# model you choose; a blank value means the driver will try to identify\n"
+        "# the model from the inverter's own reply. Set it explicitly to skip\n"
+        "# that detection or to pin a model the driver does not recognise.\n"
+        'model = ""\n'
+        "\n"
+        "# Where battery module data comes from. A blank value derives the source\n"
+        "# from the driver: relayed from the BMS when the inverter family carries\n"
+        "# that, none otherwise. 'relayed' and 'none' are the explicit forms of\n"
+        "# those two choices. 'direct' is reserved for a future battery driver.\n"
+        'battery_source = ""\n'
         "\n"
         "# Where the database is written. Prefer an SSD over a Pi's SD card.\n"
         'database_path = "/var/lib/arraysense/arraysense.db"\n'
