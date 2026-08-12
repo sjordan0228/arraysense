@@ -1220,7 +1220,13 @@ def history(
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
     cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
-    rows = store.query(names, start, end, tier=tier, device=_device(device))
+    # A mistyped year reaches ``int(start.timestamp())`` in the store and raises
+    # OverflowError (or ValueError on some platforms).  Neither of these endpoints
+    # goes through ``read_energy`` or ``band_intervals``, so they need their own
+    # guard.  The fix at d7c3dcb missed them because the audit swept only the
+    # endpoints the calendar-walk wrappers already covered.
+    with _inside_the_calendar():
+        rows = store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
@@ -1247,7 +1253,10 @@ def battery_history(
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
     cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
-    rows = store.query_modules(names, start, end, tier=tier, serial=serial, device=_device(device))
+    with _inside_the_calendar():
+        rows = store.query_modules(
+            names, start, end, tier=tier, serial=serial, device=_device(device)
+        )
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
