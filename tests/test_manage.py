@@ -409,7 +409,7 @@ def test_usage_lists_only_commands_that_actually_run(capsys: Any) -> None:
         assert callable(manage.COMMANDS[name])
 
 
-def test_upgrade_rolls_back_when_the_collector_does_not_return(
+def test_upgrade_rolls_back_when_the_service_does_not_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The whole point. A failed upgrade must leave a collecting service.
@@ -431,12 +431,39 @@ def test_upgrade_rolls_back_when_the_collector_does_not_return(
     monkeypatch.setattr(manage, "_pending_commits", lambda: ["deadbee new thing"])
     monkeypatch.setattr(manage, "_confirm", lambda _prompt: True)
     monkeypatch.setattr(manage, "service", lambda action: True)
-    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: None)
+    monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("down", None))
 
     assert manage.cmd_upgrade([]) == 1
     checkouts = [c for c in calls if "checkout" in c]
-    assert checkouts, "a failed health check must check the old commit back out"
+    assert checkouts, "a service that never answers must check the old commit back out"
     assert "abc1234" in checkouts[-1]
+
+
+def test_an_upgrade_is_not_rolled_back_because_the_inverter_is_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dongle takes one client, so an owner opening the EG4 app during an
+    upgrade must not cause a rollback of a release that works."""
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(
+        manage,
+        "wait_until_up",
+        lambda port, **kw: ("collecting", {"running": True, "connected": False}),
+    )
+    assert manage._sync_and_restart(8080) is None
+
+
+def test_a_service_that_never_answers_is_still_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A service that never comes back is still the failure the rollback exists
+    for; only an unreachable inverter was wrongly being treated as that failure."""
+    monkeypatch.setattr(manage, "run", lambda argv: subprocess.CompletedProcess(argv, 0, "", ""))
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("down", None))
+    reason = manage._sync_and_restart(8080)
+    assert reason is not None and "did not answer" in reason
 
 
 def test_upgrade_says_so_when_the_rollback_checkout_itself_fails(
@@ -464,8 +491,7 @@ def test_upgrade_says_so_when_the_rollback_checkout_itself_fails(
     monkeypatch.setattr(manage, "_confirm", lambda _p: True)
     monkeypatch.setattr(manage, "configured_port", lambda: 8080)
     monkeypatch.setattr(manage, "service", lambda action: True)
-    healths = iter([None, {"ok": True}])
-    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: next(healths))
+    monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("down", None))
 
     printed: list[str] = []
     monkeypatch.setattr(
@@ -494,7 +520,9 @@ def test_a_dependency_failure_is_not_reported_as_a_dead_collector(
 
     monkeypatch.setattr(manage, "run", fake_run)
     monkeypatch.setattr(manage, "service", lambda action: True)
-    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: {"ok": True})
+    monkeypatch.setattr(
+        manage, "wait_until_up", lambda port, **kw: ("collecting", {"running": True})
+    )
     reason = manage._sync_and_restart(8080)
     assert reason is not None
     assert "dependencies" in reason

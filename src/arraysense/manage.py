@@ -456,17 +456,26 @@ def _sync_and_restart(port: int) -> str | None:
 
     Both the upgrade and the rollback run this same pair, and each of its three
     steps fails for a different reason — a dependency that would not install,
-    a unit that would not start, and a collector that never answered are three
+    a unit that would not start, and a service that never answered are three
     different problems, and telling somebody the third when it was the first
     sends them to read the wrong log.
+
+    The final step asks whether the service came back, never whether the
+    inverter answered. The dongle accepts exactly one TCP client, so an owner
+    opening the EG4 app during an upgrade takes the inverter away for exactly
+    as long as the check runs — and rolling back a release because of that
+    undoes an upgrade that worked. Connectivity is a note, not a verdict.
     """
     sync = run(["uv", "sync", "--project", INSTALL_DIR])
     if sync.returncode != 0:
         return f"dependencies would not install: {sync.stderr.strip()[:200]}"
     if not service("restart"):
         return "systemctl could not restart the service"
-    if wait_until_healthy(port) is None:
-        return f"the collector did not answer within {int(HEALTH_TIMEOUT)}s"
+    state, body = wait_until_up(port)
+    if state == "down":
+        return f"the service did not answer within {int(HEALTH_TIMEOUT)}s"
+    if body is not None and body.get("connected") is False:
+        print("  the service is up; the inverter is not answering yet")
     return None
 
 
