@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from arraysense.collector import weather as weather_module
 from arraysense.collector.weather import WeatherPoller
 from arraysense.efficiency import EfficiencyRow
 from arraysense.forecast import CLEAR_SKY_PEAK_RADIATION, MIN_SCORED_DAYS, SkyHour
@@ -17,7 +19,9 @@ from arraysense.settings import (
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
+    WEATHER_INTERVAL_KEY,
     SettingsStore,
+    lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
@@ -396,3 +400,115 @@ async def test_prune_removes_old_forecast_rows(store: SqliteStore) -> None:
         new_hour + timedelta(hours=1),
     )
     assert len(new_day) == 1
+
+
+# --- Staying alive ---
+#
+# The loop that records the sky has nothing above it: no watchdog watches it,
+# no page reports it, and metrics.SITE_METRICS deliberately keeps weather rows
+# out of the staleness witness so the dashboard banner stays quiet through a
+# sky outage. Whatever kills it therefore kills it until somebody restarts the
+# process by hand, and the symptom is only that recorded conditions stop.
+
+
+async def test_a_locked_database_on_the_interval_read_does_not_end_the_loop(
+    store: SqliteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The interval is read from the settings table on every cycle, which is a
+    # SELECT another writer can hold past the busy timeout. That read used to
+    # sit outside the loop's guard, so one busy moment ended the sky poller for
+    # the life of the process.
+    _set_location(store)
+    ticks = asyncio.Event()
+
+    def fetch(lat: float, lon: float) -> Sample | None:
+        ticks.set()
+        return _sample()
+
+    poller = WeatherPoller(store, fetch=fetch)
+    real_get = poller._settings.get
+
+    def get(key: str) -> object:
+        if key == WEATHER_INTERVAL_KEY:
+            raise sqlite3.OperationalError("database is locked")
+        return real_get(key)
+
+    monkeypatch.setattr(poller._settings, "get", get)
+
+    await poller.start()
+    try:
+        await asyncio.wait_for(ticks.wait(), timeout=2.0)
+        # Give the cycle after the tick time to reach the interval read — and,
+        # as it used to, to die there.
+        for _ in range(100):
+            if not poller.running:
+                break
+            await asyncio.sleep(0.01)
+        assert poller.running is True
+    finally:
+        await poller.stop()
+
+
+def test_an_unreadable_interval_falls_back_to_the_registered_default(
+    store: SqliteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cadence still has one home: a read that fails takes the registry's
+    # own default rather than a number written into the loop.
+    poller = WeatherPoller(store, fetch=lambda lat, lon: None)
+
+    def get(key: str) -> object:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(poller._settings, "get", get)
+    registered = lookup_setting(WEATHER_INTERVAL_KEY).default
+    assert poller._interval() == registered
+
+
+async def test_a_loop_that_dies_is_brought_back(
+    store: SqliteStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Belt and braces for the case the guards inside the loop cannot cover: if
+    # the loop ends for any reason at all, the poller starts it again instead
+    # of going quiet for the life of the process.
+    monkeypatch.setattr(weather_module, "LOOP_RESTART_SECONDS", 0.01)
+    _set_location(store)
+    starts = 0
+    running_again = asyncio.Event()
+
+    real_loop = WeatherPoller._loop
+
+    async def flaky_loop(self: WeatherPoller) -> None:
+        nonlocal starts
+        starts += 1
+        if starts == 1:
+            raise RuntimeError("something nobody predicted")
+        running_again.set()
+        await real_loop(self)
+
+    monkeypatch.setattr(WeatherPoller, "_loop", flaky_loop)
+
+    poller = WeatherPoller(store, fetch=lambda lat, lon: _sample())
+    await poller.start()
+    try:
+        await asyncio.wait_for(running_again.wait(), timeout=2.0)
+        assert poller.running is True
+    finally:
+        await poller.stop()
+
+
+async def test_a_poller_that_has_stopped_ticking_can_be_seen_to_have_stopped(
+    store: SqliteStore,
+) -> None:
+    # Nothing can report an outage it cannot measure. A completed cycle is
+    # stamped, and the gap since it is what an endpoint or a watchdog reads.
+    _set_location(store)
+    poller = WeatherPoller(store, fetch=lambda lat, lon: _sample())
+    assert poller.stalled_for() is None
+
+    await poller.tick()
+    marked = poller.last_tick_at
+    assert marked is not None
+    assert poller.stalled_for(marked + timedelta(minutes=1)) is None
+    stalled = poller.stalled_for(marked + timedelta(hours=6))
+    assert stalled is not None
+    assert stalled > timedelta(hours=5)
