@@ -171,6 +171,141 @@ Halving the interval roughly doubles that.
 If the database is on a Raspberry Pi SD card, move it to a USB SSD. Sustained
 database writes will eventually wear a card out.
 
+## The nightly backup
+
+The nightly backup has nothing on the dashboard: no page says a backup is due,
+ran, or failed, so every failure below is something to go looking for rather
+than something that announces itself. The settings page is where it is
+configured — whether it runs, where it writes, how many copies it keeps, and
+when — and how the pieces fit together, with the measured cost to the card, is
+[docs/raspberry-pi.md](raspberry-pi.md). This section is the failures.
+
+### The backup never runs, and nothing says so
+
+A scheduled backup that fails leaves no trace on any page. Its failures go only
+to the journal of the backup unit, which is a different unit from the
+collector's — the `arraysense logs` shortcut forwards to the collector's unit
+only. The command that shows them is the plain one:
+
+```bash
+journalctl -u arraysense-backup.service
+```
+
+When the timer last fired and when it will fire next is a separate question:
+
+```bash
+systemctl list-timers arraysense-backup.timer
+```
+
+The timer fires every fifteen minutes and asks the settings whether a backup is
+due — enabled, the configured time passed, today's archive missing — and a
+firing that decides there is nothing to do returns silently. So a recent `LAST`
+means the timer fired, not that a backup was written; the journal, and the
+archive's own date, are what say whether anything actually happened.
+
+The trap is the manual test. `sudo arraysense backup` runs as root with no
+sandbox, and root can write anywhere. The timer's run runs as the `arraysense`
+user under `ProtectSystem=strict`, which allows it only its declared paths. So a
+hand-run backup can succeed, write a real archive, and print the restore command
+while the scheduled one fails every night. The manual test passes, the owner
+concludes backups work, and nothing is backing up. The journal is the only
+witness to the difference.
+
+### Read-only file system on the lock or the working copy
+
+The backup unit runs under `ProtectSystem=strict`, which makes the whole
+filesystem read-only apart from its declared writable paths. The compressed
+archive goes to the backup directory, which the unit can write. But the working
+copy and the lock are written *beside the database*, not in the backup
+directory — the working copy because it is the full uncompressed database, and
+writing that full-size copy to the card would undo the reason the database was
+moved off it in the first place. A database that lives outside the unit's
+writable set therefore fails every night with `Read-only file system`, on the
+lock or the working copy, while the filesystem permissions are perfectly fine:
+the sandbox is the read-only thing, and no bit on the directory records it.
+
+The reference installation keeps its database on a USB SSD at
+`/mnt/ssd/arraysense`. The fix is a drop-in naming that directory:
+
+    # /etc/systemd/system/arraysense-backup.service.d/ssd.conf
+    [Service]
+    ReadWritePaths=/mnt/ssd/arraysense
+
+then `systemctl daemon-reload`. This is the same carve-out the collector service
+needs for its own writes — both units run under the same sandbox.
+
+This was found on a real machine, and before it was fixed the failure did not
+even look like this: the journal said `another backup is running` when no backup
+was running, which sent somebody looking for a process that did not exist. The
+`ReadWritePaths` line was the fix there too, and it is the phrase to search for
+when a backup reports nothing written.
+
+### A destination the settings page refused
+
+Changing the backup directory on the settings page does not just store the path:
+the service first proves it could write there, by creating and removing a real
+file, under its own sandbox. A destination that only fails at the configured
+hour fails unattended, and this is the one moment a person is present to read
+the remedy. The page names which of three causes it hit, and the three look
+alike from a distance while needing different fixes:
+
+1. **The directory does not exist.** The page says so and prints the create
+   command. `sudo install -d -o arraysense -g arraysense -m 0750 /path/to/backups`
+   creates it owned by the service account, so whichever side runs first — root
+   by hand, the service on the timer — the directory does not end up owned by
+   the wrong user.
+
+2. **The service user cannot write there.** The page says the path exists but
+   the service cannot write to it. `sudo chown arraysense:arraysense /path/to/backups`
+   hands the directory to the service account. Permissions are the whole story.
+
+3. **The directory is outside the unit's `ReadWritePaths`.** The path exists and
+   the owner is right, and the write still fails, because `ProtectSystem=strict`
+   mounts it read-only to the service and the kernel answers `Read-only file
+   system` — a cause no filesystem bit records. The fix is a drop-in naming the
+   directory on *both* units — `arraysense-backup.service` writes the archive
+   there, and `arraysense.service` is the process running the check when you
+   save — then `systemctl daemon-reload`.
+
+The wrong remedy is worse than none: a chown will not fix a read-only mount, and
+no amount of `ReadWritePaths` will fix an owner.
+
+### Restoring a backup
+
+The restore command is `arraysense restore`, pointed at one of the archives:
+
+```bash
+arraysense restore /var/backups/arraysense/arraysense-2026-08-12.db.gz
+```
+
+A successful backup prints the exact restore command for that archive, so it
+does not have to be remembered. What `restore` guarantees is what a shell
+one-liner cannot: the live database is not touched until the unpacked archive
+has been proven to be a real database with rows in it. It unpacks to a temporary
+file beside the live database, checks that the file is non-empty, has database
+pages, has the expected table, and has rows — naming which check failed — and
+only then stops the service, preserves the current database as `.prev`, moves
+the restored file into place, starts the service, and waits for it to answer.
+The `.prev` is kept until the new file has started, so a restore that goes wrong
+still has the pre-restore database on disk.
+
+Do not hand-roll this with `gunzip` and a redirect. Measured on a real machine,
+that recipe destroyed a live database: a corrupt archive made `gunzip` write
+nothing, the shell redirect created a zero-byte file, `PRAGMA quick_check`
+reported `ok` on zero bytes, and the `mv` replaced 1000 rows of history with an
+empty file. The step that should have caught it silently did nothing, because
+`sqlite3` was not installed on that machine at all.
+
+### What a backup does not protect against
+
+A backup is a copy of the database on the same machine. The point is that it
+sits on a different disk from the database, so the database disk failing takes
+the original and leaves the copy. But the machine itself takes both. A Pi that
+dies — the board, the power supply, the whole box — carries the SSD and the card
+together, and the copy dies with the original. It is a defence against the
+database's disk failing, not against the machine failing, and it should not be
+described as more than that.
+
 ## Finding your dongle serial
 
 It appears on the dongle's label, in your router's DHCP client list, and as the name
