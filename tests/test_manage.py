@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import subprocess
 from typing import Any
@@ -115,6 +116,65 @@ def test_status_reports_absent_facts_as_absent(
     assert facts["first"] is None
     assert facts["last"] is None
     assert facts["bytes"] > 0
+    assert facts["readable"] is True
+
+
+def test_an_unreadable_database_is_not_reported_as_empty(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A database that could not be opened must never read as one with no rows.
+
+    Measured on the reference installation: the file is mode 0640 owned by the
+    service user, so an ordinary user got "empty" for 668 days of history.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can read a 0000 file, so this cannot be exercised")
+    db = tmp_path / "locked.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    db.chmod(0o000)
+
+    facts = manage.database_facts(str(db))
+    assert facts["bytes"] > 0
+    assert facts["readable"] is False
+    assert facts["first"] is None
+
+
+def test_an_empty_database_is_readable_and_says_so(tmp_path: Any) -> None:
+    """An empty file that opened is a measured absence; only an unopened one is
+    not. The distinction is the whole reason readable exists as a fact."""
+    db = tmp_path / "empty.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    facts = manage.database_facts(str(db))
+    assert facts["readable"] is True
+    assert facts["first"] is None
+
+
+def test_status_says_unreadable_rather_than_empty(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A database that could not be read must say so, not claim it is empty."""
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(
+        manage, "service_state", lambda port, timeout=5.0: ("collecting", {"version": "0.7.3"})
+    )
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout=5.0: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/nope/a.db")
+    monkeypatch.setattr(
+        manage,
+        "database_facts",
+        lambda path: {"bytes": 277057536, "first": None, "last": None, "readable": False},
+    )
+    manage.cmd_status([])
+    out = capsys.readouterr().out
+    assert "unreadable" in out
+    assert "empty" not in out
 
 
 def test_status_reports_a_real_date_range_from_the_real_schema(

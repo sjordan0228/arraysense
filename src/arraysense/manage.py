@@ -210,8 +210,14 @@ def database_facts(path: str) -> dict[str, Any]:
     Asked because "how big is it and how far back does it go" is most of what a
     support conversation needs, and because a fresh install legitimately has no
     range at all — which must read as absent rather than as a guessed date.
+
+    ``readable`` separates the two ways "no range" happens, and the whole
+    project exists for this distinction: a file that could not be opened is not
+    an empty database, and printing it as one told a real owner their 668 days
+    of history were gone. The default is False because every early return here
+    is a thing that was not read.
     """
-    facts: dict[str, Any] = {"bytes": 0, "first": None, "last": None}
+    facts: dict[str, Any] = {"bytes": 0, "first": None, "last": None, "readable": False}
     try:
         facts["bytes"] = os.path.getsize(path)
     except OSError:
@@ -226,6 +232,9 @@ def database_facts(path: str) -> dict[str, Any]:
         return facts
     finally:
         conn.close()
+    # The query returned, so the file genuinely opened; whether it has rows is
+    # a separate question answered below.
+    facts["readable"] = True
     if row and row[0] is not None:
         # Local dates, deliberately. energy.py cuts every calendar day in the
         # installation's local zone, so a UTC date here would disagree with the
@@ -292,8 +301,16 @@ def cmd_status(argv: list[str]) -> int:
     )
     print(driver_line(_probe(capabilities_url(port), timeout=5.0)))
     facts = database_facts(_database_path())
-    span = "empty" if facts["first"] is None else f"{facts['first']} .. {facts['last']}"
-    print(f"database:  {facts['bytes'] / 1048576:.1f} MB, {span}")
+    size = f"{facts['bytes'] / 1_048_576:.1f} MB"
+    if not facts["readable"]:
+        # The database is owned by the service user by design; reading it is a
+        # privileged act, so the remedy is sudo rather than a repair.
+        span = "unreadable — run with sudo to see the date range"
+    elif facts["first"] is None:
+        span = "empty"
+    else:
+        span = f"{facts['first']} .. {facts['last']}"
+    print(f"database:  {size}, {span}")
     return 0
 
 
