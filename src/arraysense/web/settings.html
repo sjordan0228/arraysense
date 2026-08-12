@@ -1474,6 +1474,15 @@ function mountPanelsEditor(spec) {
 const SITE_LAT = 'site.latitude';
 const SITE_LON = 'site.longitude';
 
+// A postcode-or-place lookup that fills the coordinate boxes from the
+// Open-Meteo geocoding service. Replaces the geolocation control, which
+// never appears at the origins this service is actually served from
+// (plain HTTP at a LAN address — a secure-context API that refuses
+// without asking). The coordinate boxes stay because some countries'
+// postcodes are not covered by the geocoder, and the help text must
+// not describe them as more accurate: moving 4.6 km changes modelled
+// plane-of-array irradiance by 0.006%, against a forecast grid of
+// about 11 km.
 function mountLocation() {
   const lat = fields.find((f) => f.key === SITE_LAT);
   const lon = fields.find((f) => f.key === SITE_LON);
@@ -1481,71 +1490,76 @@ function mountLocation() {
   const anchor = document.querySelector(`.f[data-for="${CSS.escape(SITE_LON)}"]`);
   if (!anchor || !anchor.parentNode) return;
 
-  // Its own row across the grid, and deliberately not a `.f` — that class
-  // means "a control for one setting", and everything which walks the form
-  // looking for a label, a value and an error line would then find a box with
-  // none of the three.
   const geo = document.createElement('div');
   geo.className = 'wide geo';
   const note = document.createElement('span');
   note.className = 'said';
   anchor.parentNode.insertBefore(geo, anchor.nextSibling);
 
-  const usable = window.isSecureContext && navigator.geolocation;
-  if (!usable) {
-    note.className = 'said';
-    note.textContent = 'A browser only shares a location with a page served over HTTPS or '
-      + `opened at localhost. This one is at ${location.origin}, where it refuses without `
-      + `asking, so ${lat.label.toLowerCase()} and ${lon.label.toLowerCase()} have to be `
-      + 'typed in — or the page opened from the machine the service runs on.';
-    geo.appendChild(note);
-    return;
-  }
-
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'iconbtn';
-  button.textContent = 'Use this device’s location';
-  geo.appendChild(button);
-  geo.appendChild(note);
+  // A text box and a Look-up button. The geocoder returns candidates;
+  // a single one fills the coordinate boxes and names what it matched.
+  // Ambiguity is shown as a short list — nothing is filled until the
+  // owner picks one.
+  geo.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+      <input type="text" id="geoQuery" placeholder="Postcode or place name"
+        style="width:220px;background:var(--tint);border:1px solid var(--panel-b);
+          color:var(--ink);border-radius:8px;padding:5px 8px;font:inherit;font-size:13px">
+      <button type="button" id="geoLookup" style="background:var(--tint);
+        border:1px solid var(--panel-b);color:var(--ink);border-radius:8px;
+        padding:5px 12px;font:inherit;font-size:12px;cursor:pointer">Look up</button>
+    </div>
+    <div class="said" id="geoNote" style="font-size:11px;color:var(--ink3)"></div>
+    <div id="geoCandidates" style="margin-top:4px;font-size:12px"></div>`;
 
   const put = (key, value) => {
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (!el) return;
-    // Five decimal places is about a metre, and the browser's own figure
-    // carries a dozen digits of arithmetic noise past the point its accuracy
-    // supports. Rounding it is not losing anything that was ever measured.
     el.value = String(Number(value.toFixed(5)));
     el.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
-  button.addEventListener('click', () => {
-    button.disabled = true;
-    note.className = 'said';
-    note.textContent = 'Asking the browser…';
-    navigator.geolocation.getCurrentPosition((position) => {
-      button.disabled = false;
-      put(SITE_LAT, position.coords.latitude);
-      put(SITE_LON, position.coords.longitude);
-      const metres = Number(position.coords.accuracy);
-      note.className = 'said ok';
-      note.textContent = 'Filled in from this device'
-        + (Number.isFinite(metres) ? `, accurate to about ${Math.round(metres)} m.` : '.')
-        + ' Nothing is saved until Save changes.';
-    }, (err) => {
-      button.disabled = false;
-      note.className = 'said warn';
-      // Reported rather than swallowed, and with the browser's own words: a
-      // refusal, a device with no fix and a timeout call for three different
-      // reactions, and the settings page is not the place to guess which.
-      const why = err && err.code === 1 ? 'The browser refused to share a location'
-        : err && err.code === 2 ? 'The device could not work out where it is'
-        : err && err.code === 3 ? 'The browser took too long to answer'
-        : 'The browser would not share a location';
-      const said = err && err.message ? ` (${err.message})` : '';
-      note.textContent = `${why}${said}. Type the coordinates in instead.`;
-    }, { timeout: 15000, maximumAge: 60000 });
-  });
+  $('geoLookup').onclick = async function() {
+    const q = $('geoQuery').value.trim();
+    if (!q) return;
+    const btn = $('geoLookup'), note = $('geoNote'), cand = $('geoCandidates');
+    btn.disabled = true; note.textContent = 'Looking up…'; cand.textContent = '';
+    try {
+      const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
+      const body = await r.json();
+      const results = (body && body.candidates) || [];
+      if (!results.length) { note.textContent = 'Nothing matched that name.'; btn.disabled = false; return; }
+      if (results.length === 1) {
+        const c = results[0];
+        put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+        note.textContent = `${c.name}, ${c.admin1 || c.country} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}). Nothing is saved until you save.`;
+        cand.textContent = '';
+      } else {
+        cand.innerHTML = results.map((c, i) => {
+          const place = [c.name, c.admin1, c.country].filter(Boolean).join(', ');
+          return `<button type="button" class="geo-cand" data-idx="${i}"
+            style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+            background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+            color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+            ${esc(place)} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)})</button>`;
+        }).join('');
+        note.textContent = `${results.length} results — pick one.`;
+        for (const b of cand.querySelectorAll('.geo-cand')) {
+          b.addEventListener('click', function() {
+            const c = results[parseInt(this.dataset.idx)];
+            put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+            note.textContent = `${c.name}, ${c.admin1 || c.country} chosen. Nothing is saved until you save.`;
+            cand.textContent = '';
+          });
+        }
+      }
+    } catch (e) {
+      note.textContent = 'Could not reach the service.';
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
 function mountExtras() {

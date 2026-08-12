@@ -84,6 +84,7 @@ from arraysense.tariff import (
     merge_shortfalls,
 )
 from arraysense.weather import fetch_archive_hours
+from arraysense.weather.open_meteo import geocode
 
 if TYPE_CHECKING:
     # For the annotation only. Nothing here calls into the collector: the
@@ -405,6 +406,21 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
         # beside any other verdict attaches an old cause to a new condition.
         "reason": s.last_error if verdict in _NAMED_FAULTS else None,
     }
+
+
+@router.get("/geocode")
+async def geocode_route(q: str, country: str | None = None) -> dict[str, Any]:
+    """Resolve a postcode or place name to coordinates via Open-Meteo geocoding.
+
+    Reads nothing and writes nothing — needs no store. Returns a list of
+    candidates, empty when the service finds nothing, absent when the fetch
+    itself failed. A page must show every candidate so the owner picks;
+    a single candidate already fills the boxes.
+    """
+    results = geocode(q.strip(), country.strip() if country else None)
+    if results is None:
+        raise HTTPException(status_code=502, detail="geocoding service unreachable")
+    return {"query": q.strip(), "candidates": results}
 
 
 @router.get("/status")

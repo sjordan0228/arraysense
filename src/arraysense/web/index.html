@@ -1976,8 +1976,86 @@ function showWizard(payload) {
         inverter, which model, and how it is wired — and it will start collecting.
         Everything here can be changed later on the settings page.</p>
       <div id="wizardHost"></div>
+      <!-- A skippable postcode step. The location is the one thing the
+           service cannot reconstruct on its own — the weather poller
+           records nothing without it, and recovery needs an explicit
+           backfill — so it is worth offering before the first start. -->
+      <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
+        <div style="font-size:14px;font-weight:600;margin-bottom:8px">Where is this installation?</div>
+        <p style="font-size:11px;color:var(--ink3);margin:0 0 10px;max-width:65ch">
+          Enter a postcode or place name so the weather service knows which sky
+          to watch. You can set this later on the settings page — skip it now
+          and the collector starts, but the forecast and the performance model
+          stay blank until a location is entered.
+        </p>
+        <div><input id="wizPostcode" type="text" placeholder="e.g. 76226"
+          style="width:220px;background:var(--tint);border:1px solid var(--panel-b);
+            color:var(--ink);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px">
+          <button type="button" id="wizGeocode" style="margin-left:6px;background:var(--pv);
+            border-color:transparent;color:#1a1204;border-radius:8px;padding:6px 14px;
+            font-weight:600;font-size:13px;cursor:pointer">Look up</button>
+          <span id="wizGeoNote" style="font-size:11px;color:var(--ink3);margin-left:8px"></span>
+        </div>
+        <div id="wizCandidates" style="margin-top:6px;font-size:12px"></div>
+      </div>
     </section>`;
-  mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: applyAndWatch });
+  // Wrap the onApply to carry the postcode result alongside the setup body.
+  // The first-run side reads latitude/longitude/timezone from the
+  // POST body and writes them into the brand-new settings table before
+  // the config file replaces the target.
+  let wizLat = null, wizLon = null, wizTz = null;
+  const _wizOriginalApply = applyAndWatch;
+  function wizApply(body, ui) {
+    if (wizLat != null) body.latitude = wizLat;
+    if (wizLon != null) body.longitude = wizLon;
+    if (wizTz != null) body.timezone = wizTz;
+    return _wizOriginalApply(body, ui);
+  }
+  const setupShell = mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: wizApply });
+  // The postcode lookup. Reads nothing and writes nothing — it only resolves
+  // a name to coordinates, and the apply carries them.
+  $('wizGeocode').onclick = async function() {
+    const q = $('wizPostcode').value.trim();
+    if (!q) return;
+    const btn = $('wizGeocode'), note = $('wizGeoNote'), cand = $('wizCandidates');
+    btn.disabled = true; note.textContent = 'Looking up…'; cand.textContent = '';
+    try {
+      const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
+      const body = await r.json();
+      const results = (body && body.candidates) || [];
+      if (!results.length) { note.textContent = 'Nothing matched that name.'; btn.disabled = false; return; }
+      if (results.length === 1) {
+        const c = results[0];
+        wizLat = c.latitude; wizLon = c.longitude; wizTz = c.timezone || null;
+        note.textContent = `${c.name}, ${c.admin1 || c.country} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}).`;
+        cand.textContent = '';
+      } else {
+        // Ambiguity is shown, never resolved silently.
+        cand.innerHTML = results.map((c, i) => {
+          const place = [c.name, c.admin1, c.country].filter(Boolean).join(', ');
+          return `<button type="button" class="wiz-cand" data-idx="${i}"
+            style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+            background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+            color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+            ${esc(place)} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)})</button>`;
+        }).join('');
+        note.textContent = `${results.length} results — pick one.`;
+        for (const b of cand.querySelectorAll('.wiz-cand')) {
+          b.addEventListener('click', function() {
+            const c = results[parseInt(this.dataset.idx)];
+            wizLat = c.latitude; wizLon = c.longitude; wizTz = c.timezone || null;
+            note.textContent = `${c.name}, ${c.admin1 || c.country} chosen.`;
+            cand.textContent = '';
+          });
+        }
+      }
+    } catch (e) {
+      note.textContent = 'Could not reach the service.';
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
 // Apply, then watch the restart. The service writes the config and restarts

@@ -22,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, date, datetime, timedelta
+from zoneinfo import available_timezones
 
 from arraysense.forecast import SkyHour
 from arraysense.metrics import INVERTER_METRICS
@@ -30,6 +31,7 @@ from arraysense.models import Sample
 logger = logging.getLogger(__name__)
 
 _BASE = "https://api.open-meteo.com/v1/forecast"
+_GEOCODE_BASE = "https://geocoding-api.open-meteo.com/v1/search"
 
 # What Open-Meteo calls each value -> the registry metric it lands in.
 _FIELDS: dict[str, str] = {
@@ -331,3 +333,71 @@ def fetch_current(latitude: float, longitude: float, timeout: float = 10.0) -> S
     if not readings:
         return None
     return Sample(timestamp=datetime.now(UTC), readings=readings)
+
+
+def geocode(query: str, country: str | None = None) -> list[dict[str, object]] | None:
+    """Resolve a postcode or place name to coordinates, or None on any failure.
+
+    Calls the same keyless Open-Meteo geocoding API as the weather client
+    already uses, so this costs no new dependency and no new key. Returns a
+    list of candidate results each carrying name, admin1, country, country
+    code, latitude, longitude and the timezone — but only when that timezone
+    is in ``zoneinfo.available_timezones()``, because ``site.timezone`` is a
+    ``choice`` setting validated against the tz database and a zone the
+    registry would refuse must be dropped here rather than travelling to the
+    page and being refused at save time on a field the owner did not
+    knowingly fill.
+
+    Returns None when the fetch fails or the reply carries no ``results``
+    key — the same shape ``fetch_current`` already handles for a missing
+    block. An empty list means the service answered, found nothing, and said
+    so, which is a successful lookup with no matches rather than a failure.
+    """
+    params: dict[str, str] = {"name": query, "count": "5", "language": "en", "format": "json"}
+    if country:
+        params["countryCode"] = country
+    url = f"{_GEOCODE_BASE}?{urllib.parse.urlencode(params)}"
+    try:
+        raw = _http_get(url, timeout=10.0)
+        body = json.loads(raw)
+        candidates = body.get("results")
+    except _FETCH_ERRORS as exc:
+        logger.debug("geocode fetch failed: %s", exc)
+        return None
+    except (KeyError, TypeError) as exc:
+        logger.debug("geocode reply unreadable: %s", exc)
+        return None
+    if not isinstance(candidates, list):
+        return None
+
+    known_zones = available_timezones()
+    results: list[dict[str, object]] = []
+    for entry in candidates:
+        if not isinstance(entry, dict):
+            continue
+        tz = entry.get("timezone")
+        if not isinstance(tz, str) or tz not in known_zones:
+            # A timezone the registry would refuse is dropped here, where
+            # the geocoder gave it, rather than travelling to the page and
+            # being refused at save time on a field the owner did not fill.
+            continue
+        lat = entry.get("latitude")
+        lon = entry.get("longitude")
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            continue
+        name = entry.get("name", "")
+        admin1 = entry.get("admin1", "")
+        country_name = entry.get("country", "")
+        country_code = entry.get("country_code", "")
+        results.append(
+            {
+                "name": str(name) if isinstance(name, str) else "",
+                "admin1": str(admin1) if isinstance(admin1, str) else "",
+                "country": str(country_name) if isinstance(country_name, str) else "",
+                "country_code": str(country_code) if isinstance(country_code, str) else "",
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "timezone": tz,
+            }
+        )
+    return results
