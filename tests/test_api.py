@@ -3032,8 +3032,48 @@ def test_forecast_serves_the_newest_revision_and_the_hours_measured(tmp_path: Pa
     # expected_today_kwh: the prediction summed, in kWh
     assert body["expected_today_kwh"] == pytest.approx(1.57, abs=0.01)
 
-    # actual_so_far_kwh: (150 + 600) / 1000
-    assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
+    # actual_so_far_kwh: (150 + 600) / 1000, once both staged hours are over.
+    # The suite can be running inside one of them, and an hour in progress is
+    # counted for the part of it that has happened rather than for a whole one.
+    if datetime.now(UTC) >= h3:
+        assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
+    else:
+        assert body["actual_so_far_kwh"] < 0.75
+
+
+def test_the_hour_in_progress_is_counted_for_the_part_that_has_happened() -> None:
+    """An hourly mean multiplied by a whole hour claims energy nobody has made.
+
+    The maintenance pass rebuilds the hourly tier through the open bucket on
+    purpose, so the current hour is always present and always a mean over only
+    the elapsed part of itself. Treating it as a full hour overstates the day by
+    the unelapsed remainder — largest at the top of each hour, and worth 9-10
+    kWh against a ~77 kWh day on the reference array.
+    """
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    complete = datetime(2026, 8, 12, 9, tzinfo=UTC)
+    open_hour = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    now = open_hour + timedelta(minutes=30)
+
+    total = _energy_so_far_kwh([(complete, 6000.0), (open_hour, 12000.0)], now)
+    assert total == pytest.approx(6.0 + 6.0)
+
+
+def test_energy_so_far_is_a_dash_and_never_a_zero() -> None:
+    """No hour has a reading yet is not the same statement as produced nothing."""
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    assert _energy_so_far_kwh([], datetime(2026, 8, 12, 10, tzinfo=UTC)) is None
+
+
+def test_an_hour_that_has_not_started_contributes_nothing() -> None:
+    """A row ahead of the clock is not energy owed against it."""
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    now = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    ahead = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    assert _energy_so_far_kwh([(ahead, 12000.0)], now) == 0.0
 
 
 def test_forecast_refresh_seconds_follows_the_setting(client: Any, monkeypatch: Any) -> None:

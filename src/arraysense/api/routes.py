@@ -80,6 +80,11 @@ from arraysense.tariff import (
     EnergyShortfall,
     PeriodEnergy,
     Tariff,
+    # Private to tariff.py, and imported here rather than rewritten: CLAUDE.md
+    # names this and costs._real_minutes as the only two places a duration is
+    # allowed to be measured, because the one that does not go through them is
+    # the one that reads a 23-hour day as 24.
+    _elapsed,
     apportion_fixed,
     estimate_bill,
     load_tariff,
@@ -177,6 +182,41 @@ def _request_zone(store: SqliteStore, tz: str | None) -> ZoneInfo:
     """
     configured = SettingsStore(store).get(SETTING_TIMEZONE)
     return resolve_zone(tz, configured if isinstance(configured, str) else None)
+
+
+def _energy_so_far_kwh(
+    hourly_means: Sequence[tuple[datetime, float]],
+    now: datetime,
+) -> float | None:
+    """Energy from a run of hourly mean powers, with the open hour left open.
+
+    Each hourly row is a mean over the readings inside its bucket, so its energy
+    is that mean times the hour — except for the hour in progress, which is a
+    mean over the part of it that has happened. The maintenance pass rebuilds
+    the hourly tier through the open bucket deliberately, so the current hour is
+    always there and always short; multiplying it by a whole hour claims energy
+    nobody has made yet, and the overstatement is largest at the top of the hour
+    and worth 9-10 kWh against a 77 kWh day on the reference array.
+
+    None when there is nothing to add up: a dash, never a zero, because zero is
+    a claim the array produced nothing.
+
+    What this still cannot see is an hour the collector covered only in part —
+    a mean over five minutes of an hour it was up for reads as an hour. The
+    hourly tier's ``sample_count`` is the only witness to that, and turning it
+    into minutes needs a cadence figure that is 11 s configured, 12 s achieved
+    and 16 s averaged over a long window, so it would trade a bounded error for
+    an unbounded guess.
+    """
+    if not hourly_means:
+        return None
+    total_wh = 0.0
+    for hour, mean_w in hourly_means:
+        # Both are UTC here, but the duration goes through _elapsed anyway: it
+        # is the habit that keeps the one that matters from being the exception.
+        elapsed_hours = _elapsed(hour, now) / 3600.0
+        total_wh += mean_w * min(max(elapsed_hours, 0.0), 1.0)
+    return total_wh / 1000.0
 
 
 def _weather_interval(store: SqliteStore) -> float:
@@ -1716,15 +1756,14 @@ def forecast(
     # Actual production so far. Null when no hour has a reading yet — a dash,
     # never zero, because zero means the array produced nothing and that is a
     # different statement from "nobody has looked yet".
-    actual_by_hour: dict[datetime, float] = {}
-    actual_wh = 0.0
-    for row in actual_rows:
-        if not row.get("error") and row.get("pv_total_power_w") is not None:
-            ts = cast(datetime, row["timestamp"])
-            w = cast(float, row["pv_total_power_w"])
-            actual_by_hour[ts] = w
-            actual_wh += w
-    actual_so_far_kwh: float | None = actual_wh / 1000.0 if actual_by_hour else None
+    actual_so_far_kwh = _energy_so_far_kwh(
+        [
+            (cast(datetime, row["timestamp"]), cast(float, row["pv_total_power_w"]))
+            for row in actual_rows
+            if not row.get("error") and row.get("pv_total_power_w") is not None
+        ],
+        now,
+    )
 
     return {
         "configured": True,
