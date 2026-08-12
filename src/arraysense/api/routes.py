@@ -2203,7 +2203,6 @@ def efficiency(
     scored_names = {r.string_name for r in daily_rows if r.string_name}
     described_names = {s.name for s in strings}
     total_kwp = sum(_string_kwp(s) for s in strings if s.name in scored_names)
-    strings_missing = bool(described_names - scored_names)
 
     # How much of the period the total was actually totalled over. A day the
     # engine could not model returns no rows at all, so it simply vanishes from
@@ -2213,6 +2212,17 @@ def efficiency(
     # count as owed — a week asked for on its Tuesday is not missing Thursday.
     days_expected = sum(1 for ds, _ in days if ds <= now)
     days_scored = len({r.day for r in by_string.get("", [])})
+
+    # A string read on some days and silent on others produces rows for only the
+    # days it was read.  Counting it as "scored" because it appears at all is how
+    # a week of four West-string days plus seven South-string days reported
+    # itself complete, with a specific yield understated in exact proportion to
+    # the days West was absent.  The total is only complete when every described
+    # string was scored on every expected day.
+    string_days: dict[str, int] = {}
+    for s in strings:
+        string_days[s.name] = len({r.day for r in by_string.get(s.name, [])})
+    any_string_incomplete = any(d < days_expected for d in string_days.values())
 
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
         expected = sum(r.expected_kwh for r in rows)
@@ -2232,6 +2242,11 @@ def efficiency(
         # Per-string kWp for per-string yield; total for total.
         kwp = total_kwp if name == "" else sum(_string_kwp(s) for s in strings if s.name == name)
         sy: float | None = actual / kwp if kwp > 0.0 else None
+        # The total is incomplete when any string is incomplete.  A per-string
+        # row is incomplete when its own days fall short of what the period owes,
+        # even if the string appeared on SOME days — four days scored of seven is
+        # a partial figure presented as complete without this check.
+        my_days = string_days.get(name, 0) if name else days_scored
         return {
             "expected_kwh": round(expected, 3),
             "actual_kwh": round(actual, 3),
@@ -2241,17 +2256,18 @@ def efficiency(
             "pr": round(pr, 4) if pr is not None else None,
             "specific_yield": round(sy, 3) if sy is not None else None,
             "tolerance_pct": _METER_TOLERANCE_PCT,
-            # Three different incompletenesses, and the flag has to carry all of
+            # Four different incompletenesses, and the flag has to carry all of
             # them. ``r.partial`` is a within-day figure — how much of a day's
-            # daylight the engine could model — and it is blind both to a day
-            # that produced no row to carry a flag on and to a string the
-            # inverter was silent about for the whole period.
+            # daylight the engine could model — and it is blind to a day that
+            # produced no row to carry a flag on, to a string the inverter was
+            # silent about for the whole period, and to a string that reported on
+            # some days but not all of them.
             "partial": (
                 any(r.partial for r in rows)
-                or days_scored < days_expected
-                or (name == "" and strings_missing)
+                or my_days < days_expected
+                or (name == "" and any_string_incomplete)
             ),
-            "days_scored": days_scored,
+            "days_scored": my_days,
             "days_expected": days_expected,
         }
 
