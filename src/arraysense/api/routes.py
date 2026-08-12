@@ -54,7 +54,14 @@ from arraysense.costs import (
     price_period,
     unpriced_minutes,
 )
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day, compute_hours
+from arraysense.curtailment import StringBaseline
+from arraysense.efficiency import (
+    CONFIG_VERSION_KEY,
+    EfficiencyRow,
+    compute_day,
+    compute_hours,
+    fitted_baselines,
+)
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.panels import StringSpec, parse_strings
@@ -2009,21 +2016,40 @@ def _hourly_efficiency_for_range(
     ]
 
 
-def _baseline_info(daily_rows: list[EfficiencyRow]) -> dict[str, Any]:
-    """Build the baseline block from the computed rows.
+_NO_BASELINE: dict[str, Any] = {"window_start": None, "window_end": None, "samples": None}
 
-    Reports the window the first day's rows cover.  Sample count is absent
-    because the daily summary rows do not carry it — a day whose baseline
-    could not be fitted returns no rows at all, so the presence of rows is
-    itself the signal that the system is calibrated.
+
+def _baseline_info(
+    baselines: Mapping[str, StringBaseline | None],
+    range_start: datetime,
+    range_end: datetime,
+) -> dict[str, Any]:
+    """What the curtailment rule was actually calibrated against, or nothing.
+
+    This used to report a window whenever any daily row existed, reasoning that
+    a day whose baseline could not be fitted returns no rows. It does not:
+    ``baseline_for`` returns None for a string with fewer than three producing
+    hours, ``compute_hours`` then disables the signature test for that string
+    and scores the day anyway, and the page said "Calibrated from <date>" for a
+    system where nothing had been fitted and where curtailment could never be
+    booked. On the reference installation that is the state every morning until
+    the third producing hour lands.
+
+    The window is the range the fit ran over rather than the first day of the
+    period, which was never when anything was fitted either, and ``samples`` is
+    the pairs behind the thinnest string's fit — the evidence the claim rests
+    on, which the page had no way to show while it was always null.
     """
-    if not daily_rows:
-        return {"window_start": None, "window_end": None, "samples": None}
-    first_day = daily_rows[0].day
+    fitted = [b for b in baselines.values() if b is not None]
+    if not fitted or len(fitted) < len(baselines):
+        # One unfitted string is enough to withhold the claim: it is exactly the
+        # string whose curtailment cannot be seen, and a window covering it
+        # would say the opposite.
+        return dict(_NO_BASELINE)
     return {
-        "window_start": first_day.isoformat(),
-        "window_end": (first_day + timedelta(days=1)).isoformat(),
-        "samples": None,
+        "window_start": range_start.isoformat(),
+        "window_end": range_end.isoformat(),
+        "samples": min(b.samples for b in fitted),
     }
 
 
@@ -2103,7 +2129,7 @@ def efficiency(
             "hours": None,
             "days": [],
             "worst_hour": None,
-            "baseline": {"window_start": None, "window_end": None, "samples": None},
+            "baseline": dict(_NO_BASELINE),
         }
 
     config_version_raw = settings.get(CONFIG_VERSION_KEY)
@@ -2138,7 +2164,7 @@ def efficiency(
             "hours": None,
             "days": [],
             "worst_hour": None,
-            "baseline": {"window_start": None, "window_end": None, "samples": None},
+            "baseline": dict(_NO_BASELINE),
         }
 
     # Aggregate: group by string_name.  The total row has string_name == "".
@@ -2266,7 +2292,11 @@ def efficiency(
     if period != "day":
         hours = None
 
-    baseline = _baseline_info(daily_rows)
+    baseline = _baseline_info(
+        fitted_baselines(store, settings, range_start, range_end, strings),
+        range_start,
+        range_end,
+    )
 
     return {
         "configured": True,

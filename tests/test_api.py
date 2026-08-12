@@ -3384,6 +3384,81 @@ def test_efficiency_refuses_a_start_off_the_end_of_the_calendar(
     assert "calendar" in r.json()["detail"]
 
 
+def test_a_system_with_nothing_fitted_is_not_called_calibrated(tmp_path: Path) -> None:
+    """ "Calibrated from <date>" was printed whenever any daily row existed.
+
+    baseline_for returns None for a string with fewer than three producing
+    hours; compute_hours then disables the signature test for it and scores the
+    day regardless, so rows exist for a system where nothing was fitted and
+    where curtailment can never be booked. On the reference installation that is
+    the state every morning. Here the per-string voltage and current are absent
+    altogether, which is as unfitted as it gets.
+    """
+    when = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=when,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["summary"] is not None, "the day was scored, which is the whole trap"
+    assert body["baseline"] == {"window_start": None, "window_end": None, "samples": None}
+
+
+def test_a_fitted_baseline_reports_its_own_window_and_evidence(tmp_path: Path) -> None:
+    """The window is the range the fit ran over, and samples is what stood behind it."""
+    day = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        for n in range(4):
+            store.append(
+                Sample(
+                    timestamp=day + timedelta(hours=n),
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0 + n,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    baseline = body["baseline"]
+    assert baseline["window_start"] == body["start"]
+    assert baseline["window_end"] == body["end"]
+    assert baseline["samples"] == 4
+
+
 def test_efficiency_rejects_an_unknown_period(tmp_path: Path) -> None:
     with _efficiency_client(tmp_path, lambda s: None) as c:
         r = c.get(

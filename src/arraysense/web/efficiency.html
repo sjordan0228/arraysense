@@ -534,8 +534,9 @@ function renderBaseline(baseline) {
   $('baseSec').hidden = false;
   const start = new Date(ws);
   const end = new Date(we);
-  // The window is one day — the first day from the scored rows. Show it as a
-  // date so the reader knows when the baselines were last fitted.
+  // The window is the range the fit actually ran over, and the block is absent
+  // entirely when nothing was fitted — a system whose strings have too few
+  // producing hours to judge must not be told it is calibrated.
   $('baseInfo').innerHTML =
     `<dt>Calibrated from</dt>`
     + `<dd>${esc(start.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }))}`

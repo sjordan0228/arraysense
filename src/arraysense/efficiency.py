@@ -195,6 +195,61 @@ def _hourly_rows(
     return by_hour
 
 
+def _fit_baselines(
+    rows_by_hour: dict[int, dict[str, object]],
+    strings: Sequence[StringSpec],
+) -> dict[str, StringBaseline | None]:
+    """Fit each string's ordinary operating point from the rows in hand.
+
+    Split out of ``compute_hours`` so the endpoint that tells an owner their
+    system is calibrated can ask what was actually fitted instead of inferring
+    it. It reported a window whenever any daily row existed, on the stated
+    reasoning that a day whose baseline could not be fitted returns no rows —
+    which is not what happens: an unfitted string simply has its signature test
+    disabled and the day is scored without it, so "Calibrated from <date>"
+    appeared for a system where nothing had been fitted and no curtailment could
+    ever be booked. Every morning on the reference installation is that state.
+
+    Fitting it twice would be worse than not reporting it, so this stays the
+    only place the fit happens and both callers walk through here.
+    """
+    baselines: dict[str, StringBaseline | None] = {}
+    for s in strings:
+        pairs: list[tuple[float, float]] = []
+        for candidate in rows_by_hour.values():
+            volts = candidate.get(f"pv{s.mppt}_voltage_v")
+            amps = candidate.get(f"pv{s.mppt}_current_a")
+            if isinstance(volts, float) and isinstance(amps, float):
+                pairs.append((volts, amps))
+        baselines[s.name] = baseline_for(s.name, pairs)
+    return baselines
+
+
+def fitted_baselines(
+    store: SqliteStore,
+    settings: SettingsStore,
+    start: datetime,
+    end: datetime,
+    strings: Sequence[StringSpec],
+) -> dict[str, StringBaseline | None]:
+    """What the curtailment rule was calibrated against over this range.
+
+    The same rows and the same fit ``compute_hours`` runs on, so a page saying
+    the array is calibrated is reading the calibration rather than guessing from
+    the presence of a summary row. A string with fewer than three producing
+    hours in the range comes back None, which is the honest "nothing was fitted"
+    the endpoint had no way to express.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be timezone-aware")
+    if not strings:
+        return {}
+    mppt_indices = sorted({s.mppt for s in strings})
+    span = _wall_clock_hours(start, end)
+    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, start.tzinfo, span)
+    return _fit_baselines(rows_by_hour, strings)
+
+
 @dataclass(frozen=True)
 class StringHour:
     """One string's share of one hour."""
@@ -278,15 +333,7 @@ def compute_hours(
 
     # Each string against its own operating point, the bank against its own
     # widest charge limit. See curtailment.py for why neither may be a constant.
-    baselines: dict[str, StringBaseline | None] = {}
-    for s in strings:
-        pairs: list[tuple[float, float]] = []
-        for candidate in rows_by_hour.values():
-            volts = candidate.get(f"pv{s.mppt}_voltage_v")
-            amps = candidate.get(f"pv{s.mppt}_current_a")
-            if isinstance(volts, float) and isinstance(amps, float):
-                pairs.append((volts, amps))
-        baselines[s.name] = baseline_for(s.name, pairs)
+    baselines = _fit_baselines(rows_by_hour, strings)
     seen_limits: list[float | None] = []
     for candidate in rows_by_hour.values():
         limit_reading = candidate.get("bms_charge_current_limit_a")
