@@ -154,6 +154,15 @@ const BASE_CSS = `
   header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:8px}
   h1{margin:0;font-size:17px;font-weight:600;letter-spacing:-.01em}
   .conn{font-size:11.5px;color:var(--ink3)}
+  /* The header's right-hand group. It exists because the theme button is mounted
+     into the header's last element child: with the status pill bare, that child
+     is the pill, so the button lands inside it and the page's next assignment to
+     the pill's textContent wipes it out — taking the tour button with it, since
+     that one is inserted beside the theme button wherever it ended up. The
+     wrapper gives them somewhere to sit beside the pill rather than within it.
+     Every page needs it, which is why it lives here rather than in six page
+     stylesheets. */
+  .hright{display:flex;align-items:center;gap:12px}
   /* The theme button. Sized and shaped like the settings gear beside it, because
      they are the same kind of thing: a control that belongs to this browser
      rather than a reading from the inverter. */

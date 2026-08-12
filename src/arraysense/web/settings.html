@@ -132,7 +132,11 @@
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div class="conn" id="stamp"></div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <div class="conn" id="stamp"></div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>

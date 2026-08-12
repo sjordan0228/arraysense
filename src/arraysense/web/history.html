@@ -55,7 +55,11 @@
 <main>
   <header>
     <h1>History</h1>
-    <div class="conn" id="conn">loading…</div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <div class="conn" id="conn">loading…</div>
+    </div>
   </header>
 
   <!-- Filled by drawNav(). Same place on every page, so the lit entry is always
