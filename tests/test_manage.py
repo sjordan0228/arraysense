@@ -1047,7 +1047,7 @@ def test_lock_refuses_a_second_run(tmp_path: Any) -> None:
     dest.mkdir()
 
     lock_path = str(source) + ".backup.lock"
-    lock_fd = manage._take_lock(lock_path)
+    lock_fd, _reason = manage._take_lock(lock_path)
     assert lock_fd is not None
 
     try:
@@ -1060,6 +1060,48 @@ def test_lock_refuses_a_second_run(tmp_path: Any) -> None:
         os.close(lock_fd)
         with contextlib.suppress(OSError):
             os.remove(lock_path)
+
+
+def test_a_lock_that_cannot_be_created_is_not_reported_as_a_busy_one(
+    tmp_path: Any, capsys: Any
+) -> None:
+    """Measured on a real machine: ProtectSystem=strict made the database's
+    directory read-only, and the backup announced that another backup was
+    running. No backup was running."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions, so this cannot be exercised")
+    locked_dir = tmp_path / "readonly"
+    locked_dir.mkdir()
+    source = locked_dir / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    locked_dir.chmod(0o500)
+    try:
+        dest = tmp_path / "backups"
+        dest.mkdir()
+        assert manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12") is None
+        out = capsys.readouterr().out
+        assert "another backup is running" not in out
+        assert "ReadWritePaths" in out
+    finally:
+        locked_dir.chmod(0o700)
+
+
+def test_a_genuinely_held_lock_still_says_so(tmp_path: Any, capsys: Any) -> None:
+    """A lock held by a real run must still say so, or the two failures would
+    become indistinguishable the other way."""
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    with open(str(source) + ".backup.lock", "x"):
+        assert manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12") is None
+        assert "another backup is running" in capsys.readouterr().out
 
 
 def test_a_zero_length_working_copy_is_rejected(tmp_path: Any) -> None:
