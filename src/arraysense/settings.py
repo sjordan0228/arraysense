@@ -557,7 +557,10 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help=(
             "The hour, on the installation's own clock, after which the day's "
             "backup may run. The timer checks every fifteen minutes, so the "
-            "run starts at the first quarter hour at or after this time."
+            "run starts at the first quarter hour at or after this time. "
+            "A time in the last quarter-hour block of the day (23:46-23:59)"
+            "runs at 23:45, the last firing before midnight, rather than "
+            "being skipped."
         ),
     ),
     SettingSpec(

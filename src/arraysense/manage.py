@@ -620,8 +620,20 @@ def _time_has_passed(now: datetime.datetime, hour: int, minute: int) -> bool:
     clock has passed it still says yes at 03:05, so the day is not skipped. On
     a 25-hour day the configured time passes twice; the caller's check for
     today's archive is what stops the second one writing a duplicate.
+
+    A time in the last quarter-hour block of the day — minute 46 through 59
+    when the hour is 23 — has no quarter-hour firing on or after it within the
+    same calendar day. The timer fires at 00, 15, 30 and 45 past the hour, so
+    23:45 is the last firing of the day, and 00:00 is on a different date. The
+    last firing acts as a catch-up for these times: backup.minute=50 runs at
+    23:45, at most five minutes early. Without this catch-up the setting is
+    unreachable — every quarter-hour firing returns False, forever.
     """
-    return (now.hour, now.minute) >= (hour, minute)
+    # Catch-up for times between 23:46 and 23:59: the last quarter-hour
+    # firing of the local day stands in so the day gets its archive.
+    return (now.hour, now.minute) >= (hour, minute) or (
+        now.hour == 23 and now.minute == 45 and hour == 23 and minute >= 46
+    )
 
 
 def archive_name(stamp: str) -> str:

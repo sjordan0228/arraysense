@@ -1537,7 +1537,11 @@ def test_a_scheduled_run_before_the_configured_time_does_nothing_at_all(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
 ) -> None:
     """This fires ninety-six times a day. A run that is not due must leave no
-    trace, or the journal is full of a backup that did not happen."""
+    trace, or the journal is full of a backup that did not happen.
+
+    The configured time (04:30) is later than the simulated moment (03:20),
+    and is reachable at the 04:30 quarter-hour firing — unlike 23:59, which
+    no quarter-hour firing ever reaches within the same calendar day."""
     source = tmp_path / "live.db"
     _a_database(source)
     dest = tmp_path / "backups"
@@ -1549,8 +1553,8 @@ def test_a_scheduled_run_before_the_configured_time_does_nothing_at_all(
         lambda url, timeout: _settings_reply(
             **{
                 "backup.directory": str(dest),
-                "backup.hour": 23,
-                "backup.minute": 59,
+                "backup.hour": 4,
+                "backup.minute": 30,
             }
         ),
     )
@@ -1689,6 +1693,66 @@ def test_a_flag_still_beats_the_setting(tmp_path: Any, monkeypatch: pytest.Monke
     assert manage.cmd_backup(["--dir", str(asked_for)]) == 0
     assert len(list(asked_for.glob("*.gz"))) == 1
     assert list(configured.glob("*.gz")) == []
+
+
+def test_every_settable_backup_time_produces_exactly_one_archive_per_day(
+    tmp_path: Any,
+) -> None:
+    """For every (hour, minute) pair the registry allows, the quarter-hour
+    firing schedule must produce exactly one backup per calendar day.
+
+    Without this invariant, hour=23 with minute in 46..59 never fires —
+    the timer runs at 00, 15, 30, 45 past the hour, so 23:45 is the last
+    firing of the day and 00:00 is on a different calendar date, leaving
+    no quarter-hour on or after the configured time within the same day.
+
+    This is a bounded version of the full simulation that found the bug:
+    all 1440 settable times driven over a 96-slot quarter-hour day."""
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    base = datetime.datetime(2026, 8, 12, 0, 0)
+    for hour in range(24):
+        for minute in range(60):
+            written = 0
+            for slot in range(96):  # 96 quarter-hour slots
+                now = base + datetime.timedelta(minutes=slot * 15)
+                if manage._time_has_passed(now, hour, minute):
+                    stamp = now.date().isoformat()
+                    if not manage._already_written(str(dest), stamp):
+                        (dest / manage.archive_name(stamp)).write_bytes(b"x")
+                        written += 1
+            assert written == 1, f"hour={hour}, minute={minute}: expected 1 backup, got {written}"
+            # Clean up for next iteration
+            for f in dest.glob("*.gz"):
+                f.unlink()
+
+
+def test_a_scheduled_run_for_23_50_runs_at_23_45(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-up path: a time the quarter-hour schedule would otherwise
+    skip must still produce exactly one archive on the right date."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{
+                "backup.directory": str(dest),
+                "backup.hour": 23,
+                "backup.minute": 50,
+            }
+        ),
+    )
+    # 23:45 local — the last quarter-hour of the day
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 23, 45))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    names = [p.name for p in dest.glob("*.gz")]
+    assert names == ["arraysense-2026-08-12.db.gz"], names
 
 
 def test_a_run_that_used_the_fallback_says_so_in_its_output(
