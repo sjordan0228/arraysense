@@ -764,6 +764,16 @@ class SqliteStore:
         present with zeroes. Narrowed to one inverter's bank, because the packs on
         a second inverter are a second bank: they are not in parallel with these,
         so nothing that compares packs against each other may see both at once.
+
+        The query walks the serials table and probes each pack's newest row
+        through the (module_id, timestamp) index — one seek per pack, whatever
+        the history holds. It used to walk module_raw and run that MAX probe per
+        raw row, which on the reference database was 142,712 index probes and a
+        21-column row read each to return four rows, and the cost grew with every
+        stored reading: this endpoint is the one a live dashboard hits hardest.
+        A module id belongs to exactly one (device, serial) — the serials table
+        keeps them that way — so the inner MAX needs no device filter of its own:
+        every row that references the id already belongs to this inverter's bank.
         """
         names = self._check_module_names(metrics)
         selected = [
@@ -772,12 +782,12 @@ class SqliteStore:
             *(self._selected("module_raw", n, "m.") for n in names),
         ]
         rows = self._conn.execute(
-            f"SELECT {', '.join(selected)} FROM module_raw m "
-            "JOIN serials s ON s.id = m.module_id "
-            "WHERE m.device = ? AND m.timestamp = ("
-            "  SELECT MAX(timestamp) FROM module_raw WHERE module_id = m.module_id"
+            f"SELECT {', '.join(selected)} FROM serials s "
+            "JOIN module_raw m ON m.module_id = s.id "
+            "WHERE s.device = ? AND m.device = ? AND m.timestamp = ("
+            "  SELECT MAX(timestamp) FROM module_raw WHERE module_id = s.id"
             ") ORDER BY s.serial",
-            (self._device(device),),
+            (self._device(device), self._device(device)),
         ).fetchall()
         columns = ["timestamp", "serial", *names]
         return [self._decode_row(columns, row, names, module=True) for row in rows]
