@@ -234,6 +234,22 @@ def test_a_missing_config_starts_setup_mode_not_an_error(tmp_path: Path) -> None
         assert client.get("/api/status").status_code == 404
 
 
+def test_setup_mode_carries_the_running_version(tmp_path: Path) -> None:
+    # The lifecycle CLI reads the running version from whichever endpoint the
+    # service serves, and setup mode serves only /api/setup. Without a version
+    # there, `arraysense status` and `arraysense version` would call a healthy
+    # new service 'not answering'.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __version__
+    from arraysense.__main__ import build_setup_app
+
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        body = client.get("/api/setup").json()
+    assert body["version"] == __version__
+
+
 def test_first_run_apply_writes_a_config_load_accepts_and_restarts(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

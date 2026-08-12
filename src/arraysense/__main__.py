@@ -355,6 +355,11 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         )
         payload = describe_setup(placeholder)
         payload["first_run"] = True
+        # Setup mode serves only this endpoint, and the lifecycle CLI reads the
+        # running version from whichever endpoint the service serves. Without it
+        # here, `arraysense version` and `arraysense status` call a service that
+        # is up and waiting for its wizard "not answering".
+        payload["version"] = __version__
         return payload
 
     @app.post("/api/setup/detect")

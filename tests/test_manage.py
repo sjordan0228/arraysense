@@ -47,6 +47,55 @@ def test_health_gives_up_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
     assert manage.wait_until_healthy(8080, timeout=90.0, sleep=0.0) is None
 
 
+def test_a_service_in_setup_mode_is_up_not_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh install has no config, serves only /api/setup, and is healthy.
+
+    Treating that as 'down' made the installer report failure on every
+    successful first install.
+    """
+
+    def fake_probe(url: str, timeout: float = 5.0) -> dict[str, Any] | None:
+        return {"first_run": True, "version": "0.7.3"} if "setup" in url else None
+
+    monkeypatch.setattr(manage, "_probe", fake_probe)
+    state, body = manage.service_state(8080)
+    assert state == "setup"
+    assert body is not None and body["first_run"] is True
+
+
+def test_a_collecting_service_is_reported_as_collecting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_probe(url: str, timeout: float = 5.0) -> dict[str, Any] | None:
+        return {"running": True, "connected": True} if "status" in url else None
+
+    monkeypatch.setattr(manage, "_probe", fake_probe)
+    assert manage.service_state(8080)[0] == "collecting"
+
+
+def test_nothing_listening_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout=5.0: None)
+    assert manage.service_state(8080) == ("down", None)
+
+
+def test_wait_until_up_accepts_setup_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The installer's verification runs through here, and a first install
+    always lands in setup mode: that must count as up."""
+    states: list[tuple[str, dict[str, Any] | None]] = [
+        ("down", None),
+        ("setup", {"first_run": True}),
+    ]
+
+    def fake_state(port: int, timeout: float = 5.0) -> tuple[str, dict[str, Any] | None]:
+        return states.pop(0)
+
+    monkeypatch.setattr(manage, "service_state", fake_state)
+    monkeypatch.setattr("arraysense.manage.time.sleep", lambda _s: None)
+    state, body = manage.wait_until_up(8080, timeout=90.0, sleep=0.0)
+    assert state == "setup"
+    assert body is not None and body["first_run"] is True
+
+
 def test_status_reports_absent_facts_as_absent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
@@ -235,9 +284,9 @@ def test_an_unknown_subcommand_lists_the_real_ones() -> None:
 def test_restart_fails_loudly_when_the_service_does_not_come_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restart is not 'systemctl returned 0'. It is 'the collector answered'."""
+    """Restart is not 'systemctl returned 0'. It is 'the service answered'."""
     monkeypatch.setattr(manage, "service", lambda action: True)
-    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: None)
+    monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("down", None))
     assert manage.cmd_restart([]) == 1
 
 
@@ -247,7 +296,20 @@ def test_restart_returns_zero_when_the_collector_comes_back(
     """Without this, a cmd_restart that always failed would pass the suite."""
     monkeypatch.setattr(manage, "service", lambda action: True)
     monkeypatch.setattr(manage, "configured_port", lambda: 8080)
-    monkeypatch.setattr(manage, "wait_until_healthy", lambda port, **kw: {"running": True})
+    monkeypatch.setattr(
+        manage, "wait_until_up", lambda port, **kw: ("collecting", {"running": True})
+    )
+    assert manage.cmd_restart([]) == 0
+
+
+def test_restart_succeeds_when_the_service_comes_back_in_setup_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The installer's verification runs through here, and a first install
+    always lands in setup mode."""
+    monkeypatch.setattr(manage, "service", lambda action: True)
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(manage, "wait_until_up", lambda port, **kw: ("setup", {"first_run": True}))
     assert manage.cmd_restart([]) == 0
 
 
@@ -262,9 +324,45 @@ def test_restart_gives_up_when_systemctl_itself_fails(
         calls.append("polled")
 
     monkeypatch.setattr(manage, "service", lambda action: False)
-    monkeypatch.setattr(manage, "wait_until_healthy", record_poll)
+    monkeypatch.setattr(manage, "wait_until_up", record_poll)
     assert manage.cmd_restart([]) == 1
     assert calls == [], "a failed systemctl must not then wait 90s for a health check"
+
+
+def test_status_in_setup_mode_says_so_rather_than_not_answering(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A service waiting for its wizard is up, not down, and has no collector
+    or driver to report — printing 'connected=False' would describe a fault
+    that does not exist."""
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(
+        manage, "service_state", lambda port, timeout=5.0: ("setup", {"version": "0.7.3"})
+    )
+    assert manage.cmd_status([]) == 0
+    out = capsys.readouterr().out
+    assert "wizard" in out.lower()
+    assert "not answering" not in out
+    assert "connected=" not in out
+
+
+def test_version_reports_the_running_version_in_setup_mode(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A service waiting for its wizard is answering, so version says so."""
+    monkeypatch.setattr(
+        manage,
+        "run",
+        lambda argv: subprocess.CompletedProcess(argv, 0, "abc1234\n", ""),
+    )
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(
+        manage, "service_state", lambda port, timeout=5.0: ("setup", {"version": "0.7.3"})
+    )
+    assert manage.cmd_version([]) == 0
+    out = capsys.readouterr().out
+    assert "0.7.3" in out
+    assert "not answering" not in out
 
 
 def test_no_arguments_runs_status(monkeypatch: pytest.MonkeyPatch) -> None:

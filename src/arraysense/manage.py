@@ -58,6 +58,11 @@ def status_url(port: int) -> str:
     return f"http://127.0.0.1:{port}/api/status"
 
 
+def setup_url(port: int) -> str:
+    """The setup endpoint, which is all a not-yet-configured service serves."""
+    return f"http://127.0.0.1:{port}/api/setup"
+
+
 def capabilities_url(port: int) -> str:
     """The declaration endpoint, written beside status_url so both agree on the host.
 
@@ -81,6 +86,24 @@ def _probe(url: str, timeout: float) -> dict[str, Any] | None:
     return body if isinstance(body, dict) else None
 
 
+def service_state(port: int, timeout: float = 5.0) -> tuple[str, dict[str, Any] | None]:
+    """What the service is doing: collecting, waiting for setup, or not there.
+
+    A fresh install has no configuration, and that absence is deliberately what
+    puts the service into setup mode so the wizard runs. Setup mode serves
+    /api/setup and nothing else, so a check that only knows /api/status reads a
+    perfectly healthy new installation as a dead one — which is what the
+    installer told every new user before this existed.
+    """
+    body = _probe(status_url(port), timeout=timeout)
+    if body is not None:
+        return ("collecting", body)
+    body = _probe(setup_url(port), timeout=timeout)
+    if body is not None:
+        return ("setup", body)
+    return ("down", None)
+
+
 def wait_until_healthy(
     port: int, timeout: float = HEALTH_TIMEOUT, sleep: float = 2.0
 ) -> dict[str, Any] | None:
@@ -96,6 +119,24 @@ def wait_until_healthy(
             return body
         time.sleep(sleep)
     return None
+
+
+def wait_until_up(
+    port: int, timeout: float = HEALTH_TIMEOUT, sleep: float = 2.0
+) -> tuple[str, dict[str, Any] | None]:
+    """Wait until the service answers at all, either collecting or in setup.
+
+    The installer needs this rather than wait_until_healthy: a first install
+    has nothing to collect with yet, and demanding a live collector there fails
+    every successful install.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state, body = service_state(port)
+        if state != "down":
+            return (state, body)
+        time.sleep(sleep)
+    return ("down", None)
 
 
 def configured_port() -> int:
@@ -227,11 +268,22 @@ def driver_line(body: dict[str, Any] | None) -> str:
 def cmd_status(argv: list[str]) -> int:
     """Print what is running and what it sees. Read-only by design — see #34."""
     port = configured_port()
-    body = _probe(status_url(port), timeout=5.0)
-    if body is None:
+    state, body = service_state(port)
+    if state == "down":
         print(f"service: not answering on port {port}")
         print("  try: arraysense logs")
         return 1
+    # service_state returns a body for every state above "down"; a None body
+    # here would be a contract violation, and crashing on it is better than
+    # printing "None" where a version belongs.
+    assert body is not None
+    if state == "setup":
+        # No collector and no driver exist yet, so printing either would be a
+        # fault that is not there; absent is absent.
+        print("service:   running, waiting for setup")
+        print("           no configuration yet — open the dashboard to run the wizard")
+        print(f"version:   {body.get('version')}")
+        return 0
     print(f"version:   {body.get('version')}")
     staleness = (body.get("staleness") or {}).get("verdict")
     print(
@@ -261,15 +313,24 @@ def cmd_logs(argv: list[str]) -> int:
 
 
 def cmd_restart(argv: list[str]) -> int:
-    """Restart and prove it came back, rather than trusting systemctl."""
+    """Restart and prove it came back, rather than trusting systemctl.
+
+    Up is not the same as collecting: a first install restarts into setup mode
+    with no config to collect under, and that is a success, not the outage the
+    health check would call it.
+    """
     if not service("restart"):
         print("systemctl restart failed; try: arraysense logs")
         return 1
     port = configured_port()
-    if wait_until_healthy(port) is None:
+    state, _body = wait_until_up(port)
+    if state == "down":
         print("restarted, but the collector did not come back within 90s")
         print("  try: arraysense logs")
         return 1
+    if state == "setup":
+        print("restarted; waiting for setup — open the dashboard to run the wizard")
+        return 0
     print("restarted and collecting")
     return 0
 
@@ -277,8 +338,13 @@ def cmd_restart(argv: list[str]) -> int:
 def cmd_version(argv: list[str]) -> int:
     """Name the installed code and what the running service reports."""
     commit = run(["git", "-C", INSTALL_DIR, "rev-parse", "--short", "HEAD"]).stdout.strip()
-    body = _probe(status_url(configured_port()), timeout=5.0) or {}
-    print(f"version: {body.get('version') or 'not answering'}")
+    state, body = service_state(configured_port())
+    version = body.get("version") if body else None
+    if state == "down":
+        version = "not answering"
+    elif version is None:
+        version = "unknown"
+    print(f"version: {version}")
     print(f"commit:  {commit or 'unknown'}")
     return 0
 

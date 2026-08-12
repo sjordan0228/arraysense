@@ -179,6 +179,10 @@ The reference machine's drop-in:
     ExecStart=
     ExecStart=/opt/arraysense/.venv/bin/python -m arraysense --config /etc/arraysense/config.toml --host 0.0.0.0 --port 80
 
+The installer writes this file itself, and it leaves `--host` out because
+`0.0.0.0` is already the default — the reference file just states it out loud,
+so its absence is not a difference that matters.
+
 The blank `ExecStart=` is deliberate, not a typo: systemd appends to a list
 directive, so the drop-in must clear the unit's ExecStart before setting its
 own — without the empty assignment the unit carries two ExecStart lines and
