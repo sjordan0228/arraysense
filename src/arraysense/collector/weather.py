@@ -15,6 +15,16 @@ the GET takes.
 No location means no fetch: the location settings are the enable, read fresh
 every tick so setting them takes effect within one interval, no restart needed.
 
+Nothing above this loop watches it. The service's watchdog follows the inverter
+collector alone, and site metrics are deliberately outside the store's
+staleness witness — a sky reading every fifteen minutes would keep the outage
+banner quiet through a real inverter outage — so a poller that stops leaves no
+symptom at all beyond conditions ceasing to be recorded. It therefore watches
+itself: every cycle's work, the interval read included, sits inside the loop's
+guard; the loop runs under a supervisor that starts it again if it ever ends;
+and each completed cycle is stamped so ``stalled_for`` can say how long the sky
+has been unrecorded to anything that asks.
+
 As well as the current sky conditions, tick() records the day's production
 forecast. The arithmetic lives in forecast.py; what happens here is the choice
 between its two bases — the array's demonstrated performance ratio when enough
@@ -61,6 +71,23 @@ logger = logging.getLogger(__name__)
 # whichever writer hit it.
 STORE_ERRORS = (sqlite3.Error,)
 
+# How long to wait before starting the loop again after it has ended. The loop
+# is not supposed to be able to end at all — every expected failure is caught
+# inside it — so this covers only what nobody predicted, and it exists because
+# the alternative is a poller that stops for the life of the process with no
+# symptom beyond the sky quietly ceasing to be recorded. A few seconds so a
+# restarted loop is back promptly; this is the supervisor's restart delay, not
+# the poll interval — a tick that fails still waits out the configured cadence
+# rather than hammering the weather service.
+LOOP_RESTART_SECONDS = 5.0
+
+# How many intervals of silence make a poller stalled rather than merely
+# between ticks. Three, so a single slow fetch is never mistaken for a stopped
+# loop: at the registered fifteen-minute cadence a stall is called after
+# three quarters of an hour, which is far shorter than the sky readings this
+# would otherwise lose and far longer than any healthy cycle.
+STALL_INTERVALS = 3
+
 
 class WeatherPoller:
     """Fetch the weather on its own clock and append what arrives.
@@ -86,6 +113,13 @@ class WeatherPoller:
         # Which way the forecast is currently being scaled, so a change of basis
         # is logged once instead of every quarter of an hour forever.
         self._basis = ""
+        # When a cycle last completed, and what last went wrong. Nothing above
+        # this poller can report an outage it cannot measure, and the sky is
+        # kept out of the store's staleness witness on purpose — a reading
+        # every fifteen minutes would keep the dashboard's banner quiet through
+        # a real inverter outage — so the poller has to say for itself.
+        self.last_tick_at: datetime | None = None
+        self.last_error: str | None = None
 
     @property
     def running(self) -> bool:
@@ -96,7 +130,7 @@ class WeatherPoller:
         """Begin the loop; a second start on a running poller does nothing."""
         if self.running:
             return
-        self._task = asyncio.create_task(self._loop(), name="weather-poller")
+        self._task = asyncio.create_task(self._supervise(), name="weather-poller")
 
     async def stop(self) -> None:
         """Cancel the loop and wait it out, so no orphan task survives shutdown."""
@@ -114,6 +148,11 @@ class WeatherPoller:
         forecast write landed — the loop's only consumer is tests today, and
         "wrote anything" is the honest reading. A failed weather fetch does not
         prevent the forecast path from running, and vice versa.
+
+        Completing stamps ``last_tick_at`` whether or not anything was written.
+        The mark says the loop is running, which is a different question from
+        whether the sky answered: an installation with no location set writes
+        nothing forever and is working exactly as configured.
         """
         latitude = self._settings.get(SETTING_LATITUDE)
         longitude = self._settings.get(SETTING_LONGITUDE)
@@ -121,10 +160,12 @@ class WeatherPoller:
             if not self._said_idle:
                 logger.info("weather idle: no location set; set latitude and longitude to enable")
                 self._said_idle = True
+            self.last_tick_at = datetime.now(UTC)
             return False
         self._said_idle = False
 
         wrote = False
+        failure: str | None = None
 
         sample = await asyncio.to_thread(self._fetch, latitude, longitude)
         if sample is not None:
@@ -132,6 +173,7 @@ class WeatherPoller:
                 self._store.append(sample)
             except STORE_ERRORS as exc:
                 logger.warning("could not store weather reading: %s", exc)
+                failure = f"could not store weather reading: {exc}"
             else:
                 wrote = True
 
@@ -156,9 +198,15 @@ class WeatherPoller:
                     self._store.append_forecast(now, points)
             except STORE_ERRORS as exc:
                 logger.warning("could not store forecast: %s", exc)
+                # Recorded, not just logged: a poller that fails quietly is the
+                # defect this loop was hardened against, and the tick's own
+                # status is the only place an operator sees it.
+                failure = f"could not store forecast: {exc}"
             else:
                 wrote = wrote or bool(points)
 
+        self.last_tick_at = datetime.now(UTC)
+        self.last_error = failure
         return wrote
 
     def _array(self) -> tuple[StringSpec, ...]:
@@ -236,14 +284,79 @@ class WeatherPoller:
         than a number written here, so the cadence has exactly one home. The
         registry declares this setting as a float; a non-numeric default is a
         programming error worth stopping on, not a condition to paper over.
+
+        The read itself is a SELECT against a database another writer can hold
+        past the busy timeout — the condition ``STORE_ERRORS`` exists for. It
+        sits outside the loop's guard (a failed tick must still wait out the
+        configured cadence), so a busy moment here has to be its own defence:
+        it takes the registered default and tries again next cycle, rather
+        than ending the sky poller — which a locked database once did, with
+        nothing watching to start it again.
         """
-        value = self._settings.get(WEATHER_INTERVAL_KEY)
+        try:
+            value: object = self._settings.get(WEATHER_INTERVAL_KEY)
+        except STORE_ERRORS as exc:
+            logger.warning("could not read the weather interval (%s); using the default", exc)
+            value = None
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             return float(value)
         default = lookup_setting(WEATHER_INTERVAL_KEY).default
         if isinstance(default, (int, float)) and not isinstance(default, bool):
             return float(default)
         raise AssertionError(f"{WEATHER_INTERVAL_KEY} is registered without a numeric default")
+
+    def stalled_for(self, now: datetime | None = None) -> timedelta | None:
+        """How long since a cycle last completed, or None while that is normal.
+
+        The sky poller is the one collector nothing else can witness. Weather
+        rows are kept out of the store's staleness check on purpose — a reading
+        every fifteen minutes would hold the dashboard's outage banner quiet
+        through a real inverter outage — so a poller that has stopped leaves no
+        trace anywhere but here. This is what an endpoint or a supervisor reads
+        to say so.
+
+        Silence is only reported once it has lasted ``STALL_INTERVALS`` of the
+        configured cadence, so a single slow fetch is never mistaken for a
+        stopped loop. A poller that was never started returns None: nothing has
+        gone quiet that anybody asked to be loud.
+        """
+        if self.last_tick_at is None:
+            return None
+        moment = now or datetime.now(UTC)
+        idle = moment - self.last_tick_at
+        threshold = timedelta(seconds=STALL_INTERVALS * self._interval())
+        return idle if idle > threshold else None
+
+    async def _supervise(self) -> None:
+        """Run the loop, and start it again if it ever ends.
+
+        Belt and braces over the guards inside ``_loop``, and the reason it is
+        worth having is what the alternative costs: a task created with
+        ``create_task`` that nobody awaits takes its exception to the asyncio
+        handler and stops, the web server carries on serving pages, and the
+        only symptom is that recorded conditions stop arriving. Days of sky can
+        go missing before anybody notices, and every one of those days then
+        fails to score in the efficiency engine.
+
+        Cancellation is how shutdown arrives and passes straight through, so
+        ``stop`` still stops.
+        """
+        while True:
+            try:
+                await self._loop()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "weather poller stopped unexpectedly; starting it again in %.0fs",
+                    LOOP_RESTART_SECONDS,
+                )
+            else:
+                logger.error(
+                    "weather poller returned without being asked to; starting it again in %.0fs",
+                    LOOP_RESTART_SECONDS,
+                )
+            await asyncio.sleep(LOOP_RESTART_SECONDS)
 
     async def _loop(self) -> None:
         while True:
@@ -253,7 +366,15 @@ class WeatherPoller:
                 raise
             # A tick already contains every expected failure; anything else is
             # a bug worth a traceback, but the sky is not worth killing the
-            # loop over — the next tick starts clean.
+            # loop over — the next tick starts clean. The cadence read stays
+            # outside the guard: a fault anywhere in the model chain has
+            # already fetched Open-Meteo twice, and retrying it every few
+            # seconds would hammer a keyless free service, so a failed tick
+            # waits out the configured interval like any other. The read
+            # itself takes the registered default when the database is busy
+            # (see _interval), so it cannot end the loop on its own either;
+            # a cadence that genuinely cannot be read propagates to the
+            # supervisor, which restarts the loop after LOOP_RESTART_SECONDS.
             except Exception:
-                logger.exception("weather tick failed unexpectedly")
+                logger.exception("weather cycle failed unexpectedly")
             await asyncio.sleep(self._interval())

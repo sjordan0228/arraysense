@@ -29,6 +29,7 @@ from arraysense.models import Sample
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
 from arraysense.store.rollup import (
+    promote_pending_hours,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -337,6 +338,11 @@ class CollectorService:
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            # Hours written outside that window — the archive backfill's, one
+            # per past hour — are queued by the store as it writes them and
+            # brought forward here. Nothing else promotes them, and the
+            # efficiency engine reads irradiance from the hourly tier alone.
+            promote_pending_hours(conn)
 
         def _rebuild_on_own_connection() -> None:
             conn = self._store.maintenance_connection()

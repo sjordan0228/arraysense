@@ -19,6 +19,7 @@ from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
     MODULE_TIERS,
+    PENDING_TABLE,
     SETTINGS_TABLE,
     expected_columns,
     inverter_metric_columns,
@@ -149,6 +150,7 @@ def test_executing_ddl_creates_expected_tables() -> None:
             SETTINGS_TABLE,
             FORECAST_TABLE,
             EFFICIENCY_TABLE,
+            PENDING_TABLE,
         }
     )
     assert tables == expected

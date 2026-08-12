@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from arraysense.models import BatteryModuleSample, Sample
+from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -888,6 +889,19 @@ def test_an_undeclared_registry_metric_reads_back_as_none(tmp_path: Path) -> Non
     assert latest["load_power_w"] is None
 
 
+def test_peak_of_an_undeclared_metric_reads_back_as_none(tmp_path: Path) -> None:
+    # The same contract query() and latest() keep. A driver may declare
+    # per-string power and no array total — Capabilities permits it — and the
+    # forecast's cold start asks for the total on every tick. Raising there
+    # takes the whole forecast down with a traceback every interval, where the
+    # honest answer is that this database has never held such a reading.
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 500.0}))
+    got = store.peak("load_power_w", _ts() - timedelta(days=30), _ts())
+    store.close()
+    assert got is None
+
+
 def test_an_undeclared_module_metric_reads_back_as_none(tmp_path: Path) -> None:
     store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
     store.append(
@@ -1705,3 +1719,108 @@ def test_a_refused_gap_leaves_the_readings_bounds_flag_alone(tmp_path: Path) -> 
     flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
     conn.close()
     assert flagged == ["pv_total_power_w"], "the refused gap deleted the reading's flag"
+
+
+# --- what each tier actually holds --------------------------------------------
+#
+# Tier selection scored tiers on point count alone and never asked whether the
+# tier it picked holds the range at all, so a window older than the raw tier's
+# floor came back empty and one straddling it came back half its length. The
+# answer to "what does this tier hold" has to come from here; the choosing lives
+# in store.tiers.
+
+
+def test_tier_spans_report_what_each_tier_holds(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    first = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    last = datetime(2026, 8, 6, 12, 30, tzinfo=UTC)
+    for when in (first, last):
+        store.append(Sample(timestamp=when, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(
+        store._conn, int(first.timestamp()) - 3600, int(last.timestamp()) + 3600
+    )
+
+    spans = store.tier_spans()
+    store.close()
+    assert spans["full"] == (first, last)
+    # The hourly bucket is labelled by the hour it starts, not by the readings
+    # inside it.
+    assert spans["hourly"] == (
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+    )
+    # Nothing built the minute tier, and a tier holding nothing says so rather
+    # than reporting a span it does not have.
+    assert spans["minute"] is None
+
+
+def test_tier_spans_are_narrowed_to_one_inverter(tmp_path: Path) -> None:
+    # Two inverters in one stack keep separate histories, and a span that mixed
+    # them would offer one unit's rows as the other's coverage.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    mine = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    theirs = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=mine, readings={"pv_total_power_w": 1000.0}))
+    store.append(
+        Sample(timestamp=theirs, readings={"pv_total_power_w": 900.0}),
+        device="CE87654321",
+    )
+    spans = store.tier_spans()
+    other = store.tier_spans(device="CE87654321")
+    store.close()
+    assert spans["full"] == (mine, mine)
+    assert other["full"] == (theirs, theirs)
+
+
+def test_module_tier_spans_are_the_module_tables(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    when = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="BA12345678", slot=1, soc_pct=55.0),),
+        )
+    )
+    spans = store.tier_spans(module=True)
+    store.close()
+    assert spans["full"] == (when, when)
+    assert spans["hourly"] is None
+    # Module data has no minute tier at all; naming one would be a tier that
+    # cannot be queried.
+    assert "minute" not in spans
+
+
+def test_the_hourly_span_is_the_tier_span(tmp_path: Path) -> None:
+    # One answer, one query: the efficiency backfill's question is the coverage
+    # question narrowed to one tier.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    when = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(store._conn, int(when.timestamp()) - 3600, int(when.timestamp()) + 3600)
+    span = store.hourly_span()
+    spans = store.tier_spans()
+    store.close()
+    assert span == spans["hourly"]
+
+
+def test_site_only_rows_do_not_stretch_the_claimed_span(tmp_path: Path) -> None:
+    # The archive backfill writes one sky reading per past hour into raw, and
+    # merge_site_hours folds those into hourly. A site-only row can land years
+    # before any inverter history, and it must not stretch what the tier claims
+    # to hold for an inverter chart: the tier cannot answer an inverter query
+    # with it. Coverage measured from the outermost row would hand the raw tier
+    # a floor that holds nothing but sky, and the minute tier's span reads as
+    # covering years of inverter history the backfill never wrote.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    sky_at = datetime(2024, 11, 1, 15, 0, tzinfo=UTC)
+    inverter_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=sky_at, readings={"outside_temperature_c": 15.0}))
+    store.append(Sample(timestamp=inverter_at, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(
+        store._conn, int(sky_at.timestamp()) - 3600, int(inverter_at.timestamp()) + 3600
+    )
+    spans = store.tier_spans()
+    store.close()
+    assert spans["full"] == (inverter_at, inverter_at)
+    assert spans["hourly"] == (inverter_at, inverter_at)
