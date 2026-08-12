@@ -29,9 +29,16 @@ EXAMPLE_STRINGS = (
 # crystalline-module figures; 0.5 %/yr is the industry's usual degradation
 # assumption. Every one is overridable per string, and every fallback is
 # reported in ``defaulted`` so no page presents an assumption as an entry.
+# The ordinary crystalline module's nominal operating cell temperature, and the
+# reference point the cell-temperature model reads a declaration against rather
+# than as an absolute. It is named here because it is a grammar fact, and
+# solar.py imports it rather than restating it: the two drifting apart would
+# move every stored efficiency figure on an installation that declared nothing.
+DEFAULT_NOCT = 45.0
+
 _FLOAT_DEFAULTS: dict[str, float] = {
     "temp_coeff": -0.35,
-    "noct": 45.0,
+    "noct": DEFAULT_NOCT,
     "bifacial": 0.0,
     "degradation": 0.5,
 }
@@ -43,6 +50,16 @@ WIRE_GAUGES = frozenset({2, 4, 6, 8, 10, 12, 14})
 # Every optional key the tail accepts, named once. The settings registry quotes
 # this in the help the page renders, and a test holds the two together: a key
 # added here and forgotten there is a setting the owner cannot discover.
+#
+# ``voc`` is the one key here that no model reads. It is a datasheet figure the
+# catalogue carries and the settings page offers, and nothing in the PVWatts
+# chain or the curtailment rule needs an open-circuit voltage — so an owner who
+# enters it correctly sees no figure move. It is kept rather than removed
+# because dropping a key refuses every stored array description that already
+# uses it, and because the string voltage a curtailment baseline is fitted from
+# is the obvious eventual reader. Anything added here must have a consumer, or
+# it is an input the owner cannot tell is being ignored — which is what ``noct``
+# was until cell_temperature started reading it.
 KNOWN_STRING_KEYS: tuple[str, ...] = (
     "temp_coeff",
     "noct",

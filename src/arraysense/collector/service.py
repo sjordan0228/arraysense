@@ -428,6 +428,20 @@ class CollectorService:
         tz, strings, config_version = config
         settings = SettingsStore(self._store)
 
+        # A code change that alters how scores are computed makes every stored
+        # efficiency day stale — the same reason a settings edit bumps the
+        # version.  Bumping here invalidates all stored days so they are
+        # recomputed with the current logic.  The check against ``minimum`` is
+        # cheap (a single-row read) and the method is a no-op after the first
+        # call, so it is safe to leave in the periodic path rather than wiring a
+        # one-shot trigger.
+        if settings.ensure_efficiency_version(1):
+            # The version just advanced — re-read it so the rows we are about to
+            # write carry the new version rather than the one they would match
+            # and never recompute.
+            raw_version = settings.get(CONFIG_VERSION_KEY)
+            config_version = raw_version if isinstance(raw_version, int) else 0
+
         local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
         for days_back in (0, 1):
             day_start = (local_now - timedelta(days=days_back)).replace(

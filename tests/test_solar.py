@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
-from arraysense.panels import parse_strings
+from arraysense.panels import DEFAULT_NOCT, parse_strings
 from arraysense.solar import (
     SYSTEM_DERATE,
     cell_temperature,
@@ -212,3 +212,63 @@ def test_a_gauge_without_a_length_is_refused() -> None:
 def test_an_unknown_gauge_is_refused_rather_than_silently_lossless() -> None:
     with pytest.raises(ValueError, match="wire_awg"):
         parse_strings("A | 1 | 12 | 400 | 5 | 180 | vmp=31.0 wire_awg=11 wire_run_ft=260")
+
+
+def test_a_declared_noct_moves_the_cell_temperature() -> None:
+    """NOCT is a validated, UI-exposed setting, and nothing read it.
+
+    The grammar accepts it, range-checks it 20-90, defaults it to 45, reports
+    the default in ``defaulted`` so a page can say "assumed 45", the settings
+    help lists it and settings.html renders a labelled input for it — and
+    cell_temperature picked its coefficients from the mounting alone. An owner
+    who read their module datasheet and typed the right figure saw no digit
+    move, with no way to know it was ignored.
+    """
+    hotter = cell_temperature(800.0, 20.0, 1.0, "open_rack", noct=60.0)
+    ordinary = cell_temperature(800.0, 20.0, 1.0, "open_rack", noct=45.0)
+    cooler = cell_temperature(800.0, 20.0, 1.0, "open_rack", noct=35.0)
+    assert cooler < ordinary < hotter
+
+
+def test_the_default_noct_reproduces_the_mounting_coefficients_exactly() -> None:
+    """The declared NOCT shifts the reference point; it does not replace it.
+
+    Every stored efficiency figure was computed with the mounting's own Faiman
+    pair, so the default has to come back to those coefficients to the last
+    digit or the whole history moves under a change that was supposed to be
+    inert. It is exact by construction rather than by luck: the default is
+    subtracted from the declaration, and a difference of zero leaves the pair
+    where it was.
+    """
+    for mounting in ("open_rack", "close_roof", "ground"):
+        for poa, air, wind in ((800.0, 20.0, 1.0), (1000.0, 35.0, 0.5), (350.0, 5.0, 7.0)):
+            assert cell_temperature(poa, air, wind, mounting, noct=DEFAULT_NOCT) == (
+                cell_temperature(poa, air, wind, mounting)
+            )
+
+
+def test_a_declared_noct_keeps_the_mounting_penalty() -> None:
+    """A datasheet NOCT is measured on an open rack; a roof is still hotter.
+
+    Reading the declaration as the absolute cell temperature at NOCT conditions
+    would erase the close-roof penalty for any owner who typed their datasheet
+    figure — the mounting is the larger term of the two and the one they did not
+    get wrong.
+    """
+    rack = cell_temperature(800.0, 20.0, 1.0, "open_rack", noct=48.0)
+    roof = cell_temperature(800.0, 20.0, 1.0, "close_roof", noct=48.0)
+    assert roof > rack + 15.0
+
+
+def test_the_declared_noct_reads_back_at_noct_conditions() -> None:
+    """An open-rack module declaring NOCT n runs at n degrees under those conditions.
+
+    NOCT is the *cell* temperature at 800 W/m2, 20 C air and 1 m/s wind — 45 C
+    is a cell 25 degrees above the air, not 65. The project's own open-rack
+    Faiman pair already describes a module of NOCT 45.1, which is the grammar's
+    default to within a tenth of a degree, and that is what makes the two
+    reconcilable rather than merely bolted together.
+    """
+    for declared in (35.0, 45.0, 55.0):
+        cell = cell_temperature(800.0, 20.0, 1.0, "open_rack", noct=declared)
+        assert cell == pytest.approx(declared, abs=0.2)
