@@ -863,15 +863,54 @@ class SqliteStore:
         Both bounds come back as aware UTC instants, because every timestamp
         that leaves this class does.
         """
-        row = self._conn.execute(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM inverter_hourly WHERE device = ?",
-            (self._device(device),),
-        ).fetchone()
-        if row is None or row[0] is None or row[1] is None:
-            return None
+        return self._table_span("inverter_hourly", self._device(device))
+
+    def tier_spans(
+        self, module: bool = False, device: str | None = None
+    ) -> dict[str, tuple[datetime, datetime] | None]:
+        """What each tier actually holds for one inverter, by tier name.
+
+        A tier that holds nothing maps to None rather than to an empty span, so
+        "this tier has no rows" and "this tier covers an instant" stay
+        different answers.
+
+        This exists because tier selection used to be blind to it. Scored on
+        point count alone, a six-hour window from two months ago picks the raw
+        tier — whose floor is thirty days back — and comes back empty, while
+        the minute tier holds every minute of it; a window straddling that
+        floor comes back half its length with nothing saying the other half
+        exists. ``store.tiers.select_tier_for_range`` is where that judgement
+        is made, and this is the fact it needs.
+
+        The bounds are read as two ordered lookups rather than MIN/MAX over the
+        table. It is the same shape ``latest`` uses and for the same reason:
+        the primary key leads on timestamp, so walking it from either end stops
+        at the first row, while an aggregate with a device filter scans the
+        whole tier — measured on a copy of the reference database at 63 ms for
+        the raw tier and 195 ms for the minute tier against 0.2 ms here, on a
+        query a page load makes. The cost this shape carries instead is a
+        device that has never recorded anything: that walks the tier once and
+        finds nothing, 32 ms on the same data.
+        """
+        unit = self._device(device)
+        tiers = MODULE_TIERS if module else INVERTER_TIERS
+        return {tier.name: self._table_span(tier.table, unit) for tier in tiers}
+
+    def _table_span(self, table: str, device: str) -> tuple[datetime, datetime] | None:
+        """The first and last timestamp one device has in ``table``, or None."""
+        bounds: list[int] = []
+        for direction in ("ASC", "DESC"):
+            row = self._conn.execute(
+                f"SELECT timestamp FROM {table} WHERE device = ? "
+                f"ORDER BY timestamp {direction} LIMIT 1",
+                (device,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            bounds.append(int(row[0]))
         return (
-            datetime.fromtimestamp(int(row[0]), tz=UTC),
-            datetime.fromtimestamp(int(row[1]), tz=UTC),
+            datetime.fromtimestamp(bounds[0], tz=UTC),
+            datetime.fromtimestamp(bounds[1], tz=UTC),
         )
 
     def scored_days(self, config_version: int) -> set[int]:

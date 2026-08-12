@@ -15,11 +15,11 @@ tier's 720 points at roughly 2 ms.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from arraysense.store.tiers import select_tier
+from arraysense.store.tiers import select_tier, select_tier_for_range
 
 # The full-cadence tier's resolution is the polling interval, which the caller
 # knows and the store does not.
@@ -153,3 +153,159 @@ def test_a_mathematical_tie_prefers_the_coarser_tier() -> None:
         )
         == "hourly"
     )
+
+
+# --- what a tier can actually answer ------------------------------------------
+#
+# Fit alone is blind to whether the tier it picks holds the range at all. The
+# raw tier keeps thirty days and the importer only ever filled it that far back,
+# so a short window from last year scores as "full" and comes back empty while
+# the minute tier holds every minute of it. A window straddling that floor is
+# worse: it comes back half-length with nothing saying the other half exists.
+#
+# The coverage a caller passes is what each tier really holds, read from the
+# store. With none passed the choice is the pure fit it always was.
+
+_NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
+_RAW_FLOOR = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+_MINUTE_FLOOR = datetime(2025, 8, 7, 12, 0, tzinfo=UTC)
+_HOURLY_FLOOR = datetime(2024, 10, 10, 18, 0, tzinfo=UTC)
+
+# The reference installation's own tier floors, from a copy of its database.
+_REAL_COVERAGE: dict[str, tuple[datetime, datetime] | None] = {
+    "full": (_RAW_FLOOR, _NOW),
+    "minute": (_MINUTE_FLOOR, _NOW),
+    "hourly": (_HOURLY_FLOOR, _NOW),
+}
+
+
+def test_a_short_window_older_than_raw_reads_the_tier_that_holds_it() -> None:
+    # Six hours, sixty days ago. Fit says "full" at any sensible width; the raw
+    # tier's floor is a month back, so "full" is an empty chart.
+    start = _NOW - timedelta(days=60)
+    choice = select_tier_for_range(
+        start,
+        start + timedelta(hours=6),
+        width_px=4000,
+        cadence_seconds=CADENCE,
+        coverage=_REAL_COVERAGE,
+    )
+    assert choice.name == "minute"
+    assert choice.complete is True
+
+
+def test_a_window_straddling_the_raw_floor_is_not_answered_half_length() -> None:
+    # Three hours either side of the floor. The raw tier answers the later half
+    # and says nothing about the earlier one, which is the truncation that looks
+    # exactly like a chart of a quiet morning.
+    choice = select_tier_for_range(
+        _RAW_FLOOR - timedelta(hours=3),
+        _RAW_FLOOR + timedelta(hours=3),
+        width_px=4000,
+        cadence_seconds=CADENCE,
+        coverage=_REAL_COVERAGE,
+    )
+    assert choice.name == "minute"
+    assert choice.complete is True
+
+
+def test_a_recent_window_is_chosen_on_fit_exactly_as_before() -> None:
+    # The common case must not move: every tier holds the last day, so the
+    # choice is the fit it always was.
+    start = _NOW - timedelta(days=1)
+    with_coverage = select_tier_for_range(
+        start, _NOW, width_px=1000, cadence_seconds=CADENCE, coverage=_REAL_COVERAGE
+    )
+    assert with_coverage.name == select_tier(
+        timedelta(days=1), width_px=1000, cadence_seconds=CADENCE
+    )
+    assert with_coverage.complete is True
+
+
+def test_a_lagging_coarse_tier_does_not_read_as_covering_the_present() -> None:
+    # The hourly tier's last bucket is the hour just gone, so a range ending now
+    # is covered. One that stopped being rebuilt three days ago is not, and the
+    # tier holding those three days should answer instead.
+    coverage = dict(_REAL_COVERAGE)
+    coverage["hourly"] = (_HOURLY_FLOOR, _NOW - timedelta(days=3))
+    choice = select_tier_for_range(
+        _NOW - timedelta(days=2),
+        _NOW,
+        width_px=200,
+        cadence_seconds=CADENCE,
+        coverage=coverage,
+    )
+    assert choice.name == "minute"
+
+
+def test_a_range_no_tier_holds_says_so_rather_than_looking_empty() -> None:
+    # Before the database begins. Something has to be returned — the caller has
+    # a query to run — but the answer carries the fact that it is not the range
+    # that was asked for.
+    start = _HOURLY_FLOOR - timedelta(days=40)
+    choice = select_tier_for_range(
+        start,
+        start + timedelta(days=1),
+        width_px=1000,
+        cadence_seconds=CADENCE,
+        coverage=_REAL_COVERAGE,
+    )
+    assert choice.complete is False
+    assert choice.available is None
+
+
+def test_a_partly_held_range_reports_the_part_that_is_held() -> None:
+    # A day ending an hour after the last hourly bucket: complete is False and
+    # the part that exists is named, so a page can qualify what it draws instead
+    # of presenting three-quarters of a day as a whole one.
+    coverage: dict[str, tuple[datetime, datetime] | None] = {
+        "full": None,
+        "minute": None,
+        "hourly": (_HOURLY_FLOOR, _NOW),
+    }
+    choice = select_tier_for_range(
+        _NOW - timedelta(hours=12),
+        _NOW + timedelta(hours=12),
+        width_px=1000,
+        cadence_seconds=CADENCE,
+        coverage=coverage,
+    )
+    assert choice.name == "hourly"
+    assert choice.complete is False
+    assert choice.available == (_NOW - timedelta(hours=12), _NOW)
+
+
+def test_an_empty_tier_is_never_preferred_to_one_holding_the_range() -> None:
+    # A fresh database whose rollups have not run: raw holds the day, the coarse
+    # tiers hold nothing at all.
+    coverage: dict[str, tuple[datetime, datetime] | None] = {
+        "full": (_NOW - timedelta(days=2), _NOW),
+        "minute": None,
+        "hourly": None,
+    }
+    choice = select_tier_for_range(
+        _NOW - timedelta(days=1),
+        _NOW,
+        width_px=1000,
+        cadence_seconds=CADENCE,
+        coverage=coverage,
+    )
+    assert choice.name == "full"
+    assert choice.complete is True
+
+
+def test_module_ranges_are_scored_against_the_module_tiers() -> None:
+    coverage: dict[str, tuple[datetime, datetime] | None] = {
+        "full": (_NOW - timedelta(days=30), _NOW),
+        "hourly": (_NOW - timedelta(days=400), _NOW),
+    }
+    choice = select_tier_for_range(
+        _NOW - timedelta(days=200),
+        _NOW - timedelta(days=199),
+        width_px=1000,
+        cadence_seconds=CADENCE,
+        coverage=coverage,
+        module=True,
+    )
+    assert choice.name == "hourly"
+    assert choice.complete is True
