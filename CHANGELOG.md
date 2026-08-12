@@ -7,6 +7,91 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.8.0 — 12 August 2026
+
+An installer, a command to manage the installation afterwards, a daily backup,
+and documentation that describes what the software does rather than what it was
+once going to do. This is the release the project is announced on.
+
+### Added
+
+- **`install.py`, a one-line bootstrap.** It refuses a host it cannot install
+  on one reason at a time before touching anything, resolves the port — 80 when
+  it is free, otherwise asking, with 8080 as the default — prints everything it
+  intends to do, and installs only after that is confirmed. It writes no
+  configuration file, because the config's absence is what runs the setup
+  wizard. `--yes`, `--port`, `--repo` and `--ref` cover unattended installs and
+  installing a fork or a pinned ref.
+- **`arraysense`, the command left behind.** `status`, `upgrade`, `logs`,
+  `restart`, `backup`, `restore`, `uninstall` and `version`. It acts; the web
+  page only reports, because the service binds `0.0.0.0` with no authentication
+  and an update button on that surface would be remote code execution on a home
+  network.
+- **`arraysense upgrade` rolls back a release that will not run.** It shows the
+  incoming commits and the incoming changelog entry, confirms, applies, and
+  restores the previous commit if the service does not come back. Rolling the
+  code back does not require rolling the database back, because migrations only
+  ever add columns.
+- **A daily backup onto a different disk.** SQLite's online backup API, so the
+  collector keeps writing; the copy is verified with `PRAGMA quick_check`
+  before it is trusted, compressed, and renamed into place atomically; older
+  backups are removed only after a new one exists. Measured on the reference
+  database: 264 MB live, about 21 MB compressed, roughly 7.2 GB a year written
+  to the card. The uncompressed working copy is written beside the database
+  rather than on the backup disk, which is what keeps that figure where it is.
+- **`arraysense restore`**, which replaces a shell recipe that could destroy the
+  database it was restoring. It unpacks beside the live database, proves the
+  result is a real database with rows in it, and only then stops the service,
+  clears the write-ahead log, moves the file into place and waits for the
+  collector to return.
+- **`docs/raspberry-pi.md`**, carrying what the reference installation actually
+  cost: SD-card wear and why the database belongs on a USB SSD, mounting by
+  UUID, the `ReadWritePaths` carve-out without which every write fails on a
+  read-only database, the USB enclosure quirk, and the RS485 udev rule and
+  `dialout` membership.
+
+### Fixed
+
+- **A fresh install reported failure.** Setup mode serves only `/api/setup`, so
+  the health check polling `/api/status` read a healthy new installation as
+  dead and told every first-time user the service had not come up. Waiting for
+  setup is now a state of its own rather than a failure.
+- **`arraysense upgrade` could never succeed.** The installer cloned with
+  `--depth 1`, so the fast-forward failed with "refusing to merge unrelated
+  histories" on every machine it created. The clone keeps its history, and an
+  upgrade repairs an installation that was made shallow.
+- **An unreachable inverter was read as a failed upgrade**, so a working
+  release was rolled back whenever the inverter was quiet — and the healthy
+  rollback was then reported as "the service is down".
+- **`arraysense status` called a database it could not read "empty".** The file
+  is owned by the service user; the size was right and the range said absent.
+  It now distinguishes empty from unreadable.
+- **The rollback claimed success it did not have**, printing "rolled back"
+  without checking that the checkout worked.
+- **A purge could recurse into a directory.** The database and its sidecars are
+  regular files; a configured path that names anything else is refused.
+- **The backup could not write beside the database**, because the unit declared
+  no state directory of its own — and reported the failure as "another backup
+  is running" when nothing was.
+- **Messages that named a cause nobody established**, throughout: a fabricated
+  "0.0 MB", "already up to date" when the comparison never ran, "restarted and
+  collecting" over a dead collector, a stale lock reported as a live one.
+- **The installer could not report a failed `uv` download**, returned success
+  for a service that would not survive a reboot, silently ignored `--port=8080`
+  and any mistyped flag, and claimed a `.local` address on hosts that do not
+  answer mDNS. Its docstring claimed it downloads no further scripts while
+  piping `uv`'s installer, which was the stated mitigation for running it as
+  root.
+- **`/api/capabilities` reported no model** while returning everything derived
+  from it, so a page had every consequence of "this is a FlexBOSS21" and not the
+  fact itself.
+- **Documented retention is not enforced.** Nothing prunes any tier and the
+  database grows about 5 MB a day; the pages say so now, and the published
+  "roughly 280 MB" sizing figure is gone. Tracked in #135.
+- Three published pages said the software did not work. They now carry the
+  measured record instead: 668 days of hourly history, 34.5 days of continuous
+  collection covering 99.76 % of that window.
+
 ## 0.7.3 — 11 August 2026
 
 ### Fixed
