@@ -111,6 +111,20 @@
     margin:4px 0}
   .facts .conv-head{grid-column:1/-1;font-size:12px;font-weight:600;color:var(--ink2);
     margin-top:4px}
+
+  /* --- Tabs --------------------------------------------------------------- */
+  .tabs{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  .tabs button{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
+    line-height:1.45;cursor:pointer}
+  .tabs button:hover{color:var(--ink2)}
+  .tabs button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink);font-weight:500}
+  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* A group whose tab is not the active one, hidden rather than removed so the
+     controls keep their values and the dirty check still sees them. */
+  .grp[hidden]{display:none}
+  /* The empty-tab note, rendered when a tab with no settings is deep-linked. */
+  .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:8px 0}
 </style>
 </head>
 <body>
@@ -125,9 +139,11 @@
 
   <div class="p pn" id="pnote" hidden></div>
 
+  <div class="tabs" id="tabs" role="tablist" aria-label="Settings sections"></div>
+
   <form id="form" autocomplete="off"></form>
 
-  <section class="p">
+  <section class="p" id="saveBar">
     <div class="actions">
       <button class="iconbtn" id="save" type="button" disabled>Save changes</button>
       <button class="iconbtn" id="revert" type="button" disabled>Discard</button>
@@ -141,7 +157,7 @@
   <!-- Not a setting: what the process running behind this page actually is.
        It is read from /api/status and /api/capabilities and nothing here can
        be typed into, which is why it sits outside the form. -->
-  <section class="p">
+  <section class="p" id="aboutSec">
     <div class="chead"><h2>About this installation</h2></div>
     <div class="facts" id="facts"></div>
     <p class="masknote" id="factnote"></p>
@@ -169,20 +185,93 @@ let saved = {};
 // cannot be read falls back to the loose registry controls for connection.
 let setupPayload = null;
 
-// The groups, in the order they are shown, keyed by the prefix of the settings
-// that belong to each. A prefix with no entry here still renders — under its
-// own name — so adding a setting to the registry can never make it invisible.
-const GROUPS = [
+// The tabs, in the order the owner set them up: first the inverter the wizard
+// configured, then the array it reads, then the battery it charges, then how
+// that data is collected and kept, then money, then site preferences, then
+// the read-only "About this installation" section that was always here.
+//
+// Each tab claims one or more setting prefixes. A prefix not claimed by any
+// tab still renders — collected under an "Other" tab that only appears when
+// there are unclaimed prefixes — so adding a setting to the registry can
+// never make it invisible. An empty tab (a prefix with no settings yet) is
+// hidden from the tab bar; the "backup" prefix is named here so that when
+// its settings arrive they land in Collection without a page change.
+//
+// >>> tab-defs
+const TABS = [
   {
-    prefix: 'tariff',
-    title: 'What electricity costs',
-    intro: 'The Costs page prices nothing until these are entered.',
+    id: 'inverter',
+    title: 'Inverter',
+    prefixes: ['connection'],
   },
+  {
+    id: 'solar-panels',
+    title: 'Solar panels',
+    prefixes: ['panels', 'efficiency'],
+  },
+  {
+    id: 'battery',
+    title: 'Battery',
+    prefixes: ['battery'],
+  },
+  {
+    id: 'collection',
+    title: 'Collection',
+    prefixes: ['collector', 'backup'],
+  },
+  {
+    id: 'rate-bands',
+    title: 'Rate bands',
+    prefixes: ['tariff'],
+  },
+  {
+    id: 'general',
+    title: 'General',
+    prefixes: ['site', 'display'],
+  },
+  {
+    id: 'about',
+    title: 'About',
+    about: true,
+  },
+];
+
+const tabForPrefix = Object.create(null);
+for (const tab of TABS) {
+  if (tab.prefixes) {
+    for (const p of tab.prefixes) tabForPrefix[p] = tab.id;
+  }
+}
+// <<< tab-defs
+
+// The groups, in the order they are shown within a tab, keyed by the prefix
+// of the settings that belong to each. These provide the heading and
+// introduction for each prefix's block of controls. A prefix with no entry
+// here still renders — under its own bare name — the way it always did.
+const GROUPS = [
   {
     prefix: 'connection',
     title: 'The inverter',
     intro: 'How the collector reaches the dongle. Changing any of these needs the collector '
       + 'restarted before it takes effect.',
+  },
+  {
+    prefix: 'panels',
+    title: 'Solar panels',
+    intro: 'The array, one line per string — the efficiency model reads exactly what is '
+      + 'entered here, and every value left blank falls to a default the form shows.',
+  },
+  {
+    prefix: 'efficiency',
+    title: 'Efficiency',
+    intro: 'The efficiency model scores what the array actually produced against what the '
+      + 'sun offered.',
+  },
+  {
+    prefix: 'battery',
+    title: 'Battery bank',
+    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
+      + 'fill the gaps and set the heater and idle-draw accounting.',
   },
   {
     prefix: 'collector',
@@ -194,20 +283,18 @@ const GROUPS = [
       + 'at 10 seconds — so the database grows in proportion to how often you ask.',
   },
   {
+    prefix: 'backup',
+    title: 'Backup',
+    intro: 'Where the database is copied to for safekeeping.',
+  },
+  {
+    prefix: 'tariff',
+    title: 'What electricity costs',
+    intro: 'The Costs page prices nothing until these are entered.',
+  },
+  {
     prefix: 'site',
-    title: 'General',
-  },
-  {
-    prefix: 'panels',
-    title: 'Solar panels',
-    intro: 'The array, one line per string — the efficiency model reads exactly what is '
-      + 'entered here, and every value left blank falls to a default the form shows.',
-  },
-  {
-    prefix: 'battery',
-    title: 'Battery bank',
-    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
-      + 'fill the gaps and set the heater and idle-draw accounting.',
+    title: 'Site',
   },
   {
     prefix: 'display',
@@ -354,13 +441,17 @@ function render() {
   for (const group of order) {
     const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
     if (!mine.length) continue;
+    // The tab this group's prefix belongs to, or "other" when no tab claims
+    // it — so a setting added to the registry tomorrow still appears under a
+    // catch-all tab rather than silently vanishing.
+    const tabId = tabForPrefix[group.prefix] || 'other';
     // The connection group is the wizard's other shell: the same Manufacturer →
     // Model → Connection picker the first-run wizard shows, mounted from
     // /api/setup so the two cannot drift. It replaces the loose registry
     // controls entirely, and only when the payload is in hand — a build whose
     // /api/setup could not be read falls through to the controls below.
     if (group.prefix === 'connection' && setupPayload) {
-      blocks.push(`<section class="p grp">
+      blocks.push(`<section class="p grp" data-tab="${esc(tabId)}">
           <div class="chead"><h2>${esc(group.title)}</h2></div>
           ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
           <div id="connHost"></div>
@@ -388,7 +479,7 @@ function render() {
           <span class="err" hidden></span>
         </div>`;
     }).join('');
-    blocks.push(`<section class="p grp">
+    blocks.push(`<section class="p grp" data-tab="${esc(tabId)}">
         <div class="chead"><h2>${esc(group.title)}</h2></div>
         ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
         <div class="fields">${controls}</div>
@@ -421,7 +512,113 @@ function render() {
       ? ` ${secret.join(' and ')} come back from the service with their middles replaced. `
         + 'Leave a masked value alone and it is left alone; retype it in full to change it.'
       : '');
+
+  // Build the tab bar and select the initial tab. Done after the form is
+  // populated so drawTabs can tell which tabs have content.
+  drawTabs();
+  selectTab(wantedTab());
 }
+
+// ---------------------------------------------------------------------------
+// Tab switching.
+//
+// Follows the same hash-routed pattern index.html's wireTabs() uses for the
+// dashboard views: the URL fragment is authoritative when present, otherwise
+// the remembered choice from localStorage wins, otherwise the first tab. The
+// hash is updated when a tab is clicked so the target is shareable and the
+// back button works. Tabs with no settings are left out of the bar; the
+// "backup" prefix is named in TABS so that when its settings arrive they
+// land in Collection without a page change.
+// ---------------------------------------------------------------------------
+
+// The "Other" tab id, used when a prefix is not claimed by any defined tab.
+// Separate from the TABS array so the tab-defs slice stays pure for testing.
+const OTHER_TAB_ID = 'other';
+
+// Which tabs actually have content, computed after the form is populated.
+// The About tab always appears; settings tabs only appear if at least one
+// group section bears their data-tab.
+function visibleTabIds() {
+  const ids = new Set();
+  for (const el of $('form').querySelectorAll('.grp[data-tab]')) {
+    ids.add(el.dataset.tab);
+  }
+  // The "other" catch-all only shows when there are unclaimed prefixes.
+  // About always shows — it is not driven by form content.
+  const order = [];
+  for (const tab of TABS) {
+    if (tab.about || ids.has(tab.id)) order.push(tab.id);
+  }
+  if (ids.has(OTHER_TAB_ID)) order.push(OTHER_TAB_ID);
+  return order;
+}
+
+function drawTabs() {
+  const bar = $('tabs');
+  if (!bar) return;
+  const visible = visibleTabIds();
+  bar.innerHTML = visible.map((id) => {
+    const tab = TABS.find((t) => t.id === id);
+    const title = tab ? tab.title : 'Other';
+    return `<button type="button" role="tab" data-tab="${esc(id)}">${esc(title)}</button>`;
+  }).join('');
+  bar.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => selectTab(btn.dataset.tab));
+  });
+}
+
+function selectTab(id) {
+  // Update tab button states.
+  const bar = $('tabs');
+  if (bar) {
+    bar.querySelectorAll('button').forEach((btn) => {
+      btn.setAttribute('aria-pressed', btn.dataset.tab === id ? 'true' : 'false');
+    });
+  }
+  // Show or hide the form and its groups. Every group stays in the DOM so
+  // unsaved changes survive a tab switch — only visibility changes.
+  const isAbout = (id === 'about');
+  $('form').hidden = isAbout;
+  for (const el of $('form').querySelectorAll('.grp[data-tab]')) {
+    el.hidden = el.dataset.tab !== id;
+  }
+  // Save buttons are part of editing, not part of the About section.
+  const saveBar = $('saveBar');
+  if (saveBar) saveBar.hidden = isAbout;
+  // The About section is only its own tab.
+  const aboutSec = $('aboutSec');
+  if (aboutSec) aboutSec.hidden = !isAbout;
+  // The "Where these live" details stay visible regardless.
+
+  // Persist the choice and update the URL without a page reload.
+  try { localStorage.setItem('as.settingsTab', id); } catch (e) { /* private browsing */ }
+  if (location.hash !== '#' + id) {
+    history.replaceState(null, '', '#' + id);
+  }
+}
+
+// Which tab the reader should land on. The URL fragment wins when it names a
+// tab that exists; otherwise the localStorage choice, if it names a tab that
+// is currently visible; otherwise the first visible tab. On the very first
+// visit with no hash and no stored preference this is the Inverter tab.
+function wantedTab() {
+  const visible = visibleTabIds();
+  // Hash is authoritative when it names a visible tab.
+  const hash = location.hash.replace('#', '');
+  if (hash && visible.includes(hash)) return hash;
+  // localStorage remembers the last tab this browser was on.
+  let held = null;
+  try { held = localStorage.getItem('as.settingsTab'); } catch (e) { /* private browsing */ }
+  if (held && visible.includes(held)) return held;
+  // Fall back to the first visible tab.
+  return visible[0] || TABS[0].id;
+}
+
+// Listen for hash changes (back/forward, or a link from another page).
+window.addEventListener('hashchange', () => {
+  const wanted = wantedTab();
+  selectTab(wanted);
+});
 
 // ---------------------------------------------------------------------------
 // The rate bands, as controls instead of as a line of syntax.
