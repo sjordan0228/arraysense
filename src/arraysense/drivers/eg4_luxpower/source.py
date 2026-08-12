@@ -1143,12 +1143,12 @@ class Eg4LuxPowerSource:
         setting: the store files rows under one of them, and two spellings of
         one inverter would be two inverters as far as it is concerned.
 
-        The model is left absent. pylxpweb detects the family from the
-        device-type holding register and this driver reads no holding registers,
-        so naming the 18kPV here would be the model we develop against dressed
-        up as something the inverter said.
+        The model is what this installation is configured as, ``None`` when
+        nothing configured one. Nobody has asked the inverter — the driver reads
+        no holding registers — so a configured model that is wrong will not be
+        caught here.
         """
-        return DeviceIdentity(driver=NAME, serial=self.device)
+        return DeviceIdentity(driver=NAME, serial=self.device, model=self._config.model or None)
 
     @property
     def capabilities(self) -> Capabilities:

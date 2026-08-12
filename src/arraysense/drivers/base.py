@@ -264,11 +264,10 @@ class DeviceIdentity:
     be the same string the source reports as ``device``; two spellings of one
     inverter is two inverters as far as the store is concerned.
 
-    ``model`` is None when it has not been established rather than filled with
-    the model we happen to be developing against. pylxpweb detects the family
-    from a device-type holding register and this collector reads no holding
-    registers at all, so on the reference system the honest answer today is
-    "the driver knows the family, nobody has asked the inverter".
+    ``model`` is the model the installation is configured as, ``None`` when no
+    model was configured. It is not a detected value: no driver reads the
+    device-type holding register today, so this reports what was declared rather
+    than what was measured.
     """
 
     driver: str
