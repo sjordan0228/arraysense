@@ -39,10 +39,14 @@
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <!-- What the server actually served, not what was asked for. A chart drawn
-         from the minute rollup looks exactly like one drawn from raw samples,
-         so the resolution has to be stated rather than assumed. -->
-    <div class="conn" id="res">loading…</div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <!-- What the server actually served, not what was asked for. A chart drawn
+           from the minute rollup looks exactly like one drawn from raw samples,
+           so the resolution has to be stated rather than assumed. -->
+      <div class="conn" id="res">loading…</div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>

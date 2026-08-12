@@ -215,7 +215,9 @@
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div style="display:flex;align-items:center;gap:12px">
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
       <div class="conn" id="conn"><span class="dot" style="background:var(--ink3)"></span>connecting…</div>
       <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙</button>
     </div>
