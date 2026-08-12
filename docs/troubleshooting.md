@@ -164,8 +164,9 @@ stopping the service.
 
 ## The database is growing faster than expected
 
-Check `poll_interval`. At the default eleven seconds, expect roughly 9 MB per day
-including the rollup tiers. Halving the interval roughly doubles that.
+Check `poll_interval`. At the default eleven seconds the database grows about
+5.3 MB per day across all tiers (measured on the reference installation).
+Halving the interval roughly doubles that.
 
 If the database is on a Raspberry Pi SD card, move it to a USB SSD. Sustained
 database writes will eventually wear a card out.

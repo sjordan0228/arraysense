@@ -27,8 +27,11 @@ SD cards wear out under sustained writes, and a card that fails takes the
 database with it. The tool this project replaces wrote about 400 GB a year to
 the card on the reference installation. ArraySense writes less than that, but
 it writes continuously, every poll, every day. The reference database stands at
-264 MB after 668 days of hourly history and 34.5 days of raw collection — small
-enough that the risk sounds theoretical, and continuous enough to be real.
+264 MB after 668 days of hourly history and 34.5 days of raw collection, and it
+grows about 5.3 MB per day — no tier is pruned today, so the database grows
+without bound until [#135](https://github.com/sjordan0228/arraysense/issues/135)
+lands. That is small enough that the risk sounds theoretical, and continuous
+enough to be real.
 
 Put the database on a USB SSD and point `database_path` at it. On the reference
 machine the database directory is `/mnt/ssd/arraysense`, the same path the
@@ -90,16 +93,16 @@ else. `arraysense backup` writes a compressed copy of the database every day to
 the database itself does not live, and that is the whole point: a backup on the
 same disk as the original is protection against nothing.
 
-Measured on the real 264 MB database:
+Measured on the real database on 11 August 2026:
 
 | step | size |
 | --- | --- |
 | live database | 264 MB |
 | working copy beside it, on the SSD | 264 MB — `Connection.backup()` copies free pages too |
-| compressed, on the card | about 21 MB |
+| compressed, on the card | 23.3 MB |
 
-A compressed daily copy writes about **7.2 GB a year** to the card, against
-96 GB a year for a naive `cp` of the raw file — the difference between 1.8% and
+A compressed daily copy writes about **8.5 GB a year** to the card, against
+96 GB a year for a naive `cp` of the raw file — the difference between 2.2% and
 24% of the write load the database was moved off the card to escape. The card
 only ever receives the compressed file. The SSD needs free space equal to the
 database size while a backup runs; if it runs out the collector's own writes fail
@@ -116,10 +119,11 @@ daily copies are kept; the oldest are rotated away, and only after a new one has
 been written and verified — never before, because a rotation that runs first
 turns a failed backup into data loss.
 
-Install it:
+The bootstrap installer writes these files and enables the timer automatically.
+To install them by hand:
 
-    sudo cp packaging/arraysense-backup.service packaging/arraysense-backup.timer /etc/systemd/system/
-    sudo cp packaging/arraysense-backup.tmpfiles.conf /etc/tmpfiles.d/arraysense-backup.conf
+    sudo cp /opt/arraysense/packaging/arraysense-backup.service /opt/arraysense/packaging/arraysense-backup.timer /etc/systemd/system/
+    sudo cp /opt/arraysense/packaging/arraysense-backup.tmpfiles.conf /etc/tmpfiles.d/arraysense-backup.conf
     sudo systemd-tmpfiles --create
     sudo systemctl daemon-reload
     sudo systemctl enable --now arraysense-backup.timer
@@ -130,7 +134,9 @@ Without it, a hand-run backup as root creates the directory root:root and the
 timer (which runs as `arraysense`) can never write there — failing silently every
 night.
 
-The timer fires at 03:15 and is `Persistent=true`, so a Pi that was off at 03:15
+The timer fires at 03:15 plus a randomised delay of up to fifteen minutes
+(`RandomizedDelaySec=15m`), so the actual trigger varies — on the reference
+machine it was 03:18 on its last run — and is `Persistent=true`, so a Pi that was off at 03:15
 runs the backup when it comes back rather than skipping a day silently. The
 service runs as the `arraysense` user under `ProtectSystem=strict`, with
 `/var/backups/arraysense` the only writable path apart from the database's own
