@@ -13,6 +13,10 @@ data/
 __pycache__/
 *.py[cod]
 .venv/
+# Without the second form a .venv SYMLINK is not matched by the directory
+# pattern above, and `git add -A` commits it. That happened once, from a
+# git worktree pointed at the main checkout's environment.
+.venv
 *.egg-info/
 dist/
 build/
