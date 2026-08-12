@@ -49,6 +49,15 @@ RestartSec=10
 # that. Everything else is closed off.
 StateDirectory=arraysense
 ConfigurationDirectory=arraysense
+# The backup destination, which this service does not write to — it proves it
+# could. A destination is refused on the settings page unless a real file can
+# be created there, and ProtectSystem=strict makes every path outside this set
+# read-only however good its permissions are, so without this line the service
+# would refuse its own default. The leading '-' means "ignore if absent", which
+# keeps an installation that never installed the backup fragments starting.
+# An installation that moves the destination needs a drop-in naming it here as
+# well as on arraysense-backup.service.
+ReadWritePaths=-/var/backups/arraysense
 NoNewPrivileges=true
 PrivateTmp=true
 # false, not true, so a serial installation's USB-to-RS485 adapter — /dev/ttyUSB0
