@@ -67,10 +67,12 @@ from typing import TYPE_CHECKING
 from arraysense.metrics import SITE_METRICS, lookup
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.store.migrate import needs_device_migration
+from arraysense.store.rollup import LATE_APPEND_SECONDS
 from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
     MODULE_TIERS,
+    PENDING_TABLE,
     expected_columns,
     inverter_metric_columns,
     migration_ddl,
@@ -529,6 +531,8 @@ class SqliteStore:
                 protect_readings=sample.is_failed,
             )
             self._append_modules(cur, epoch, unit, sample.battery_modules)
+            if site:
+                self._queue_late_hour(cur, epoch)
 
     def query(
         self,
@@ -1080,6 +1084,29 @@ class SqliteStore:
         if sample.error is not None or sample.battery_modules:
             return False
         return bool(sample.readings) and set(sample.readings) <= SITE_METRICS
+
+    def _queue_late_hour(self, cur: sqlite3.Cursor, epoch: int) -> None:
+        """Record that an old hour has new sky readings and needs promoting.
+
+        The rollup follows the raw tier's recent end: maintenance rebuilds the
+        last three hours on every pass, which covers every writer that stamps a
+        row at the moment it writes it. The archive backfill does not — it
+        writes one sample per past hour, up to two years of them — and those
+        rows sat in the raw tier where nothing promoted them, invisible to the
+        efficiency engine, which reads irradiance from the hourly tier and
+        nowhere else, while the route that wrote them reported them as written.
+
+        Queued inside the append's own transaction, so an hour is queued if and
+        only if its reading was stored. A fresh reading queues nothing: the
+        maintenance rebuild already covers it, and a row a tick would be a
+        queue that never emptied.
+        """
+        if epoch >= int(datetime.now(tz=UTC).timestamp()) - LATE_APPEND_SECONDS:
+            return
+        cur.execute(
+            f"INSERT INTO {PENDING_TABLE} (hour) VALUES (?)",
+            (epoch // 3600 * 3600,),
+        )
 
     def _written_columns(self, sample: Sample, *, site: bool) -> tuple[str, ...]:
         """Return the columns this append may write, and no others.

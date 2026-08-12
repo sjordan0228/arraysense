@@ -63,10 +63,18 @@ is widened outward to whole buckets before anything is deleted or read.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from collections.abc import Sequence
 
-from arraysense.metrics import Aggregation, MetricSpec, lookup
-from arraysense.store.schema import inverter_metric_columns, module_metric_columns
+from arraysense.metrics import SITE_METRICS, Aggregation, MetricSpec, lookup
+from arraysense.store.schema import (
+    PENDING_TABLE,
+    inverter_metric_columns,
+    module_metric_columns,
+)
+
+logger = logging.getLogger(__name__)
 
 # A failed poll is stored with its reason and no readings (see models.Sample).
 # Excluding it from the aggregate stops it being counted as a reading of zero.
@@ -558,3 +566,110 @@ def rebuild_module_hourly(conn: sqlite3.Connection, start: int, end: int) -> Non
         end,
         _columns_present(conn, "module_raw", "module_hourly", module_metric_columns()),
     )
+
+
+# How old a raw row has to be for its hour to need promoting by hand. Anything
+# newer is already covered: maintenance rebuilds the last three hours from raw
+# on every pass. Two hours keeps this strictly inside that window — a test pins
+# the relationship — so a row written just outside the live path's reach is
+# still caught by the rebuild if the queue is drained late.
+LATE_APPEND_SECONDS = 2 * 3600
+
+# How many queued hours one pass promotes. A two-year archive backfill queues
+# eighteen thousand of them, and the queue drains a batch a minute rather than
+# holding the write lock for the whole of it in one go. Also keeps the hour
+# list inside SQLite's bound-parameter limit by a wide margin.
+PROMOTE_BATCH = 500
+
+
+def merge_site_hours(conn: sqlite3.Connection, hours: Sequence[int]) -> int:
+    """Fold recorded sky readings for whole past hours into the hourly tier.
+
+    Deliberately not a rebuild, and the difference is the point. A rebuild
+    deletes the destination buckets and refills them from raw, which is right
+    while raw still holds the hour and catastrophic once it does not: raw keeps
+    thirty days, the hourly tier is kept for ever, and rebuilding an hour from
+    two years ago would delete that hour's inverter history to write one
+    temperature into it. This writes only the site columns, and only where the
+    raw rows have something to say — a site column raw cannot answer for is
+    left exactly as it stands, because absence in a thirty-day tier is no
+    evidence at all about an hour outside it.
+
+    What it is for: the archive backfill appends one sample per past hour into
+    the raw tier, and the efficiency engine reads irradiance from the hourly
+    tier alone. Without this every backfilled hour older than the maintenance
+    window is invisible to the feature the backfill exists to feed, while the
+    route reports the hours as written.
+
+    Returns how many hourly rows were touched, for the log line that says a
+    backfill has landed.
+    """
+    if not hours:
+        return 0
+    columns = _columns_present(conn, "inverter_raw", "inverter_hourly", tuple(sorted(SITE_METRICS)))
+    if not columns:
+        return 0
+    buckets = sorted({hour // 3600 * 3600 for hour in hours})
+    part = _floor_div("timestamp", 3600)
+    agg = ", ".join(
+        f"{_bucket_expr(column, lookup(column), 3600)} AS {column}" for column in columns
+    )
+    # Only rows carrying at least one site reading are counted, so an hour that
+    # holds nothing but inverter polls produces no row here and its stored
+    # readings are never disturbed.
+    carries_site = " OR ".join(f"{column} IS NOT NULL" for column in columns)
+    placeholders = ", ".join("?" for _ in buckets)
+    select = (
+        f"SELECT {part} * 3600 AS timestamp, device, COUNT(*) AS sample_count, {agg} "
+        f"FROM inverter_raw WHERE {part} * 3600 IN ({placeholders}) "
+        f"AND {_ERROR_FILTER} AND ({carries_site}) "
+        # Grouped by the bucket expression, never by the output name: SQLite
+        # resolves "timestamp" to the source column, which puts every raw row
+        # in a group of its own and leaves the hour holding whichever of them
+        # the upsert wrote last instead of its mean.
+        f"GROUP BY {part}, device"
+    )
+    cols_sql = ", ".join(("timestamp", "device", "sample_count", *columns))
+    # COALESCE, not a plain assignment: the aggregate is NULL for a metric no
+    # raw row in the hour reported, and the archive answers one hour in two
+    # pieces — the means over the hour and the readings at its label — so the
+    # first piece must not be erased when the second arrives.
+    updates = ", ".join(
+        f"{column} = COALESCE(excluded.{column}, inverter_hourly.{column})" for column in columns
+    )
+    with conn:
+        cur = conn.execute(
+            f"INSERT INTO inverter_hourly ({cols_sql}) {select} "
+            f"ON CONFLICT (timestamp, device) DO UPDATE SET {updates}",
+            buckets,
+        )
+    return cur.rowcount
+
+
+def promote_pending_hours(conn: sqlite3.Connection, limit: int = PROMOTE_BATCH) -> int:
+    """Promote a batch of queued past hours into the hourly tier; return how many.
+
+    The queue is written by the store as it appends a site reading stamped
+    outside the maintenance window — see ``SqliteStore.append`` — so this knows
+    exactly which buckets to bring forward instead of scanning a month of raw
+    to find out.
+
+    Rows are claimed by rowid and deleted by rowid, so an append landing
+    between the read and the delete queues a new row and is promoted on the
+    next pass rather than being cleared unpromoted. Duplicate hours are
+    harmless: the merge collapses them.
+    """
+    claimed = conn.execute(
+        f"SELECT rowid, hour FROM {PENDING_TABLE} ORDER BY hour LIMIT ?", (limit,)
+    ).fetchall()
+    if not claimed:
+        return 0
+    merged = merge_site_hours(conn, [int(row[1]) for row in claimed])
+    ids = [int(row[0]) for row in claimed]
+    with conn:
+        conn.execute(
+            f"DELETE FROM {PENDING_TABLE} WHERE rowid IN ({', '.join('?' for _ in ids)})",
+            ids,
+        )
+    logger.info("promoted %d backfilled hour(s) into the hourly tier", len(ids))
+    return merged

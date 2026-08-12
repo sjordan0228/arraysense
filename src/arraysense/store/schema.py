@@ -122,6 +122,7 @@ INVALID_TABLE = "invalid_readings"
 SETTINGS_TABLE = "settings"
 FORECAST_TABLE = "forecast"
 EFFICIENCY_TABLE = "efficiency_day"
+PENDING_TABLE = "rollup_pending"
 
 _MODULE_PREFIX = re.compile(r"^battery_module\d+_")
 
@@ -299,6 +300,26 @@ def _forecast_ddl(as_name: str) -> str:
     )
 
 
+def _rollup_pending_ddl(as_name: str) -> str:
+    """Return the DDL for the queue of past hours waiting to be rolled up.
+
+    Maintenance rebuilds the last three hours, which covers every writer that
+    stamps its rows at the moment it writes them. One writer does not: the
+    archive backfill appends a sample per past hour, up to two years of them,
+    and those landed in the raw tier where nothing ever promoted them — the
+    efficiency engine reads irradiance from the hourly tier alone. The hour is
+    queued as it is written, so the next maintenance pass knows exactly which
+    buckets to bring forward instead of scanning a month of raw to find out.
+
+    Deliberately a rowid table, which is why it does not take the shared
+    options. A pass deletes the rows it claimed by rowid, so a write landing
+    between the pass reading the queue and clearing it makes a new row and
+    survives; keyed on the hour instead, that write would be swallowed by the
+    delete and the hour would never be promoted at all.
+    """
+    return f"CREATE TABLE IF NOT EXISTS {as_name} (\n    hour INTEGER NOT NULL\n) STRICT"
+
+
 def _efficiency_day_ddl(as_name: str) -> str:
     """Return the DDL for the per-day efficiency summary table.
 
@@ -419,6 +440,8 @@ def ddl_for(table: str, as_name: str | None = None, declared: Iterable[str] | No
         return _forecast_ddl(name)
     if table == EFFICIENCY_TABLE:
         return _efficiency_day_ddl(name)
+    if table == PENDING_TABLE:
+        return _rollup_pending_ddl(name)
     if table == SERIALS_TABLE:
         return _serials_ddl(name)
     if table == INVALID_TABLE:
@@ -567,6 +590,7 @@ def schema_ddl(declared: Iterable[str] | None = None) -> str:
         ddl_for(SETTINGS_TABLE),
         ddl_for(FORECAST_TABLE),
         ddl_for(EFFICIENCY_TABLE),
+        ddl_for(PENDING_TABLE),
     ]
     for table in DEVICED_TABLES:
         statements.append(ddl_for(table, declared=declared))
