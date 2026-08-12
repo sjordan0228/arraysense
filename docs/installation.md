@@ -131,6 +131,10 @@ The installer leaves an `arraysense` command on the PATH:
 | `arraysense upgrade` | covered below |
 | `arraysense uninstall` | covered below |
 
+The database is owned by the service user, so the date range needs
+`sudo arraysense status`; run as an ordinary user the size is still shown but
+the range reports that it could not be read.
+
 The service also looks after itself. The shipped unit sets `Restart=always`, and
 deliberately not `on-failure`: the watchdog below ends a stalled loop with
 SIGTERM, which systemd would otherwise count as a clean exit and never restart
