@@ -303,7 +303,7 @@ def resolve_port(
         print("  that port is in use or not permitted; pick another")
 
 
-def _flag_value(argv: list[str], index: int, flag: str, error: str) -> tuple[str, int]:
+def _flag_value(argv: list[str], index: int, error: str) -> tuple[str, int]:
     """The value of a space-separated flag, advancing past it.
 
     A flag at the very end of argv has no value, which is a different mistake
@@ -354,18 +354,18 @@ def parse_args(argv: list[str]) -> Args:
             yes = True
         elif arg == "--port":
             value, index = _flag_value(
-                argv, index, "--port", "--port needs a number, for example: --port 8080"
+                argv, index, "--port needs a number, for example: --port 8080"
             )
             port = _parse_port(value)
         elif arg.startswith("--port="):
             port = _parse_port(arg.split("=", 1)[1])
         elif arg == "--repo":
-            value, index = _flag_value(argv, index, "--repo", "--repo needs a URL or path")
+            value, index = _flag_value(argv, index, "--repo needs a URL or path")
             repo = value
         elif arg.startswith("--repo="):
             repo = arg.split("=", 1)[1]
         elif arg == "--ref":
-            value, index = _flag_value(argv, index, "--ref", "--ref needs a branch, tag or commit")
+            value, index = _flag_value(argv, index, "--ref needs a branch, tag or commit")
             ref = value
         elif arg.startswith("--ref="):
             ref = arg.split("=", 1)[1]
@@ -389,6 +389,7 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
         "  install uv (its Python 3.12 lands in /opt/uv-python when the system's is older)",
         f"  clone {target} into {INSTALL_DIR}",
         f"  create the system user {SERVICE_USER!r}",
+        "  give that user ownership of the clone and its data",
         f"  create {CONFIG_DIR} and {DATA_DIR}",
         f"  install a systemd service listening on port {port}",
         f"  install the management command {CLI_SHIM}",
