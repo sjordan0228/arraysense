@@ -242,6 +242,37 @@ def test_port_80_gets_the_capability_and_other_ports_do_not() -> None:
     assert "CAP_NET_BIND_SERVICE" not in install.dropin_text(8080)
 
 
+def test_the_plan_discloses_the_capability_for_any_privileged_port() -> None:
+    """The drop-in grants the capability below 1024, so the plan must say so
+    for 443 just as it did for 80 — a privilege grant is the line a
+    security-minded reader is looking for."""
+    assert "CAP_NET_BIND_SERVICE" in install.render_plan(443)
+    assert "CAP_NET_BIND_SERVICE" not in install.render_plan(8080)
+
+
+def test_the_capability_line_sits_with_the_actions_not_after_the_paragraph() -> None:
+    """insert(-1) put the bullet after the 'no config file' paragraph; the one
+    line that discloses a privilege grant must read as one of the actions."""
+    plan = install.render_plan(80)
+    assert plan.index("CAP_NET_BIND_SERVICE") < plan.index("It will NOT write")
+
+
+def test_the_docstring_no_longer_claims_no_further_scripts() -> None:
+    """The old opening lied: the installer downloads and runs uv's installer.
+    That claim was the stated mitigation for piping the script into root, so a
+    regression here matters more than a docstring."""
+    assert "downloads no further scripts" not in (install.__doc__ or "")
+    assert "uv" in (install.__doc__ or "")
+
+
+def test_the_disk_refusal_no_longer_quotes_the_wrong_growth_figure() -> None:
+    """52 MB a day was the disk-write volume restated as file growth, ~10x."""
+    refusal = install.preflight(**_ok(free_bytes=512 * 1024**2))
+    assert refusal is not None
+    assert "52 MB" not in refusal.remedy
+    assert "MB a day" in refusal.remedy
+
+
 def test_the_shim_runs_manage_under_the_system_interpreter() -> None:
     """Never the virtualenv: upgrade rebuilds it while this is running."""
     shim = install.shim_text()

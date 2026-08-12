@@ -1,10 +1,11 @@
 """install.py — the one-line bootstrap that puts Solar ArraySense on a machine.
 
-Fetched over HTTPS and piped into root, so it is written to be read first: it
-downloads no further scripts, prints everything it intends to do before doing
-any of it, and is safe to run twice. Questions are read from the controlling
-terminal, never stdin: run this as `curl ... | sudo python3 -` and stdin is
-the script itself, already at EOF.
+Fetched over HTTPS and piped into root, so it is written to be read first. It
+fetches exactly two things — uv's installer, downloaded and run by sh, and the
+repository it clones — prints everything it intends to do before doing any of
+it, and is safe to run twice. Questions are read from the controlling terminal,
+never stdin: run this as `curl ... | sudo python3 -` and stdin is the script
+itself, already at EOF.
 
 Stdlib only, and it must PARSE on Python 3.8 — it runs on whatever interpreter
 the distribution shipped, before uv has installed 3.12 for the service. Modern
@@ -28,9 +29,10 @@ from typing import NamedTuple, TypedDict
 SUPPORTED_ARCHES = ("aarch64", "x86_64")
 
 # uv fetches its own Python and the dependency tree, and the database grows
-# about 52 MB a day at a ten-second poll. A host under this will fail within
-# weeks whatever happens today, so it is refused now with a reason rather than
-# later with a full disk.
+# about 5 MB a day at a ten-second poll — file growth, measured on the
+# reference install, not the disk-write volume. A host under this will run out
+# within about a year whatever happens today, so it is refused now with a
+# reason rather than later with a full disk.
 MIN_FREE_BYTES = 2 * 1024**3
 
 MIN_PYTHON = (3, 8)
@@ -163,7 +165,7 @@ def preflight(
         return Refusal(
             f"not enough free disk: {free_bytes / 1024**3:.1f} GB, "
             f"need {MIN_FREE_BYTES / 1024**3:.0f} GB",
-            "Free some space. The database grows about 52 MB a day.",
+            "Free some space. The database grows about 5 MB a day.",
         )
     return None
 
@@ -355,13 +357,15 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
         f"  create {CONFIG_DIR} and {DATA_DIR}",
         f"  install a systemd service listening on port {port}",
         f"  install the management command {CLI_SHIM}",
+    ]
+    if port < 1024:
+        lines.append("  grant CAP_NET_BIND_SERVICE so the service can bind a privileged port")
+    lines += [
         "",
         "It will NOT write a configuration file — the first visit to the",
         "dashboard runs the setup wizard, and an existing config would skip it.",
         "",
     ]
-    if port == 80:
-        lines.insert(-1, "  grant CAP_NET_BIND_SERVICE so a non-root service can bind port 80")
     return "\n".join(lines)
 
 
