@@ -809,20 +809,15 @@ class SqliteStore:
     ) -> float | None:
         """The highest raw reading of one metric in a window, or None if nothing.
 
-        This is what calibrates the forecast: the system's own observed peak is
-        the honest measure of what the array can do, where a nameplate rating
-        would be an assumption. Reads the raw tier because a coarser tier's
-        mean flattens exactly the peak this is for.
+        Reads the raw tier because a coarser tier's mean flattens exactly the
+        peak a caller is asking for.
 
         A registry metric this database has no column for answers None, the
         same way ``query`` and ``latest`` do through ``_selected``: the driver
         never declared it, so nothing was ever recorded, and that is a reading
         nobody took rather than an error. It has to be checked here instead of
         deferred to ``_selected``, whose ``NULL AS name`` is not something
-        MAX() can be wrapped around. The caller is the forecast's cold start,
-        which asks for the array total on a driver that may declare only
-        per-string power — a raise there is a traceback every interval and no
-        forecast recorded at all.
+        MAX() can be wrapped around.
         """
         (name,) = self._check_inverter_names([metric])
         if name not in self._present["inverter_raw"]:
