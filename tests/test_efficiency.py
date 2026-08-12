@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
+from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day, compute_hours
 from arraysense.panels import parse_strings
 from arraysense.settings import SettingsStore
 from arraysense.store.sqlite_store import SqliteStore
@@ -538,3 +538,41 @@ def test_an_hour_with_no_wind_reading_is_unmodelled_not_modelled_as_still_air(
     store.close()
     total = next(r for r in rows if r.string_name == "")
     assert total.modelled_hours == 7, "the windless hour was modelled from air nobody measured"
+
+
+def test_a_range_longer_than_a_day_scores_every_day_in_it(tmp_path: Path) -> None:
+    """The worst hour of a week has to be searched for in the whole week.
+
+    ``_hourly_rows`` indexed each row by its wall-clock offset from the range's
+    opening edge and then kept only offsets under twenty-four, so a week's
+    scoring stopped at the end of the first day. The summary and the trend were
+    unaffected — they come from ``compute_day``, one day at a time — but the
+    Efficiency page's "Worst hour" panel reads this, and on the reference
+    installation it named an hour that lost 1.7 kWh while the real worst hour of
+    that week lost 4.4. The same truncation made the baseline fit structurally
+    dead: it is documented as spanning the range and never saw past day one.
+    """
+    store = _store(str(tmp_path / "week.db"))
+    day_start = _summer_day(0)
+    for day in range(7):
+        for h in range(8, 16):
+            _insert_hourly(
+                store._conn,
+                _utc(h) + timedelta(days=day),
+                # One day loses most of its output; it must be findable.
+                pv_power=300.0 if day == 5 else 3200.0,
+                ghi=800.0,
+                dni=850.0,
+                dhi=120.0,
+                wind=2.0,
+                air_c=30.0,
+            )
+    hours = compute_hours(
+        store, SettingsStore(store), day_start, day_start + timedelta(days=7), _ONE_STRING
+    )
+    store.close()
+
+    days_seen = {h.hour.date() for h in hours}
+    assert len(days_seen) == 7, f"only {sorted(days_seen)} was scored of a seven-day range"
+    worst = max(hours, key=lambda h: h.unexplained_kwh)
+    assert worst.hour.date() == (day_start + timedelta(days=5)).date()

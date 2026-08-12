@@ -118,17 +118,46 @@ def _daylight_weights(
     return weights
 
 
+def _wall_clock_hours(start: datetime, end: datetime) -> int:
+    """How many hour slots the range covers as the wall clock reads them.
+
+    Deliberately *not* elapsed time. Every hour in this module is addressed by
+    its offset from the range's opening edge on the owner's own clock — that is
+    what ``start + timedelta(hours=offset)`` produces and what the row index is
+    built from — so the count of slots has to be read the same way or the two
+    disagree by an hour twice a year. The zone is dropped explicitly rather
+    than subtracted away, because CLAUDE.md records that subtracting two aware
+    datetimes sharing a ``tzinfo`` silently ignores the zone: here that is the
+    answer wanted, and saying so is what stops the next reader from "fixing" it
+    into elapsed time.
+
+    A spring-forward day therefore offers twenty-four slots of which one names
+    an hour that did not happen; no row can carry it, so it is skipped. A
+    fall-back day offers twenty-four for twenty-five real hours and the
+    repeated hour keeps one of its two rows. Both were true before this
+    function existed and neither is what the range length decides.
+    """
+    return round((end.replace(tzinfo=None) - start.replace(tzinfo=None)).total_seconds() / 3600)
+
+
 def _hourly_rows(
     store: SqliteStore,
     day_start: datetime,
     day_end: datetime,
     mppt_indices: list[int],
     tz: tzinfo,
+    span: int,
 ) -> dict[int, dict[str, object]]:
     """Return the hourly-tier rows indexed by hour offset from ``day_start``.
 
     An hour with no inverter reading is a collector gap and is excluded from
     both sides; an hour with no irradiance inputs is one the model cannot run.
+
+    ``span`` is how many hour slots the caller means to score, and rows outside
+    it are dropped. It is a parameter rather than a constant twenty-four
+    because this is asked over a week and a month as well as a day: hard-coding
+    the day threw away every hour after the first, which left the Efficiency
+    page hunting a month's worst hour inside its first morning.
 
     Returns a dict of ``hour_offset -> row`` where row is the decoded query
     result keyed by metric name.
@@ -161,7 +190,7 @@ def _hourly_rows(
         assert isinstance(ts, datetime)
         local = ts.astimezone(tz)
         hour_offset = (local - day_start).days * 24 + local.hour
-        if 0 <= hour_offset < 24:
+        if 0 <= hour_offset < span:
             by_hour[hour_offset] = row
     return by_hour
 
@@ -242,7 +271,8 @@ def compute_hours(
 
     tz = start.tzinfo
     mppt_indices = sorted({s.mppt for s in strings})
-    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz)
+    span = _wall_clock_hours(start, end)
+    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz, span)
     if not rows_by_hour:
         return []
 
@@ -263,7 +293,6 @@ def compute_hours(
         seen_limits.append(limit_reading if isinstance(limit_reading, float) else None)
     limit_anchor = window_max_limit(seen_limits)
 
-    span = round((end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() / 3600)
     hours: list[HourEfficiency] = []
     for offset in range(span):
         when = start + timedelta(hours=offset)
