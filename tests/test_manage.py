@@ -1704,3 +1704,21 @@ def test_a_run_that_used_the_fallback_says_so_in_its_output(
     monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
     assert manage.cmd_backup(["--dir", str(dest)]) == 0
     assert "built-in" in capsys.readouterr().out
+
+
+def test_uninstall_names_the_backup_directory_that_is_actually_configured(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """The destination is a setting, so naming the built-in default would send
+    somebody to an empty directory while the copies they were told about sit on
+    a disk somewhere else."""
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(**{"backup.directory": "/mnt/usb/copies"}),
+    )
+    monkeypatch.setattr(manage, "_confirm", lambda _p: False)
+    assert manage.cmd_uninstall(["--purge"]) == 0
+    out = capsys.readouterr().out
+    assert "/mnt/usb/copies" in out
+    assert manage.BACKUP_DIR not in out

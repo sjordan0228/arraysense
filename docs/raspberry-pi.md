@@ -145,6 +145,15 @@ To install them by hand:
     sudo systemctl daemon-reload
     sudo systemctl enable --now arraysense-backup.timer
 
+An installation made before the schedule became a setting needs those two unit
+files copied again, plus `arraysense.service` itself —
+`sudo cp /opt/arraysense/packaging/arraysense.service /etc/systemd/system/`,
+then `daemon-reload` and `arraysense restart`. `arraysense upgrade` fetches
+code and does not rewrite units, so until they are copied the old timer keeps
+firing once a day at 03:15 and the settings page refuses its own default
+destination — the collector needs the `ReadWritePaths` line the new unit
+carries before it can prove that directory is writable.
+
 The tmpfiles.d fragment creates `/var/backups/arraysense` owned by the
 `arraysense` user before either the timer or a hand-run backup touches it.
 Without it, a hand-run backup as root creates the directory root:root and the

@@ -1231,9 +1231,15 @@ def cmd_uninstall(argv: list[str]) -> int:
     print(f"This removes the service, the code at {INSTALL_DIR}, and {CLI_SHIM}.")
     if purge:
         print(f"--purge given: {db} and /etc/arraysense WILL ALSO BE DELETED.")
-        print(
-            f"  compressed backups in {BACKUP_DIR} are not removed by --purge; delete them by hand"
-        )
+        # Where the backups actually are, asked while the service is still
+        # running to answer. The destination is a setting, so naming the
+        # built-in default would send somebody to an empty directory and
+        # leave the copies they were told about sitting on a disk elsewhere.
+        conf, _reason = backup_settings(configured_port())
+        # Bound out of the f-string: nesting the same quote inside one is a
+        # syntax error before 3.12, and this file runs on 3.8.
+        where = conf["backup.directory"]
+        print(f"  compressed backups in {where} are not removed by --purge; delete them by hand")
     else:
         print("The database and config are kept. Pass --purge to remove them too.")
     if not _confirm("Continue?"):
