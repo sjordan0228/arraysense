@@ -349,16 +349,23 @@ def _inside_the_calendar() -> Iterator[None]:
     who typed a date wrongly that the server was broken, and left a traceback in
     the log of an unattended service saying so.
 
-    ``ValueError`` travels with ``OverflowError`` because the same mistyped year
-    raises one from ``replace(year=…)`` and the other from ``date`` arithmetic.
+    ``OverflowError`` is always a calendar-bounds problem — the guard can prove
+    it — so it carries a prefix saying so.  ``ValueError`` is passed through
+    with its original detail because it can come from a domain check inside a
+    calendar-walking function (a costed period that is too long, a reversed
+    range) and those messages are already specific enough on their own.  This
+    guard should only wrap calendar-walking code, never business logic, so a
+    ``ValueError`` from an unrelated cause does not become a client error here.
     """
     try:
         yield
-    except (OverflowError, ValueError) as exc:
+    except OverflowError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"the range steps outside the calendar: {exc}",
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _cadence_seconds(poll_interval: float) -> int:
@@ -1060,10 +1067,9 @@ def costs(
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 
-    with _inside_the_calendar():
-        result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
-        bill = estimate_bill(tariff, energy)
-        unpriced = round(unpriced_minutes(tariff, start, end, zone))
+    result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
+    bill = estimate_bill(tariff, energy)
+    unpriced = round(unpriced_minutes(tariff, start, end, zone))
 
     # The page needs more than the priced totals to be honest about them: the
     # hours each band covers so it can be labelled, the house energy behind the
@@ -1327,11 +1333,11 @@ def energy(
         # electricity.
         with _inside_the_calendar():
             priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
-            for index, split in enumerate(priced_buckets):
-                splits[read.edges[index]] = split
-                money[read.edges[index]] = price_period(
-                    tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
-                )
+        for index, split in enumerate(priced_buckets):
+            splits[read.edges[index]] = split
+            money[read.edges[index]] = price_period(
+                tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
+            )
         if read.buckets:
             first, last = read.buckets[0].start, read.buckets[-1].start
             spanned = [
@@ -1976,16 +1982,23 @@ def _daily_range(
     # Month: the calendar month that contains day_start, from its first day
     # through the first day of the following month.
     if period == "month":
-        first_of_month = day_start.replace(day=1)
-        if first_of_month.month == 12:
-            next_month = first_of_month.replace(year=first_of_month.year + 1, month=1, day=1)
-        else:
-            next_month = first_of_month.replace(month=first_of_month.month + 1, day=1)
-        days_count = (next_month - first_of_month).days
-        return [
-            (first_of_month + timedelta(days=i), first_of_month + timedelta(days=i + 1))
-            for i in range(days_count)
-        ]
+        try:
+            first_of_month = day_start.replace(day=1)
+            if first_of_month.month == 12:
+                next_month = first_of_month.replace(year=first_of_month.year + 1, month=1, day=1)
+            else:
+                next_month = first_of_month.replace(month=first_of_month.month + 1, day=1)
+            days_count = (next_month - first_of_month).days
+            return [
+                (first_of_month + timedelta(days=i), first_of_month + timedelta(days=i + 1))
+                for i in range(days_count)
+            ]
+        except ValueError:
+            # ``replace(year=10000)`` raises ValueError rather than OverflowError
+            # because the constructor rejects the year before any arithmetic
+            # happens.  Convert it so the single ``_inside_the_calendar`` guard
+            # catches every shape the same mistake can take.
+            raise OverflowError("date value out of range") from None
     return []
 
 

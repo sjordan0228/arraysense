@@ -313,7 +313,14 @@ def _next_edge(edge: datetime, period: Period, zone: ZoneInfo) -> datetime:
     """
     if period == "month":
         year, month = (edge.year + 1, 1) if edge.month == 12 else (edge.year, edge.month + 1)
-        return datetime(year, month, 1, tzinfo=zone)
+        try:
+            return datetime(year, month, 1, tzinfo=zone)
+        except ValueError:
+            # ``datetime(10000, 1, 1, ...)`` raises ValueError because the
+            # constructor sees the out-of-range year before any arithmetic.
+            # Convert it so the single ``_inside_the_calendar`` guard catches
+            # every shape the same mistake can take.
+            raise OverflowError("date value out of range") from None
     day = date(edge.year, edge.month, edge.day) + timedelta(days=1)
     return datetime(day.year, day.month, day.day, tzinfo=zone)
 
