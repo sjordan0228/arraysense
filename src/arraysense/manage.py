@@ -34,6 +34,17 @@ CLI_SHIM = "/usr/local/bin/arraysense"
 UNIT_PATH = "/etc/systemd/system/arraysense.service"
 DROPIN_DIR = "/etc/systemd/system/arraysense.service.d"
 
+# Where the backup writes, how many it keeps, whether it runs and when — all
+# four are settings now, read from the running service over HTTP. What follows
+# is only what to use when the service cannot be asked, which happens on a box
+# whose service is down and is exactly when a backup matters most.
+#
+# This module cannot import the registry those defaults belong to: it runs under
+# the distribution's Python 3.8 while the package needs 3.12. So the values are
+# duplicated here, deliberately and visibly, and ``tests/test_manage.py`` fails
+# the moment the copy disagrees with the registry. Without that test this is the
+# "computed in two places" mistake, one of which nobody is looking at.
+#
 # The backup lands on a different disk — the SD card on the reference
 # installation, which is exactly where the database does not live because a card
 # wears out under sustained writes. Only the compressed file is written there;
@@ -43,6 +54,28 @@ BACKUP_DIR = "/var/backups/arraysense"
 # half a gigabyte, and the measured 7.2 GB a year of card writes is the whole
 # point of compressing.
 BACKUP_KEEP = 14
+# Whether the timer's run does anything. A hand-run backup ignores this: somebody
+# typing the command wants a copy now, and a paused schedule is not a refusal.
+BACKUP_ENABLED = True
+# The hour and minute, on the installation's own clock, after which the day's
+# backup may run. The timer fires every fifteen minutes and asks; these decide.
+BACKUP_HOUR = 3
+BACKUP_MINUTE = 15
+
+# The registry keys these stand in for, mapped to the value used when the
+# service does not report one. Spelled as the registry spells them so a renamed
+# setting fails the drift test rather than falling back silently forever.
+BACKUP_FALLBACK = {
+    "backup.enabled": BACKUP_ENABLED,
+    "backup.directory": BACKUP_DIR,
+    "backup.keep": BACKUP_KEEP,
+    "backup.hour": BACKUP_HOUR,
+    "backup.minute": BACKUP_MINUTE,
+}
+# Not in the fallback map: an unset zone is the registry's own default and means
+# "follow the machine's clock", which is a decision rather than a gap, so it is
+# never reported as one.
+TIMEZONE_KEY = "site.timezone"
 
 # What a held lock means, in one place so the reason _take_lock reports and the
 # message the caller prints cannot drift apart.
@@ -106,6 +139,16 @@ def status_url(port: int) -> str:
 def setup_url(port: int) -> str:
     """The setup endpoint, which is all a not-yet-configured service serves."""
     return f"http://127.0.0.1:{port}/api/setup"
+
+
+def settings_url(port: int) -> str:
+    """Where the stored settings are read from, on the same box as everything else.
+
+    The service already merges registry defaults over whatever is stored, so
+    one GET answers "what is configured" without this file knowing anything
+    about the registry, the database schema, or how a default is spelled.
+    """
+    return f"http://127.0.0.1:{port}/api/settings"
 
 
 def capabilities_url(port: int) -> str:
@@ -429,6 +472,173 @@ def _verify_working_copy(path: str) -> bool:
         return False
 
 
+def _whole(raw: object, low: int, high: int | None = None) -> int | None:
+    """A reported number as a whole one inside its range, or None for anything else.
+
+    None means the service said nothing usable, never a plausible stand-in: an
+    hour of 99 believed is a backup that never becomes due again, and a value
+    invented here would be indistinguishable from one somebody chose.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        number = raw
+    elif isinstance(raw, float) and raw == int(raw):
+        number = int(raw)
+    else:
+        return None
+    if number < low or (high is not None and number > high):
+        return None
+    return number
+
+
+def _read_backup_value(key: str, raw: object) -> object:
+    """Coerce one reported setting, or None when the service gave nothing usable.
+
+    Each is read to the shape the CLI needs rather than trusted as it arrives.
+    The service validates on write, but this file also has to survive a
+    database edited by hand and a service older than these settings.
+    """
+    if key == "backup.enabled":
+        return raw if isinstance(raw, bool) else None
+    if key == "backup.directory":
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+    if key == "backup.keep":
+        # The floor is this file's own rule: rotation slices the list by
+        # ``[:-keep]``, which stops rotating at all below one. The ceiling is
+        # the registry's business, and a bound copied here would be one more
+        # thing to keep in step.
+        return _whole(raw, 1)
+    if key == "backup.hour":
+        return _whole(raw, 0, 23)
+    if key == "backup.minute":
+        return _whole(raw, 0, 59)
+    return None
+
+
+def backup_settings(port: int, timeout: float = 5.0) -> tuple[dict[str, Any], str]:
+    """What the service says the backup should do, and what was not answered.
+
+    Read over HTTP because this file cannot import the settings registry: it
+    runs on the distribution's Python 3.8 and the package needs 3.12. The
+    endpoint already merges the registry's defaults over whatever is stored,
+    so one GET answers the whole question without this file knowing how a
+    default is spelled.
+
+    The second element is empty when every value came from the service, and
+    otherwise says which ones did not and that the built-in copies were used
+    instead. A fallback nobody is told about is a second source of truth
+    pretending to be the first — and on a box whose service is down, which is
+    exactly when a backup matters most, that is the state the CLI is in.
+    """
+    body = _probe(settings_url(port), timeout=timeout)
+    values = body.get("values") if body is not None else None
+    conf: dict[str, Any] = {}
+    if not isinstance(values, dict):
+        conf.update(BACKUP_FALLBACK)
+        conf[TIMEZONE_KEY] = ""
+        return (
+            conf,
+            f"the service is not answering on port {port}, so the built-in backup "
+            "defaults are being used rather than the stored settings",
+        )
+    unanswered = []
+    for key in sorted(BACKUP_FALLBACK):
+        value = _read_backup_value(key, values.get(key))
+        if value is None:
+            unanswered.append(key)
+            value = BACKUP_FALLBACK[key]
+        conf[key] = value
+    zone = values.get(TIMEZONE_KEY)
+    conf[TIMEZONE_KEY] = zone.strip() if isinstance(zone, str) else ""
+    if not unanswered:
+        return (conf, "")
+    named = ", ".join(unanswered)
+    return (
+        conf,
+        f"the service reported nothing usable for {named}, so the built-in "
+        "defaults are being used for them",
+    )
+
+
+def _zone(name: str) -> datetime.tzinfo | None:
+    """The installation's zone, or None meaning the machine's own clock.
+
+    An empty setting means "follow the machine", which is the registry's
+    default and what every date in this CLI used before the setting existed.
+    zoneinfo arrived in 3.9 and this file has to run on 3.8, so its absence is
+    the same answer rather than an error.
+    """
+    if not name:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError, OSError):
+        # ZoneInfoNotFoundError is a KeyError. A zone this machine's tz
+        # database has never heard of is not worth failing a backup over.
+        return None
+
+
+def _at_zone(moment: datetime.datetime, zone_name: str) -> datetime.datetime:
+    """Place an instant on the installation's calendar.
+
+    Both questions the scheduled run asks — has the configured time passed,
+    and has today already been backed up — are local-calendar questions, and
+    they are cut in the installation's own zone for the same reason energy.py
+    cuts a day there: the archive is named for a date, and a UTC date names a
+    different day for anybody east or west of Greenwich after their evening.
+    """
+    return moment.astimezone(_zone(zone_name))
+
+
+def _local_now(zone_name: str) -> datetime.datetime:
+    """Now, on the installation's clock.
+
+    Taken as an instant and then placed, rather than read straight off the
+    local clock, so the conversion the schedule depends on is the same line of
+    code the tests drive with a known instant.
+    """
+    # datetime.UTC is the 3.11 spelling of this and this file runs on 3.8.
+    return _at_zone(datetime.datetime.now(datetime.timezone.utc), zone_name)  # noqa: UP017
+
+
+def _time_has_passed(now: datetime.datetime, hour: int, minute: int) -> bool:
+    """Whether the installation's clock has reached the configured time today.
+
+    Compared as wall-clock fields, never by subtracting or differencing two
+    datetimes. Two datetimes sharing a tzinfo subtract as though they were
+    naive, which is the trap this project has already paid for twice — and the
+    wall clock is what the question is actually about: a backup configured for
+    03:15 runs when the clock in the house says 03:15.
+
+    That reading is also what makes the odd days come out right. On a
+    23-hour day a configured 02:30 may never exist, and asking whether the
+    clock has passed it still says yes at 03:05, so the day is not skipped. On
+    a 25-hour day the configured time passes twice; the caller's check for
+    today's archive is what stops the second one writing a duplicate.
+    """
+    return (now.hour, now.minute) >= (hour, minute)
+
+
+def archive_name(stamp: str) -> str:
+    """The filename for one day's archive, in the one place that decides it.
+
+    Written and looked for by different code paths — the writer, the rotation
+    glob, and the scheduled run's "has today already been done" — so a name
+    spelled twice is a scheduler that backs up every fifteen minutes.
+    """
+    return f"arraysense-{stamp}.db.gz"
+
+
+def _already_written(dest_dir: str, stamp: str) -> bool:
+    """Whether the archive for this local day is already on disk."""
+    return os.path.exists(os.path.join(dest_dir, archive_name(stamp)))
+
+
 def _check_backup_dir(path: str) -> bool:
     """Verify the backup destination exists and is writable by this user.
 
@@ -542,7 +752,7 @@ def backup_now(source: str, dest_dir: str, keep: int, stamp: str) -> str | None:
             _remove_path(work_path)
             return None
 
-        dest_path = os.path.join(dest_dir, f"arraysense-{stamp}.db.gz")
+        dest_path = os.path.join(dest_dir, archive_name(stamp))
         part_path = dest_path + ".part"
         try:
             with open(work_path, "rb") as src, gzip.open(part_path, "wb") as out:
@@ -1094,41 +1304,76 @@ def cmd_backup(argv: list[str]) -> int:
     undo the reason the database was moved off it. The restore recipe is printed
     after a successful run because a backup nobody knows how to restore is not a
     backup.
+
+    Where it writes, how many it keeps, whether it runs at all and when are the
+    installation's settings, read from the running service. A flag still beats
+    them, because somebody typing ``--dir`` is answering a different question
+    from the one the settings answer.
+
+    ``--scheduled`` is the timer's mode and nobody else's. The timer fires
+    every fifteen minutes and this decides whether there is anything to do:
+    the backup must be enabled, the configured time must have passed on the
+    installation's own clock, and today's archive must not already exist. A
+    run that is not due returns silently — ninety-six firings a day, each
+    announcing that it did nothing, would bury the one that mattered. A
+    hand-run ``arraysense backup`` ignores all three and backs up now.
     """
-    dest_dir = BACKUP_DIR
-    keep = BACKUP_KEEP
+    scheduled = False
+    dir_flag: str | None = None
+    keep_flag: int | None = None
     index = 0
     while index < len(argv):
         arg = argv[index]
-        if arg in ("--dir", "--keep"):
+        if arg == "--scheduled":
+            scheduled = True
+        elif arg in ("--dir", "--keep"):
             index += 1
             if index >= len(argv):
                 print(f"{arg} needs a value")
                 return 1
             value = argv[index]
             if arg == "--dir":
-                dest_dir = value
+                dir_flag = value
             else:
                 parsed = _backup_keep(value)
                 if parsed is None:
                     return 1
-                keep = parsed
+                keep_flag = parsed
         elif arg.startswith("--dir="):
-            dest_dir = arg.split("=", 1)[1]
+            dir_flag = arg.split("=", 1)[1]
         elif arg.startswith("--keep="):
             parsed = _backup_keep(arg.split("=", 1)[1])
             if parsed is None:
                 return 1
-            keep = parsed
+            keep_flag = parsed
         else:
-            print("usage: arraysense backup [--dir PATH] [--keep N]")
+            print("usage: arraysense backup [--dir PATH] [--keep N] [--scheduled]")
             return 1
         index += 1
+
+    conf, fallback = backup_settings(configured_port())
+    dest_dir = conf["backup.directory"] if dir_flag is None else dir_flag
+    keep = conf["backup.keep"] if keep_flag is None else keep_flag
+    now = _local_now(conf[TIMEZONE_KEY])
+    stamp = now.date().isoformat()
+
+    if scheduled:
+        if not conf["backup.enabled"]:
+            return 0
+        if not _time_has_passed(now, conf["backup.hour"], conf["backup.minute"]):
+            return 0
+        if _already_written(dest_dir, stamp):
+            return 0
+    # Said here rather than at the read, so a firing that decided there was
+    # nothing to do stays silent while a backup actually written under the
+    # built-in defaults says which settings it ran on.
+    if fallback:
+        print(fallback)
 
     source = _database_path()
     if not _check_backup_dir(dest_dir):
         return 1
-    written = backup_now(source, dest_dir, keep, datetime.date.today().isoformat())
+    written = backup_now(source, dest_dir, keep, stamp)
     if written is None:
         return 1
     try:
