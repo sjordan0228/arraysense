@@ -7,6 +7,53 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.8.1 — 12 August 2026
+
+### Fixed
+
+- **Two writers shared one row and destroyed each other's readings.** The raw
+  tier is keyed by timestamp and device at one-second resolution, and it has two
+  writers: the inverter poll loop, and the weather poller on its own
+  fifteen-minute clock. Nothing coordinates the two clocks, and the write
+  replaced every column of the row, so whichever landed second erased the first.
+
+  Replayed over a month of the reference installation's real history — 255,798
+  rows — a weather tick landed on a second an inverter poll already owned
+  **294 times in 3,116 ticks**, and every one of those polls lost all 91 of its
+  readings while its own battery modules kept theirs at that same instant. Worse,
+  a tick landing on a recorded outage cleared the reason: **all 62 gap rows in
+  that month were erased** by the replay. An outage smoothed into a straight
+  segment is an outage nobody ever notices.
+
+  Each writer now updates only its own columns, told apart by the metric
+  registry's own classification of what is the site's and what is the
+  inverter's. Replayed again, the same 294 collisions produce rows carrying both
+  writers' data — which no row in the database had ever held — and no losses.
+
+- **The archive backfill destroyed the weather it had just written.** The
+  archive answers one hour in two pieces, the means over the hour just gone and
+  the readings taken at the label, and a day's request therefore also writes the
+  previous day's last hour. Backfilling a range wrote each shared hour twice and
+  kept only the second half. A site reading now writes the columns it carries
+  and leaves the rest of that instant alone.
+
+- **A failed poll could overwrite the reading before it.** The gap was stamped
+  before the connection was even attempted, while a successful reading is
+  stamped when the read completes — and since the cadence is the interval or the
+  read time, whichever is longer, a failure filed under that older stamp landed
+  on the second the previous poll's reading was filed under. The stamp now comes
+  from the moment the failure was seen, and a recorded gap is refused outright on
+  any row that holds a reading, which also covers a clock stepped backwards.
+
+- **The daily energy counters were cut at UTC midnight rather than the owner's.**
+  The inverter resets them at its local midnight. Between the two midnights —
+  five hours on the reference installation, and the five that hold the evening
+  peak — the cache believed it was still yesterday and carried the old day's
+  totals into the new one, where the daily metrics roll up with max and that
+  stale high-water mark then stood for the rest of the day. The day is now cut in
+  the installation's own zone, which also makes the 23- and 25-hour days come out
+  right.
+
 ## 0.8.0 — 12 August 2026
 
 An installer, a command to manage the installation afterwards, a daily backup,
