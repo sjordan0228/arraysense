@@ -28,6 +28,7 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -326,6 +327,31 @@ def _check_range(start: datetime, end: datetime) -> None:
     """Reject a range that ends before it starts."""
     if end <= start:
         raise HTTPException(status_code=400, detail="end must be after start")
+
+
+@contextmanager
+def _inside_the_calendar() -> Iterator[None]:
+    """Turn a walk that steps off the end of the calendar into a 400.
+
+    Every one of these endpoints walks its range a day or a month at a time, and
+    a bound near year 1 or year 9999 makes the next step land outside anything a
+    ``datetime`` can hold. That is the caller's mistake — a mistyped year in a
+    date field reaches it — and every other malformed input on the same
+    endpoints already answers 400 or 422: an unknown metric, a blank device, a
+    reversed range, an unknown zone, a bad period. Only this shape told somebody
+    who typed a date wrongly that the server was broken, and left a traceback in
+    the log of an unattended service saying so.
+
+    ``ValueError`` travels with ``OverflowError`` because the same mistyped year
+    raises one from ``replace(year=…)`` and the other from ``date`` arithmetic.
+    """
+    try:
+        yield
+    except (OverflowError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"the range steps outside the calendar: {exc}",
+        ) from exc
 
 
 def _cadence_seconds(poll_interval: float) -> int:
@@ -1009,7 +1035,8 @@ def costs(
     # be measured *from*, rather than starting at whatever row happens to fall
     # inside it. Without the lead, the first stretch of every month is short by
     # however long it took the first sample to arrive.
-    lead = start - COUNTER_LEAD
+    with _inside_the_calendar():
+        lead = start - COUNTER_LEAD
     # Minute first, then coarser, then raw. Hourly has to be in the chain and
     # not just as a last resort: the minute tier is kept for a year, so a month
     # older than that has nothing there while the hourly tier holds it back to
@@ -1023,13 +1050,13 @@ def costs(
         rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
         if rows:
             break
-    try:
+    with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
-    bill = estimate_bill(tariff, energy)
+    with _inside_the_calendar():
+        result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
+        bill = estimate_bill(tariff, energy)
+        unpriced = round(unpriced_minutes(tariff, start, end, zone))
 
     # The page needs more than the priced totals to be honest about them: the
     # hours each band covers so it can be labelled, the house energy behind the
@@ -1046,7 +1073,7 @@ def costs(
         "rows": _band_rows(tariff, energy, result),
         "measured_minutes": energy.measured_minutes,
         "elapsed_minutes": energy.elapsed_minutes,
-        "unpriced_minutes": round(unpriced_minutes(tariff, start, end, zone)),
+        "unpriced_minutes": unpriced,
         # Per counter: what the figures hold, what the meter counted that they
         # do not, and whether some loss has no statable size. The labels on
         # every money figure are worded from this, never from the minutes
@@ -1267,7 +1294,8 @@ def energy(
     start, end = with_zone(start, zone), with_zone(end, zone)
     _check_range(start, end)
 
-    read = read_energy(store, start, end, period=period, zone=zone)
+    with _inside_the_calendar():
+        read = read_energy(store, start, end, period=period, zone=zone)
 
     tariff, stored = (None, "")
     if priced:
@@ -1290,12 +1318,13 @@ def energy(
         # of the next, and pricing hours still in the future leaves the whole
         # month unmeasured and shows a dash beside a month that plainly used
         # electricity.
-        priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
-        for index, split in enumerate(priced_buckets):
-            splits[read.edges[index]] = split
-            money[read.edges[index]] = price_period(
-                tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
-            )
+        with _inside_the_calendar():
+            priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
+            for index, split in enumerate(priced_buckets):
+                splits[read.edges[index]] = split
+                money[read.edges[index]] = price_period(
+                    tariff, split, fixed_charge=_bucket_fixed(tariff, period, split)
+                )
         if read.buckets:
             first, last = read.buckets[0].start, read.buckets[-1].start
             spanned = [
@@ -1649,11 +1678,10 @@ def bands(
     # the server's. ``band_intervals`` says so with a ValueError, which would
     # otherwise leave FastAPI to answer 500 — telling somebody who asked for five
     # years that the service is broken. ``/api/costs`` converts the same error
-    # for the same reason.
-    try:
+    # for the same reason, and a range that runs off the calendar entirely is
+    # the same mistake one step further out.
+    with _inside_the_calendar():
         intervals = band_intervals(tariff, start, end, zone)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     windows = [
         {
@@ -2046,7 +2074,8 @@ def efficiency(
         raise HTTPException(status_code=400, detail=f"start must be YYYY-MM-DD: {exc}") from exc
 
     day_start = datetime.combine(start_date, datetime.min.time(), tzinfo=zone)
-    days = _daily_range(day_start, period)
+    with _inside_the_calendar():
+        days = _daily_range(day_start, period)
     if not days:
         raise HTTPException(
             status_code=400, detail=f"could not compute range for period={period!r}"

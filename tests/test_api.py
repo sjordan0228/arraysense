@@ -3333,6 +3333,57 @@ def test_efficiency_unconfigured_returns_configured_false(tmp_path: Path) -> Non
     assert body["baseline"]["window_start"] is None
 
 
+@pytest.mark.parametrize(
+    ("endpoint", "params"),
+    [
+        ("/api/energy", {"start": "0001-01-01T00:00", "end": "0001-01-02T00:00"}),
+        ("/api/energy", {"start": "9999-12-30T00:00", "end": "9999-12-31T00:00"}),
+        ("/api/costs", {"start": "0001-01-01T00:00", "end": "0001-01-31T00:00"}),
+        ("/api/costs", {"start": "9999-12-01T00:00", "end": "9999-12-31T00:00"}),
+        ("/api/bands", {"start": "9999-12-01T00:00", "end": "9999-12-31T00:00"}),
+    ],
+)
+def test_a_range_off_the_end_of_the_calendar_is_a_bad_request(
+    tmp_path: Path, endpoint: str, params: dict[str, str]
+) -> None:
+    """A mistyped year is the caller's mistake, and every other one answers 400.
+
+    These endpoints walk their range a day or a month at a time, and a bound near
+    year 1 or year 9999 makes the next step land outside anything a datetime can
+    hold. It escaped the handler as a 500 with a traceback in the log of an
+    unattended service, while an unknown metric, a blank device, a reversed
+    range, an unknown zone and a bad period all answered cleanly.
+    """
+    store = SqliteStore(str(tmp_path / "cal.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=T0, readings={"pv_total_power_w": 1000.0}))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "cal.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app, raise_server_exceptions=False) as c:
+        c.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+        r = c.get(endpoint, params={**params, "period": "month"})
+    store.close()
+    assert r.status_code == 400, r.text
+    assert "calendar" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("period", ["day", "week", "month"])
+def test_efficiency_refuses_a_start_off_the_end_of_the_calendar(
+    tmp_path: Path, period: str
+) -> None:
+    """_daily_range walks into year 10000 for all three periods."""
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get("/api/efficiency", params={"period": period, "start": "9999-12-31"})
+    assert r.status_code == 400, r.text
+    assert "calendar" in r.json()["detail"]
+
+
 def test_efficiency_rejects_an_unknown_period(tmp_path: Path) -> None:
     with _efficiency_client(tmp_path, lambda s: None) as c:
         r = c.get(
