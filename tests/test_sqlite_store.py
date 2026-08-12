@@ -888,6 +888,19 @@ def test_an_undeclared_registry_metric_reads_back_as_none(tmp_path: Path) -> Non
     assert latest["load_power_w"] is None
 
 
+def test_peak_of_an_undeclared_metric_reads_back_as_none(tmp_path: Path) -> None:
+    # The same contract query() and latest() keep. A driver may declare
+    # per-string power and no array total — Capabilities permits it — and the
+    # forecast's cold start asks for the total on every tick. Raising there
+    # takes the whole forecast down with a traceback every interval, where the
+    # honest answer is that this database has never held such a reading.
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 500.0}))
+    got = store.peak("load_power_w", _ts() - timedelta(days=30), _ts())
+    store.close()
+    assert got is None
+
+
 def test_an_undeclared_module_metric_reads_back_as_none(tmp_path: Path) -> None:
     store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
     store.append(

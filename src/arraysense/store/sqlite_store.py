@@ -800,8 +800,20 @@ class SqliteStore:
         the honest measure of what the array can do, where a nameplate rating
         would be an assumption. Reads the raw tier because a coarser tier's
         mean flattens exactly the peak this is for.
+
+        A registry metric this database has no column for answers None, the
+        same way ``query`` and ``latest`` do through ``_selected``: the driver
+        never declared it, so nothing was ever recorded, and that is a reading
+        nobody took rather than an error. It has to be checked here instead of
+        deferred to ``_selected``, whose ``NULL AS name`` is not something
+        MAX() can be wrapped around. The caller is the forecast's cold start,
+        which asks for the array total on a driver that may declare only
+        per-string power — a raise there is a traceback every interval and no
+        forecast recorded at all.
         """
         (name,) = self._check_inverter_names([metric])
+        if name not in self._present["inverter_raw"]:
+            return None
         row = self._conn.execute(
             f"SELECT MAX({name}) FROM inverter_raw "
             "WHERE device = ? AND timestamp >= ? AND timestamp < ?",
