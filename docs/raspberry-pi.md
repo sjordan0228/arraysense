@@ -82,6 +82,85 @@ and the "put the database on an SSD" advice elsewhere in these docs is exactly
 what a reader follows straight into this error. Only the named path becomes
 writable; the rest of the sandbox is untouched.
 
+## A daily backup, on the card that is not the database
+
+The SSD holds the only copy of the database, and an SSD can fail like anything
+else. `arraysense backup` writes a compressed copy of the database every day to
+`/var/backups/arraysense` — a directory on the SD card, which is precisely where
+the database itself does not live, and that is the whole point: a backup on the
+same disk as the original is protection against nothing.
+
+Measured on the real 264 MB database:
+
+| step | size |
+| --- | --- |
+| live database | 264 MB |
+| working copy beside it, on the SSD | 264 MB — `Connection.backup()` copies free pages too |
+| compressed, on the card | about 21 MB |
+
+A compressed daily copy writes about **7.2 GB a year** to the card, against
+96 GB a year for a naive `cp` of the raw file — the difference between 1.8% and
+24% of the write load the database was moved off the card to escape. The card
+only ever receives the compressed file. The SSD needs free space equal to the
+database size while a backup runs; if it runs out the collector's own writes fail
+for that window and are recorded as gaps.
+
+The uncompressed working copy is never written to the card. It is made beside
+the database itself with SQLite's own online backup API — the only correct way
+to copy a live database that is being written to, in WAL mode, where a plain
+file copy of the `.db` alone would miss the `-wal` and produce a torn snapshot —
+then verified with `PRAGMA quick_check` before it is trusted, and only then
+compressed and renamed into place on the card. A run interrupted halfway leaves
+a `.part` file, never something that looks like a finished backup. Fourteen
+daily copies are kept; the oldest are rotated away, and only after a new one has
+been written and verified — never before, because a rotation that runs first
+turns a failed backup into data loss.
+
+Install it:
+
+    sudo cp packaging/arraysense-backup.service packaging/arraysense-backup.timer /etc/systemd/system/
+    sudo cp packaging/arraysense-backup.tmpfiles.conf /etc/tmpfiles.d/arraysense-backup.conf
+    sudo systemd-tmpfiles --create
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now arraysense-backup.timer
+
+The tmpfiles.d fragment creates `/var/backups/arraysense` owned by the
+`arraysense` user before either the timer or a hand-run backup touches it.
+Without it, a hand-run backup as root creates the directory root:root and the
+timer (which runs as `arraysense`) can never write there — failing silently every
+night.
+
+The timer fires at 03:15 and is `Persistent=true`, so a Pi that was off at 03:15
+runs the backup when it comes back rather than skipping a day silently. The
+service runs as the `arraysense` user under `ProtectSystem=strict`, with
+`/var/backups/arraysense` the only writable path. The working copy needs write
+access beside the database itself, so an installation whose database lives
+outside `StateDirectory` — the SSD here, exactly as for the collector — needs
+its own carve-out:
+
+    # /etc/systemd/system/arraysense-backup.service.d/ssd.conf
+    [Service]
+    ReadWritePaths=/mnt/ssd/arraysense
+
+Run a backup by hand with `sudo arraysense backup` (add `--dir PATH` or
+`--keep N` to override the destination or the number kept). A successful run
+prints the exact restore recipe:
+
+    restore with:
+      sudo systemctl stop arraysense
+      sudo -u arraysense gunzip -c /var/backups/arraysense/arraysense-2026-08-12.db.gz > /mnt/ssd/arraysense/arraysense.db.restore
+      sudo -u arraysense sqlite3 /mnt/ssd/arraysense/arraysense.db.restore "PRAGMA quick_check"   # must print ok
+      sudo rm -f /mnt/ssd/arraysense/arraysense.db-wal /mnt/ssd/arraysense/arraysense.db-shm
+      sudo -u arraysense mv /mnt/ssd/arraysense/arraysense.db.restore /mnt/ssd/arraysense/arraysense.db
+      sudo systemctl start arraysense
+
+The archive is unpacked beside the database and verified before the live file
+is touched, so a corrupt or truncated archive is discovered rather than restored.
+The rm is not optional: a stale write-ahead log left by a crash is replayed
+over the restored file and silently undoes it. The recipe is printed rather
+than left to the documentation because a backup
+nobody knows how to restore is not a backup.
+
 ## The USB enclosure: `usb-storage.quirks`
 
 The reference SSD is a USB enclosure, and under sustained writes it dropped off

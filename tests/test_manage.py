@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import gzip
 import os
+import shutil
 import sqlite3
 import subprocess
 from typing import Any
@@ -11,6 +14,108 @@ import pytest
 
 from arraysense import manage
 from arraysense.store import schema
+
+
+def test_a_backup_round_trips_every_row(tmp_path: Any) -> None:
+    """The point of the whole thing: what comes back must be what went in."""
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    for ts in range(1783512004, 1783512004 + 50):
+        conn.execute(
+            "INSERT INTO inverter_raw (timestamp, device) VALUES (?, ?)", (ts, "CE12345678")
+        )
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    written = manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    assert written is not None
+
+    restored = tmp_path / "restored.db"
+    with gzip.open(written, "rb") as src, open(restored, "wb") as out:
+        shutil.copyfileobj(src, out)
+    conn = sqlite3.connect(str(restored))
+    assert conn.execute("SELECT COUNT(*) FROM inverter_raw").fetchone()[0] == 50
+    conn.close()
+
+
+def test_an_unreadable_source_writes_nothing_and_deletes_nothing(tmp_path: Any) -> None:
+    """A run that could not read the database must not be mistaken for one that
+    found nothing — and must never rotate a good backup away."""
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    keeper = dest / "arraysense-2026-08-01.db.gz"
+    keeper.write_bytes(b"older backup")
+
+    assert (
+        manage.backup_now(str(tmp_path / "missing.db"), str(dest), keep=1, stamp="2026-08-12")
+        is None
+    )
+    assert keeper.exists(), "an old backup must survive a failed run"
+
+
+def test_rotation_keeps_the_newest_and_only_after_success(tmp_path: Any) -> None:
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    for day in ("2026-08-01", "2026-08-02", "2026-08-03"):
+        (dest / f"arraysense-{day}.db.gz").write_bytes(b"x")
+
+    manage.backup_now(str(source), str(dest), keep=2, stamp="2026-08-12")
+    names = sorted(p.name for p in dest.glob("arraysense-*.db.gz"))
+    assert names == ["arraysense-2026-08-03.db.gz", "arraysense-2026-08-12.db.gz"]
+
+
+def test_no_half_written_backup_is_left_behind(tmp_path: Any) -> None:
+    """The compressed file is renamed into place, so an interrupted run cannot
+    leave something that looks finished."""
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    assert list(dest.glob("*.part")) == []
+
+
+def test_the_working_copy_is_made_beside_the_source_not_the_destination(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination is an SD card on the reference installation, and the
+    uncompressed copy is six times the size of the compressed one. Writing it
+    to the card would undo the reason the database lives on a separate disk."""
+    source_dir = tmp_path / "ssd"
+    source_dir.mkdir()
+    source = source_dir / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+    dest = tmp_path / "card"
+    dest.mkdir()
+    seen: list[str] = []
+    real_connect: Any = sqlite3.connect
+
+    def watching_connect(target: str, *a: Any, **k: Any) -> Any:
+        seen.append(str(target))
+        return real_connect(target, *a, **k)
+
+    # manage.sqlite3 is the same module object as sqlite3 here, so patching the
+    # module patches what backup_now sees.
+    monkeypatch.setattr(sqlite3, "connect", watching_connect)
+    manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+    working = [s for s in seen if s.endswith(".tmp") or "backup" in os.path.basename(s)]
+    assert all(not s.startswith(str(dest)) for s in working), seen
 
 
 def test_health_returns_the_body_once_the_collector_is_live(
@@ -891,3 +996,129 @@ def test_uninstall_says_so_when_daemon_reload_fails(
     assert manage.cmd_uninstall([]) == 1
     said = "\n".join(printed)
     assert "reload" in said.lower()
+
+
+def test_the_restore_recipe_removes_the_write_ahead_log(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A stale -wal is replayed over the restored file and silently undoes it.
+
+    Measured: restoring over a database that still had a hot -wal produced the
+    pre-restore content, 2000 rows where the backup held 10, and quick_check
+    reported ok.
+    """
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    assert manage.cmd_backup(["--dir", str(dest)]) == 0
+    out = capsys.readouterr().out
+    assert f"rm -f {source}-wal {source}-shm" in out
+    # The archive is unpacked beside the database and verified before the live
+    # file is touched, so a corrupt or truncated archive is discovered rather than
+    # restored.
+    assert "PRAGMA quick_check" in out
+    assert out.index("systemctl stop") < out.index("gunzip") < out.index("quick_check")
+    assert out.index("quick_check") < out.index("rm -f") < out.index("mv ")
+    assert out.index("mv ") < out.index("systemctl start")
+
+
+# --- Lock ---
+
+
+def test_lock_refuses_a_second_run(tmp_path: Any) -> None:
+    """Two overlapping runs share a working path and a destination name.
+
+    A hand-run backup does not go through systemd's serialisation of a oneshot
+    unit. Interleaved, two runs can publish a verified archive of an empty
+    database while rotating a real backup away.
+    """
+    source = tmp_path / "live.db"
+    conn = sqlite3.connect(str(source))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+    dest = tmp_path / "backups"
+    dest.mkdir()
+
+    lock_path = str(source) + ".backup.lock"
+    lock_fd = manage._take_lock(lock_path)
+    assert lock_fd is not None
+
+    try:
+        written = manage.backup_now(str(source), str(dest), keep=14, stamp="2026-08-12")
+        assert written is None
+        # Nothing was written — no backup, no .part, no .tmp
+        assert list(dest.glob("arraysense-*.db.gz")) == []
+        assert list(dest.glob("*.part")) == []
+    finally:
+        os.close(lock_fd)
+        with contextlib.suppress(OSError):
+            os.remove(lock_path)
+
+
+def test_a_zero_length_working_copy_is_rejected(tmp_path: Any) -> None:
+    """sqlite3.connect creates a new file when the path does not exist, and
+    quick_check on an empty database returns 'ok' — so a missing or empty
+    working copy must be caught before the file is opened, not after."""
+    empty = tmp_path / "empty.db"
+    empty.write_bytes(b"")
+    assert manage._verify_working_copy(str(empty)) is False
+
+    missing = str(tmp_path / "nonexistent.db")
+    assert manage._verify_working_copy(missing) is False
+
+    real = tmp_path / "real.db"
+    real.write_bytes(b"SQLite format 3\0...")
+    assert manage._verify_working_copy(str(real)) is True
+
+
+def test_sqlite_connect_creates_an_empty_database_that_passes_quick_check(
+    tmp_path: Any,
+) -> None:
+    """Prove the threat the zero-length guard exists for.
+
+    sqlite3.connect creates a new file when the path does not exist, and
+    quick_check on an empty database returns 'ok' — which is how two
+    overlapping runs can publish a verified-looking archive of nothing.
+    """
+    missing = str(tmp_path / "nonexistent.db")
+    conn = sqlite3.connect(missing)
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+        assert row[0] == "ok"
+        assert os.path.getsize(missing) == 0
+    finally:
+        conn.close()
+
+
+# --- Destination directory check ---
+
+
+def test_check_backup_dir_refuses_a_missing_directory(tmp_path: Any) -> None:
+    """A backup that silently invents its own destination with the wrong owner
+    is how this failed in the first place."""
+    assert manage._check_backup_dir(str(tmp_path / "does_not_exist")) is False
+
+
+def test_check_backup_dir_refuses_an_unwritable_directory(tmp_path: Any) -> None:
+    """root running first creates the directory root:root; the service running
+    as arraysense then cannot write there and fails silently every night."""
+    if os.geteuid() == 0:
+        pytest.skip("root can write to a 0500 directory")
+    unwritable = tmp_path / "unwritable"
+    unwritable.mkdir(mode=0o500)
+    assert manage._check_backup_dir(str(unwritable)) is False
+
+
+def test_check_backup_dir_accepts_a_writable_directory(tmp_path: Any) -> None:
+    """The happy path must be confirmed, because a false refusal would stop a
+    working installation from running its daily backup."""
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    assert manage._check_backup_dir(str(writable)) is True

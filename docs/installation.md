@@ -128,6 +128,7 @@ The installer leaves an `arraysense` command on the PATH:
 | `arraysense logs` | the service's journal; flags pass through to `journalctl`, so `-f` follows |
 | `arraysense restart` | restarts the service and waits — up to 90 seconds — until the collector is answering, rather than trusting that `systemctl start` succeeded |
 | `arraysense version` | the version and the commit it is running |
+| `arraysense backup` | a compressed daily copy of the database, written to a different disk and verified before it is trusted; `--dir` and `--keep` override the destination and how many are kept. On a Pi, see [raspberry-pi.md](raspberry-pi.md) |
 | `arraysense upgrade` | covered below |
 | `arraysense uninstall` | covered below |
 
