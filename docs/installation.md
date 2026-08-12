@@ -176,8 +176,9 @@ throw away.
 ## The hand-editing fallback
 
 The wizard is the supported path, and the whole setup can also be configured by
-hand. `config.example.toml` is the reference for that: it documents every setting.
-Copying it into `/etc/arraysense/config.toml` is what *skips* the wizard, so do it
+hand. `config.example.toml` is the reference for that: it covers every setting a
+new installation is likely to need, with comments explaining each one. Copying it
+into `/etc/arraysense/config.toml` is what *skips* the wizard, so do it
 only when you mean to configure by hand. Copy it, fill in the inverter serial and
 the connection's own details — the dongle address and serial, or the serial
 device path with `transport = "modbus_serial"` — keep it mode 600, and run the
