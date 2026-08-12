@@ -570,10 +570,16 @@ def test_geocode_returns_multiple_candidates(monkeypatch: pytest.MonkeyPatch) ->
     assert results[1]["country"] == "Denmark"
 
 
-def test_geocode_no_results_key_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The reply for a query matching nothing: no ``results`` key at all."""
+def test_geocode_no_results_key_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A query matching nothing: the reply carries no ``results`` key at all.
+
+    That is the service answering "nothing", not the service failing, so it
+    must read as an empty list rather than a None the route would call
+    "unreachable" — a Canadian postcode returning nothing at all is the
+    page saying "nothing matched", never "the service is down".
+    """
     monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b'{"generationtime_ms": 1.5}')
-    assert open_meteo.geocode("M5V") is None
+    assert open_meteo.geocode("M5V") == []
 
 
 def test_geocode_empty_list_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -348,10 +348,13 @@ def geocode(query: str, country: str | None = None) -> list[dict[str, object]] |
     page and being refused at save time on a field the owner did not
     knowingly fill.
 
-    Returns None when the fetch fails or the reply carries no ``results``
-    key — the same shape ``fetch_current`` already handles for a missing
-    block. An empty list means the service answered, found nothing, and said
-    so, which is a successful lookup with no matches rather than a failure.
+    Returns None when the fetch fails or the reply cannot be read — the same
+    shape ``fetch_current`` already handles for a missing block. An empty
+    list means the service answered, found nothing, and said so: the reply
+    for a query that matches nothing carries no ``results`` key at all, and
+    that absence must reach the page as "no match", never as "unreachable" —
+    which is the whole difference between a Canadian postcode returning
+    nothing and the service being down.
     """
     params: dict[str, str] = {"name": query, "count": "5", "language": "en", "format": "json"}
     if country:
@@ -368,7 +371,12 @@ def geocode(query: str, country: str | None = None) -> list[dict[str, object]] |
         logger.debug("geocode reply unreadable: %s", exc)
         return None
     if not isinstance(candidates, list):
-        return None
+        # The service answered without a results key, which is what a query
+        # matching nothing looks like. That is a successful lookup with no
+        # matches, so it answers an empty list; None stays reserved for the
+        # fetch failing or the reply being unreadable, which the route above
+        # reports as "unreachable".
+        return []
 
     known_zones = available_timezones()
     results: list[dict[str, object]] = []

@@ -1592,31 +1592,32 @@ function mountLocation() {
       const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
       if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
       const body = await r.json();
-      const results = (body && body.candidates) || [];
-      if (!results.length) { note.textContent = 'Nothing matched that name.'; btn.disabled = false; return; }
-      if (results.length === 1) {
-        const c = results[0];
+      // The same decision the wizard's box makes — nothing, a single pick, or
+      // a list — so a reply can never mean one thing here and another there.
+      const out = geocodeOutcome((body && body.candidates) || []);
+      if (out.status === 'none') { note.textContent = out.note; btn.disabled = false; return; }
+      if (out.status === 'single') {
+        const c = out.candidate;
         put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
-        note.textContent = `${c.name}, ${c.admin1 || c.country} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)}). Nothing is saved until you save.`;
+        note.textContent = `${out.note} Nothing is saved until you save.`;
         cand.textContent = '';
-      } else {
-        cand.innerHTML = results.map((c, i) => {
-          const place = [c.name, c.admin1, c.country].filter(Boolean).join(', ');
-          return `<button type="button" class="geo-cand" data-idx="${i}"
-            style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
-            background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
-            color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
-            ${esc(place)} (${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)})</button>`;
-        }).join('');
-        note.textContent = `${results.length} results — pick one.`;
-        for (const b of cand.querySelectorAll('.geo-cand')) {
-          b.addEventListener('click', function() {
-            const c = results[parseInt(this.dataset.idx)];
-            put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
-            note.textContent = `${c.name}, ${c.admin1 || c.country} chosen. Nothing is saved until you save.`;
-            cand.textContent = '';
-          });
-        }
+        return;
+      }
+      cand.innerHTML = out.candidates.map((c, i) => {
+        return `<button type="button" class="geo-cand" data-idx="${i}"
+          style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+          background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+          color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+          ${esc(placeLabel(c))} (${Number(c.latitude).toFixed(5)}, ${Number(c.longitude).toFixed(5)})</button>`;
+      }).join('');
+      note.textContent = out.note;
+      for (const b of cand.querySelectorAll('.geo-cand')) {
+        b.addEventListener('click', function() {
+          const c = out.candidates[parseInt(this.dataset.idx)];
+          put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+          note.textContent = `${placeLabel(c)} chosen. Nothing is saved until you save.`;
+          cand.textContent = '';
+        });
       }
     } catch (e) {
       note.textContent = 'Could not reach the service.';

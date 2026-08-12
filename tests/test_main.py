@@ -250,6 +250,77 @@ def test_setup_mode_carries_the_running_version(tmp_path: Path) -> None:
     assert body["version"] == __version__
 
 
+def test_setup_geocode_reports_a_no_match_as_empty_not_unreachable(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A query matching nothing comes back from Open-Meteo with no results key
+    # at all. The wizard's box must be able to tell that "nothing matched"
+    # from "the service is down", so the setup route answers empty candidates
+    # (200) rather than the 502 it reserves for a failed fetch.
+    from fastapi.testclient import TestClient
+
+    from arraysense import weather
+    from arraysense.__main__ import build_setup_app
+
+    monkeypatch.setattr(
+        weather.open_meteo, "_http_get", lambda url, timeout: b'{"generationtime_ms": 1.5}'
+    )
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.get("/api/geocode", params={"q": "M5V"})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["query"] == "M5V"
+        assert body["candidates"] == []
+
+
+def test_setup_geocode_calls_the_same_client_as_the_running_service(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The route is a two-line shell over geocode(); the matching behaviour is
+    # geocode()'s and is covered by its own tests. This pins the shell: a
+    # fetch failure is a 502, a found place is a 200 with candidates.
+    from fastapi.testclient import TestClient
+
+    from arraysense import weather
+    from arraysense.__main__ import build_setup_app
+
+    def _found(url: str, timeout: float) -> bytes:
+        return (
+            b'{"results":[{"name":"Argyle","admin1":"Texas","country":"United States",'
+            b'"country_code":"US","latitude":33.12123,"longitude":-97.18335,'
+            b'"timezone":"America/Chicago"}]}'
+        )
+
+    monkeypatch.setattr(weather.open_meteo, "_http_get", _found)
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.get("/api/geocode", params={"q": "76226"})
+        assert r.status_code == 200
+        assert len(r.json()["candidates"]) == 1
+        assert r.json()["candidates"][0]["name"] == "Argyle"
+
+
+def test_setup_geocode_returns_502_when_the_fetch_itself_fails(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    from urllib.error import URLError
+
+    from fastapi.testclient import TestClient
+
+    from arraysense import weather
+    from arraysense.__main__ import build_setup_app
+
+    def _down(url: str, timeout: float) -> bytes:
+        raise URLError("down")
+
+    monkeypatch.setattr(weather.open_meteo, "_http_get", _down)
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.get("/api/geocode", params={"q": "76226"})
+        assert r.status_code == 502
+
+
 def test_first_run_apply_writes_a_config_load_accepts_and_restarts(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
@@ -284,6 +355,105 @@ def test_first_run_apply_writes_a_config_load_accepts_and_restarts(
     config = load(target)
     assert config.driver == "fake"
     assert config.inverter_serial == "CE00000000"
+
+
+def test_first_run_apply_writes_a_resolved_postcode_to_the_settings_table(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # The wizard's one skippable box: when the owner accepts a geocoded
+    # postcode, the apply writes latitude, longitude and timezone into the
+    # brand-new settings table before the config file replaces the target. A
+    # coordinate the registry refuses then fails the apply with the existing
+    # 400 and leaves the installation in setup mode, and an empty box stores
+    # nothing rather than a guess.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+    from arraysense.settings import (
+        SETTING_LATITUDE,
+        SETTING_LONGITUDE,
+        SETTING_TIMEZONE,
+        SettingsStore,
+    )
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    db = tmp_path / "db.sqlite"
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(db),
+                "latitude": 33.12123,
+                "longitude": -97.18335,
+                "timezone": "America/Chicago",
+            },
+        )
+        assert r.status_code == 200, r.text
+    store = SqliteStore(str(db), device=TEST_DEVICE)
+    settings = SettingsStore(store)
+    assert settings.get(SETTING_LATITUDE) == 33.12123
+    assert settings.get(SETTING_LONGITUDE) == -97.18335
+    assert settings.get(SETTING_TIMEZONE) == "America/Chicago"
+    store.close()
+
+
+def test_first_run_apply_with_no_postcode_stores_no_location(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # Skipping the box leaves the location unset — not zero, not a default.
+    # An unset latitude that read as 0.0 would put the installation in the
+    # Gulf of Guinea, and this project exists because absent data rendered as
+    # a number.
+    from fastapi.testclient import TestClient
+
+    from arraysense import __main__ as main_module
+    from arraysense.__main__ import build_setup_app
+    from arraysense.settings import (
+        SETTING_LATITUDE,
+        SETTING_LONGITUDE,
+        SETTING_TIMEZONE,
+        SettingsStore,
+    )
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
+    fired: list[str] = []
+    monkeypatch.setattr(main_module, "_schedule_setup_restart", lambda: fired.append("restart"))
+    db = tmp_path / "db.sqlite"
+    app = build_setup_app(config_path=tmp_path / "config.toml")
+    with TestClient(app) as client:
+        r = client.post(
+            "/api/setup/apply",
+            json={
+                "driver": "fake",
+                "model": "Simulated",
+                "transport": "dongle",
+                "dongle_host": "192.0.2.1",
+                "dongle_serial": "BA00000000",
+                "inverter_serial": "CE00000000",
+                "database_path": str(db),
+            },
+        )
+        assert r.status_code == 200, r.text
+    store = SqliteStore(str(db), device=TEST_DEVICE)
+    settings = SettingsStore(store)
+    assert settings.get(SETTING_LATITUDE) is None
+    assert settings.get(SETTING_LONGITUDE) is None
+    # The zone's default is the empty string, which means "follow the
+    # machine's zone"; a skipped box must not leave a guess behind either.
+    assert settings.get(SETTING_TIMEZONE) == ""
+    store.close()
 
 
 def test_first_run_apply_refuses_what_load_would_refuse(tmp_path: Path, monkeypatch: Any) -> None:
