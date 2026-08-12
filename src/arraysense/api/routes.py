@@ -84,6 +84,7 @@ from arraysense.tariff import (
     merge_shortfalls,
 )
 from arraysense.weather import fetch_archive_hours
+from arraysense.weather.open_meteo import geocode
 
 if TYPE_CHECKING:
     # For the annotation only. Nothing here calls into the collector: the
@@ -407,6 +408,21 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
     }
 
 
+@router.get("/geocode")
+async def geocode_route(q: str, country: str | None = None) -> dict[str, Any]:
+    """Resolve a postcode or place name to coordinates via Open-Meteo geocoding.
+
+    Reads nothing and writes nothing — needs no store. Returns a list of
+    candidates, empty when the service finds nothing, absent when the fetch
+    itself failed. A page must show every candidate so the owner picks;
+    a single candidate already fills the boxes.
+    """
+    results = geocode(q.strip(), country.strip() if country else None)
+    if results is None:
+        raise HTTPException(status_code=502, detail="geocoding service unreachable")
+    return {"query": q.strip(), "candidates": results}
+
+
 @router.get("/status")
 async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
     """Whether the collector is alive, connected, and holding the dongle.
@@ -593,21 +609,31 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "battery_module_metrics": None,
         }
         if declared is not None:
-            entry.update(
-                {
-                    "pv_strings": declared.pv_strings,
-                    "energy": declared.energy.value,
-                    "backup_output": declared.backup_output,
-                    "generator_input": declared.generator_input,
-                    "split_phase": declared.split_phase,
-                    "three_phase": declared.three_phase,
-                    "parallel_capable": declared.parallel_capable,
-                    "per_module_battery": declared.per_module_battery,
-                    "transport": declared.transport,
-                    "metrics": list(inverter_metric_columns(declared.metrics)),
-                    "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            capabilities_update: dict[str, Any] = {
+                "pv_strings": declared.pv_strings,
+                "energy": declared.energy.value,
+                "backup_output": declared.backup_output,
+                "generator_input": declared.generator_input,
+                "split_phase": declared.split_phase,
+                "three_phase": declared.three_phase,
+                "parallel_capable": declared.parallel_capable,
+                "per_module_battery": declared.per_module_battery,
+                "transport": declared.transport,
+                "metrics": list(inverter_metric_columns(declared.metrics)),
+                "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            }
+            if declared.conversion is not None:
+                capabilities_update["conversion"] = {
+                    "cec_pct": declared.conversion.cec_pct,
+                    "max_pv_to_grid_pct": declared.conversion.max_pv_to_grid_pct,
+                    "max_battery_to_grid_pct": declared.conversion.max_battery_to_grid_pct,
+                    "max_pv_to_battery_pct": declared.conversion.max_pv_to_battery_pct,
+                    "idle_normal_w": declared.conversion.idle_normal_w,
+                    "idle_standby_w": declared.conversion.idle_standby_w,
+                    "approximate": list(declared.conversion.approximate),
+                    "citation": declared.conversion.citation,
                 }
-            )
+            entry.update(capabilities_update)
         devices.append(entry)
     return {"devices": devices}
 
@@ -1777,11 +1803,26 @@ def panels(request: Request, store: _ReadStore) -> dict[str, Any]:
             "battery.installed",
         )
     }
+    from arraysense.panels import PANEL_CATALOGUE
+
     declared = getattr(request.app.state.service.source, "capabilities", None)
     return {
         "strings": [{**asdict(s), "defaulted": sorted(s.defaulted)} for s in strings],
         "battery": battery,
         "declared_mppts": declared.pv_strings if declared is not None else None,
+        "catalogue": [
+            {
+                "name": e.name,
+                "description": e.description,
+                "vmp": e.vmp,
+                "voc": e.voc,
+                "temp_coeff": e.temp_coeff,
+                "noct": e.noct,
+                "degradation": e.degradation,
+                "citation": e.citation,
+            }
+            for e in PANEL_CATALOGUE
+        ],
     }
 
 

@@ -391,6 +391,53 @@ function buildSetupBody(s) {
 // <<< setup-logic
 
 // ---------------------------------------------------------------------------
+// The postcode lookup's decisions. The wizard and the settings page both turn
+// a /api/geocode reply into one of three states — nothing matched, a single
+// pick, or a list the owner chooses from — and both caption a candidate with
+// its place name, region and country. These are pure and DOM-free so node can
+// hold them to it (tests/test_geocode_logic_js.py), the same way the sections
+// above are checked: an ambiguous reply must never be silently resolved to
+// its first entry, and a reply that found nothing must never be shown as a
+// found place.
+// ---------------------------------------------------------------------------
+
+// >>> geocode-logic
+// How a candidate reads in a caption: the place name, the region it sits in
+// and the country, each dropped when the geocoder did not supply it. Both
+// pages use the same sentence so the owner sees the same town in the wizard
+// and on the settings page.
+function placeLabel(c) {
+  return [c && c.name, c && c.admin1, c && c.country].filter(Boolean).join(', ');
+}
+
+// The one decision the box makes from a /api/geocode reply. 'none' means the
+// service answered and found nothing — the reply that carries no results key
+// at all — and the owner is told so and left to continue, never blocked.
+// 'single' carries the one candidate, already resolved, because there is
+// nothing to choose between. 'multiple' carries the whole list and no pick,
+// because resolving an ambiguous postcode to its first result would guess at
+// which country the owner means.
+function geocodeOutcome(candidates) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    return { status: 'none', note: 'Nothing matched that name.' };
+  }
+  if (candidates.length === 1) {
+    const c = candidates[0];
+    return {
+      status: 'single',
+      candidate: c,
+      note: `${placeLabel(c)} (${Number(c.latitude).toFixed(5)}, ${Number(c.longitude).toFixed(5)}).`,
+    };
+  }
+  return {
+    status: 'multiple',
+    candidates: candidates,
+    note: `${candidates.length} results — pick one.`,
+  };
+}
+// <<< geocode-logic
+
+// ---------------------------------------------------------------------------
 // The device's declaration, from /api/capabilities. The store answers every
 // query for every registry metric — one this device cannot produce reads back
 // the same null a reading nobody took gives — so the declaration is the only

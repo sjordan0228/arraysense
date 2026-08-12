@@ -208,6 +208,12 @@ class Capabilities:
     # page saying "connected by dongle" over a serial link would be worse than
     # saying nothing at all.
     transport: str = "dongle"
+    # Manufacturer's conversion figures for the model, carried as a cited
+    # ConversionSpec. None at family level because a family has no single
+    # answer; ``resolve_model`` applies the model's. These are facts with a
+    # provenance, never editable settings, and nothing consumes them
+    # arithmetically.
+    conversion: ConversionSpec | None = None
 
     def __post_init__(self) -> None:
         """Reject a declaration that contradicts itself or the metric registry.
@@ -378,6 +384,45 @@ class InverterDriver(InverterSource, Protocol):
 
 
 @dataclass(frozen=True)
+class ConversionSpec:
+    """Manufacturer-stated conversion figures for one inverter model.
+
+    All six come off one table in one document, so they are carried as a group
+    with one citation rather than as six loose fields each repeating the same
+    source. ``approximate`` names the fields the document itself hedges (the
+    "~70 W" and "~18 W" idle figures), kept rather than laundered into
+    precision the datasheet does not offer.
+
+    Nothing consumes these arithmetically — they are provenance-carrying facts
+    about the machine, rendered as a manufacturer's claim alongside the model
+    name and version, never edited by the owner. See the spec for why they
+    must not enter solar.expected_watts or the performance ratio.
+    """
+
+    cec_pct: float
+    max_pv_to_grid_pct: float
+    max_battery_to_grid_pct: float
+    max_pv_to_battery_pct: float
+    idle_normal_w: float
+    idle_standby_w: float
+    approximate: tuple[str, ...] = ()
+    citation: str = ""
+
+    def __post_init__(self) -> None:
+        """Refuse a conversion spec that cites nothing.
+
+        These are a manufacturer's claim about a product line rather than a
+        measurement, and a number whose provenance nobody can check is a
+        number presented as fact when it is not.
+        """
+        if not self.citation.strip():
+            raise ValueError(
+                "a ConversionSpec must name the document it was read from; "
+                "these are manufacturer claims, not measurements"
+            )
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     """One model within a driver family, and how it differs from the family.
 
@@ -392,6 +437,12 @@ class ModelSpec:
     name: str
     pv_strings: int | None = None
     battery_module_slots: int | None = None
+    # Manufacturer's conversion figures, where the model's spec sheet carries
+    # them. None for models whose sheets have not been fetched and read — the
+    # same rule their pv_strings already follow. These are facts with a
+    # provenance, never editable settings, and nothing consumes them
+    # arithmetically.
+    conversion: ConversionSpec | None = None
     citation: str = ""
     # What is known to be wrong or unproven about this model, in a sentence a
     # page can show. A model reaches the wizard because the family's protocol
@@ -403,9 +454,23 @@ class ModelSpec:
     caveat: str = ""
 
     def __post_init__(self) -> None:
-        """Refuse a delta that cites nothing."""
-        has_delta = self.pv_strings is not None or self.battery_module_slots is not None
-        if has_delta and not self.citation.strip():
+        """Refuse a delta that cites nothing.
+
+        Derived from the dataclass fields rather than listed by hand, so a new
+        delta field added without touching this line is still caught — which
+        is what would have happened to ``conversion`` if the old hand-written
+        pair had been left in place. ``conversion`` is excluded from the delta
+        check because it carries its own citation enforced by
+        ``ConversionSpec.__post_init__``, and that citation is the spec sheet
+        rather than the model's own measurement citation.
+        """
+        _non_delta = frozenset({"name", "citation", "caveat", "conversion"})
+        delta_fields = [
+            f.name
+            for f in __import__("dataclasses").fields(self.__class__)
+            if f.name not in _non_delta and getattr(self, f.name) is not None
+        ]
+        if delta_fields and not self.citation.strip():
             raise ValueError(
                 f"model {self.name!r} asserts a hardware fact without a citation; "
                 "name the measurement or document it came from"
@@ -434,6 +499,8 @@ def resolve_model(family: Capabilities, model: ModelSpec) -> Capabilities:
         )
     if model.battery_module_slots is not None:
         resolved = replace(resolved, battery_module_slots=model.battery_module_slots)
+    if model.conversion is not None:
+        resolved = replace(resolved, conversion=model.conversion)
     return resolved
 
 

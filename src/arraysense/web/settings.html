@@ -102,6 +102,10 @@
     border-bottom:1px solid var(--grid-line);padding-bottom:5px}
   .facts .row u{text-decoration:none;color:var(--ink3)}
   .facts .row b{font-weight:500;text-align:right}
+  .facts .facts-rule{grid-column:1/-1;border:none;border-top:1px solid var(--panel-b);
+    margin:4px 0}
+  .facts .conv-head{grid-column:1/-1;font-size:12px;font-weight:600;color:var(--ink2);
+    margin-top:4px}
 </style>
 </head>
 <body>
@@ -1152,6 +1156,30 @@ function splitStringLine(line) {
 // is the stable end-of-slice sentinel and is never called.
 function panelsEditorEnd() {}
 
+// A warning shown on the string row when a generic panel type was chosen
+// instead of entering every electrical figure by hand. The wording names
+// what is actually at risk: a run length entered against a generic module
+// is an estimate resting on an estimate, because the wire loss depends on
+// operating voltage and a generic Vmp is representative of the format
+// rather than measured from the owner's modules.
+function panelWarningText(panelName, rowIndex) {
+  if (!panelName) return '';
+  const cat = (panelState._catalogue || []);
+  const entry = cat.find((e) => e.name === panelName);
+  if (!entry) return '';
+  const defs = (panelState._defaulted || {});
+  const rowDefs = Array.isArray(defs[rowIndex]) ? defs[rowIndex] : [];
+  const haveVmp = rowDefs.includes('vmp');
+  const haveAll = ['vmp', 'voc', 'temp_coeff', 'noct', 'degradation']
+    .every((k) => rowDefs.includes(k));
+  let msg = `${entry.description} — representative figures` + (haveAll ? '.' : ',');
+  if (haveVmp) {
+    msg += ' Vmp is assumed rather than measured from your modules,'
+      + ' so a wire loss computed from it is an estimate resting on an estimate.';
+  }
+  return ` <span class="hint warn-note" style="display:inline-block;margin-top:2px">${esc(msg)}</span>`;
+}
+
 // State of the string editor. Same shape as bandState: holds what was
 // originally in the textarea, and while nothing is touched that exact string
 // goes back.
@@ -1175,7 +1203,29 @@ function panelMarkup(row, i) {
   };
   const val = (key) => esc(adv[key] || '');
 
+  // A panel-type picker above the advanced fields. Offers the catalogue
+  // entries plus a "none" option, and shows a warning when a generic
+  // entry was used — the warning carries what is actually at risk, which
+  // is narrower than "this may be wrong": a generic Vmp makes the wire
+  // loss an estimate resting on an estimate, and the owner should know.
+  const catalogue = (panelState._catalogue || []);
+  const panelOptions = [{name: '', description: 'Enter values below'}].concat(
+    catalogue.map((e) => ({name: e.name, description: e.description})));
+  const chosenPanel = adv.panel || '';
+  const panelSel = panelOptions.map((opt) => {
+    const sel = opt.name === chosenPanel ? ' selected' : '';
+    return `<option value="${esc(opt.name)}"${sel}>${esc(opt.description)}</option>`;
+  }).join('');
+  const panelWarning = chosenPanel ? panelWarningText(chosenPanel, i) : '';
+
   const advRows = [
+    `<div class="span" style="margin-bottom:4px">
+       <span class="cap">Panel type</span>
+       <select data-role="adv" data-key="panel" aria-label="Panel type">
+         ${panelSel}
+       </select>
+       ${panelWarning}
+     </div>`,
     `<div class="span">
        <span class="cap">Temp coefficient</span>
        <input type="text" data-role="adv" data-key="temp_coeff"
@@ -1389,11 +1439,29 @@ function wirePanels(host) {
   }
 }
 
-function mountPanelsEditor(spec) {
+async function mountPanelsEditor(spec) {
   const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
   if (!box) return;
   const area = box.querySelector('[data-key]');
   if (!area) return;
+
+  // Read the parsed strings to learn which fields are defaulted per string
+  // and which catalogue entries exist. The catalogue drives the panel-picker
+  // dropdown; the defaulted sets drive the warning on each row.
+  let catalogue = [];
+  let defaulted = {};
+  try {
+    const r = await fetch('/api/panels');
+    if (r.ok) {
+      const body = await r.json();
+      catalogue = (body && body.catalogue) || [];
+      const strings = (body && body.strings) || [];
+      defaulted = {};
+      strings.forEach((s, idx) => {
+        if (s.defaulted && s.defaulted.length) defaulted[idx] = s.defaulted;
+      });
+    }
+  } catch (e) { /* the editor works without the catalogue; the picker stays empty */ }
 
   const rows = [];
   if (area.value.trim()) {
@@ -1403,7 +1471,7 @@ function mountPanelsEditor(spec) {
       rows.push(splitStringLine(line));
     }
   }
-  panelState = { original: area.value, rows, changed: false };
+  panelState = { original: area.value, rows, changed: false, _catalogue: catalogue, _defaulted: defaulted };
 
   const shell = document.createElement('div');
   shell.className = 'bands';
@@ -1470,6 +1538,15 @@ function mountPanelsEditor(spec) {
 const SITE_LAT = 'site.latitude';
 const SITE_LON = 'site.longitude';
 
+// A postcode-or-place lookup that fills the coordinate boxes from the
+// Open-Meteo geocoding service. Replaces the geolocation control, which
+// never appears at the origins this service is actually served from
+// (plain HTTP at a LAN address — a secure-context API that refuses
+// without asking). The coordinate boxes stay because some countries'
+// postcodes are not covered by the geocoder, and the help text must
+// not describe them as more accurate: moving 4.6 km changes modelled
+// plane-of-array irradiance by 0.006%, against a forecast grid of
+// about 11 km.
 function mountLocation() {
   const lat = fields.find((f) => f.key === SITE_LAT);
   const lon = fields.find((f) => f.key === SITE_LON);
@@ -1477,78 +1554,84 @@ function mountLocation() {
   const anchor = document.querySelector(`.f[data-for="${CSS.escape(SITE_LON)}"]`);
   if (!anchor || !anchor.parentNode) return;
 
-  // Its own row across the grid, and deliberately not a `.f` — that class
-  // means "a control for one setting", and everything which walks the form
-  // looking for a label, a value and an error line would then find a box with
-  // none of the three.
   const geo = document.createElement('div');
   geo.className = 'wide geo';
   const note = document.createElement('span');
   note.className = 'said';
   anchor.parentNode.insertBefore(geo, anchor.nextSibling);
 
-  const usable = window.isSecureContext && navigator.geolocation;
-  if (!usable) {
-    note.className = 'said';
-    note.textContent = 'A browser only shares a location with a page served over HTTPS or '
-      + `opened at localhost. This one is at ${location.origin}, where it refuses without `
-      + `asking, so ${lat.label.toLowerCase()} and ${lon.label.toLowerCase()} have to be `
-      + 'typed in — or the page opened from the machine the service runs on.';
-    geo.appendChild(note);
-    return;
-  }
-
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'iconbtn';
-  button.textContent = 'Use this device’s location';
-  geo.appendChild(button);
-  geo.appendChild(note);
+  // A text box and a Look-up button. The geocoder returns candidates;
+  // a single one fills the coordinate boxes and names what it matched.
+  // Ambiguity is shown as a short list — nothing is filled until the
+  // owner picks one.
+  geo.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+      <input type="text" id="geoQuery" placeholder="Postcode or place name"
+        style="width:220px;background:var(--tint);border:1px solid var(--panel-b);
+          color:var(--ink);border-radius:8px;padding:5px 8px;font:inherit;font-size:13px">
+      <button type="button" id="geoLookup" style="background:var(--tint);
+        border:1px solid var(--panel-b);color:var(--ink);border-radius:8px;
+        padding:5px 12px;font:inherit;font-size:12px;cursor:pointer">Look up</button>
+    </div>
+    <div class="said" id="geoNote" style="font-size:11px;color:var(--ink3)"></div>
+    <div id="geoCandidates" style="margin-top:4px;font-size:12px"></div>`;
 
   const put = (key, value) => {
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (!el) return;
-    // Five decimal places is about a metre, and the browser's own figure
-    // carries a dozen digits of arithmetic noise past the point its accuracy
-    // supports. Rounding it is not losing anything that was ever measured.
     el.value = String(Number(value.toFixed(5)));
     el.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
-  button.addEventListener('click', () => {
-    button.disabled = true;
-    note.className = 'said';
-    note.textContent = 'Asking the browser…';
-    navigator.geolocation.getCurrentPosition((position) => {
-      button.disabled = false;
-      put(SITE_LAT, position.coords.latitude);
-      put(SITE_LON, position.coords.longitude);
-      const metres = Number(position.coords.accuracy);
-      note.className = 'said ok';
-      note.textContent = 'Filled in from this device'
-        + (Number.isFinite(metres) ? `, accurate to about ${Math.round(metres)} m.` : '.')
-        + ' Nothing is saved until Save changes.';
-    }, (err) => {
-      button.disabled = false;
-      note.className = 'said warn';
-      // Reported rather than swallowed, and with the browser's own words: a
-      // refusal, a device with no fix and a timeout call for three different
-      // reactions, and the settings page is not the place to guess which.
-      const why = err && err.code === 1 ? 'The browser refused to share a location'
-        : err && err.code === 2 ? 'The device could not work out where it is'
-        : err && err.code === 3 ? 'The browser took too long to answer'
-        : 'The browser would not share a location';
-      const said = err && err.message ? ` (${err.message})` : '';
-      note.textContent = `${why}${said}. Type the coordinates in instead.`;
-    }, { timeout: 15000, maximumAge: 60000 });
-  });
+  $('geoLookup').onclick = async function() {
+    const q = $('geoQuery').value.trim();
+    if (!q) return;
+    const btn = $('geoLookup'), note = $('geoNote'), cand = $('geoCandidates');
+    btn.disabled = true; note.textContent = 'Looking up…'; cand.textContent = '';
+    try {
+      const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
+      const body = await r.json();
+      // The same decision the wizard's box makes — nothing, a single pick, or
+      // a list — so a reply can never mean one thing here and another there.
+      const out = geocodeOutcome((body && body.candidates) || []);
+      if (out.status === 'none') { note.textContent = out.note; btn.disabled = false; return; }
+      if (out.status === 'single') {
+        const c = out.candidate;
+        put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+        note.textContent = `${out.note} Nothing is saved until you save.`;
+        cand.textContent = '';
+        return;
+      }
+      cand.innerHTML = out.candidates.map((c, i) => {
+        return `<button type="button" class="geo-cand" data-idx="${i}"
+          style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+          background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+          color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+          ${esc(placeLabel(c))} (${Number(c.latitude).toFixed(5)}, ${Number(c.longitude).toFixed(5)})</button>`;
+      }).join('');
+      note.textContent = out.note;
+      for (const b of cand.querySelectorAll('.geo-cand')) {
+        b.addEventListener('click', function() {
+          const c = out.candidates[parseInt(this.dataset.idx)];
+          put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+          note.textContent = `${placeLabel(c)} chosen. Nothing is saved until you save.`;
+          cand.textContent = '';
+        });
+      }
+    } catch (e) {
+      note.textContent = 'Could not reach the service.';
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
-function mountExtras() {
+async function mountExtras() {
   const bands = fields.find((f) => f.key === BANDS_KEY);
   if (bands) mountBandEditor(bands);
   const panels = fields.find((f) => f.key === PANELS_KEY);
-  if (panels) mountPanelsEditor(panels);
+  if (panels) await mountPanelsEditor(panels);
   mountLocation();
 }
 
@@ -1879,6 +1962,33 @@ function drawFacts(status, caps) {
     rows.push(factRow(`${prefix}per-module battery`, flagWords(d.per_module_battery)));
     rows.push(factRow(`${prefix}metrics produced`, countWords(d.metrics)));
     rows.push(factRow(`${prefix}per-module metrics`, countWords(d.battery_module_metrics)));
+    // Manufacturer's conversion figures, where the model's spec sheet carries
+    // them. Rendered as fact, never as a setting — nothing computes with them.
+    if (d.conversion) {
+      rows.push('<hr class="facts-rule">');
+      rows.push('<div class="conv-head">What this model is rated at</div>');
+      const c = d.conversion;
+      // Array.includes rather than a Set, because the band-editor test
+      // forbids constructing one in the wiring section below //SLICE_TO.
+      const approx = Array.isArray(c.approximate) ? c.approximate : [];
+      const isApprox = (key) => approx.includes(key);
+      const fmt = (val, key) => isApprox(key) ? `~${val}` : String(val);
+      rows.push(factRow('CEC efficiency',
+        `${fmt(c.cec_pct, 'cec_pct')}%`));
+      rows.push(factRow('PV to grid',
+        `${fmt(c.max_pv_to_grid_pct, 'max_pv_to_grid_pct')}%`));
+      rows.push(factRow('Battery to grid',
+        `${fmt(c.max_battery_to_grid_pct, 'max_battery_to_grid_pct')}%`));
+      rows.push(factRow('PV to battery',
+        `${fmt(c.max_pv_to_battery_pct, 'max_pv_to_battery_pct')}%`));
+      rows.push(factRow('Idle draw normal',
+        `${fmt(c.idle_normal_w, 'idle_normal_w')} W`));
+      rows.push(factRow('Idle draw standby',
+        `${fmt(c.idle_standby_w, 'idle_standby_w')} W`));
+      if (c.citation) {
+        rows.push(factRow('Source', esc(c.citation)));
+      }
+    }
   });
   $('facts').innerHTML = rows.join('');
 }

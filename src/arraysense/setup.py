@@ -72,24 +72,26 @@ def describe_setup(config: Config, dev_root: Path | str = "/dev") -> dict[str, A
                 )
                 if delta is not None
             ]
-            models.append(
-                {
-                    "name": model.name,
-                    "citation": model.citation,
-                    # Which of the values below the citation actually covers.
-                    # The rest are inherited family defaults, and a page must
-                    # be able to label the difference — a cited fact and a
-                    # conservative default are different claims.
-                    "cited_fields": cited,
-                    # Empty for a model with nothing known against it. A page
-                    # that shows a model without showing this presents an
-                    # unproven decode as a supported one, which is the whole
-                    # reason the field exists.
-                    "caveat": model.caveat,
-                    "pv_strings": resolved.pv_strings,
-                    "battery_module_slots": resolved.battery_module_slots,
+            entry_dict = {
+                "name": model.name,
+                "citation": model.citation,
+                "cited_fields": cited,
+                "caveat": model.caveat,
+                "pv_strings": resolved.pv_strings,
+                "battery_module_slots": resolved.battery_module_slots,
+            }
+            if model.conversion is not None:
+                entry_dict["conversion"] = {
+                    "cec_pct": model.conversion.cec_pct,
+                    "max_pv_to_grid_pct": model.conversion.max_pv_to_grid_pct,
+                    "max_battery_to_grid_pct": model.conversion.max_battery_to_grid_pct,
+                    "max_pv_to_battery_pct": model.conversion.max_pv_to_battery_pct,
+                    "idle_normal_w": model.conversion.idle_normal_w,
+                    "idle_standby_w": model.conversion.idle_standby_w,
+                    "approximate": list(model.conversion.approximate),
+                    "citation": model.conversion.citation,
                 }
-            )
+            models.append(entry_dict)
         by_maker.setdefault(entry.manufacturer, []).append(
             {"driver": entry.name, "description": entry.description, "models": models}
         )

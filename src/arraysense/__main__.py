@@ -334,8 +334,15 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
     from arraysense.api.app import install_text_guard, mount_pages
     from arraysense.api.routes import DetectRequest, run_detect
     from arraysense.config import DEFAULT_DATABASE_PATH
-    from arraysense.settings import check_serial_device
+    from arraysense.settings import (
+        SETTING_LATITUDE,
+        SETTING_LONGITUDE,
+        SETTING_TIMEZONE,
+        SettingsStore,
+        check_serial_device,
+    )
     from arraysense.setup import describe_setup, render_config
+    from arraysense.weather.open_meteo import geocode
 
     app = FastAPI(title="Solar ArraySense setup", version=__version__)
     mount_pages(app)
@@ -361,6 +368,19 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         # is up and waiting for its wizard "not answering".
         payload["version"] = __version__
         return payload
+
+    @app.get("/api/geocode")
+    async def setup_geocode(q: str, country: str | None = None) -> dict[str, object]:
+        """Resolve a postcode or place name to coordinates via Open-Meteo.
+
+        Mounted identically to the running-service route so the wizard can
+        resolve a postcode before there is a store. Reads nothing, writes
+        nothing — needs no database.
+        """
+        results = geocode(q.strip(), country.strip() if country else None)
+        if results is None:
+            raise HTTPException(status_code=502, detail="geocoding service unreachable")
+        return {"query": q.strip(), "candidates": results}
 
     @app.post("/api/setup/detect")
     async def setup_detect(body: dict[str, object]) -> dict[str, str]:
@@ -432,12 +452,31 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
             # open would otherwise become the real config and crash-loop every
             # restart with no setup mode left to offer.
             declared = drivers.get(candidate.driver).capabilities.metrics
-            SqliteStore(
+            store = SqliteStore(
                 candidate.database_path,
                 device=candidate.inverter_serial,
                 metrics=declared,
                 synchronous=candidate.synchronous,
-            ).close()
+            )
+            # The wizard offers a skippable postcode step. If the owner
+            # filled it, write the location now — before the config file
+            # replaces the target, so a coordinate the registry refuses
+            # fails the apply with the existing 400 and leaves the
+            # installation in setup mode. Written after the replace, the
+            # same refusal would strand an installation mid-restart.
+            location: dict[str, object] = {}
+            for key, setting in (
+                ("latitude", SETTING_LATITUDE),
+                ("longitude", SETTING_LONGITUDE),
+                ("timezone", SETTING_TIMEZONE),
+            ):
+                value = body.get(key)
+                if value is not None:
+                    location[setting] = value
+            if location:
+                settings = SettingsStore(store)
+                settings.set_many(location)
+            store.close()
         except (
             ValueError,
             FileNotFoundError,

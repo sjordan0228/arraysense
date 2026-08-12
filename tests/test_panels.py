@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from arraysense.panels import EXAMPLE_STRINGS, MOUNTINGS, parse_strings
+from arraysense.panels import EXAMPLE_STRINGS, MOUNTINGS, PANEL_CATALOGUE, parse_strings
 
 
 def test_a_minimal_line_parses_with_every_default_named() -> None:
@@ -102,3 +102,75 @@ def test_a_quoted_note_may_contain_the_separator() -> None:
 def test_a_tail_of_unreadable_text_is_still_refused() -> None:
     with pytest.raises(ValueError, match="could not read"):
         parse_strings("E | 1 | 9 | 410 | 25 | 90 | garbage here")
+
+
+# --- panel catalogue -----------------------------------------------------------
+
+
+def test_panel_catalogue_entries_exist() -> None:
+    assert len(PANEL_CATALOGUE) == 2
+    names = [e.name for e in PANEL_CATALOGUE]
+    assert "108cell_perc" in names
+    assert "120halfcell_perc" in names
+
+
+def test_panel_entry_fills_vmp_and_voc() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90 | panel=108cell_perc")
+    assert s.vmp == pytest.approx(31.01)
+    assert s.voc == pytest.approx(37.07)
+    assert s.panel == "108cell_perc"
+    assert "vmp" in s.defaulted
+    assert "voc" in s.defaulted
+
+
+def test_explicit_key_beats_catalogue_value() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90 | panel=108cell_perc vmp=32.5")
+    assert s.vmp == 32.5  # owner's own, not the catalogue's 31.01
+    assert "vmp" not in s.defaulted  # explicitly set, not defaulted
+
+
+def test_unknown_panel_entry_refused_by_name() -> None:
+    with pytest.raises(ValueError, match="unknown panel entry"):
+        parse_strings("East | 1 | 9 | 410 | 25 | 90 | panel=nonesuch")
+
+
+def test_panel_catalogue_fields_join_defaulted() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90 | panel=108cell_perc")
+    for field in ("vmp", "voc", "temp_coeff", "noct", "degradation"):
+        assert field in s.defaulted, f"{field} should be defaulted from the catalogue"
+
+
+def test_catalogue_values_match_source_documents() -> None:
+    """Pin the transcribed figures against drift.
+
+    The values must match panel-specs.md, which was researched from the
+    manufacturer datasheets. Changing one means re-reading the datasheet
+    and noting it in the changelog.
+    """
+    perc = {e.name: e for e in PANEL_CATALOGUE}["108cell_perc"]
+    assert perc.vmp == 31.01
+    assert perc.voc == 37.07
+    assert perc.temp_coeff == -0.35
+    assert perc.noct == 45.0
+    assert perc.degradation == 0.45
+    assert "Runergy" in perc.citation
+
+    half = {e.name: e for e in PANEL_CATALOGUE}["120halfcell_perc"]
+    assert half.vmp == 34.5
+    assert half.voc == 41.4
+    assert half.temp_coeff == -0.36
+    assert half.noct == 45.0
+    assert half.degradation == 0.5
+    assert "Aptos" in half.citation
+
+
+def test_panel_is_none_when_not_chosen() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90")
+    assert s.panel is None
+
+
+def test_panel_is_stored_in_known_string_keys() -> None:
+    # A test the settings page reads to learn which keys the grammar accepts.
+    from arraysense.panels import KNOWN_STRING_KEYS
+
+    assert "panel" in KNOWN_STRING_KEYS
