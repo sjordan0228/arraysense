@@ -58,12 +58,14 @@ from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, 
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
+    BACKUP_DIRECTORY_KEY,
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     WEATHER_INTERVAL_KEY,
     SettingsStore,
+    check_backup_directory,
     check_serial_device,
     describe,
     lookup_setting,
@@ -799,6 +801,32 @@ def _reject_undeclared_mppts(request: Request, wanted: dict[str, Any]) -> None:
             )
 
 
+def _reject_unwritable_backup_dir(request: Request, wanted: dict[str, Any]) -> None:
+    """Refuse a backup destination this service cannot write to.
+
+    The registry cannot ask this. Its ``check=`` callbacks are functions of the
+    text and answer the same on every machine, while whether a directory can be
+    written is a fact about the disk and the sandbox in front of it. So it is
+    asked here, at the only moment somebody is present to read the remedy —
+    a backup that first discovers the problem at 03:15 discovers it alone.
+
+    Only when the value changes. The page posts what was edited, but nothing
+    stops a client posting the whole form, and an installation whose backup
+    disk has gone missing must still be able to change its tariff. Refusing
+    every save over a fault the save did not introduce would lock the settings
+    page over a broken backup.
+
+    Raises ValueError, which the route maps to 400 with the rest.
+    """
+    wanted_dir = wanted.get(BACKUP_DIRECTORY_KEY)
+    if not isinstance(wanted_dir, str):
+        return
+    settings = SettingsStore(request.app.state.store)
+    if settings.get(BACKUP_DIRECTORY_KEY) == wanted_dir:
+        return
+    check_backup_directory(wanted_dir)
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -820,6 +848,7 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         # written. Inside the try so its ValueError maps to 400 like the rest.
         _reject_unbootable_connection(request, wanted)
         _reject_undeclared_mppts(request, wanted)
+        _reject_unwritable_backup_dir(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
