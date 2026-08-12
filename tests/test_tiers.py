@@ -191,7 +191,7 @@ def test_a_short_window_older_than_raw_reads_the_tier_that_holds_it() -> None:
         coverage=_REAL_COVERAGE,
     )
     assert choice.name == "minute"
-    assert choice.complete is True
+    assert choice.bounded is True
 
 
 def test_a_window_straddling_the_raw_floor_is_not_answered_half_length() -> None:
@@ -206,7 +206,26 @@ def test_a_window_straddling_the_raw_floor_is_not_answered_half_length() -> None
         coverage=_REAL_COVERAGE,
     )
     assert choice.name == "minute"
-    assert choice.complete is True
+    assert choice.bounded is True
+
+
+def test_bounded_says_the_stored_bounds_enclose_the_range() -> None:
+    # The flag is deliberately not named "complete": it is judged from a tier's
+    # first and last rows, so a collector outage inside the range is invisible
+    # to it. The name has to say what it measures — bounds-enclosure, not a
+    # hole-free answer — so a caller cannot present a partial series as whole
+    # on its strength alone.
+    start = _NOW - timedelta(hours=6)
+    coverage: dict[str, tuple[datetime, datetime] | None] = {
+        "full": (start, _NOW),
+        "minute": None,
+        "hourly": None,
+    }
+    choice = select_tier_for_range(
+        start, _NOW, width_px=4000, cadence_seconds=CADENCE, coverage=coverage
+    )
+    assert choice.bounded is True
+    assert choice.available == (start, _NOW)
 
 
 def test_a_recent_window_is_chosen_on_fit_exactly_as_before() -> None:
@@ -219,7 +238,7 @@ def test_a_recent_window_is_chosen_on_fit_exactly_as_before() -> None:
     assert with_coverage.name == select_tier(
         timedelta(days=1), width_px=1000, cadence_seconds=CADENCE
     )
-    assert with_coverage.complete is True
+    assert with_coverage.bounded is True
 
 
 def test_a_lagging_coarse_tier_does_not_read_as_covering_the_present() -> None:
@@ -250,12 +269,12 @@ def test_a_range_no_tier_holds_says_so_rather_than_looking_empty() -> None:
         cadence_seconds=CADENCE,
         coverage=_REAL_COVERAGE,
     )
-    assert choice.complete is False
+    assert choice.bounded is False
     assert choice.available is None
 
 
 def test_a_partly_held_range_reports_the_part_that_is_held() -> None:
-    # A day ending an hour after the last hourly bucket: complete is False and
+    # A day ending an hour after the last hourly bucket: bounded is False and
     # the part that exists is named, so a page can qualify what it draws instead
     # of presenting three-quarters of a day as a whole one.
     coverage: dict[str, tuple[datetime, datetime] | None] = {
@@ -271,7 +290,7 @@ def test_a_partly_held_range_reports_the_part_that_is_held() -> None:
         coverage=coverage,
     )
     assert choice.name == "hourly"
-    assert choice.complete is False
+    assert choice.bounded is False
     assert choice.available == (_NOW - timedelta(hours=12), _NOW)
 
 
@@ -291,7 +310,7 @@ def test_an_empty_tier_is_never_preferred_to_one_holding_the_range() -> None:
         coverage=coverage,
     )
     assert choice.name == "full"
-    assert choice.complete is True
+    assert choice.bounded is True
 
 
 def test_module_ranges_are_scored_against_the_module_tiers() -> None:
@@ -308,4 +327,4 @@ def test_module_ranges_are_scored_against_the_module_tiers() -> None:
         module=True,
     )
     assert choice.name == "hourly"
-    assert choice.complete is True
+    assert choice.bounded is True

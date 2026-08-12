@@ -24,8 +24,8 @@ The two measurements it makes are deliberately different questions:
   tier must not be marked down for an hour nobody has recorded yet — during a
   collector outage every tier is equally short, and a rule that scored raw
   down for it would quietly promote a six-hour chart to hourly buckets.
-- *Whether the answer is whole* is judged against the range that was asked
-  for, because that is the only question a reader cares about.
+- *Whether the bounds enclose the range* is judged against the range that was
+  asked for, because that is the only question a reader cares about.
 """
 
 from __future__ import annotations
@@ -156,17 +156,19 @@ def _best_fit(
 
 @dataclass(frozen=True)
 class TierChoice:
-    """A chosen tier and how much of the asked-for range it can actually answer.
+    """A chosen tier, and whether its bounds enclose the range that was asked.
 
-    ``complete`` is False when the tier holds materially less than was asked
-    for, and ``available`` then names the part it does hold — None when it
-    holds none of it. A caller drawing a partial answer has to say so: a
-    half-length series looks exactly like a quiet half-day, which is the shape
-    the project's cardinal rule exists to forbid.
+    ``bounded`` is True when the tier's first and last rows straddle the whole
+    range. It is deliberately not named "complete": it is judged from the
+    tier's endpoints alone, so a collector outage inside the range is
+    invisible to it, and a caller drawing the series must not present it as
+    whole on this flag's strength. When ``bounded`` is False, ``available``
+    names the part of the range the tier does hold — None when it holds none
+    of it.
     """
 
     name: str
-    complete: bool
+    bounded: bool
     available: tuple[datetime, datetime] | None
 
 
@@ -226,10 +228,12 @@ def select_tier_for_range(
     buckets before it stops counting as able to answer, which is the edge
     between "this bucket is still open" and "this tier does not hold that".
 
-    What decides whether the answer is *whole* is the range that was asked for,
-    since that is the only question the reader has. When no tier can answer at
-    all the best fit is still returned — the caller has a query to run either
-    way — with ``complete`` False and ``available`` None.
+    What the returned flag measures is whether the chosen tier's bounds
+    enclose the range that was asked for — the only question a span can answer
+    — and it says nothing about holes between those bounds, which is why it is
+    named ``bounded`` rather than ``complete``. When no tier can answer at all
+    the best fit is still returned — the caller has a query to run either way
+    — with ``bounded`` False and ``available`` None.
     """
     if end <= start:
         raise ValueError(f"end must be after start, got {start} to {end}")
@@ -254,13 +258,13 @@ def select_tier_for_range(
 
     window = held[chosen.name]
     short = span.total_seconds() - _seconds(window)
-    complete = short <= 2 * _resolution_seconds(chosen, cadence_seconds)
+    bounded = short <= 2 * _resolution_seconds(chosen, cadence_seconds)
     return TierChoice(
         name=chosen.name,
-        complete=complete,
-        # A complete answer covers the range that was asked for; the stored
-        # bounds are a shade inside it only because the newest bucket is still
-        # being filled, and reporting that as a shortfall would qualify every
-        # live chart on the dashboard.
-        available=(start, end) if complete else window,
+        bounded=bounded,
+        # An answer whose bounds enclose the range covers it as asked; the
+        # stored bounds are a shade inside it only because the newest bucket
+        # is still being filled, and reporting that as a shortfall would
+        # qualify every live chart on the dashboard.
+        available=(start, end) if bounded else window,
     )
