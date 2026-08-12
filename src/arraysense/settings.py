@@ -1038,6 +1038,38 @@ class SettingsStore:
         )
         logger.info("array configuration changed; efficiency version now %d", current + 1)
 
+    def ensure_efficiency_version(self, minimum: int) -> bool:
+        """Advance the config version to at least ``minimum`` if it is below it.
+
+        Called when a code change alters how scores are computed — the same
+        reason ``_bump_config_version`` fires on an array-description change, but
+        triggered by a new deployment rather than a settings edit.  Returns True
+        when a bump actually happened so the caller can log it.
+
+        Bumping invalidates every stored efficiency day, which forces a
+        recomputation of history and is not free.  The caller chooses the
+        ``minimum`` by knowing what version the previous code wrote; a minimum of
+        1 is the right call after the first logic change in a fresh installation
+        that has only ever written version 0.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)
+        ).fetchone()
+        try:
+            current = int(row[0]) if row and row[0] else 0
+        except ValueError:
+            current = 0
+        if current >= minimum:
+            return False
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (CONFIG_VERSION_KEY, str(minimum)),
+            )
+        logger.info("efficiency version bumped from %d to %d for a code change", current, minimum)
+        return True
+
     def set_many(self, values: dict[str, object]) -> None:
         """Validate every value, then store all of them in one transaction.
 
