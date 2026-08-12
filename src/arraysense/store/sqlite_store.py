@@ -136,10 +136,13 @@ class SqliteStore:
     writes and to the cheap single-row reads that stay on the event loop. Reads
     that scan tiers go through ``read_view`` instead — the store bound to its
     own short-lived connection — and maintenance gets ``maintenance_connection``,
-    so neither can hold the primary while the collector needs it. Writes go to
-    the full-cadence tiers and commit per sample; the coarse tiers are filled
-    later by ``arraysense.store.rollup`` and read back through the same query
-    methods.
+    so neither can hold the primary while the collector needs it. A writer that
+    must work off the event loop — the archive backfill answering an HTTP POST
+    from FastAPI's threadpool — gets ``write_connection``, the same store bound
+    to its own connection, so its commits and rollbacks are its own. Writes go
+    to the full-cadence tiers and commit per sample; the coarse tiers are
+    filled later by ``arraysense.store.rollup`` and read back through the same
+    query methods.
 
     Every metric name a caller passes is checked against the registry before any
     SQL is built. A typo therefore raises KeyError instead of returning a column
@@ -417,6 +420,52 @@ class SqliteStore:
         conn = sqlite3.connect(self._path, check_same_thread=False)
         self._apply_connection_pragmas(conn, establish_wal=False)
         return conn
+
+    @contextlib.contextmanager
+    def write_connection(self) -> Iterator[SqliteStore]:
+        """A store bound to its own connection, for writes made off the event loop.
+
+        The write twin of ``read_view``, for the one writer that cannot stay on
+        the loop: the archive backfill answers an HTTP POST from FastAPI's
+        threadpool while the collector appends from the event loop. A thread
+        alone is not enough, for the reason ``maintenance_connection``
+        documents — on a ``sqlite3.Connection`` ``with conn:`` is transaction
+        state rather than a lock, so two threads entering it on one connection
+        share a single commit and a single rollback. The collector's per-sample
+        commit would then publish the backfill's half-written hour, and a
+        backfill transaction that failed part-way — a busy backup or a full
+        disk raises ``database is locked`` — would roll back a poll that had
+        been stored successfully, inverter row, module rows and serials
+        registration together. Losing a reading is the failure this project
+        exists to prevent, so the writer gets its own connection and its own
+        transactions, exactly as the rollup did.
+
+        WAL is what makes that affordable: readers are never blocked by the
+        writer, so the API keeps answering throughout. What remains is writer
+        contention with the collector itself, which the busy timeout absorbs.
+
+        The connection is opened on entry and closed on exit, on the thread
+        that entered the block, and must not be kept past it. A memory-backed
+        store cannot be reopened — every connect() makes a new empty database
+        — so it yields the store itself, whose single connection is the only
+        one there is; that is the test configuration, where the collector is
+        not polling concurrently.
+        """
+        if self.is_memory_backed:
+            yield self
+            return
+        conn = sqlite3.connect(self._path, check_same_thread=False)
+        try:
+            self._apply_connection_pragmas(conn, establish_wal=False)
+            writer = object.__new__(SqliteStore)
+            # The same wholesale copy read_view makes, for the same reason: a
+            # hand-picked copy is an invariant nobody maintains, and everything
+            # shared is immutable after __init__; only the connection differs.
+            writer.__dict__.update(self.__dict__)
+            writer._conn = conn
+            yield writer
+        finally:
+            conn.close()
 
     def _device(self, device: str | None) -> str:
         """Resolve a caller's device against the one this store was opened for.
