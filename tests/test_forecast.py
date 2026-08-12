@@ -2,7 +2,8 @@
 
 The engine's own arithmetic is held to pvlib elsewhere; what matters here is the
 scaling decision — which basis is chosen, what the median does to an outlier,
-and that a fresh install falls back rather than inventing a ratio.
+and that an installation with too little record behind it gets no forecast at
+all rather than one scaled by a statistic that cannot support it.
 """
 
 from __future__ import annotations
@@ -11,12 +12,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from arraysense import forecast
 from arraysense.efficiency import EfficiencyRow
 from arraysense.forecast import (
     MIN_SCORED_DAYS,
     SkyHour,
     expected_points,
-    fallback_points,
     modelled_watts,
     trailing_pr,
 )
@@ -162,20 +163,13 @@ def test_wind_raises_the_expectation() -> None:
     assert modelled_watts(STRINGS, LAT, LON, breezy) > modelled_watts(STRINGS, LAT, LON, calm)
 
 
-def test_the_fallback_is_the_old_peak_scaled_curve() -> None:
-    """Unchanged behaviour for an installation with nothing to demonstrate yet."""
-    sky = [_noon()]
-    points = fallback_points(sky, observed_peak_pv=9_500.0)
-    assert points[0][1] == pytest.approx(900.0 * 9_500.0 / 950.0)
+def test_the_module_offers_no_second_best_scale() -> None:
+    """There is no peak-scaled curve left to reach for.
 
-
-def test_the_fallback_never_goes_negative() -> None:
-    dark = SkyHour(
-        when=_noon().when,
-        ghi=0.0,
-        dni=0.0,
-        dhi=0.0,
-        air_c=20.0,
-        wind_ms=1.0,
-    )
-    assert fallback_points([dark], observed_peak_pv=9_500.0)[0][1] == 0.0
+    It over-called by 43-63 % against the reference installation's own record on
+    every one of the last twelve complete days, and nothing a viewer could reach
+    distinguished it from the demonstrated curve. Removing it is the fix; a name
+    still importable is an invitation to reintroduce it.
+    """
+    assert not hasattr(forecast, "fallback_points")
+    assert not hasattr(forecast, "CLEAR_SKY_PEAK_RADIATION")

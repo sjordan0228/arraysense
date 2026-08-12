@@ -38,7 +38,6 @@ from arraysense.forecast import (
     PR_WINDOW_DAYS,
     SkyHour,
     expected_points,
-    fallback_points,
     trailing_pr,
 )
 from arraysense.models import Sample
@@ -145,14 +144,20 @@ class WeatherPoller:
         if sky is not None:
             now = datetime.now(UTC)
             points = self._forecast_points(sky, latitude, longitude, now)
-            if points:
-                try:
+            try:
+                # Pruning is not conditional on there being something to write.
+                # An installation that has stopped forecasting — an array
+                # description withdrawn, a run of days nothing could score —
+                # would otherwise keep its last predictions forever, which is
+                # the one state where old rows have nothing arriving to push
+                # them out.
+                self._store.prune_forecast(now - timedelta(days=90))
+                if points:
                     self._store.append_forecast(now, points)
-                    self._store.prune_forecast(now - timedelta(days=90))
-                except STORE_ERRORS as exc:
-                    logger.warning("could not store forecast: %s", exc)
-                else:
-                    wrote = True
+            except STORE_ERRORS as exc:
+                logger.warning("could not store forecast: %s", exc)
+            else:
+                wrote = wrote or bool(points)
 
         return wrote
 
@@ -181,13 +186,20 @@ class WeatherPoller:
         longitude: float,
         now: datetime,
     ) -> list[tuple[datetime, float]]:
-        """Model the coming hours, scaled the best way the record supports.
+        """Model the coming hours, or record nothing and say why.
 
-        Demonstrated performance is preferred. The peak-scaled fallback is
-        reached only by an installation with fewer than ``MIN_SCORED_DAYS``
-        scored days behind it — days the maintenance clock writes, so a system
-        collecting normally leaves the fallback within a week of being
-        configured and never returns to it.
+        There is one basis and no second-best. A described array with
+        ``MIN_SCORED_DAYS`` complete days behind it gets the modelled curve
+        scaled by what it has demonstrably been delivering; anything less gets
+        no forecast at all, and the dashboard draws the absence it already draws
+        when the poller has never run.
+
+        This used to fall back to the peak-scaled curve the demonstrated ratio
+        replaced, on the grounds that it was the behaviour a fresh install had
+        always had. Measured against the reference installation it over-called
+        by 43-63 % on every one of the last twelve complete days, and no reader
+        of the stored forecast or of ``/api/forecast`` could tell which curve
+        they had — see forecast.py.
 
         Which basis is in force is logged when it changes rather than on every
         tick, because this runs every fifteen minutes forever and a line per
@@ -208,23 +220,14 @@ class WeatherPoller:
                     self._basis = "pr"
                 return expected_points(strings, latitude, longitude, sky, ratio)
 
-        observed_peak_pv = self._store.peak("pv_total_power_w", now - timedelta(days=30), now)
-        if observed_peak_pv is None:
-            if self._basis != "none":
-                logger.info(
-                    "no scored days and no PV history in the last 30 days; "
-                    "recording no forecast until the array has been measured"
-                )
-                self._basis = "none"
-            return []
-        if self._basis != "peak":
+        if self._basis != "none":
             logger.info(
-                "fewer than %d scored days; forecasting from the observed peak until "
-                "the array has been measured for longer",
+                "fewer than %d complete scored days for a described array; recording no "
+                "forecast until this one has been measured for longer",
                 MIN_SCORED_DAYS,
             )
-            self._basis = "peak"
-        return fallback_points(sky, observed_peak_pv)
+            self._basis = "none"
+        return []
 
     def _interval(self) -> float:
         """Seconds until the next tick, read fresh so a settings change applies.

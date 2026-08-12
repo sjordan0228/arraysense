@@ -11,7 +11,7 @@ import pytest
 
 from arraysense.collector.weather import WeatherPoller
 from arraysense.efficiency import EfficiencyRow
-from arraysense.forecast import CLEAR_SKY_PEAK_RADIATION, MIN_SCORED_DAYS, SkyHour
+from arraysense.forecast import MIN_SCORED_DAYS, SkyHour
 from arraysense.models import Sample
 from arraysense.settings import (
     PANELS_STRINGS_KEY,
@@ -158,17 +158,23 @@ def _score_days(store: SqliteStore, count: int, pr: float, *, partial: bool = Fa
     store.write_efficiency_day(rows)
 
 
-async def test_forecast_falls_back_to_the_observed_peak_without_scored_days(
-    store: SqliteStore,
-) -> None:
-    """An installation with no scored history keeps the behaviour it always had."""
+async def test_no_scored_days_records_no_forecast_at_all(store: SqliteStore) -> None:
+    """PV history alone is not a forecast, however much of it there is.
+
+    The peak-scaled curve this replaces called 43-63% more than the reference
+    array made on every one of the last twelve complete days, and nothing a
+    viewer could reach told it apart from the demonstrated one: the forecast
+    table holds a target hour, a time it was made and a number of watts, and
+    /api/forecast returns no basis. A figure that wrong, unlabelled and
+    indistinguishable from a measured one, is worse than the "no forecast data
+    for today" the dashboard already draws when there is nothing to say.
+    """
     _set_location(store)
 
-    peak_pv = 8000.0
     store.append(
         Sample(
             timestamp=datetime.now(UTC) - timedelta(days=1),
-            readings={"pv_total_power_w": peak_pv},
+            readings={"pv_total_power_w": 8000.0},
         )
     )
 
@@ -177,25 +183,19 @@ async def test_forecast_falls_back_to_the_observed_peak_without_scored_days(
     sky = [_sky(hour1, 500.0), _sky(hour2, 800.0)]
 
     poller = WeatherPoller(store, fetch=lambda lat, lon: _sample(), fetch_forecast=lambda a, b: sky)
-    assert await poller.tick() is True
+    assert await poller.tick() is True, "the weather reading itself must still land"
 
-    k = peak_pv / CLEAR_SKY_PEAK_RADIATION
-    day = store.forecast_day(hour1, hour2 + timedelta(hours=1))
-    latest = day
-    assert len(latest) == 2
-    assert latest[0]["expected_w"] == float(round(500.0 * k))
-    assert latest[1]["expected_w"] == float(round(800.0 * k))
+    assert store.forecast_day(hour1, hour2 + timedelta(hours=1)) == []
 
 
 async def test_enough_scored_days_switch_the_forecast_to_demonstrated_performance(
     store: SqliteStore,
 ) -> None:
-    """With five scored days the curve is modelled and scaled, not peak-scaled.
+    """With five scored days the curve is modelled and scaled by what was shown.
 
-    The peak fallback would call an enormous number here — the staged peak is
-    deliberately far above what this one twelve-panel string can make, which is
-    exactly the failure the old model had — so the two paths cannot be confused
-    for one another.
+    The staged PV peak is deliberately far above what this one twelve-panel
+    string can make, so a curve scaled by it rather than by the demonstrated
+    ratio could not be mistaken for this one.
     """
     _set_location(store)
     _describe_array(store)
@@ -218,14 +218,12 @@ async def test_enough_scored_days_switch_the_forecast_to_demonstrated_performanc
     watts = rows[0]["expected_w"]
     assert isinstance(watts, float)
 
-    # One string of twelve 370 W panels cannot exceed its own nameplate, and the
-    # peak fallback would have said 900 * 15000/950 ≈ 14,210 W.
+    # One string of twelve 370 W panels cannot exceed its own nameplate.
     assert 0.0 < watts < 12 * 370
-    assert watts != float(round(900.0 * 15000.0 / CLEAR_SKY_PEAK_RADIATION))
 
 
 async def test_four_scored_days_are_not_enough(store: SqliteStore) -> None:
-    """One short of the floor still falls back rather than fitting a ratio."""
+    """One short of the floor records nothing rather than fitting a ratio to it."""
     _set_location(store)
     _describe_array(store)
     peak_pv = 8000.0
@@ -245,13 +243,12 @@ async def test_four_scored_days_are_not_enough(store: SqliteStore) -> None:
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))
-    assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
+    assert store.forecast_day(hour, hour + timedelta(hours=1)) == []
 
 
 async def test_partial_days_do_not_count_toward_the_floor(store: SqliteStore) -> None:
     """A day watched in part has a ratio fitted to whichever part, so it cannot
-    be one of the five that unlock a demonstrated forecast."""
+    be one of the five that unlock a forecast."""
     _set_location(store)
     _describe_array(store)
     peak_pv = 8000.0
@@ -271,14 +268,18 @@ async def test_partial_days_do_not_count_toward_the_floor(store: SqliteStore) ->
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))
-    assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
+    assert store.forecast_day(hour, hour + timedelta(hours=1)) == []
 
 
-async def test_an_undescribed_array_falls_back_however_many_days_are_scored(
+async def test_an_undescribed_array_records_no_forecast_however_many_days_are_scored(
     store: SqliteStore,
 ) -> None:
-    """Without a described array there is nothing to run the model over."""
+    """Without a described array there is nothing to run the model over.
+
+    This is the case that never resolved itself: an installation with no array
+    description accrues no scored days, so the old fallback was not a first-week
+    measure for it but the permanent answer, wrong by half, forever.
+    """
     _set_location(store)
     peak_pv = 8000.0
     store.append(
@@ -297,8 +298,7 @@ async def test_an_undescribed_array_falls_back_however_many_days_are_scored(
     )
     assert await poller.tick() is True
 
-    rows = store.forecast_day(hour, hour + timedelta(hours=1))
-    assert rows[0]["expected_w"] == float(round(500.0 * peak_pv / CLEAR_SKY_PEAK_RADIATION))
+    assert store.forecast_day(hour, hour + timedelta(hours=1)) == []
 
 
 async def test_no_pv_history_records_no_forecast_but_weather_still_lands(
@@ -366,13 +366,8 @@ async def test_forecast_fetch_none_writes_no_forecast_weather_unaffected(
 async def test_prune_removes_old_forecast_rows(store: SqliteStore) -> None:
     """After a tick, forecast rows older than 90 days are gone."""
     _set_location(store)
-
-    store.append(
-        Sample(
-            timestamp=datetime.now(UTC) - timedelta(days=1),
-            readings={"pv_total_power_w": 8000.0},
-        )
-    )
+    _describe_array(store)
+    _score_days(store, MIN_SCORED_DAYS, pr=0.9)
 
     old_hour = datetime.now(UTC) - timedelta(days=100)
     store.append_forecast(made_at=old_hour, points=[(old_hour, 5000.0)])
@@ -396,3 +391,29 @@ async def test_prune_removes_old_forecast_rows(store: SqliteStore) -> None:
         new_hour + timedelta(hours=1),
     )
     assert len(new_day) == 1
+
+
+async def test_old_rows_are_pruned_even_when_there_is_no_forecast_to_write(
+    store: SqliteStore,
+) -> None:
+    """The one state where nothing arrives to push the old rows out.
+
+    An installation whose array description is withdrawn, or whose days stop
+    being scorable, records no new prediction — and while the prune sat behind
+    the write, its last predictions would have stayed in the table for as long
+    as it ran.
+    """
+    _set_location(store)
+
+    old_hour = datetime.now(UTC) - timedelta(days=100)
+    store.append_forecast(made_at=old_hour, points=[(old_hour, 5000.0)])
+
+    new_hour = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+    poller = WeatherPoller(
+        store,
+        fetch=lambda lat, lon: _sample(),
+        fetch_forecast=lambda lat, lon: [_sky(new_hour, 600.0)],
+    )
+    assert await poller.tick() is True
+
+    assert store.forecast_day(old_hour - timedelta(hours=1), old_hour + timedelta(hours=1)) == []

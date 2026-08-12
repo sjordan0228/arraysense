@@ -26,10 +26,23 @@ forecast is therefore right about the roof even when the configuration is not.
 Two things it deliberately does not do. It does not predict curtailment: PR is
 measured with curtailed energy removed from both sides, so this says what the
 array would make with somewhere for the power to go, and a day the bank fills
-early will fall short of it without the model being wrong. And it does not
-invent a figure it cannot support — below ``MIN_SCORED_DAYS`` scored days it
-falls back to the old peak-scaled curve and says so through ``basis``, because a
-median of two days is not a demonstrated ratio.
+early will fall short of it without the model being wrong. And below
+``MIN_SCORED_DAYS`` scored days it produces nothing at all rather than falling
+back, because a median of two days is not a demonstrated ratio and there is no
+second-best scale here worth having.
+
+That last is a correction. The peak-scaled curve was kept as a fallback for a
+fresh installation's first week, on the reasoning that it was the behaviour that
+had always been there — and measured against the reference installation's own
+record it called between 43 % and 63 % more than the array made on every one of
+the last twelve complete days. Nothing a viewer could reach distinguished it
+from the demonstrated curve: the forecast table holds a target hour, the time it
+was made and a number of watts, ``/api/forecast`` returns no basis, and the
+dashboard drew the same dashed line either way. Nor was it the first week of
+anything for an installation with no array described, which accrues no scored
+days and would have been served that curve for as long as it ran. An unlabelled
+figure half again too large is not a lesser forecast, and the dashboard already
+knows how to say it has none.
 
 Pure functions throughout: no I/O, no clock, no store. The poller fetches, reads
 the stored days, and hands both in.
@@ -55,15 +68,10 @@ logger = logging.getLogger(__name__)
 # cleaned. It is also the window the Efficiency page's own trend draws.
 PR_WINDOW_DAYS = 28
 
-# The fewest scored days that make a median mean anything. Below this the
-# forecast falls back rather than presenting a ratio fitted to a long weekend as
+# The fewest scored days that make a median mean anything. Below this there is
+# no forecast rather than a ratio fitted to a long weekend and presented as
 # though it described the array.
 MIN_SCORED_DAYS = 5
-
-# The fallback's clear-sky reference peak, carried over unchanged from the model
-# this replaces so a fresh install behaves exactly as it did before. It is only
-# ever reached in the first few days of an installation's life.
-CLEAR_SKY_PEAK_RADIATION = 950.0  # W/m²
 
 
 @dataclass(frozen=True)
@@ -157,16 +165,3 @@ def expected_points(
         (hour.when, max(modelled_watts(strings, latitude, longitude, hour) * pr, 0.0))
         for hour in sky
     ]
-
-
-def fallback_points(
-    sky: Sequence[SkyHour], observed_peak_pv: float
-) -> list[tuple[datetime, float]]:
-    """The old peak-scaled curve, for an array with too little history to judge.
-
-    Kept exactly as it was rather than improved, because its whole job is to be
-    the behaviour a fresh install has always had until five days have been
-    scored. It over-calls, and it is labelled as an estimate for that reason.
-    """
-    k = observed_peak_pv / CLEAR_SKY_PEAK_RADIATION
-    return [(hour.when, max(hour.ghi * k, 0.0)) for hour in sky]
