@@ -25,7 +25,14 @@ import socket
 import subprocess
 import sys
 from collections.abc import Callable
-from typing import NamedTuple, TypedDict
+
+try:
+    from typing import NamedTuple, TypedDict
+except ImportError:  # Python < 3.8: still load so preflight can refuse the
+    # interpreter with its own message instead of a traceback from the import
+    from typing import NamedTuple
+
+    TypedDict = dict  # type: ignore[assignment]
 
 SUPPORTED_ARCHES = ("aarch64", "x86_64")
 

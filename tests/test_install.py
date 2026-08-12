@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import importlib
 import os
 import shutil
 import socket
@@ -73,6 +74,25 @@ def _run_main(
 
 def test_a_healthy_host_passes() -> None:
     assert install.preflight(**_ok()) is None
+
+
+def test_the_module_loads_when_typing_lacks_typed_dict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a pre-3.8 host typing has no TypedDict, and an unconditional import
+    killed the too-old refusal with an ImportError traceback before it could
+    print. Simulate that typing gap in a fresh module load and prove the
+    module still loads and preflight still refuses."""
+    import typing
+
+    monkeypatch.delattr(typing, "TypedDict")
+    spec = importlib.util.spec_from_file_location("install_oldpy", install.__file__)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    refusal = module.preflight(**_ok(python_version=(3, 7)))
+    assert refusal is not None
+    assert "too old" in refusal.reason
 
 
 @pytest.mark.parametrize(
