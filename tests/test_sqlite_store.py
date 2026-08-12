@@ -1629,3 +1629,58 @@ def test_a_sky_reading_does_not_clear_the_inverters_bounds_flags(tmp_path: Path)
     flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
     conn.close()
     assert flagged == ["pv_total_power_w"], "the weather tick cleared the inverter's flag"
+
+
+def test_a_gap_does_not_overwrite_a_reading_at_the_same_second(tmp_path: Path) -> None:
+    """A poll that measured nothing must never delete one that measured something.
+
+    The tier's key is whole seconds and the dongle answers an eleven-second
+    interval in twelve to seventeen, so the failure that follows a slow read
+    can land on the second that read was stamped with. The reading is the thing
+    that cannot be taken again.
+    """
+    path = tmp_path / "gap-over-reading.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={"pv_total_power_w": 9000.0},
+            battery_modules=(_module(),),
+        )
+    )
+    store.append(Sample.failed(when, "TimeoutError: no reply from inverter"))
+    store.close()
+
+    conn = _open_db(path)
+    pv, error = _row(conn, "pv_total_power_w", "error")
+    conn.close()
+    assert pv == 9000, "the gap deleted a reading that had been taken"
+    assert error is None, "an outage was recorded over an instant that holds a measurement"
+
+
+def test_a_gap_still_lands_where_nothing_was_read(tmp_path: Path) -> None:
+    """The guard protects readings, and must not quietly stop recording outages.
+
+    Both cases an outage can arrive at: a second nothing has written at all,
+    and one carrying only a sky reading — the inverter was unreachable then
+    too, and the weather poller kept its own clock through it.
+    """
+    path = tmp_path / "gap-lands.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    empty_second = _ts()
+    sky_second = _ts() + timedelta(seconds=1)
+    store.append(Sample.failed(empty_second, "TimeoutError: first"))
+    store.append(Sample(timestamp=sky_second, readings=_sky()))
+    store.append(Sample.failed(sky_second, "TimeoutError: second"))
+    store.close()
+
+    conn = _open_db(path)
+    rows = dict(conn.execute("SELECT timestamp, error FROM inverter_raw"))
+    ghi = conn.execute(
+        "SELECT ghi_wm2 FROM inverter_raw WHERE timestamp = ?", (int(sky_second.timestamp()),)
+    ).fetchone()[0]
+    conn.close()
+    assert rows[int(empty_second.timestamp())] == "TimeoutError: first"
+    assert rows[int(sky_second.timestamp())] == "TimeoutError: second"
+    assert ghi is not None, "recording the outage erased the sky reading beside it"

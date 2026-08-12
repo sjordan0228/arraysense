@@ -56,6 +56,7 @@ the caller both are the same fact: nothing was measured here.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -79,6 +80,8 @@ from arraysense.store.schema import (
 
 if TYPE_CHECKING:
     from arraysense.efficiency import EfficiencyRow
+
+logger = logging.getLogger(__name__)
 
 
 def _is_memory_path(path: str) -> bool:
@@ -224,6 +227,12 @@ class SqliteStore:
         # here rather than per write.
         self._site_columns = tuple(name for name in self._columns if name in SITE_METRICS)
         self._inverter_columns = tuple(name for name in self._columns if name not in SITE_METRICS)
+        # What has to be true of a row before a recorded gap may land on it:
+        # that it holds no inverter reading. Built once because it names every
+        # inverter column, and read only when a gap is being written.
+        self._unread_guard = " AND ".join(
+            f"inverter_raw.{name} IS NULL" for name in self._inverter_columns
+        )
         self._module_columns = module_metric_columns(declared)
         self._inverter_names = frozenset(inverter_metric_columns())
         self._module_names = frozenset(module_metric_columns())
@@ -451,6 +460,11 @@ class SqliteStore:
         the metrics being written: a full clear let one writer erase the other's
         record of a fault at the same second.
 
+        One write is refused rather than narrowed. A recorded gap lands only on
+        a row that holds no inverter reading — see ``_upsert_inverter_row`` —
+        because a poll that measured nothing must never delete a poll that
+        measured something, and at one-second resolution the two can collide.
+
         The sample's timestamp must be timezone-aware. A naive one is read as local
         time on the way to epoch seconds, which files the row hours from where it
         belongs and puts it out of order with its neighbours.
@@ -499,7 +513,15 @@ class SqliteStore:
             ]
             if not site:
                 values.append(sample.error)
-            self._upsert_inverter_row(cur, epoch, unit, columns, values, with_error=not site)
+            self._upsert_inverter_row(
+                cur,
+                epoch,
+                unit,
+                columns,
+                values,
+                with_error=not site,
+                protect_readings=sample.is_failed,
+            )
             self._append_modules(cur, epoch, unit, sample.battery_modules)
 
     def query(
@@ -1061,6 +1083,7 @@ class SqliteStore:
         values: list[int | str | None],
         *,
         with_error: bool,
+        protect_readings: bool = False,
     ) -> None:
         """Write one wide row to inverter_raw, updating only the writer's own columns.
 
@@ -1089,6 +1112,20 @@ class SqliteStore:
         assembled any other way is still the right length, so it writes cleanly
         and files every metric under the wrong column name.
 
+        ``protect_readings`` is set when the row being written is a recorded
+        gap, and it adds the one condition an update here may not proceed
+        without: that the stored row holds no inverter reading. A gap is a poll
+        that measured nothing, and it arrives stamped at the moment the failure
+        was seen — which can be the same *second* as the reading the previous
+        poll completed, since the tier's key is whole seconds and the dongle
+        answers an eleven-second interval in twelve to seventeen. Letting the
+        gap through there would delete a measurement to record an outage that
+        did not begin until after it, and the next attempt records its own gap a
+        backoff later at a second of its own, so nothing is lost by standing
+        down. It also holds where ordering cannot: a clock stepped backwards by
+        NTP puts a later failure on an earlier second, and no stamp taken in the
+        collector can defend against that.
+
         An empty update list becomes DO NOTHING, because ``DO UPDATE SET`` with
         nothing to set is a syntax error rather than a no-op. Nothing reaches it
         today: the inverter path always carries ``error``, and a site append
@@ -1106,11 +1143,20 @@ class SqliteStore:
             if updated
             else "DO NOTHING"
         )
+        if protect_readings and updated and self._unread_guard:
+            conflict = f"{conflict} WHERE {self._unread_guard}"
         cur.execute(
             f"INSERT INTO inverter_raw ({cols_sql}) VALUES ({placeholders}) "
             f"ON CONFLICT(timestamp, device) {conflict}",
             (epoch, device, *values),
         )
+        if protect_readings and cur.rowcount == 0:
+            # Not silent: the gap is real and was not recorded, and a collector
+            # that logs nothing here leaves the next reader wondering why an
+            # outage the status page counted has no row behind it.
+            logger.info(
+                "gap at %d not recorded for %s: that second already holds a reading", epoch, device
+            )
 
     def _append_modules(
         self,
