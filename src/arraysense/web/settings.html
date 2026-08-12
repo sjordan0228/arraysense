@@ -1156,6 +1156,30 @@ function splitStringLine(line) {
 // is the stable end-of-slice sentinel and is never called.
 function panelsEditorEnd() {}
 
+// A warning shown on the string row when a generic panel type was chosen
+// instead of entering every electrical figure by hand. The wording names
+// what is actually at risk: a run length entered against a generic module
+// is an estimate resting on an estimate, because the wire loss depends on
+// operating voltage and a generic Vmp is representative of the format
+// rather than measured from the owner's modules.
+function panelWarningText(panelName, rowIndex) {
+  if (!panelName) return '';
+  const cat = (panelState._catalogue || []);
+  const entry = cat.find((e) => e.name === panelName);
+  if (!entry) return '';
+  const defs = (panelState._defaulted || {});
+  const rowDefs = Array.isArray(defs[rowIndex]) ? defs[rowIndex] : [];
+  const haveVmp = rowDefs.includes('vmp');
+  const haveAll = ['vmp', 'voc', 'temp_coeff', 'noct', 'degradation']
+    .every((k) => rowDefs.includes(k));
+  let msg = `${entry.description} — representative figures` + (haveAll ? '.' : ',');
+  if (haveVmp) {
+    msg += ' Vmp is assumed rather than measured from your modules,'
+      + ' so a wire loss computed from it is an estimate resting on an estimate.';
+  }
+  return ` <span class="hint warn-note" style="display:inline-block;margin-top:2px">${esc(msg)}</span>`;
+}
+
 // State of the string editor. Same shape as bandState: holds what was
 // originally in the textarea, and while nothing is touched that exact string
 // goes back.
@@ -1179,7 +1203,29 @@ function panelMarkup(row, i) {
   };
   const val = (key) => esc(adv[key] || '');
 
+  // A panel-type picker above the advanced fields. Offers the catalogue
+  // entries plus a "none" option, and shows a warning when a generic
+  // entry was used — the warning carries what is actually at risk, which
+  // is narrower than "this may be wrong": a generic Vmp makes the wire
+  // loss an estimate resting on an estimate, and the owner should know.
+  const catalogue = (panelState._catalogue || []);
+  const panelOptions = [{name: '', description: 'Enter values below'}].concat(
+    catalogue.map((e) => ({name: e.name, description: e.description})));
+  const chosenPanel = adv.panel || '';
+  const panelSel = panelOptions.map((opt) => {
+    const sel = opt.name === chosenPanel ? ' selected' : '';
+    return `<option value="${esc(opt.name)}"${sel}>${esc(opt.description)}</option>`;
+  }).join('');
+  const panelWarning = chosenPanel ? panelWarningText(chosenPanel, i) : '';
+
   const advRows = [
+    `<div class="span" style="margin-bottom:4px">
+       <span class="cap">Panel type</span>
+       <select data-role="adv" data-key="panel" aria-label="Panel type">
+         ${panelSel}
+       </select>
+       ${panelWarning}
+     </div>`,
     `<div class="span">
        <span class="cap">Temp coefficient</span>
        <input type="text" data-role="adv" data-key="temp_coeff"
@@ -1393,11 +1439,29 @@ function wirePanels(host) {
   }
 }
 
-function mountPanelsEditor(spec) {
+async function mountPanelsEditor(spec) {
   const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
   if (!box) return;
   const area = box.querySelector('[data-key]');
   if (!area) return;
+
+  // Read the parsed strings to learn which fields are defaulted per string
+  // and which catalogue entries exist. The catalogue drives the panel-picker
+  // dropdown; the defaulted sets drive the warning on each row.
+  let catalogue = [];
+  let defaulted = {};
+  try {
+    const r = await fetch('/api/panels');
+    if (r.ok) {
+      const body = await r.json();
+      catalogue = (body && body.catalogue) || [];
+      const strings = (body && body.strings) || [];
+      defaulted = {};
+      strings.forEach((s, idx) => {
+        if (s.defaulted && s.defaulted.length) defaulted[idx] = s.defaulted;
+      });
+    }
+  } catch (e) { /* the editor works without the catalogue; the picker stays empty */ }
 
   const rows = [];
   if (area.value.trim()) {
@@ -1407,7 +1471,7 @@ function mountPanelsEditor(spec) {
       rows.push(splitStringLine(line));
     }
   }
-  panelState = { original: area.value, rows, changed: false };
+  panelState = { original: area.value, rows, changed: false, _catalogue: catalogue, _defaulted: defaulted };
 
   const shell = document.createElement('div');
   shell.className = 'bands';
@@ -1562,11 +1626,11 @@ function mountLocation() {
   };
 }
 
-function mountExtras() {
+async function mountExtras() {
   const bands = fields.find((f) => f.key === BANDS_KEY);
   if (bands) mountBandEditor(bands);
   const panels = fields.find((f) => f.key === PANELS_KEY);
-  if (panels) mountPanelsEditor(panels);
+  if (panels) await mountPanelsEditor(panels);
   mountLocation();
 }
 
