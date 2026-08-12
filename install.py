@@ -1,10 +1,11 @@
 """install.py — the one-line bootstrap that puts Solar ArraySense on a machine.
 
-Fetched over HTTPS and piped into root, so it is written to be read first: it
-downloads no further scripts, prints everything it intends to do before doing
-any of it, and is safe to run twice. Questions are read from the controlling
-terminal, never stdin: run this as `curl ... | sudo python3 -` and stdin is
-the script itself, already at EOF.
+Fetched over HTTPS and piped into root, so it is written to be read first. It
+fetches exactly two things — uv's installer, downloaded and run by sh, and the
+repository it clones — prints everything it intends to do before doing any of
+it, and is safe to run twice. Questions are read from the controlling terminal,
+never stdin: run this as `curl ... | sudo python3 -` and stdin is the script
+itself, already at EOF.
 
 Stdlib only, and it must PARSE on Python 3.8 — it runs on whatever interpreter
 the distribution shipped, before uv has installed 3.12 for the service. Modern
@@ -17,20 +18,29 @@ nesting inside f-strings.
 
 from __future__ import annotations
 
+import glob
 import os
 import shutil
 import socket
 import subprocess
 import sys
 from collections.abc import Callable
-from typing import NamedTuple, TypedDict
+
+try:
+    from typing import NamedTuple, TypedDict
+except ImportError:  # Python < 3.8: still load so preflight can refuse the
+    # interpreter with its own message instead of a traceback from the import
+    from typing import NamedTuple
+
+    TypedDict = dict  # type: ignore[assignment]
 
 SUPPORTED_ARCHES = ("aarch64", "x86_64")
 
 # uv fetches its own Python and the dependency tree, and the database grows
-# about 52 MB a day at a ten-second poll. A host under this will fail within
-# weeks whatever happens today, so it is refused now with a reason rather than
-# later with a full disk.
+# about 5 MB a day at a ten-second poll — file growth, measured on the
+# reference install, not the disk-write volume. A host under this will run out
+# within about a year whatever happens today, so it is refused now with a
+# reason rather than later with a full disk.
 MIN_FREE_BYTES = 2 * 1024**3
 
 MIN_PYTHON = (3, 8)
@@ -58,6 +68,25 @@ DROPIN_DIR = "/etc/systemd/system/arraysense.service.d"
 # installer, so a bare "uv" lookup fails. find_uv() checks these places after
 # PATH, in the order a bootstrap actually leaves them.
 UV_CANDIDATES = ("/root/.local/bin/uv", "/usr/local/bin/uv", "/usr/bin/uv")
+
+# uv downloads its own Python when no system interpreter satisfies
+# requires-python, and puts it under the caller's home by default — /root for
+# the root that runs this. The service runs as an unprivileged user under
+# ProtectHome=true, so a Python under /root would be masked and the service
+# could not exec it. Directing it to /opt/uv-python, outside any home, is where
+# the production installation also keeps it.
+UV_PYTHON_INSTALL_DIR = "/opt/uv-python"
+
+# The backup is a second unit, a timer and a tmpfiles fragment, each named as
+# it ships in the clone and where it must land. Installing all three is part of
+# the install, not an extra: the management table promises a daily compressed
+# copy, and a promise nothing on the machine keeps is how a database loss stays
+# lost.
+BACKUP_FILES = (
+    ("arraysense-backup.service", "/etc/systemd/system/arraysense-backup.service"),
+    ("arraysense-backup.timer", "/etc/systemd/system/arraysense-backup.timer"),
+    ("arraysense-backup.tmpfiles.conf", "/etc/tmpfiles.d/arraysense-backup.conf"),
+)
 
 
 class Refusal(NamedTuple):
@@ -94,6 +123,7 @@ class Host(TypedDict):
     euid: int
     machine: str
     has_git: bool
+    has_curl: bool
     free_bytes: int
     python_version: tuple[int, ...]
 
@@ -121,6 +151,7 @@ def preflight(
     euid: int,
     machine: str,
     has_git: bool,
+    has_curl: bool,
     free_bytes: int,
     python_version: tuple[int, ...],
 ) -> Refusal | None:
@@ -159,11 +190,16 @@ def preflight(
             "git is not installed, and both install and upgrade are a fetch",
             "Install git with your package manager, then run this again.",
         )
+    if not has_curl:
+        return Refusal(
+            "curl is not installed, and the first step downloads uv's installer",
+            "Install curl with your package manager, then run this again.",
+        )
     if free_bytes < MIN_FREE_BYTES:
         return Refusal(
             f"not enough free disk: {free_bytes / 1024**3:.1f} GB, "
             f"need {MIN_FREE_BYTES / 1024**3:.0f} GB",
-            "Free some space. The database grows about 52 MB a day.",
+            "Free some space. The database grows about 5 MB a day.",
         )
     return None
 
@@ -176,6 +212,7 @@ def observe_host() -> Host:
         "euid": os.geteuid(),
         "machine": os.uname().machine,
         "has_git": shutil.which("git") is not None,
+        "has_curl": shutil.which("curl") is not None,
         "free_bytes": shutil.disk_usage(_install_filesystem()).free,
         "python_version": sys.version_info[:2],
     }
@@ -240,13 +277,20 @@ def resolve_port(
     have one chosen for it.
     """
     if chosen is not None:
+        if not 1 <= chosen <= 65535:
+            raise SystemExit(f"--port must be a number from 1 to 65535, not {chosen}")
+        if not probe(chosen):
+            raise SystemExit(f"port {chosen} is in use or not permitted; pick another with --port")
         return chosen
     if probe(80):
         return 80
     while True:
         answer = ask("Port 80 is in use. Which port should the dashboard use? [8080] ").strip()
         if not answer:
-            return DEFAULT_PORT
+            if probe(DEFAULT_PORT):
+                return DEFAULT_PORT
+            print("  that port is in use or not permitted; pick another")
+            continue
         if not answer.isdigit():
             print("  that is not a port number; pick one like 8080")
             continue
@@ -259,6 +303,33 @@ def resolve_port(
         print("  that port is in use or not permitted; pick another")
 
 
+def _flag_value(argv: list[str], index: int, error: str) -> tuple[str, int]:
+    """The value of a space-separated flag, advancing past it.
+
+    A flag at the very end of argv has no value, which is a different mistake
+    from a value that is not a valid choice, and gets its own message.
+    """
+    if index + 1 >= len(argv):
+        raise SystemExit(error)
+    return argv[index + 1], index + 1
+
+
+def _parse_port(text: str) -> int:
+    """A --port value as an integer, or the reason it is not one.
+
+    isdigit() alone is not enough: it accepts superscript digits such as '²'
+    that int() then rejects with ValueError, which would traceback out of a
+    script piped into root. The range check mirrors the interactive prompt.
+    """
+    try:
+        port = int(text)
+    except ValueError:
+        raise SystemExit("--port needs a number, for example: --port 8080") from None
+    if not 1 <= port <= 65535:
+        raise SystemExit("--port must be a number from 1 to 65535")
+    return port
+
+
 def parse_args(argv: list[str]) -> Args:
     """The flags that let this run without a person watching.
 
@@ -266,27 +337,42 @@ def parse_args(argv: list[str]) -> Args:
     pipe; --repo and --ref let the same install target a fork or a pinned
     release instead of whatever sits on the project's default branch. All four
     default to the boring values, so a bare invocation is a normal install.
+    Both the space and the = form are accepted, because the management command
+    accepts both and a typo'd flag has to be refused rather than silently
+    ignored — the previous membership-test parsing did exactly that with
+    --port=8080, landing an install on port 80 while the operator believed
+    they had chosen 8080.
     """
-    assumed_yes = "--yes" in argv
+    yes = False
     port: int | None = None
-    if "--port" in argv:
-        index = argv.index("--port")
-        if index + 1 >= len(argv) or not argv[index + 1].isdigit():
-            raise SystemExit("--port needs a number, for example: --port 8080")
-        port = int(argv[index + 1])
     repo = REPO_URL
-    if "--repo" in argv:
-        index = argv.index("--repo")
-        if index + 1 >= len(argv):
-            raise SystemExit("--repo needs a URL or path")
-        repo = argv[index + 1]
     ref: str | None = None
-    if "--ref" in argv:
-        index = argv.index("--ref")
-        if index + 1 >= len(argv):
-            raise SystemExit("--ref needs a branch, tag or commit")
-        ref = argv[index + 1]
-    return {"yes": assumed_yes, "port": port, "repo": repo, "ref": ref}
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--yes":
+            yes = True
+        elif arg == "--port":
+            value, index = _flag_value(
+                argv, index, "--port needs a number, for example: --port 8080"
+            )
+            port = _parse_port(value)
+        elif arg.startswith("--port="):
+            port = _parse_port(arg.split("=", 1)[1])
+        elif arg == "--repo":
+            value, index = _flag_value(argv, index, "--repo needs a URL or path")
+            repo = value
+        elif arg.startswith("--repo="):
+            repo = arg.split("=", 1)[1]
+        elif arg == "--ref":
+            value, index = _flag_value(argv, index, "--ref needs a branch, tag or commit")
+            ref = value
+        elif arg.startswith("--ref="):
+            ref = arg.split("=", 1)[1]
+        else:
+            raise SystemExit(f"unrecognized argument: {arg}")
+        index += 1
+    return {"yes": yes, "port": port, "repo": repo, "ref": ref}
 
 
 def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
@@ -300,23 +386,28 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
     lines = [
         "Solar ArraySense will:",
         "",
-        "  install uv (which brings its own Python 3.12)",
+        "  install uv (its Python 3.12 lands in /opt/uv-python when the system's is older)",
         f"  clone {target} into {INSTALL_DIR}",
         f"  create the system user {SERVICE_USER!r}",
+        "  give that user ownership of the clone and its data",
         f"  create {CONFIG_DIR} and {DATA_DIR}",
         f"  install a systemd service listening on port {port}",
         f"  install the management command {CLI_SHIM}",
+        "  install the daily backup service and timer (writing /var/backups/arraysense)",
+        "  enable the service and the backup timer to start at boot",
+    ]
+    if port < 1024:
+        lines.append("  grant CAP_NET_BIND_SERVICE so the service can bind a privileged port")
+    lines += [
         "",
         "It will NOT write a configuration file — the first visit to the",
         "dashboard runs the setup wizard, and an existing config would skip it.",
         "",
     ]
-    if port == 80:
-        lines.insert(-1, "  grant CAP_NET_BIND_SERVICE so a non-root service can bind port 80")
     return "\n".join(lines)
 
 
-def clone_argv(repo: str, ref: str | None) -> list[str]:
+def clone_argv(repo: str) -> list[str]:
     """The git clone command, exposed so a test can pin its shape.
 
     Deliberately no --depth: a shallow clone holds a single commit and git then
@@ -325,28 +416,62 @@ def clone_argv(repo: str, ref: str | None) -> list[str]:
     installation this installer created unable to upgrade at all, which is the
     one thing the lifecycle CLI exists for; the saving is small and the cost is
     the whole upgrade path.
+
+    The pinned ref is not on this command: git clone --branch takes a branch or
+    tag and refuses a bare commit, and --ref is documented as pinning a commit
+    too. checkout_argv applies the ref in the clone instead, where git accepts
+    branch, tag and commit alike.
     """
-    clone = ["git", "clone"]
-    if ref:
-        clone += ["--branch", str(ref)]
-    clone += [repo, INSTALL_DIR]
-    return clone
+    return ["git", "clone", repo, INSTALL_DIR]
+
+
+def checkout_argv(ref: str) -> list[str]:
+    """Check out the pinned ref in the fresh clone.
+
+    A full clone carries every branch's history, so any commit reachable from a
+    branch or tag is present to check out; git itself disambiguates a seven-hex
+    name between a branch and a shortened sha.
+    """
+    return ["git", "-C", INSTALL_DIR, "checkout", ref]
+
+
+def _packaging_file(name: str) -> str:
+    """A file from the clone's packaging directory.
+
+    The unit and the backup fragments travel with the source they run; if the
+    clone did not land, the file cannot be there, so the failure is a sentence
+    rather than a traceback.
+    """
+    path = os.path.join(INSTALL_DIR, "packaging", name)
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        raise SystemExit(f"cannot read {path}; the clone is incomplete") from None
+
+
+def _write_file(path: str, text: str) -> None:
+    """Write one file the install leaves behind, with a message on failure.
+
+    Every subprocess step gets its OSError turned into a sentence by _step; the
+    filesystem writes were the only steps that could still traceback. A failed
+    write at this point is a half-install either way, so the message says which
+    file failed rather than pretending nothing did.
+    """
+    try:
+        with open(path, "w") as handle:
+            handle.write(text)
+    except OSError as exc:
+        raise SystemExit(f"could not write {path}: {exc}") from None
 
 
 def unit_text() -> str:
     """The service unit, read from the clone so there is one copy of it.
 
     The unit travels with the source it runs; the drop-in is the right shape
-    for a per-machine tweak, but the unit itself is part of the code. If the
-    clone did not land, the file cannot be there, so the failure is a sentence
-    rather than a traceback.
+    for a per-machine tweak, but the unit itself is part of the code.
     """
-    path = os.path.join(INSTALL_DIR, "packaging", "arraysense.service")
-    try:
-        with open(path) as handle:
-            return handle.read()
-    except OSError:
-        raise SystemExit(f"cannot read the service unit {path}; the clone is incomplete") from None
+    return _packaging_file("arraysense.service")
 
 
 def dropin_text(port: int) -> str:
@@ -375,7 +500,19 @@ def shim_text() -> str:
     virtualenv while it is running, and a CLI living inside it would be pulling
     the floor up behind itself.
     """
-    return f'#!/bin/sh\nexec /usr/bin/env python3 {INSTALL_DIR}/src/arraysense/manage.py "$@"\n'
+    return (
+        "#!/bin/sh\n"
+        "# sudo runs this with a PATH that does not include uv, and the upgrade\n"
+        "# command needs uv; put the directory it lands in first.\n"
+        "for d in /root/.local/bin /home/*/.local/bin /usr/local/bin /usr/bin; do\n"
+        '  if [ -x "$d/uv" ]; then\n'
+        '    PATH="$d:$PATH"\n'
+        "    export PATH\n"
+        "    break\n"
+        "  fi\n"
+        "done\n"
+        f'exec /usr/bin/env python3 {INSTALL_DIR}/src/arraysense/manage.py "$@"\n'
+    )
 
 
 def find_uv() -> str | None:
@@ -384,27 +521,31 @@ def find_uv() -> str | None:
     Its installer puts it in ~/.local/bin, which is not on the PATH of the
     process that just ran that installer — so looking it up by name finds
     nothing and raises FileNotFoundError halfway through an install that has
-    already cloned the repository.
+    already cloned the repository. A uv a non-root user installed in their own
+    home is found the same way.
     """
     found = shutil.which("uv")
     if found:
         return found
-    for candidate in UV_CANDIDATES:
+    candidates = list(UV_CANDIDATES) + sorted(glob.glob("/home/*/.local/bin/uv"))
+    for candidate in candidates:
         expanded = os.path.expanduser(candidate)
         if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
             return expanded
     return None
 
 
-def _step(argv: list[str]) -> int:
+def _step(argv: list[str], *, env: dict[str, str] | None = None) -> int:
     """Run one install step, reporting a missing executable as a failed step.
 
     subprocess raises FileNotFoundError for a command that is not there, and an
     uncaught traceback halfway through a root install tells the operator
-    nothing about which half completed.
+    nothing about which half completed. env is passed through untouched, so the
+    uv sync step can steer uv's own Python out of root's home without weakening
+    the service sandbox.
     """
     try:
-        return subprocess.run(argv, check=False).returncode
+        return subprocess.run(argv, check=False, env=env).returncode
     except OSError as exc:
         print(f"could not run {argv[0]}: {exc}")
         return 127
@@ -428,24 +569,41 @@ def outbound_ip() -> str | None:
         probe.close()
 
 
-def render_handoff(port: int, host: str) -> str:
+def mdns_active() -> bool:
+    """Whether this host answers .local names, so the handoff may claim one.
+
+    avahi-daemon is the mDNS responder on Debian and Raspberry Pi OS; without
+    it a .local name resolves nowhere at all, and printing it as an address a
+    person can open sends them chasing a name that does not answer. A host that
+    has no avahi gets only the IP line, never a guessed name.
+    """
+    return _step(["systemctl", "is-active", "--quiet", "avahi-daemon"]) == 0
+
+
+def render_handoff(port: int, host: str, *, local: bool) -> str:
     """The addresses a person opens to reach the wizard.
 
-    The .local name is always shown; the IP line comes from the routing table
-    rather than the hostname lookup, which maps to 127.0.1.1 on Debian. When no
-    route can be determined there is no IP line at all — never a placeholder
-    that looks like an address.
+    The .local name is shown only when the host actually answers mDNS — the
+    same rule that drops the IP line when no route can be determined, never a
+    placeholder that looks like an address. The IP line comes from the routing
+    table rather than the hostname lookup, which maps to 127.0.1.1 on Debian.
+    The hostname is split at the first dot so an FQDN does not become
+    box.example.com.local.
     """
     suffix = "" if port == 80 else f":{port}"
+    short_host = host.split(".")[0]
     ip = outbound_ip()
-    heading = (
-        "Installed. Open either of these to run the setup wizard:"
-        if ip is not None
-        else "Installed. Open this to run the setup wizard:"
-    )
-    lines = ["", heading, f"  http://{host}.local{suffix}"]
+    lines = [""]
+    if local:
+        lines.append(f"  http://{short_host}.local{suffix}")
     if ip is not None:
         lines.append(f"  http://{ip}{suffix}")
+    heading = (
+        "Installed. Open either of these to run the setup wizard:"
+        if len(lines) == 3
+        else "Installed. Open this to run the setup wizard:"
+    )
+    lines.insert(1, heading)
     return "\n".join(lines)
 
 
@@ -461,11 +619,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if os.path.isdir(os.path.join(INSTALL_DIR, ".git")):
         print(f"{INSTALL_DIR} already exists.")
-        print("To update, run: arraysense upgrade")
-        print(f"To repair this installation, remove {INSTALL_DIR} and run this again.")
+        print(f"To repair a half-installed machine, remove {INSTALL_DIR} and run this again.")
+        print("If the install completed, update it with: arraysense upgrade")
         return 1
 
-    port = resolve_port(chosen=args["port"])
+    try:
+        port = resolve_port(chosen=args["port"])
+    except NoTerminal:
+        print("no controlling terminal, so the port cannot be chosen for you.")
+        print("Run this from a terminal, or say which port to use:")
+        print(f"  sudo python3 install.py --yes --port {DEFAULT_PORT}")
+        return 1
     print(render_plan(port, repo=args["repo"], ref=args["ref"]))
     if not args["yes"]:
         try:
@@ -478,13 +642,25 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  sudo python3 install.py --yes --port {port}")
             return 1
 
-    clone = clone_argv(repo=args["repo"], ref=args["ref"])
+    clone = clone_argv(repo=args["repo"])
 
     # useradd may fail because the user already exists from a previous run;
     # every other step failing means the install is broken and stops here.
     steps = [
-        (["sh", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"], False),
+        (
+            [
+                "sh",
+                "-c",
+                "curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh "
+                "&& sh /tmp/uv-install.sh; rc=$?; rm -f /tmp/uv-install.sh; exit $rc",
+            ],
+            False,
+        ),
         (clone, False),
+    ]
+    if args["ref"] is not None:
+        steps.append((checkout_argv(args["ref"]), False))
+    steps += [
         (
             [
                 "useradd",
@@ -507,29 +683,54 @@ def main(argv: list[str] | None = None) -> int:
     uv = find_uv()
     if uv is None:
         print("uv did not land where this process can find it.")
-        print(f"Install uv and finish by hand with: uv sync --project {INSTALL_DIR}")
+        print(f"Install uv, remove {INSTALL_DIR}, and run this again.")
         return 1
 
-    for step_argv in [
-        [uv, "sync", "--project", INSTALL_DIR],
-        ["chown", "-R", f"{SERVICE_USER}:{SERVICE_USER}", INSTALL_DIR],
-    ]:
-        if _step(step_argv) != 0:
-            print(f"failed: {' '.join(step_argv)}")
-            return 1
+    if (
+        _step(
+            [uv, "sync", "--project", INSTALL_DIR],
+            env={**os.environ, "UV_PYTHON_INSTALL_DIR": UV_PYTHON_INSTALL_DIR},
+        )
+        != 0
+    ):
+        print(f"failed: {uv} sync --project {INSTALL_DIR}")
+        return 1
+    if _step(["chown", "-R", f"{SERVICE_USER}:{SERVICE_USER}", INSTALL_DIR]) != 0:
+        print("failed: chown the clone to the arraysense user")
+        return 1
 
     unit = unit_text()
-    with open("/etc/systemd/system/arraysense.service", "w") as handle:
-        handle.write(unit)
-    os.makedirs(DROPIN_DIR, exist_ok=True)
-    with open(os.path.join(DROPIN_DIR, "port.conf"), "w") as handle:
-        handle.write(dropin_text(port))
-    with open(CLI_SHIM, "w") as handle:
-        handle.write(shim_text())
-    os.chmod(CLI_SHIM, 0o755)
+    _write_file("/etc/systemd/system/arraysense.service", unit)
+    try:
+        os.makedirs(DROPIN_DIR, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit(f"could not create {DROPIN_DIR}: {exc}") from None
+    _write_file(os.path.join(DROPIN_DIR, "port.conf"), dropin_text(port))
+    _write_file(CLI_SHIM, shim_text())
+    try:
+        os.chmod(CLI_SHIM, 0o755)
+    except OSError as exc:
+        raise SystemExit(f"could not make {CLI_SHIM} executable: {exc}") from None
 
-    _step(["systemctl", "daemon-reload"])
-    _step(["systemctl", "enable", "--now", "arraysense"])
+    # The documented one-line install is the only install, so it installs the
+    # backup too — the management table promises a daily compressed copy, and a
+    # promise nothing on the machine keeps is how a database loss stays lost.
+    for source, dest in BACKUP_FILES:
+        _write_file(dest, _packaging_file(source))
+    if _step(["systemd-tmpfiles", "--create"]) != 0:
+        print("failed: systemd-tmpfiles --create")
+        return 1
+    if _step(["systemctl", "daemon-reload"]) != 0:
+        print("systemctl daemon-reload failed; the units may not be loadable")
+        return 1
+    if _step(["systemctl", "enable", "--now", "arraysense"]) != 0:
+        print("the service is installed but was not enabled for boot:")
+        print("  systemctl enable --now arraysense")
+        return 1
+    if _step(["systemctl", "enable", "--now", "arraysense-backup.timer"]) != 0:
+        print("the backup timer is installed but was not enabled for boot:")
+        print("  systemctl enable --now arraysense-backup.timer")
+        return 1
 
     # The health check has one home, in manage.py, and this is it being used.
     verify = _step(
@@ -544,7 +745,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Installed, but the service did not come up. Run: arraysense logs")
         return 1
 
-    print(render_handoff(port, socket.gethostname()))
+    print(render_handoff(port, socket.gethostname(), local=mdns_active()))
     return 0
 
 
