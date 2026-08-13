@@ -93,6 +93,22 @@ else. `arraysense backup` writes a compressed copy of the database every day to
 the database itself does not live, and that is the whole point: a backup on the
 same disk as the original is protection against nothing.
 
+Where it writes, how many copies it keeps, whether it runs at all and at what
+time are settings on the settings page, under **backup**:
+
+| setting | default | what it decides |
+| --- | --- | --- |
+| `backup.enabled` | on | whether the timer's run does anything at all |
+| `backup.directory` | `/var/backups/arraysense` | where the compressed copies go |
+| `backup.keep` | 14 | how many are kept before the oldest is rotated away |
+| `backup.hour` / `backup.minute` | 03:15 | the time, on this installation's own clock, after which the day's backup may run |
+
+The destination is checked when you change it, by creating and removing a real
+file there, and a path that cannot be written is refused with the reason. This
+is not fussiness: a destination that only fails at 03:15 fails unattended, and
+the one remedy that fits — an owner, or the `ReadWritePaths` carve-out below —
+depends on which way it failed.
+
 Measured on the real database on 11 August 2026:
 
 | step | size |
@@ -114,10 +130,11 @@ to copy a live database that is being written to, in WAL mode, where a plain
 file copy of the `.db` alone would miss the `-wal` and produce a torn snapshot —
 then verified with `PRAGMA quick_check` before it is trusted, and only then
 compressed and renamed into place on the card. A run interrupted halfway leaves
-a `.part` file, never something that looks like a finished backup. Fourteen
-daily copies are kept; the oldest are rotated away, and only after a new one has
-been written and verified — never before, because a rotation that runs first
-turns a failed backup into data loss.
+a `.part` file, never something that looks like a finished backup. As many
+daily copies are kept as `backup.keep` says, fourteen by default; the oldest
+are rotated away, and only after a new one has been written and verified —
+never before, because a rotation that runs first turns a failed backup into
+data loss.
 
 The bootstrap installer writes these files and enables the timer automatically.
 To install them by hand:
@@ -128,17 +145,34 @@ To install them by hand:
     sudo systemctl daemon-reload
     sudo systemctl enable --now arraysense-backup.timer
 
+An installation made before the schedule became a setting needs those two unit
+files copied again, plus `arraysense.service` itself —
+`sudo cp /opt/arraysense/packaging/arraysense.service /etc/systemd/system/`,
+then `daemon-reload` and `arraysense restart`. `arraysense upgrade` fetches
+code and does not rewrite units, so until they are copied the old timer keeps
+firing once a day at 03:15 and the settings page refuses its own default
+destination — the collector needs the `ReadWritePaths` line the new unit
+carries before it can prove that directory is writable.
+
 The tmpfiles.d fragment creates `/var/backups/arraysense` owned by the
 `arraysense` user before either the timer or a hand-run backup touches it.
 Without it, a hand-run backup as root creates the directory root:root and the
 timer (which runs as `arraysense`) can never write there — failing silently every
 night.
 
-The timer fires at 03:15 plus a randomised delay of up to fifteen minutes
-(`RandomizedDelaySec=15m`), so the actual trigger varies — on the reference
-machine it was 03:18 on its last run — and is `Persistent=true`, so a Pi that was off at 03:15
-runs the backup when it comes back rather than skipping a day silently. The
-service runs as the `arraysense` user under `ProtectSystem=strict`, with
+The timer fires every fifteen minutes and asks; the settings answer. Each
+firing runs `arraysense backup --scheduled`, which returns silently unless the
+backup is enabled, the configured time has passed on this installation's own
+clock, and today's archive is missing — so the journal gets one entry a day
+rather than ninety-six. The consequence to know is that the run starts at the
+first quarter hour at or after the configured time: 03:15 runs at 03:15, and
+03:20 runs at 03:30. `Persistent=true` is still set, so a Pi that was off at
+the configured time runs the backup when it comes back rather than skipping a
+day silently, and the day is this installation's own calendar day — a machine
+in New York backing up at 23:30 writes the archive dated that evening, not the
+next morning's UTC date.
+
+The service runs as the `arraysense` user under `ProtectSystem=strict`, with
 `/var/backups/arraysense` the only writable path apart from the database's own
 directory — which `StateDirectory=arraysense` covers, exactly as for the
 collector. The working copy and the lock are written beside the database, so an
@@ -153,9 +187,16 @@ Getting this wrong produces a timer that fails every night with `Read-only file
 system` on the lock or the working copy, so that is the phrase to search for
 when a backup reports nothing written.
 
-Run a backup by hand with `sudo arraysense backup` (add `--dir PATH` or
-`--keep N` to override the destination or the number kept). A successful run
-prints the path written and the restore command to use:
+A `backup.directory` moved somewhere else needs the same carve-out, on both
+units — `arraysense-backup.service` writes the archive there, and
+`arraysense.service` is what checks the path when you save it. The settings
+page refuses a destination it cannot write to and names which of the two
+problems it hit, so this is caught when it is typed rather than at 03:15.
+
+Run a backup by hand with `sudo arraysense backup`, which ignores the schedule
+and the enabled setting and makes a copy now — add `--dir PATH` or `--keep N`
+to override the stored destination or the number kept for that one run. A
+successful run prints the path written and the restore command to use:
 
     restore with: arraysense restore /var/backups/arraysense/arraysense-2026-08-12.db.gz
 

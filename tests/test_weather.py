@@ -497,3 +497,153 @@ def test_radiation_is_stamped_to_the_hour_it_describes(
         )
     for metric in ("outside_temperature_c", "wind_speed_ms"):
         assert by_metric[metric] == label, f"{metric} is read at its label and must not be moved"
+
+
+# --- geocode ---------------------------------------------------------------
+
+
+def _geocode_payload(candidates: list[dict[str, object]] | None) -> bytes:
+    payload: dict[str, object] = {}
+    if candidates is not None:
+        payload["results"] = candidates
+    return json.dumps(payload).encode()
+
+
+def test_geocode_returns_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        open_meteo,
+        "_http_get",
+        lambda url, timeout: _geocode_payload(
+            [
+                {
+                    "name": "Argyle",
+                    "admin1": "Texas",
+                    "country": "United States",
+                    "country_code": "US",
+                    "latitude": 33.12123,
+                    "longitude": -97.18335,
+                    "timezone": "America/Chicago",
+                }
+            ]
+        ),
+    )
+    results = open_meteo.geocode("76226")
+    assert results is not None
+    assert len(results) == 1
+    assert results[0]["name"] == "Argyle"
+    assert results[0]["latitude"] == 33.12123
+    assert results[0]["longitude"] == -97.18335
+    assert results[0]["timezone"] == "America/Chicago"
+
+
+def test_geocode_returns_multiple_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        open_meteo,
+        "_http_get",
+        lambda url, timeout: _geocode_payload(
+            [
+                {
+                    "name": "Antwerp",
+                    "admin1": "Flanders",
+                    "country": "Belgium",
+                    "country_code": "BE",
+                    "latitude": 51.22,
+                    "longitude": 4.40,
+                    "timezone": "Europe/Brussels",
+                },
+                {
+                    "name": "Frederiksberg",
+                    "admin1": "Capital Region",
+                    "country": "Denmark",
+                    "country_code": "DK",
+                    "latitude": 55.68,
+                    "longitude": 12.53,
+                    "timezone": "Europe/Copenhagen",
+                },
+            ]
+        ),
+    )
+    results = open_meteo.geocode("2000")
+    assert results is not None
+    assert len(results) == 2
+    assert results[0]["country"] == "Belgium"
+    assert results[1]["country"] == "Denmark"
+
+
+def test_geocode_no_results_key_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A query matching nothing: the reply carries no ``results`` key at all.
+
+    That is the service answering "nothing", not the service failing, so it
+    must read as an empty list rather than a None the route would call
+    "unreachable" — a Canadian postcode returning nothing at all is the
+    page saying "nothing matched", never "the service is down".
+    """
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b'{"generationtime_ms": 1.5}')
+    assert open_meteo.geocode("M5V") == []
+
+
+def test_geocode_empty_list_returns_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: _geocode_payload([]))
+    results = open_meteo.geocode("nonesuch")
+    assert results == []
+
+
+def test_geocode_network_failure_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fail(url: str, timeout: float) -> bytes:
+        raise URLError("down")
+
+    monkeypatch.setattr(open_meteo, "_http_get", _fail)
+    assert open_meteo.geocode("76226") is None
+
+
+def test_geocode_malformed_json_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(open_meteo, "_http_get", lambda url, timeout: b"<html>oops</html>")
+    assert open_meteo.geocode("76226") is None
+
+
+def test_geocode_drops_unknown_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A timezone the registry would refuse must be dropped here."""
+    monkeypatch.setattr(
+        open_meteo,
+        "_http_get",
+        lambda url, timeout: _geocode_payload(
+            [
+                {
+                    "name": "Somewhere",
+                    "country": "Nowhere",
+                    "country_code": "XX",
+                    "latitude": 0.0,
+                    "longitude": 0.0,
+                    "timezone": "Mars/Olympus",
+                }
+            ]
+        ),
+    )
+    results = open_meteo.geocode("test")
+    assert results == []
+
+
+def test_geocode_passes_country_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    def fake_get(url: str, timeout: float) -> bytes:
+        seen.append(url)
+        return _geocode_payload(
+            [
+                {
+                    "name": "Antwerp",
+                    "country": "Belgium",
+                    "country_code": "BE",
+                    "latitude": 51.22,
+                    "longitude": 4.40,
+                    "timezone": "Europe/Brussels",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(open_meteo, "_http_get", fake_get)
+    results = open_meteo.geocode("2000", country="BE")
+    assert results is not None
+    assert len(results) == 1
+    assert "countryCode=BE" in seen[0]
+    assert results[0]["country_code"] == "BE"

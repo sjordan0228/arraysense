@@ -29,9 +29,16 @@ EXAMPLE_STRINGS = (
 # crystalline-module figures; 0.5 %/yr is the industry's usual degradation
 # assumption. Every one is overridable per string, and every fallback is
 # reported in ``defaulted`` so no page presents an assumption as an entry.
+# The ordinary crystalline module's nominal operating cell temperature, and the
+# reference point the cell-temperature model reads a declaration against rather
+# than as an absolute. It is named here because it is a grammar fact, and
+# solar.py imports it rather than restating it: the two drifting apart would
+# move every stored efficiency figure on an installation that declared nothing.
+DEFAULT_NOCT = 45.0
+
 _FLOAT_DEFAULTS: dict[str, float] = {
     "temp_coeff": -0.35,
-    "noct": 45.0,
+    "noct": DEFAULT_NOCT,
     "bifacial": 0.0,
     "degradation": 0.5,
 }
@@ -43,6 +50,16 @@ WIRE_GAUGES = frozenset({2, 4, 6, 8, 10, 12, 14})
 # Every optional key the tail accepts, named once. The settings registry quotes
 # this in the help the page renders, and a test holds the two together: a key
 # added here and forgotten there is a setting the owner cannot discover.
+#
+# ``voc`` is the one key here that no model reads. It is a datasheet figure the
+# catalogue carries and the settings page offers, and nothing in the PVWatts
+# chain or the curtailment rule needs an open-circuit voltage — so an owner who
+# enters it correctly sees no figure move. It is kept rather than removed
+# because dropping a key refuses every stored array description that already
+# uses it, and because the string voltage a curtailment baseline is fitted from
+# is the obvious eventual reader. Anything added here must have a consumer, or
+# it is an input the owner cannot tell is being ignored — which is what ``noct``
+# was until cell_temperature started reading it.
 KNOWN_STRING_KEYS: tuple[str, ...] = (
     "temp_coeff",
     "noct",
@@ -55,9 +72,69 @@ KNOWN_STRING_KEYS: tuple[str, ...] = (
     "wire_awg",
     "wire_run_ft",
     "note",
+    "panel",
 )
 _DEFAULT_MOUNTING = "open_rack"
 _DEFAULTS: dict[str, float | str] = {**_FLOAT_DEFAULTS, "mounting": _DEFAULT_MOUNTING}
+
+# --- Panel catalogue -----------------------------------------------------------
+# Each entry supplies the electrical figures a datasheet states, drawn from a
+# real manufacturer document fetched and read in full. A shipped entry is never
+# edited in place — a corrected figure ships as a new entry name, because
+# efficiency.config_version is bumped by writes under the panels. prefix and a
+# value changed inside the code rather than inside the setting would alter what
+# every existing installation is expected to produce while leaving every stored
+# day agreeing with a version that no longer describes it.
+#
+# Adding a third format means transcribing a third datasheet first — see
+# docs/superpowers/issues/panel-specs.md for the precedent.
+
+
+@dataclass(frozen=True)
+class PanelCatalogueEntry:
+    """One generic panel format, its electrical figures, and where they came from.
+
+    Wattage is never supplied — it is the one figure an owner reliably knows,
+    printed on the module and on the invoice.
+    """
+
+    name: str
+    description: str
+    vmp: float
+    voc: float
+    temp_coeff: float
+    noct: float
+    degradation: float
+    # Which document these figures were transcribed from, and when.
+    citation: str
+
+
+PANEL_CATALOGUE: tuple[PanelCatalogueEntry, ...] = (
+    PanelCatalogueEntry(
+        name="108cell_perc",
+        description="108-cell mono PERC (typical)",
+        vmp=31.01,
+        voc=37.07,
+        temp_coeff=-0.35,
+        noct=45.0,
+        degradation=0.45,
+        citation="Runergy HY-DH108P8B-400 datasheet (DH108P8B-Global-Ver3.0), "
+        "400 W bin; fetched and read 2026-08-10",
+    ),
+    PanelCatalogueEntry(
+        name="120halfcell_perc",
+        description="120-half-cell mono PERC bifacial (typical)",
+        vmp=34.5,
+        voc=41.4,
+        temp_coeff=-0.36,
+        noct=45.0,
+        degradation=0.5,
+        citation="Aptos DNA-120-BF26-370W datasheet (Ref_083124), "
+        "370 W bin; fetched and read 2026-08-10",
+    ),
+)
+
+_CATALOGUE_BY_NAME: dict[str, PanelCatalogueEntry] = {e.name: e for e in PANEL_CATALOGUE}
 
 _INSTALLED = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 # key=value tokens; a quoted value may hold spaces. Built for the tail only.
@@ -88,6 +165,11 @@ class StringSpec:
     wire_awg: int | None
     wire_run_ft: float | None
     note: str
+    # Which catalogue entry was chosen, or None when the owner typed every
+    # value by hand. Stored as a name rather than a table of values so a
+    # generic choice is distinguishable from the owner's own entry — the
+    # warning requested in the spec.
+    panel: str | None
     defaulted: frozenset[str]
 
 
@@ -152,18 +234,43 @@ def _parse_line(line: str) -> StringSpec:
         # would be a config the owner believes is set.
         raise _refuse(line, f"unknown key(s) {sorted(unknown)}; known: {sorted(KNOWN_STRING_KEYS)}")
 
-    defaulted = {k for k in _DEFAULTS if k not in keys}
+    # --- resolve panel= before the per-field overrides -------------------------
+    # A catalogue entry supplies representative electrical figures from a real
+    # datasheet. Each one is applied only when the owner has not already set
+    # that key in the tail — an explicit key beats a catalogue value — and each
+    # applied field is named in ``defaulted`` so the page can label it as
+    # assumed rather than as the owner's own entry.
+    panel_name: str | None = None
+    owner_keys = set(keys)  # snapshot before catalogue injection
+    if "panel" in keys:
+        panel_name = keys["panel"]
+        entry = _CATALOGUE_BY_NAME.get(panel_name)
+        if entry is None:
+            raise _refuse(
+                line,
+                f"unknown panel entry {panel_name!r}; known: {sorted(_CATALOGUE_BY_NAME)}",
+            )
+        for field_name, field_value in (
+            ("vmp", entry.vmp),
+            ("voc", entry.voc),
+            ("temp_coeff", entry.temp_coeff),
+            ("noct", entry.noct),
+            ("degradation", entry.degradation),
+        ):
+            if field_name not in keys:
+                keys[field_name] = str(field_value)
+
+    defaulted: set[str] = set()
+    for k in _DEFAULTS:
+        if k not in keys:
+            defaulted.add(k)
+    if panel_name is not None:
+        entry = _CATALOGUE_BY_NAME[panel_name]
+        for field_name in ("vmp", "voc", "temp_coeff", "noct", "degradation"):
+            if field_name not in owner_keys:
+                defaulted.add(field_name)
     if "installed" not in keys:
         defaulted.add("installed")
-
-    temp_coeff = (
-        _number(line, "temp_coeff", keys["temp_coeff"], -1.0, 0.0)
-        if "temp_coeff" in keys
-        else _FLOAT_DEFAULTS["temp_coeff"]
-    )
-    noct = (
-        _number(line, "noct", keys["noct"], 20, 90) if "noct" in keys else _FLOAT_DEFAULTS["noct"]
-    )
     wire_awg: int | None = None
     if "wire_awg" in keys:
         gauge = int(_number(line, "wire_awg", keys["wire_awg"], 0, 20))
@@ -182,6 +289,14 @@ def _parse_line(line: str) -> StringSpec:
     if (wire_awg is None) != (wire_run_ft is None):
         raise _refuse(line, "wire_awg and wire_run_ft must be given together")
 
+    temp_coeff = (
+        _number(line, "temp_coeff", keys["temp_coeff"], -1.0, 0.0)
+        if "temp_coeff" in keys
+        else _FLOAT_DEFAULTS["temp_coeff"]
+    )
+    noct = (
+        _number(line, "noct", keys["noct"], 20, 90) if "noct" in keys else _FLOAT_DEFAULTS["noct"]
+    )
     mounting = keys.get("mounting", _DEFAULT_MOUNTING)
     if mounting not in MOUNTINGS:
         raise _refuse(line, f"mounting must be one of {MOUNTINGS}, got {mounting!r}")
@@ -219,6 +334,7 @@ def _parse_line(line: str) -> StringSpec:
         wire_awg=wire_awg,
         wire_run_ft=wire_run_ft,
         note=keys.get("note", ""),
+        panel=panel_name,
         defaulted=frozenset(defaulted),
     )
 

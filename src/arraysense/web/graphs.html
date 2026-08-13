@@ -21,6 +21,15 @@
      can be: a label line and a short plot, repeated. */
   .band{margin-bottom:7px}
   .band:last-child{margin-bottom:0}
+  /* Section groups get more air and a top rule so each group stands apart
+     without adding a new colour. --tint is a neutral surface shade, not one of
+     the five measured data hues, so no collision with a series is at stake.
+     The first group sits straight under the toolbar, which is its own divider,
+     so it gets neither the margin nor the rule above it — and the selector has
+     to be :first-of-type, because <header> and the toolbar are the earlier
+     siblings :first-child would never get past. */
+  section.p{margin-top:18px;padding-top:14px;border-top:1px solid var(--tint)}
+  section.p:first-of-type{margin-top:0;padding-top:0;border-top:none}
   /* Indented past the y axis so the name sits over the plot rather than over
      the tick labels, and lines up with the "nothing recorded" message that
      replaces the plot when there is nothing to draw. */
@@ -30,19 +39,40 @@
   .bandlab .bs{font-size:9.5px;color:var(--ink3);letter-spacing:.02em;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
+  .bandread{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-variant-numeric:tabular-nums;font-size:13px;color:var(--ink);
+    white-space:nowrap;text-align:right;overflow:hidden;text-overflow:ellipsis}
+  .bandread .cur{font-size:15px;font-weight:600}
+  .bandread .peak{font-size:11px;color:var(--ink2)}
   .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
   .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <!-- What the server actually served, not what was asked for. A chart drawn
-         from the minute rollup looks exactly like one drawn from raw samples,
-         so the resolution has to be stated rather than assumed. -->
-    <div class="conn" id="res">loading…</div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <!-- What the server actually served, not what was asked for. A chart drawn
+           from the minute rollup looks exactly like one drawn from raw samples,
+           so the resolution has to be stated rather than assumed. -->
+      <div class="conn" id="res">loading…</div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>
@@ -452,15 +482,24 @@ async function loadCaps() {
   bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)));
 }
 
-// Every inverter metric the kept bands read, asked for in one request. Built
-// from what is plotted rather than kept beside it and allowed to drift.
+// What the kept bands read, split by which writer's clock the metric lives on.
+// The inverter is polled every 11 s and answers about every 12 s, and the
+// weather poller runs every 15 minutes,
+// and the two families must not share one request or one x axis: a request
+// that names metrics from both returns every row of either, so the sky's rows
+// still land between the inverter's and still break every inverter series
+// (see load(), and the query guard that cannot help a mixed ask). Built from
+// what is plotted rather than kept beside it and allowed to drift.
 //
-// Site metrics (weather) are always present here because the caps filter never
-// drops site bands — they are exempt. The weather section hides when the
-// fetched window carries no data rather than the bands being removed, so the
-// metrics must still be fetched: without the fetch the page cannot tell that
-// data has appeared and the section would stay hidden forever.
-const metricsAsk = () => [...new Set(bands.flatMap(neededBy))].join(',');
+// Site bands are never dropped by the caps filter — they are exempt — so the
+// site ask is stable. The weather section hides when the fetched window
+// carries no data rather than the bands being removed, so the site metrics
+// must still be fetched: without the fetch the page cannot tell that data has
+// appeared and the section would stay hidden forever.
+const siteMetricsAsk = () =>
+  [...new Set(BANDS.filter((b) => b.site).flatMap(neededBy))].join(',');
+const inverterMetricsAsk = () =>
+  [...new Set(bands.filter((b) => !b.site).flatMap(neededBy))].join(',');
 
 // What a pack band holds, in the order the columns are stacked into the data.
 // Both drawn traces are temperatures of the same battery from the same BMS, so
@@ -544,7 +583,8 @@ function isLast(b) {
 
 const bandHtml = (b) => `<div class="band">
   <div class="bandlab"><span class="bn">${esc(b.label)}</span>
-    <span class="bs">${esc(b.source || b.metric || '')}</span></div>
+    <span class="bs">${esc(b.source || b.metric || '')}</span>
+    <span class="bandread" id="${esc(b.id)}Read">—</span></div>
   <div class="chart" id="${esc(b.id)}Wrap" role="img"
        aria-label="${esc(b.label)} over the selected range"></div>
 </div>`;
@@ -565,10 +605,16 @@ const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
 // band is drawn in, and a band with nothing in any of its columns says so
 // rather than drawing an empty plot — a flat line on an axis is a reading of
 // nothing, and nothing recorded is not that.
-function paintBand(b, xs, cols) {
+function paintBand(b, xs, cols, sync) {
   const k = kindOf(b);
   const lines = linesOf(b);
-  if (!anyReading(...cols)) { chartMessage(b.id, 'nothing recorded in this range'); return; }
+  if (!anyReading(...cols)) {
+    chartMessage(b.id, 'nothing recorded in this range');
+    // The previous window's "latest · peak" must not survive above a chart
+    // that now says nothing was recorded, so the readout is cleared with it.
+    updateBandReadout(b.id, []);
+    return;
+  }
   const fmt = b.fmt || k.fmt;
   // Every trace in the readout, in the order they are stacked, so a pack's
   // three temperatures are read off one hover rather than three.
@@ -584,6 +630,18 @@ function paintBand(b, xs, cols) {
     height: BAND_H + (isLast(b) ? AXIS_H : 0),
     unit: unitOf(b),
     opts: chartBase({
+      // Every band in one family is drawn over the same x range, so a cursor
+      // on any one of them must put the crosshair at the same instant on all
+      // the rest — that is the whole reason the page is small multiples. The
+      // sync group is the family's x array, not the whole page: the weather
+      // bands and the per-pack bands arrive from their own endpoints on their
+      // own clocks, and a chart may only sync with charts whose x window its
+      // own data lives in, or a drag on one family pushes another's axis to a
+      // range it has no points in. The inverter bands take the page's default
+      // group (sync is undefined); the other two families name their own. The
+      // y scale is deliberately left out of CHART_SYNC, so a band's own value
+      // never rides another band's axis.
+      sync,
       scales: { x: { time: true }, y: { range: b.signed ? mirrored : k.range } },
       // The blank axis keeps the vertical gridlines and the plot's bottom
       // margin on every band, so the bands stay aligned with the one that does
@@ -601,6 +659,52 @@ function paintBand(b, xs, cols) {
       plugins,
     }),
   }, [xs, ...cols]);
+  // Update the band readout with the latest and peak values.
+  updateBandReadout(b.id, cols[0], fmt, b.signed === true, lines.length > 1 ? lines[0].label : null);
+}
+
+// Update the band readout element with the latest and peak values from the data
+// column. Absent data shows an em-dash, never zero. With nothing to read at
+// all the readout is the bare dash — a range with no readings must not keep the
+// previous range's figures above it.
+//
+// On a signed band the peak is the largest excursion by magnitude, keeping its
+// sign, so the formatter still reads "charging" or "discharging" for the
+// extreme it names. On an unsigned band it is the plain maximum. A band that
+// carries more than one line names which line the figures belong to (`who`), so
+// a pack's readout never reads as the band's own number when it is one of three.
+function updateBandReadout(id, values, fmt, signed, who) {
+  const el = $(id + 'Read');
+  if (!el) return;
+  let latest = null;
+  let peak = null;
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (values[i] !== null && isFinite(values[i])) {
+      latest = values[i];
+      break;
+    }
+  }
+  for (const v of values) {
+    if (v !== null && isFinite(v)) {
+      const wins = signed
+        ? peak === null || Math.abs(v) > Math.abs(peak)
+        : peak === null || v > peak;
+      if (wins) peak = v;
+    }
+  }
+  if (latest === null && peak === null) { el.textContent = DASH; return; }
+  const latestStr = latest === null ? DASH : fmt(latest);
+  const peakStr = peak === null ? DASH : fmt(peak);
+  // The readout is markup now, so every interpolated part is escaped. The line
+  // label and the formatted values are the app's own today — fixed labels and
+  // the formatters this file shares with the other pages — but anything that
+  // joins a write through innerHTML passes through esc(), because the day one
+  // of these carries markup the escape is the whole difference between drawing
+  // it and executing it. esc() exists on this page for the rest of its markup;
+  // it belongs in front of the interpolations that join this line too.
+  const prefix = who ? esc(who) + ' ' : '';
+  el.innerHTML = prefix + '<span class="cur">' + esc(latestStr) + '</span>'
+    + ' · <span class="peak">peak ' + esc(peakStr) + '</span>';
 }
 
 // A band's own values, converted into the unit it is drawn in. tempOf answers
@@ -615,8 +719,26 @@ function drawInverter(body) {
   if (!body) return;
   const f = frame(body.points || []);
   // The spread bands sit in this section but are not inverter registers; they
-  // are painted from the module endpoint by drawSpreads.
-  for (const b of bands) if (!b.derived) paintBand(b, f.xs, [valuesFor(b, f)]);
+  // are painted from the module endpoint by drawSpreads. The weather bands
+  // are a third clock again and are painted by drawWeather from the site
+  // response, never from this frame.
+  for (const b of bands) if (!b.derived && !b.site) paintBand(b, f.xs, [valuesFor(b, f)]);
+}
+
+// The weather bands draw from their own frame, built from the site response.
+// Sharing the inverter response's frame is what left them blank: their
+// readings land one every fifteen minutes among two thousand inverter rows,
+// so no two of them are ever adjacent and uPlot has no segment to draw. A
+// frame over the sky's own rows gives the two bands a series of adjacent
+// instants. The synced crosshair still lands on them, because uPlot syncs on
+// the x value rather than on a shared array of instants — see CHART_SYNC.
+function drawWeather(body) {
+  if (!body) return;
+  const f = frame(body.points || []);
+  // The weather bands' own group: they share the sky's x array with each other
+  // and with nobody else on the page, so a zoom on an inverter band must not
+  // push their axis to a window the sky has no rows in.
+  for (const b of bands) if (b.site) paintBand(b, f.xs, [valuesFor(b, f)], { key: 'graphs-weather' });
 }
 
 // One spread series: the distance between the highest and lowest pack at each
@@ -660,7 +782,9 @@ function drawSpreads(points, serials) {
     if (!b.derived) continue;
     const s = spreadOf(points, serials, b.derived, b.scale);
     if (!s.xs.length) { chartMessage(b.id, 'needs two or more packs reporting'); continue; }
-    paintBand(b, s.xs, [s.values]);
+    // Spreads are drawn from the module rows, so they share the packs' group:
+    // same x array, same clock, and a zoom on one must ride across the other.
+    paintBand(b, s.xs, [s.values], { key: 'graphs-packs' });
   }
 }
 
@@ -734,7 +858,10 @@ function drawPacks(body) {
     // tempOf answers an absent reading with null, so absent survives the
     // conversion — the same guarantee valuesFor() relies on for the inverter
     // bands, and the reason a silent pack cannot arrive on the axis at zero.
-    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)));
+    // The per-pack bands share the module rows' x array with the spreads, so
+    // they get the packs' group rather than the page default the inverter
+    // bands sit in.
+    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)), { key: 'graphs-packs' });
   });
   // The spreads are drawn from the same rows, up in the Battery section: they
   // are a property of the bank rather than of any one pack, so they belong
@@ -783,13 +910,20 @@ async function load() {
   const end = new Date();
   const start = new Date(end.getTime() - range.seconds * 1000);
   const when = `start=${start.toISOString()}&end=${end.toISOString()}`;
-  // Two asks, because the two endpoints choose from two different lists of
-  // tiers and one width cannot be right for both.
+  // Three asks. The two /api/history calls split the band metrics by which
+  // writer's clock they live on — the inverter's and the weather poller's —
+  // because the two families share a tier but not sample instants, and one
+  // request for both would return every row of either and put each weather
+  // row's nulls into every inverter series (issue #159). The pack ask is the
+  // third, on its own width because it chooses from a different pair of
+  // tiers. Each response names the tier it got; the inverter and the sky ask
+  // with the same width, so they land on the same one.
   const width = widthFor(range.seconds);
   const packWidth = moduleWidthFor(range.seconds);
   const problems = [];
-  const [inv, packs] = await Promise.all([
-    get(`/api/history?${when}&metrics=${metricsAsk()}&width=${width}`).catch(() => null),
+  const [inv, site, packs] = await Promise.all([
+    get(`/api/history?${when}&metrics=${inverterMetricsAsk()}&width=${width}`).catch(() => null),
+    get(`/api/history?${when}&metrics=${siteMetricsAsk()}&width=${width}`).catch(() => null),
     get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
       .catch(() => null),
   ]);
@@ -797,6 +931,7 @@ async function load() {
   // owner's zoom with it over a problem that usually lasts one request, and
   // what is on screen is still the last thing the inverter actually said.
   if (!inv) problems.push('history unavailable — showing the last successful read');
+  if (!site) problems.push('site weather unavailable — showing the last successful read');
   if (!packs) problems.push('per-pack temperature unavailable');
   // A rollup is not among them. On the longer spans it is exactly what this
   // page asked to have chosen for it, and each side names the tier it got
@@ -808,6 +943,7 @@ async function load() {
   resolution(inv);
   packResolution(packs);
   drawInverter(inv);
+  drawWeather(site);
   drawPacks(packs);
   // The data-in-window rule for site metrics: hide the weather section when the
   // fetched window carries no non-null value for either site metric. An install
@@ -815,9 +951,11 @@ async function load() {
   // — an empty chart reads as a fault — and an install where the weather poller
   // stopped a month ago degrades right when the owner scrolls to a window
   // before it stopped. Only on a successful fetch: a failed poll must not tear
-  // the section down over a problem that usually lasts one request.
-  if (inv) {
-    const hasWeather = (inv.points || []).some(
+  // the section down over a problem that usually lasts one request. The site
+  // response carries only weather rows (and gap rows), so this is a question
+  // about whether the window holds any.
+  if (site) {
+    const hasWeather = (site.points || []).some(
       (p) => numOrNull(p.outside_temperature_c) !== null
           || numOrNull(p.cloud_cover_pct) !== null,
     );

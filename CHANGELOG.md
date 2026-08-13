@@ -7,6 +7,226 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.10.0 — 13 August 2026
+
+The dashboard gets a look of its own, and a way to change it. Behind that, the
+faults building it turned up — including two that had been showing wrong numbers
+and one that had been drawing a chart with no line in it.
+
+### Added
+
+- **Glass, and the choice not to have it.** The pages are frosted panels over a
+  wash that follows the system: warm while the array is producing, cooling to
+  indigo on battery and after dark. The old flat look remains as Classic, chosen
+  from a Theme area on the Settings page. The choice is remembered per browser,
+  like light and dark beside it — one household can want the wall tablet glassy
+  and the laptop plain, and a setting stored on the service could not do that.
+
+- **The current state, on every page.** A small strip in the header carries
+  solar, house, battery and grid wherever you are, rather than only on the
+  dashboard. When the collector stops it mutes and says how old the figures are;
+  a three-day-old reading labelled "live" is the failure this project exists to
+  prevent, and it was caught in review before it shipped.
+
+- **Both energy diagrams flow.** The ribbons move, hovering one isolates it and
+  dims the rest with its share of the total, and losses are separated by hatch
+  rather than a sixth colour — a distinction that does not depend on telling two
+  hues apart.
+
+- **A rate schedule you can read at a glance.** Settings draws every hour of
+  every month coloured by the band that covers it, so a tariff can be checked by
+  looking rather than by reading twelve rows of syntax. It is drawn from the
+  band windows the service computes for the charts; the tariff itself is still
+  parsed in exactly one place, on the service.
+
+- **Charts say what they are showing.** Each band on the Graphs page carries its
+  current reading and its peak, and hovering any band moves the crosshair on all
+  of them at the same instant — which is the reason the page is small multiples
+  rather than one chart. On a signed band the peak is the largest excursion
+  either way, so a hard discharge is not reported as the smallest charge.
+
+- **Icons**, from Phosphor, vendored with their licence beside the fonts and the
+  chart library. Every label stays: an icon here is reinforcement and never the
+  name of anything.
+
+- Typography: Space Grotesk and JetBrains Mono, self-hosted, with the readings
+  in the mono face and tabular figures so columns line up.
+
+### Fixed
+
+- **The live view was reading the whole battery table to answer one question.**
+  `latest_modules` ran a correlated subquery that scanned 142,712 rows to find
+  four packs. It now drives from the serial list, one index seek each:
+  **454 ms to 9 ms** on the reference installation, and flat as the history
+  grows rather than getting slower every day.
+
+- **The theme control was unreachable on five of the six pages.** It was built
+  at load, appended inside the status pill, and destroyed the moment that pill
+  wrote its next line. It existed for about a second and then vanished.
+
+- **Two writers were breaking each other's charts.** The inverter is polled every
+  eleven seconds and the sky every fifteen minutes, and both write into the same
+  tier. Every sky reading punched a hole in every inverter series — four an hour
+  — and, the other way round, the weather bands' readings sat so far apart among
+  the inverter's that no two were ever adjacent, so the Weather section drew
+  nothing at all. It looked like a section with no data. It had data the whole
+  time.
+
+- **`peak` named the wrong extreme on a signed band.** A day the bank only ever
+  discharged reported the *smallest* discharge as its peak.
+
+- **A range with no data kept the last range's figures** above a chart that said
+  nothing was recorded.
+
+- The Graphs page scrolled sideways on a phone.
+
+- **A figure could break from its unit.** The cable-drop reading on the
+  Inverter view sat beside a caption long enough to squeeze it, so 0.3 V
+  wrapped and read as 0.3 and then V on the line below.
+
+### Known
+
+- There is still no authentication. Anything on the network can read the
+  dashboard and write its settings, so run it on a network you trust.
+
+- Declared tier retention is not enforced, so the database grows without bound.
+
+## 0.9.0 — 12 August 2026
+
+The setup wizard learns what an installation is, a first-visit tour explains the
+pages, the backup becomes something you configure rather than something fixed,
+and the settings page stops being one long scroll. Behind that, an audit of the
+data path — the collector, the store, the API and the modelled figures — and the
+defects it found.
+
+### Added
+
+- **The wizard asks where the installation is.** One optional postcode, resolved
+  through Open-Meteo's keyless geocoder, shown back as the town it found so it
+  can be checked before it is accepted. Coordinates remain for the countries the
+  geocoder does not cover, and nothing calls them more accurate: moving 4.6 km
+  changes modelled plane-of-array irradiance by 0.006 %, against a forecast grid
+  of about 11 km. Location is the one thing the service never reconstructs for
+  itself afterwards.
+- **The inverter's conversion figures are carried as cited fact.** CEC 96.9 %,
+  PV to grid 97.5 %, battery to grid 94 %, PV to battery 99.9 %, idle around
+  70 W and 18 W, from the EG4 18kPV spec sheet version 1.4.3, labelled a
+  manufacturer's claim rather than a measurement. They are shown, not used: both
+  sides of the performance comparison are DC, so putting a conversion figure in
+  it would lift every installation's ratio by about three per cent for no
+  physical reason.
+- **A panel catalogue**, each entry cited, with a warning when a generic module
+  is chosen — a generic is a guess, and it should not be indistinguishable from
+  a measured panel.
+- **A guided tour of the pages**, offered by a dismissible banner rather than
+  interrupting, and dismissed per browser: a tour is shown to a person, and one
+  household member silencing it on the kitchen tablet should not silence it on
+  somebody else's phone. It skips what an installation does not have, and never
+  restates a number, so it cannot drift from the cards it describes.
+- **`arraysense restore`**, replacing a printed shell recipe that could destroy
+  the database it was restoring. It unpacks beside the live database, proves the
+  result is a database with rows in it, and only then stops the service, clears
+  the write-ahead log and moves the file into place.
+- **The backup is configured, not fixed.** Destination, retention, schedule and
+  whether it runs at all are settings. The timer fires every fifteen minutes and
+  the command decides whether a backup is due, so systemd keeps reliable wakeups
+  and catch-up after downtime while the installation owns the time. A
+  destination is checked before it is accepted, and the three ways it can fail —
+  missing, not writable, outside the unit's writable set — are told apart.
+- **Tabs on the settings page**, in the order an installation is configured. A
+  prefix no tab claims still appears, so a setting added to the registry
+  tomorrow cannot vanish behind a layout.
+- **Troubleshooting for the backup**, including the trap that a hand-run backup
+  succeeds while the scheduled one fails, because they run as different users
+  under different sandboxes.
+
+### Fixed
+
+- **A week or a month was scored from its first day.** The hourly rows were
+  truncated at 24 offsets. On the reference installation the worst hour of the
+  week of 3 August moves from 1.708 to 6.322 kWh.
+- **A total no longer hides how much of its period it covers.** It carries the
+  days scored against the days expected, and says which incompleteness it is.
+- **A string the inverter never reported is absent, not zero.** It no longer
+  produced a row claiming expected 0.0, actual 0.0 and a specific yield of 0.0.
+  Days stored under the old logic present a zero as a measurement, so the
+  efficiency config version moves and history is scored again.
+- **The peak-scaled forecast is gone rather than labelled.** It over-called by
+  43 to 63 per cent on twelve consecutive days, and for an installation with no
+  array described it was not a first-week measure but the permanent answer.
+  Below five scored days there is now no forecast.
+- **The sky poller could stop without saying so.** One failed interval read
+  ended the loop for good; nothing watched it, and the only symptom was that
+  recorded conditions stopped.
+- **A tier that could not answer a range said so**, rather than returning
+  nothing or a silently truncated answer.
+- **A date typed off the end of the calendar** answered 500 on several
+  endpoints. It is a bad request, on all of them.
+- **"Calibrated from" was printed whenever any daily row existed**, whether or
+  not anything had been fitted.
+- **The efficiency backfill shared the collector's transaction.** A backfill
+  failing part-way rolled back a poll that had succeeded, taking its readings,
+  its battery rows and its device registration with it. It has its own
+  connection now, as the rollup already had.
+- Also: a sub-second poll interval is a configuration error rather than a 500;
+  the hour in progress is no longer extrapolated to a whole one; the declared
+  NOCT is read by the cell-temperature model; and `peak()` answers absent for a
+  column the database does not have.
+
+### Known
+
+Declared tier retention is still not enforced and the database grows about
+5 MB a day (#135). Two strings on one MPPT are still double-counted (#133).
+There is still no authentication (#34), so this should not be exposed to the
+internet.
+
+## 0.8.1 — 12 August 2026
+
+### Fixed
+
+- **Two writers shared one row and destroyed each other's readings.** The raw
+  tier is keyed by timestamp and device at one-second resolution, and it has two
+  writers: the inverter poll loop, and the weather poller on its own
+  fifteen-minute clock. Nothing coordinates the two clocks, and the write
+  replaced every column of the row, so whichever landed second erased the first.
+
+  Replayed over a month of the reference installation's real history — 255,798
+  rows — a weather tick landed on a second an inverter poll already owned
+  **294 times in 3,116 ticks**, and every one of those polls lost all 91 of its
+  readings while its own battery modules kept theirs at that same instant. Worse,
+  a tick landing on a recorded outage cleared the reason: **all 62 gap rows in
+  that month were erased** by the replay. An outage smoothed into a straight
+  segment is an outage nobody ever notices.
+
+  Each writer now updates only its own columns, told apart by the metric
+  registry's own classification of what is the site's and what is the
+  inverter's. Replayed again, the same 294 collisions produce rows carrying both
+  writers' data — which no row in the database had ever held — and no losses.
+
+- **The archive backfill destroyed the weather it had just written.** The
+  archive answers one hour in two pieces, the means over the hour just gone and
+  the readings taken at the label, and a day's request therefore also writes the
+  previous day's last hour. Backfilling a range wrote each shared hour twice and
+  kept only the second half. A site reading now writes the columns it carries
+  and leaves the rest of that instant alone.
+
+- **A failed poll could overwrite the reading before it.** The gap was stamped
+  before the connection was even attempted, while a successful reading is
+  stamped when the read completes — and since the cadence is the interval or the
+  read time, whichever is longer, a failure filed under that older stamp landed
+  on the second the previous poll's reading was filed under. The stamp now comes
+  from the moment the failure was seen, and a recorded gap is refused outright on
+  any row that holds a reading, which also covers a clock stepped backwards.
+
+- **The daily energy counters were cut at UTC midnight rather than the owner's.**
+  The inverter resets them at its local midnight. Between the two midnights —
+  five hours on the reference installation, and the five that hold the evening
+  peak — the cache believed it was still yesterday and carried the old day's
+  totals into the new one, where the daily metrics roll up with max and that
+  stale high-water mark then stood for the rest of the day. The day is now cut in
+  the installation's own zone, which also makes the 23- and 25-hour days come out
+  right.
+
 ## 0.8.0 — 12 August 2026
 
 An installer, a command to manage the installation afterwards, a daily backup,

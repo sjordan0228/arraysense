@@ -76,13 +76,29 @@
   .assume li{margin-bottom:6px}
   .assume ul{margin:0;padding-left:17px}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div class="conn" id="stamp"></div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <div class="conn" id="stamp"></div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>
@@ -108,7 +124,7 @@
       tilt and azimuth — and the model compares what the sun offered against what the
       inverter actually recorded. Without that there is no expected production, and a
       performance ratio read from nothing would be an invented number.</p>
-    <a class="iconbtn" href="/settings">Describe the array in settings</a>
+    <a class="iconbtn" href="/settings#solar-panels">Describe the array in settings</a>
   </div>
 
   <div class="p nodata-msg" id="nodataMsg" hidden>
@@ -321,11 +337,39 @@ function renderPR(summary) {
   $('syVal').innerHTML = syStr(summary.specific_yield);
 }
 
+// >>> eff-partial-reason
+// Why this period is partial, in the owner's terms, or null when it is not.
+//
+// Two quite different incompletenesses arrive under one flag and they want
+// different sentences. Missing whole days is the one worth naming first and
+// with a count: a week totalled over four days understates its specific yield
+// by nearly half, and "not all daylight hours could be modelled" describes the
+// wrong thing entirely — every hour of every day present may have been
+// modelled perfectly.
+function effPartialReason(summary) {
+  if (!summary || !summary.partial) return null;
+  const scored = summary.days_scored;
+  const owed = summary.days_expected;
+  if (Number.isFinite(scored) && Number.isFinite(owed) && owed > 1 && scored < owed) {
+    return 'only ' + scored + ' of the ' + owed + ' days in this period could be scored, '
+      + 'so every total below covers those days alone';
+  }
+  const strs = summary.strings_scored;
+  const described = summary.strings_described;
+  if (Number.isFinite(strs) && Number.isFinite(described) && strs < described) {
+    return (described - strs) + ' of the ' + described + ' strings reported nothing at all, '
+      + 'so the totals below are the rest of the array and not the whole of it';
+  }
+  return 'not all daylight hours could be modelled, so the performance ratio is drawn '
+    + 'from a fraction of the day';
+}
+// <<< eff-partial-reason
+
 function renderPartialNote(summary) {
   const box = $('partialNote');
-  if (summary && summary.partial) {
-    box.innerHTML = '<span class="warn">This is a partial period</span> — not all daylight hours '
-      + 'could be modelled, so the performance ratio is drawn from a fraction of the day. '
+  const reason = effPartialReason(summary);
+  if (reason) {
+    box.innerHTML = '<span class="warn">This is a partial period</span> — ' + reason + '. '
       + 'It is labelled rather than hidden, because a partial measurement is useful; it is '
       + 'only ever wrong when it is presented as a complete one.';
     box.hidden = false;
@@ -506,8 +550,9 @@ function renderBaseline(baseline) {
   $('baseSec').hidden = false;
   const start = new Date(ws);
   const end = new Date(we);
-  // The window is one day — the first day from the scored rows. Show it as a
-  // date so the reader knows when the baselines were last fitted.
+  // The window is the range the fit actually ran over, and the block is absent
+  // entirely when nothing was fitted — a system whose strings have too few
+  // producing hours to judge must not be told it is calibrated.
   $('baseInfo').innerHTML =
     `<dt>Calibrated from</dt>`
     + `<dd>${esc(start.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }))}`

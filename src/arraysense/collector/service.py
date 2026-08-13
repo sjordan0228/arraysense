@@ -29,6 +29,7 @@ from arraysense.models import Sample
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
 from arraysense.store.rollup import (
+    promote_pending_hours,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -337,6 +338,11 @@ class CollectorService:
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            # Hours written outside that window — the archive backfill's, one
+            # per past hour — are queued by the store as it writes them and
+            # brought forward here. Nothing else promotes them, and the
+            # efficiency engine reads irradiance from the hourly tier alone.
+            promote_pending_hours(conn)
 
         def _rebuild_on_own_connection() -> None:
             conn = self._store.maintenance_connection()
@@ -421,6 +427,20 @@ class CollectorService:
             return
         tz, strings, config_version = config
         settings = SettingsStore(self._store)
+
+        # A code change that alters how scores are computed makes every stored
+        # efficiency day stale — the same reason a settings edit bumps the
+        # version.  Bumping here invalidates all stored days so they are
+        # recomputed with the current logic.  The check against ``minimum`` is
+        # cheap (a single-row read) and the method is a no-op after the first
+        # call, so it is safe to leave in the periodic path rather than wiring a
+        # one-shot trigger.
+        if settings.ensure_efficiency_version(1):
+            # The version just advanced — re-read it so the rows we are about to
+            # write carry the new version rather than the one they would match
+            # and never recompute.
+            raw_version = settings.get(CONFIG_VERSION_KEY)
+            config_version = raw_version if isinstance(raw_version, int) else 0
 
         local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
         for days_back in (0, 1):
@@ -586,20 +606,34 @@ class CollectorService:
         condition, and the loop that backs off and tries again outlives it.
         Returns None while yielding, when no read was attempted at all, and
         when a reading was taken but could not be stored.
+
+        Every stamp here is taken when the thing it stamps happened, and for a
+        gap that means when the failure was seen rather than when the attempt
+        began. The difference is a row: a successful sample is stamped by the
+        driver at read completion, the cadence is ``max(interval, read time)``,
+        and the reference dongle takes twelve to seventeen seconds to answer an
+        eleven-second interval — so a stamp taken before the read lands on the
+        same second the *previous* successful poll was stamped with. A failure
+        stamped there overwrites a reading that was taken successfully, and the
+        history then shows an outage at the one instant it holds a measurement
+        for.
         """
         if self.status.yielding:
             return None
 
-        timestamp = datetime.now(tz=UTC)
         try:
             await self._source.connect()
         except TRANSPORT_ERRORS as exc:
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+            return self._record_gap(
+                datetime.now(tz=UTC), f"{type(exc).__name__}: {exc}", kind="transport"
+            )
 
         try:
             sample = await self._source.read()
         except TRANSPORT_ERRORS as exc:
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="transport")
+            return self._record_gap(
+                datetime.now(tz=UTC), f"{type(exc).__name__}: {exc}", kind="transport"
+            )
         except BUILD_ERRORS as exc:
             # A sample the driver could not build is deterministic for that
             # reply — the same bytes refuse again — but a later reply may be
@@ -608,7 +642,9 @@ class CollectorService:
             # exactly as for an unreachable inverter. BUILD_ERRORS is scoped to
             # read() rather than covering connect(), so a genuine bug in our own
             # code still surfaces instead of being recorded as an outage.
-            return self._record_gap(timestamp, f"{type(exc).__name__}: {exc}", kind="build")
+            return self._record_gap(
+                datetime.now(tz=UTC), f"{type(exc).__name__}: {exc}", kind="build"
+            )
 
         # Set before the write is attempted, because it is the read that
         # establishes it and the read has already happened. Leaving it to the
@@ -623,10 +659,12 @@ class CollectorService:
             # this reading. Counted as a failure all the same, so the loop backs
             # off instead of hammering a database that is busy — and so the
             # watchdog sees the silence if it never clears.
-            self._count_failure(timestamp, failed, kind="store")
+            self._count_failure(sample.timestamp, failed, kind="store")
             return None
 
-        self.status.last_success = timestamp
+        # The reading's own stamp, not the loop's. These marks feed the stall
+        # watchdog, and a poll is only as recent as the sample it produced.
+        self.status.last_success = sample.timestamp
         self.status.last_error = None
         self.status.last_failure_kind = None
         self.status.consecutive_failures = 0

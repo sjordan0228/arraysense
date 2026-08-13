@@ -1,15 +1,27 @@
-# systemd timer for the daily database backup.
+# systemd timer for the database backup.
 #
-# Persistent=true matters: a Pi that was off at 03:15 runs the backup when it
-# comes back rather than skipping a day silently. Without it a missed firing is
-# simply lost, and the first sign of trouble would be a gap in the backups.
+# It fires every fifteen minutes and asks; the settings answer. Whether the
+# backup runs at all and at what time are stored in the database and edited on
+# the settings page, so the schedule is the owner's to change without a root
+# shell — and `arraysense backup --scheduled` returns silently unless the
+# backup is enabled, the configured time has passed on the installation's own
+# clock, and today's archive is missing. The consequence to know is that the
+# run starts at the first quarter hour at or after the configured time: 03:15
+# runs at 03:15, and 03:20 runs at 03:30.
+#
+# Persistent=true matters: a Pi that was off at the configured time runs the
+# backup when it comes back rather than skipping a day silently. Without it a
+# missed firing is simply lost, and the first sign of trouble would be a gap in
+# the backups.
+#
+# No RandomizedDelaySec. Nothing here contends for a shared resource, and
+# jitter on a fifteen-minute check would only make the configured minute a lie.
 
 [Unit]
-Description=Daily Solar ArraySense database backup
+Description=Solar ArraySense database backup check
 
 [Timer]
-OnCalendar=*-*-* 03:15:00
-RandomizedDelaySec=15m
+OnCalendar=*-*-* *:00/15:00
 Persistent=true
 
 [Install]

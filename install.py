@@ -393,7 +393,8 @@ def render_plan(port: int, repo: str = REPO_URL, ref: str | None = None) -> str:
         f"  create {CONFIG_DIR} and {DATA_DIR}",
         f"  install a systemd service listening on port {port}",
         f"  install the management command {CLI_SHIM}",
-        "  install the daily backup service and timer (writing /var/backups/arraysense)",
+        "  install the backup service and timer (a daily copy to /var/backups/arraysense,"
+        " changeable on the settings page)",
         "  enable the service and the backup timer to start at boot",
     ]
     if port < 1024:

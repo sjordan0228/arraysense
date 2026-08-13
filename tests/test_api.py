@@ -10,6 +10,7 @@ always agrees.
 from __future__ import annotations
 
 import itertools
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,7 +21,14 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from arraysense.api.app import PAGES, SHARED_SCRIPT, _file_route, create_app
+from arraysense.api.app import (
+    PAGES,
+    SHARED_SCRIPT,
+    THEME_SHEETS,
+    VENDORED,
+    _file_route,
+    create_app,
+)
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
@@ -404,6 +412,44 @@ def test_history_picks_a_coarser_tier_for_a_longer_span(client: Any) -> None:
     ).json()
     assert short["tier"] == "full"
     assert long["tier"] == "hourly"
+
+
+def test_a_sub_second_poll_interval_still_draws_a_chart(tmp_path: Path) -> None:
+    """A legal config file must not turn every chart into a server fault.
+
+    Config accepts any poll_interval above zero and only the settings overlay is
+    bounded at a second, so `poll_interval = 0.5` in config.toml passes straight
+    through. Truncated to a whole number it became a cadence of zero, which
+    select_tier is right to refuse — and nothing caught the refusal, so the
+    Graphs page and the battery history answered 500 with nothing anywhere
+    naming the interval as the cause. A sub-second poll is a plausible thing to
+    try on RS485.
+    """
+    store = SqliteStore(str(tmp_path / "fast.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=T0, readings={"pv_total_power_w": 1000.0}))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "fast.db"),
+        poll_interval=0.5,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    with TestClient(create_app(store=store, service=service, config=config)) as c:
+        params = {
+            "start": T0.isoformat(),
+            "end": (T0 + timedelta(hours=1)).isoformat(),
+            "metrics": "pv_total_power_w",
+        }
+        assert c.get("/api/history", params=params).status_code == 200
+        assert (
+            c.get(
+                "/api/battery/history",
+                params={**params, "metrics": "soc_pct"},
+            ).status_code
+            == 200
+        )
+    store.close()
 
 
 def test_history_rejects_an_unknown_metric(client: Any) -> None:
@@ -914,6 +960,54 @@ def test_an_unset_coordinate_arrives_as_null_and_the_equator_as_zero(client: Any
     assert client.get("/api/settings").json()["values"]["site.latitude"] is None
 
 
+def test_a_backup_destination_is_accepted_only_if_it_can_be_written(
+    client: Any, tmp_path: Path
+) -> None:
+    # A destination that only fails at 03:15 fails unattended. The check runs
+    # where there is still a person present to read the remedy.
+    good = tmp_path / "backups"
+    good.mkdir()
+    assert client.put("/api/settings", json={"backup.directory": str(good)}).status_code == 200
+    assert client.get("/api/settings").json()["values"]["backup.directory"] == str(good)
+
+
+def test_a_backup_destination_that_cannot_be_written_is_refused_by_name(
+    client: Any, tmp_path: Path
+) -> None:
+    missing = tmp_path / "not_there"
+    r = client.put("/api/settings", json={"backup.directory": str(missing)})
+    assert r.status_code == 400
+    detail = r.json()["detail"]
+    assert str(missing) in detail, "the rejection has to name the path that was refused"
+    assert "install -d" in detail, "and the command that fixes it"
+    # And the key, because that is how the settings page decides which field a
+    # rejection belongs to. Without it the remedy lands in the page banner
+    # rather than under the box somebody just typed into.
+    assert "backup.directory" in detail
+    # Nothing was stored, so the backup still writes where it did before.
+    assert (
+        client.get("/api/settings").json()["values"]["backup.directory"]
+        == "/var/backups/arraysense"
+    )
+
+
+def test_an_unchanged_backup_destination_is_not_re_checked(client: Any, tmp_path: Path) -> None:
+    # The page posts what changed, but nothing stops a client posting the whole
+    # form. An installation whose backup disk has gone missing must still be
+    # able to change its tariff — refusing every save over a fault the save did
+    # not introduce would lock the settings page over a broken backup.
+    from arraysense.settings import SettingsStore
+
+    gone = str(tmp_path / "unplugged")
+    SettingsStore(client.app.state.store).set("backup.directory", gone)
+    r = client.put(
+        "/api/settings",
+        json={"backup.directory": gone, "display.temperature_unit": "C"},
+    )
+    assert r.status_code == 200
+    assert r.json()["changed"] == ["display.temperature_unit"]
+
+
 def test_an_unparseable_timezone_is_a_400_at_the_settings_endpoint(client: Any) -> None:
     r = client.put("/api/settings", json={"site.timezone": "Mars/Olympus_Mons"})
     assert r.status_code == 400
@@ -945,6 +1039,60 @@ def test_every_page_in_the_allow_list_has_a_route(client: Any) -> None:
     routed = {getattr(route, "path", None) for route in client.app.routes}
     assert set(PAGES) <= routed
     assert f"/{SHARED_SCRIPT}" in routed
+    assert {f"/{sheet}" for sheet in THEME_SHEETS} <= routed
+
+
+@pytest.mark.parametrize("sheet", THEME_SHEETS)
+def test_a_theme_sheet_is_served_as_a_stylesheet(client: Any, sheet: str) -> None:
+    # An appearance is layered over the base styling common.js injects, so it
+    # has to arrive as CSS. Served as text/plain a browser ignores the link
+    # entirely and the page renders Classic while claiming to be something else.
+    r = client.get(f"/{sheet}")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/css")
+    assert "@font-face" in r.text
+
+
+def test_every_page_carries_the_default_look_and_settles_it_before_the_body() -> None:
+    # Three things about one pair of lines, and each of them has a failure of
+    # its own. The <link> has to be written in the markup, because a stylesheet
+    # the parser finds holds the first paint back and one a script inserts does
+    # not — a page that created it would paint in the wrong look and restyle
+    # under the reader on every navigation. It has to sit below the page's own
+    # <style>, or the page overrides the look it was given.
+    # And the call has to follow it inside <head>, so a browser holding Classic
+    # has the link removed before there is a body to paint. A page that omits
+    # either shows a different look from its neighbours, which reads as a broken
+    # page rather than as a missing line.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    for filename in PAGES.values():
+        head = (web / filename).read_text().split("</head>", 1)[0]
+        link = re.search(r'<link id="appearance-sheet" rel="stylesheet" href="/([^"]+)">', head)
+        assert link, f"{filename} carries no default look"
+        assert link.group(1) in THEME_SHEETS, f"{filename} links a sheet the app does not serve"
+        call = head.find("applyStoredAppearance()")
+        assert call != -1, f"{filename} never settles the stored look"
+        assert link.start() > head.rindex("</style>"), f"{filename} links the look above its styles"
+        assert call > link.start(), f"{filename} settles the look before the link exists"
+
+
+def test_the_sheet_common_js_links_is_the_one_the_pages_and_the_app_name() -> None:
+    # Three places name one file: the pages' <link>, the look's href in
+    # common.js, and the routed set in app.py. A rename that touches two of them
+    # leaves a browser asking for a URL that 404s, and a stylesheet that never
+    # arrives is not an error a page can show — it is Classic, silently, on a
+    # browser that asked for Glass.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    common = (web / "common.js").read_text()
+    start = common.index("const APPEARANCE_SHEET")
+    linked = re.findall(r"'/([A-Za-z0-9._-]+\.css)'", common[start : common.index("\n", start)])
+    assert linked, "common.js links no appearance sheet at all"
+    for name in linked:
+        assert name in THEME_SHEETS, name
+    for filename in PAGES.values():
+        head = (web / filename).read_text().split("</head>", 1)[0]
+        page_sheet = re.search(r'id="appearance-sheet" rel="stylesheet" href="/([^"]+)"', head)
+        assert page_sheet and page_sheet.group(1) in linked, filename
 
 
 @pytest.mark.parametrize("path", ["/graphs", "/history", "/costs"])
@@ -1015,8 +1163,82 @@ def test_the_vendored_licence_ships_with_it(client: Any) -> None:
     assert "MIT" in r.text
 
 
+def test_the_phosphor_sprite_is_served(client: Any) -> None:
+    # The icons are injected from one vendored sprite for the same network
+    # reason the chart library is. Served as anything but an SVG the icons
+    # silently fail to mount, which a page answers by dropping the symbol
+    # rather than by saying why.
+    r = client.get("/vendor/phosphor.svg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/svg+xml"
+    assert "ph-gear" in r.text
+
+
+def test_the_phosphor_licence_ships_with_it(client: Any) -> None:
+    # Phosphor is MIT, and the notice that must travel with it is the core
+    # package's "Copyright (c) 2023 Phosphor Icons" — the phosphor-icons/web
+    # repository carries a differently-dated notice, so asserting the wording
+    # guards against a maintainer comparing against the wrong repo.
+    r = client.get("/vendor/phosphor.LICENSE")
+    assert r.status_code == 200
+    assert "MIT License" in r.text
+    assert "Copyright (c) 2023 Phosphor Icons" in r.text
+
+
 def test_an_unknown_vendored_name_is_a_404(client: Any) -> None:
     assert client.get("/vendor/anything.js").status_code == 404
+
+
+@pytest.mark.parametrize("name", [n for n in VENDORED if n.endswith(".woff2")])
+def test_a_vendored_font_is_served_as_a_font(client: Any, name: str) -> None:
+    # The service runs on home networks with no route to a CDN, so the fonts are
+    # vendored for the same reason uPlot is. wOF2 is the file's magic number:
+    # served as anything the browser does not recognise as a font, the page
+    # silently falls back to the system stack and changes shape.
+    r = client.get(f"/vendor/{name}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "font/woff2"
+    assert r.content[:4] == b"wOF2"
+
+
+def _font_licences() -> dict[str, str]:
+    """Each vendored font paired with the licence file it must ship beside.
+
+    Derived from the font's own name — the family, then ``.LICENSE`` — rather
+    than listed, because a list is exactly what a third family added later slips
+    past: the font appears, nothing names its notice, and every assertion here
+    goes on passing.
+    """
+    return {
+        name: f"{name.removesuffix('.woff2').split('-')[0]}.LICENSE"
+        for name in VENDORED
+        if name.endswith(".woff2")
+    }
+
+
+@pytest.mark.parametrize(("font", "licence"), sorted(_font_licences().items()))
+def test_a_vendored_font_ships_with_its_licence(client: Any, font: str, licence: str) -> None:
+    # These fonts are under the SIL Open Font License, which requires the notice
+    # to travel with the font. A binary whose licence stayed behind is the one
+    # way vendoring becomes a problem — and this repository is public, so the
+    # binary travels.
+    assert licence in VENDORED, f"{font} is served with no licence beside it"
+    r = client.get(f"/vendor/{licence}")
+    assert r.status_code == 200
+    assert "SIL Open Font License" in r.text
+
+
+def test_every_vendored_font_declares_a_face_in_the_theme_sheet() -> None:
+    # The allow-list and the stylesheet have to name the same files: a font in
+    # VENDORED that nothing asks for is dead weight in a public repository, and
+    # one the sheet asks for that is not in the allow-list is a 404 the page
+    # answers by quietly using a different typeface.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    css = (web / "theme-glass.css").read_text()
+    for name in (n for n in VENDORED if n.endswith(".woff2")):
+        assert f"/vendor/{name}" in css, name
+    for url in re.findall(r'url\("(/vendor/[^"]+)"\)', css):
+        assert url.removeprefix("/vendor/") in VENDORED, url
 
 
 def test_a_path_traversal_cannot_reach_the_configuration(client: Any) -> None:
@@ -1687,7 +1909,9 @@ def test_pages_and_the_shared_script_are_revalidated(client: Any) -> None:
     # yesterday's script. When that happened the page called a helper that did
     # not exist yet, the chart threw, and the failure surfaced as "history
     # unavailable" — pointing at the network for a fault in the cache.
-    for path in ("/", "/graphs", "/history", "/costs", "/settings", "/common.js"):
+    paths = ["/", "/graphs", "/history", "/costs", "/settings", "/common.js"]
+    paths += [f"/{sheet}" for sheet in THEME_SHEETS]
+    for path in paths:
         r = client.get(path)
         assert r.status_code == 200, path
         assert "no-cache" in r.headers.get("cache-control", ""), path
@@ -1697,6 +1921,19 @@ def test_the_vendored_library_is_still_cacheable(client: Any) -> None:
     # It is versioned by its filename and never changes under the same name, so
     # revalidating it every load would buy nothing and cost a request.
     r = client.get("/vendor/uPlot.min.css")
+    assert r.status_code == 200
+    assert "no-cache" not in r.headers.get("cache-control", "")
+
+
+@pytest.mark.parametrize("name", [n for n in VENDORED if n.endswith(".woff2")])
+def test_a_vendored_font_is_cacheable(client: Any, name: str) -> None:
+    # A font is a released binary, replaced by shipping a different file rather
+    # than by editing this one, so asking again on every page load would buy
+    # nothing. Nothing mechanical enforces that — these names carry no version,
+    # as the note beside VENDORED says — it is a convention this test pins the
+    # caching half of. The theme sheet is the other way round: it is edited
+    # under its own name, so it revalidates above.
+    r = client.get(f"/vendor/{name}")
     assert r.status_code == 200
     assert "no-cache" not in r.headers.get("cache-control", "")
 
@@ -2946,8 +3183,55 @@ def test_forecast_serves_the_newest_revision_and_the_hours_measured(tmp_path: Pa
     # expected_today_kwh: the prediction summed, in kWh
     assert body["expected_today_kwh"] == pytest.approx(1.57, abs=0.01)
 
-    # actual_so_far_kwh: (150 + 600) / 1000
-    assert body["actual_so_far_kwh"] == pytest.approx(0.75, abs=0.01)
+    # actual_so_far_kwh: the energy from the completed hours plus whatever
+    # fraction of the hour in progress has elapsed.  The staged means are
+    # 150 W at h1 and 600 W at h2; each full hour contributes mean/1000 kWh.
+    # Computing the expected value from ``now`` rather than branching on it
+    # keeps the assertion exact no matter when the suite runs — a value of
+    # 0.0 would be wrong at 01:30 (when h1 is complete) and a value of 0.75
+    # would be wrong at 01:30 (when h2 is still in progress).  The old
+    # ``< 0.75`` branch would have passed for any value below 0.75,
+    # including a wrongly small partial hour.
+    now = datetime.now(UTC)
+    frac_h1 = min(max((now - h1).total_seconds() / 3600.0, 0.0), 1.0)
+    frac_h2 = min(max((now - h2).total_seconds() / 3600.0, 0.0), 1.0)
+    expected_so_far = (150.0 * frac_h1 + 600.0 * frac_h2) / 1000.0
+    assert body["actual_so_far_kwh"] == pytest.approx(expected_so_far, abs=0.02)
+
+
+def test_the_hour_in_progress_is_counted_for_the_part_that_has_happened() -> None:
+    """An hourly mean multiplied by a whole hour claims energy nobody has made.
+
+    The maintenance pass rebuilds the hourly tier through the open bucket on
+    purpose, so the current hour is always present and always a mean over only
+    the elapsed part of itself. Treating it as a full hour overstates the day by
+    the unelapsed remainder — largest at the top of each hour, and worth 9-10
+    kWh against a ~77 kWh day on the reference array.
+    """
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    complete = datetime(2026, 8, 12, 9, tzinfo=UTC)
+    open_hour = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    now = open_hour + timedelta(minutes=30)
+
+    total = _energy_so_far_kwh([(complete, 6000.0), (open_hour, 12000.0)], now)
+    assert total == pytest.approx(6.0 + 6.0)
+
+
+def test_energy_so_far_is_a_dash_and_never_a_zero() -> None:
+    """No hour has a reading yet is not the same statement as produced nothing."""
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    assert _energy_so_far_kwh([], datetime(2026, 8, 12, 10, tzinfo=UTC)) is None
+
+
+def test_an_hour_that_has_not_started_contributes_nothing() -> None:
+    """A row ahead of the clock is not energy owed against it."""
+    from arraysense.api.routes import _energy_so_far_kwh
+
+    now = datetime(2026, 8, 12, 10, tzinfo=UTC)
+    ahead = datetime(2026, 8, 12, 11, tzinfo=UTC)
+    assert _energy_so_far_kwh([(ahead, 12000.0)], now) == 0.0
 
 
 def test_forecast_refresh_seconds_follows_the_setting(client: Any, monkeypatch: Any) -> None:
@@ -3064,6 +3348,79 @@ def test_backfill_writes_archive_hours_and_reports_progress(client: Any, monkeyp
     assert body["last_day"] == "2026-08-01"
 
 
+def test_backfill_keeps_both_halves_of_an_hour_it_writes_twice(
+    client: Any, monkeypatch: Any
+) -> None:
+    """Two archive requests write one hour, and the second must not erase the first.
+
+    ``fetch_archive_hours`` splits every label into the means over the hour
+    just gone and the readings taken at the label itself. A day's request
+    therefore writes the previous day's last hour as well, so an hour's
+    temperature arrives from one request and that same hour's irradiance from
+    the next — and while a site append replaced the whole set, the backfill
+    destroyed the weather it had itself just written.
+    """
+    from arraysense.api import routes
+
+    shared = datetime(2026, 8, 1, 23, tzinfo=UTC)
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        if start.day == 1:
+            return [Sample(timestamp=shared, readings={"outside_temperature_c": 28.5})]
+        return [Sample(timestamp=shared, readings={"ghi_wm2": 120.0})]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-02"})
+    assert r.status_code == 200
+
+    store = client.app.state.store
+    (row,) = store.query(["outside_temperature_c", "ghi_wm2"], shared, shared)
+    assert row["outside_temperature_c"] == 28.5, "the second archive write erased the first"
+    assert row["ghi_wm2"] == 120.0
+
+
+def test_backfill_leaves_an_inverter_poll_on_the_hour_alone(client: Any, monkeypatch: Any) -> None:
+    """A poll stored on an exact hour survives the archive landing on that second.
+
+    Archive samples are stamped on exact UTC hour boundaries and the collector
+    stores whenever it manages a read, so roughly three of a day's twenty-four
+    boundaries already hold an inverter poll. While every append rewrote the
+    whole row, one backfill request over a year of history silently deleted
+    thousands of readings from an irreplaceable record — and the endpoint
+    reported the hours it wrote as a success. Nothing about the endpoint says a
+    site writer is at work, so this is guarded here, at the surface anyone on
+    the LAN can reach, as well as in the store.
+    """
+    from arraysense.api import routes
+
+    boundary = datetime(2026, 8, 1, 18, tzinfo=UTC)
+    store = client.app.state.store
+    store.append(
+        Sample(
+            timestamp=boundary,
+            readings={"pv_total_power_w": 10217.0, "battery_soc_pct": 55.0},
+        )
+    )
+
+    def fake_archive(
+        lat: float, lon: float, start: Any, end: Any, timeout: float = 30.0
+    ) -> list[Sample]:
+        return [Sample(timestamp=boundary, readings={"ghi_wm2": 977.0})]
+
+    monkeypatch.setattr(routes, "fetch_archive_hours", fake_archive)
+    client.put("/api/settings", json={"site.latitude": 33.0, "site.longitude": -97.0})
+    r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
+    assert r.status_code == 200
+
+    (row,) = store.query(["pv_total_power_w", "battery_soc_pct", "ghi_wm2"], boundary, boundary)
+    assert row["pv_total_power_w"] == 10217.0, "the backfill erased an inverter reading"
+    assert row["battery_soc_pct"] == 55.0
+    assert row["ghi_wm2"] == 977.0
+
+
 def test_backfill_without_a_location_is_a_named_refusal(client: Any) -> None:
     r = client.post("/api/efficiency/backfill", json={"start": "2026-08-01", "end": "2026-08-01"})
     assert r.status_code == 400
@@ -3132,6 +3489,132 @@ def test_efficiency_unconfigured_returns_configured_false(tmp_path: Path) -> Non
     assert body["hours"] is None
     assert body["worst_hour"] is None
     assert body["baseline"]["window_start"] is None
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "params"),
+    [
+        ("/api/energy", {"start": "0001-01-01T00:00", "end": "0001-01-02T00:00"}),
+        ("/api/energy", {"start": "9999-12-30T00:00", "end": "9999-12-31T00:00"}),
+        ("/api/costs", {"start": "0001-01-01T00:00", "end": "0001-01-31T00:00"}),
+        ("/api/costs", {"start": "9999-12-01T00:00", "end": "9999-12-31T00:00"}),
+        ("/api/bands", {"start": "9999-12-01T00:00", "end": "9999-12-31T00:00"}),
+    ],
+)
+def test_a_range_off_the_end_of_the_calendar_is_a_bad_request(
+    tmp_path: Path, endpoint: str, params: dict[str, str]
+) -> None:
+    """A mistyped year is the caller's mistake, and every other one answers 400.
+
+    These endpoints walk their range a day or a month at a time, and a bound near
+    year 1 or year 9999 makes the next step land outside anything a datetime can
+    hold. It escaped the handler as a 500 with a traceback in the log of an
+    unattended service, while an unknown metric, a blank device, a reversed
+    range, an unknown zone and a bad period all answered cleanly.
+    """
+    store = SqliteStore(str(tmp_path / "cal.db"), device=TEST_DEVICE)
+    store.append(Sample(timestamp=T0, readings={"pv_total_power_w": 1000.0}))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "cal.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app, raise_server_exceptions=False) as c:
+        c.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+        r = c.get(endpoint, params={**params, "period": "month"})
+    store.close()
+    assert r.status_code == 400, r.text
+    assert "calendar" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("period", ["day", "week", "month"])
+def test_efficiency_refuses_a_start_off_the_end_of_the_calendar(
+    tmp_path: Path, period: str
+) -> None:
+    """_daily_range walks into year 10000 for all three periods."""
+    with _efficiency_client(tmp_path, lambda s: None) as c:
+        r = c.get("/api/efficiency", params={"period": period, "start": "9999-12-31"})
+    assert r.status_code == 400, r.text
+    assert "calendar" in r.json()["detail"]
+
+
+def test_a_system_with_nothing_fitted_is_not_called_calibrated(tmp_path: Path) -> None:
+    """ "Calibrated from <date>" was printed whenever any daily row existed.
+
+    baseline_for returns None for a string with fewer than three producing
+    hours; compute_hours then disables the signature test for it and scores the
+    day regardless, so rows exist for a system where nothing was fitted and
+    where curtailment can never be booked. On the reference installation that is
+    the state every morning. Here the per-string voltage and current are absent
+    altogether, which is as unfitted as it gets.
+    """
+    when = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=when,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["summary"] is not None, "the day was scored, which is the whole trap"
+    assert body["baseline"] == {"window_start": None, "window_end": None, "samples": None}
+
+
+def test_a_fitted_baseline_reports_its_own_window_and_evidence(tmp_path: Path) -> None:
+    """The window is the range the fit ran over, and samples is what stood behind it."""
+    day = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        for n in range(4):
+            store.append(
+                Sample(
+                    timestamp=day + timedelta(hours=n),
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0 + n,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    baseline = body["baseline"]
+    assert baseline["window_start"] == body["start"]
+    assert baseline["window_end"] == body["end"]
+    assert baseline["samples"] == 4
 
 
 def test_efficiency_rejects_an_unknown_period(tmp_path: Path) -> None:
@@ -3212,6 +3695,103 @@ def test_efficiency_period_day_computes_daily_summary(tmp_path: Path) -> None:
     assert s["specific_yield"] is not None
     assert s["tolerance_pct"] == 3.0
     # One hour is partial (< 60% of daylight covered).
+    assert s["partial"] is True
+
+
+def test_efficiency_does_not_divide_two_strings_output_by_three_strings_kwp(
+    tmp_path: Path,
+) -> None:
+    """A string nobody read leaves the array's yield without a denominator for it.
+
+    On 10 July 2025 the reference installation reported PV1 and PV2 for ninety
+    hourly rows and NULL for PV3 throughout. The endpoint served PV3 as
+    expected 0.0, actual 0.0 and a specific yield of 0.0 kWh/kWp — a string that
+    was never read presented as a string that produced nothing — and divided the
+    two strings that did report by all 14.04 kWp of the array, with partial
+    false. The waterfall reconciled perfectly while a third of the array was
+    unmeasured.
+    """
+    when = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=when,
+                readings={
+                    "pv1_power_w": 4000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 12.9,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    two = "South | 1 | 20 | 400 | 25 | 180\nWest | 2 | 20 | 400 | 25 | 270"
+    with _efficiency_client(tmp_path, build, strings=two) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert [s["name"] for s in body["strings"]] == ["South"], "a silent string was scored"
+    one = next(s for s in body["strings"] if s["name"] == "South")
+    summary = body["summary"]
+    assert summary["specific_yield"] == pytest.approx(one["specific_yield"])
+    assert summary["strings_scored"] == 1
+    assert summary["strings_described"] == 2
+    assert summary["partial"] is True
+
+
+def test_efficiency_week_says_how_many_of_its_days_it_scored(tmp_path: Path) -> None:
+    """A week totalled over four days must not be presented as a week.
+
+    compute_day returns nothing at all for a day it cannot model, so a day the
+    collector missed or the weather service was unreachable for simply drops out
+    of the aggregate. The summary then summed whatever was left and set
+    ``partial`` from a per-day within-day coverage flag, which says nothing
+    about whole days that never appeared — and the specific yield came out
+    understated in exact proportion to the days missing. This is the Costs
+    completeness rule again: coverage in what was watched is not coverage in
+    what is being claimed.
+    """
+    hours = [datetime(2026, 8, 3, 13, tzinfo=UTC) + timedelta(days=d) for d in range(4)]
+
+    def build(store: SqliteStore) -> None:
+        for when in hours:
+            store.append(
+                Sample(
+                    timestamp=when,
+                    readings={
+                        "pv1_power_w": 4000.0,
+                        "pv1_voltage_v": 310.0,
+                        "pv1_current_a": 12.9,
+                        "ghi_wm2": 600.0,
+                        "dni_wm2": 500.0,
+                        "dhi_wm2": 100.0,
+                        "wind_speed_ms": 2.0,
+                        "outside_temperature_c": 30.0,
+                        "battery_soc_pct": 60.0,
+                        "bms_charge_current_limit_a": 400.0,
+                    },
+                )
+            )
+
+    with _efficiency_client(tmp_path, build) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "week", "start": "2026-08-03", "tz": "America/Chicago"},
+        ).json()
+
+    assert len(body["days"]) == 4
+    s = body["summary"]
+    assert s["days_scored"] == 4
+    assert s["days_expected"] == 7
     assert s["partial"] is True
 
 

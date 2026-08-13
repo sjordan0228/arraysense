@@ -13,7 +13,10 @@
 <script src="/common.js"></script>
 <style>
   .grp{margin-bottom:12px}
-  .grp .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;margin:0 0 14px}
+  /* The Theme area takes the same introduction as a settings group without
+     being one — see the comment on #lookSec in the body. */
+  .grp .intro,#lookSec .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
+    margin:0 0 14px}
   .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
   @media(max-width:760px){.fields{grid-template-columns:1fr}}
   /* A field whose value is long prose — the rate bands — needs the row to
@@ -28,6 +31,18 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
   .f input:focus,.f select:focus,.f textarea:focus{outline:2px solid var(--pv);outline-offset:1px;
     border-color:transparent}
+  /* A native select draws the browser's own chrome and the shared rule above
+     goes partly unapplied, so it reads foreign next to the inputs. appearance:none
+     hands the whole box back to that rule — same border, radius, background, text
+     and font as the text inputs — and the only thing drawn for it is a small
+     down-caret, built from two gradient halves in the page's own --ink2 so
+     neither theme needs a colour of its own. The element is still the native
+     <select>: the list it opens and its keyboard behaviour are untouched. */
+  .f select{appearance:none;-webkit-appearance:none;cursor:pointer;padding-right:28px;
+    background-image:linear-gradient(45deg,transparent 50%,var(--ink2) 50%),
+      linear-gradient(135deg,transparent 50%,var(--ink2) 50%);
+    background-position:right 15px center,right 10px center;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat,no-repeat}
   .f .help{font-size:11px;color:var(--ink3);line-height:1.55}
   /* A field the server rejected. The message sits with the control that caused
      it: a single banner saying "invalid" leaves the reader hunting ten fields
@@ -53,6 +68,11 @@
      unit renders exactly as it did before. */
   .f .ctl{display:flex;align-items:center;gap:8px;min-width:0}
   .f .ctl .u{font-size:11.5px;color:var(--ink3);white-space:nowrap}
+  /* A yes/no setting, sized to itself. Everything else in `.f input` is
+     written for a box you type into, and a checkbox stretched to the column
+     width is a hundred-pixel tick. */
+  .f input[type=checkbox]{width:17px;height:17px;padding:0;margin:3px 0;flex:0 0 auto;
+    accent-color:var(--pv)}
 
   /* --- The location helper --------------------------------------------- */
   .geo{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -82,7 +102,12 @@
   .mons{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
   .mons button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
     border-radius:7px;padding:3px 8px;font:inherit;font-size:11.5px;cursor:pointer;line-height:1.4}
-  .mons button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  /* A chosen month fills amber rather than grey, so the season a band covers
+     reads at a glance — twelve grey pills showed the writing, not the schedule.
+     The dark text is the pair the amber Save button already uses: the theme's
+     own --ink is white in the dark theme and would vanish on the amber. */
+  .mons button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
+    color:#1a1204;font-weight:600}
   .mons .season{font-size:11px;color:var(--ink3);margin-left:4px}
   .bandacts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .bandacts .iconbtn{font-size:11.5px;padding:3px 9px}
@@ -102,23 +127,151 @@
     border-bottom:1px solid var(--grid-line);padding-bottom:5px}
   .facts .row u{text-decoration:none;color:var(--ink3)}
   .facts .row b{font-weight:500;text-align:right}
+  .facts .facts-rule{grid-column:1/-1;border:none;border-top:1px solid var(--panel-b);
+    margin:4px 0}
+  .facts .conv-head{grid-column:1/-1;font-size:12px;font-weight:600;color:var(--ink2);
+    margin-top:4px}
+
+  /* --- Theme ------------------------------------------------------------- */
+  /* The two per-browser choices. They share none of the .f rules above and that
+     is deliberate: those are written for a box holding a value on its way to
+     the service, and these are closed lists of choices with nothing to send.
+     A fieldset and a legend rather than a div and a heading, so the group is a
+     group to a screen reader as well as to the eye. */
+  .looks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
+  @media(max-width:760px){.looks{grid-template-columns:1fr}}
+  .look{border:1px solid var(--panel-b);border-radius:10px;background:var(--tint);
+    padding:8px 12px 11px;margin:0;min-width:0}
+  .look legend{font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;color:var(--ink3);
+    padding:0 5px}
+  .look .opt{display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:1.9;
+    cursor:pointer}
+  /* Sized to itself, for the reason the checkbox rule above gives: everything
+     else here stretches to the column and a stretched radio is a lozenge. */
+  .look input[type=radio]{width:15px;height:15px;margin:0;flex:0 0 auto;accent-color:var(--pv);
+    cursor:pointer;align-self:center}
+  /* The focus ring the tab bar uses, restated for these because the glass sheet
+     rings inputs in --pv at zero specificity; matching the tabs keeps one page
+     to one focus colour whichever look is on. */
+  .look input[type=radio]:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  .look .opt .was{font-size:11px;color:var(--ink3)}
+  .look .help{font-size:11px;color:var(--ink3);line-height:1.55;margin:6px 0 0}
+
+  /* --- Tabs --------------------------------------------------------------- */
+  .tabs{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  .tabs button{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
+    line-height:1.45;cursor:pointer}
+  .tabs button:hover{color:var(--ink2)}
+  /* The active tab is amber on purpose, and it is not the same "selected" as
+     the nav pill above it. The pill says which page this is and stays grey;
+     the tab says which section of this page is open. The tab is deliberately
+     the louder of the two so the two levels read as different questions. */
+  .tabs button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
+    color:#1a1204;font-weight:600}
+  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* A group whose tab is not the active one, hidden rather than removed so the
+     controls keep their values and the dirty check still sees them. */
+  .grp[hidden]{display:none}
+  /* The empty-tab note, rendered when a tab with no settings is deep-linked. */
+  .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:8px 0}
+
+  /* --- The rate-schedule heatmap ----------------------------------------- */
+  /* Not a settings group: a read-only picture of the stored tariff, shown on
+     the Rate bands tab beneath the editor. It draws from /api/bands and never
+     parses the tariff itself, so it lives outside the form render() rebuilds,
+     the way the Theme area does. */
+  .heat .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
+    margin:0 0 14px}
+  .heat-wrap{overflow-x:auto}
+  .heatmap{border-collapse:separate;border-spacing:2px;width:auto;min-width:100%;
+    font-size:12px}
+  /* The shared table rules are for figures; this grid is a picture. The cells
+     keep their own size and the month column its own width, and no cell carries
+     the page-wide bottom border. */
+  .heatmap th,.heatmap td{padding:0;border:0;text-align:center}
+  .heatmap thead th{font-size:9px;font-weight:600;letter-spacing:.04em;color:var(--ink3);
+    padding:2px 0 5px;text-transform:none}
+  .heatmap tbody th{font-size:10.5px;font-weight:600;color:var(--ink2);text-align:left;
+    padding-right:9px;white-space:nowrap;text-transform:none;letter-spacing:0}
+  .heatmap td{width:26px;height:17px;border-radius:3.5px;background:var(--tint);
+    box-shadow:inset 0 0 0 1px var(--panel-b)}
+  /* An hour no band covers is hatched — the site's own word for absent — never
+     a colour of its own and never left looking like a broken cell. */
+  .heatmap td.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 2px,
+    transparent 2px 5px);box-shadow:inset 0 0 0 1px var(--panel-b)}
+  .heatmap td:hover{box-shadow:inset 0 0 0 2px var(--ink3)}
+  .heat-legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px;font-size:11.5px;
+    color:var(--ink2)}
+  .heat-key{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .heat-key i{width:17px;height:12px;border-radius:2.5px;display:inline-block;
+    box-shadow:inset 0 0 0 1px var(--panel-b)}
+  .heat-key i.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 2px,
+    transparent 2px 5px)}
+  .heatcap{font-size:11px;color:var(--ink3);line-height:1.6;max-width:86ch;margin-top:12px}
+  .heat-note{font-size:12px;line-height:1.6;color:var(--ink2);max-width:82ch;margin:4px 0 0;
+    border-left:3px solid var(--ink3);padding-left:12px}
+  .heat-note.warn{border-left-color:var(--warn)}
+  .heat-note.warn b{color:var(--warn)}
+  .heat-err{margin-top:6px;font-size:12px;line-height:1.6;color:var(--ink2);max-width:82ch}
+  .heat-err b{color:var(--bad);display:block;margin-bottom:4px;font-weight:600}
+  .heat-err .iconbtn{margin-top:12px}
+  /* The name each cell carries for a screen reader. The colour is the visual
+     encoding; the text inside the cell is the accessibility encoding, and a
+     legend, a hover title and this table together mean a band's identity never
+     rests on its hue alone. */
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;font-size:12px}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div class="conn" id="stamp"></div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <div class="conn" id="stamp"></div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>
 
   <div class="p pn" id="pnote" hidden></div>
 
+  <div class="tabs" id="tabs" role="tablist" aria-label="Settings sections"></div>
+
   <form id="form" autocomplete="off"></form>
 
-  <section class="p">
+  <!-- The schedule the Costs page prices by, drawn from the service's own band
+       windows. Not a setting and deliberately outside the form: it is read from
+       the stored tariff and never edits it, and a save rebuilding the form must
+       not wipe it — the same reason the Theme area sits outside. It belongs to
+       the Rate bands tab and is shown and hidden with it. -->
+  <section class="p heat" id="heatSec" hidden>
+    <div class="chead"><h2>When each rate applies</h2>
+      <span class="legend muted">the schedule the Costs page prices by</span>
+    </div>
+    <p class="intro">Which band covers which hour of which month, read from the same
+      service-side band windows the dashboard shades its charts with — the tariff itself
+      is parsed only on the service, never here.</p>
+    <div id="heatHost"><p class="heat-note">Reading the rate schedule…</p></div>
+  </section>
+
+  <section class="p" id="saveBar">
     <div class="actions">
       <button class="iconbtn" id="save" type="button" disabled>Save changes</button>
       <button class="iconbtn" id="revert" type="button" disabled>Discard</button>
@@ -129,10 +282,42 @@
     </div>
   </section>
 
+  <!-- Not settings, and not an oversight to be tidied into the registry later.
+       Everything else on this page is described by settings.py and stored in
+       the service's database, which is one value for the whole installation.
+       These two are per browser, held in localStorage beside the theme the
+       header glyph switches, and that is the point: one household can want the
+       wall tablet dark and glassy and the laptop following the room, and a
+       registry entry would force whichever was saved last onto both. So there
+       is no spec behind these controls, no PUT to /api/settings and no Save
+       button — the choice is the browser's own and takes effect as it is made,
+       which is also why the section sits below the save bar rather than above
+       it, where its note about the database would read as covering this too. -->
+  <section class="p" id="lookSec" hidden>
+    <div class="chead"><h2>Theme</h2></div>
+    <p class="intro">These two belong to this browser alone. They take effect as soon as they
+      are chosen, are remembered here rather than by the service, and change nothing for
+      anybody else who opens this installation.</p>
+    <div class="looks">
+      <fieldset class="look">
+        <legend>Appearance</legend>
+        <div id="lookAppearance"></div>
+        <p class="help">What the pages are made of. Glass frosts the panels and sets the
+          numbers in their own typeface; Classic is the flat look the pages had before it.</p>
+      </fieldset>
+      <fieldset class="look">
+        <legend>Colour mode</legend>
+        <div id="lookTheme"></div>
+        <p class="help">The same choice the ◑ button in the header cycles through, and the
+          same value behind it — changing either moves the other.</p>
+      </fieldset>
+    </div>
+  </section>
+
   <!-- Not a setting: what the process running behind this page actually is.
        It is read from /api/status and /api/capabilities and nothing here can
        be typed into, which is why it sits outside the form. -->
-  <section class="p">
+  <section class="p" id="aboutSec">
     <div class="chead"><h2>About this installation</h2></div>
     <div class="facts" id="facts"></div>
     <p class="masknote" id="factnote"></p>
@@ -160,20 +345,93 @@ let saved = {};
 // cannot be read falls back to the loose registry controls for connection.
 let setupPayload = null;
 
-// The groups, in the order they are shown, keyed by the prefix of the settings
-// that belong to each. A prefix with no entry here still renders — under its
-// own name — so adding a setting to the registry can never make it invisible.
-const GROUPS = [
+// The tabs, in the order the owner set them up: first the inverter the wizard
+// configured, then the array it reads, then the battery it charges, then how
+// that data is collected and kept, then money, then site preferences, then
+// the read-only "About this installation" section that was always here.
+//
+// Each tab claims one or more setting prefixes. A prefix not claimed by any
+// tab still renders — collected under an "Other" tab that only appears when
+// there are unclaimed prefixes — so adding a setting to the registry can
+// never make it invisible. An empty tab (a prefix with no settings yet) is
+// hidden from the tab bar; the "backup" prefix is named here so that when
+// its settings arrive they land in Collection without a page change.
+//
+// >>> tab-defs
+const TABS = [
   {
-    prefix: 'tariff',
-    title: 'What electricity costs',
-    intro: 'The Costs page prices nothing until these are entered.',
+    id: 'inverter',
+    title: 'Inverter',
+    prefixes: ['connection'],
   },
+  {
+    id: 'solar-panels',
+    title: 'Solar panels',
+    prefixes: ['panels', 'efficiency'],
+  },
+  {
+    id: 'battery',
+    title: 'Battery',
+    prefixes: ['battery'],
+  },
+  {
+    id: 'collection',
+    title: 'Collection',
+    prefixes: ['collector', 'backup'],
+  },
+  {
+    id: 'rate-bands',
+    title: 'Rate bands',
+    prefixes: ['tariff'],
+  },
+  {
+    id: 'general',
+    title: 'General',
+    prefixes: ['site', 'display'],
+  },
+  {
+    id: 'about',
+    title: 'About',
+    about: true,
+  },
+];
+
+const tabForPrefix = Object.create(null);
+for (const tab of TABS) {
+  if (tab.prefixes) {
+    for (const p of tab.prefixes) tabForPrefix[p] = tab.id;
+  }
+}
+// <<< tab-defs
+
+// The groups, in the order they are shown within a tab, keyed by the prefix
+// of the settings that belong to each. These provide the heading and
+// introduction for each prefix's block of controls. A prefix with no entry
+// here still renders — under its own bare name — the way it always did.
+const GROUPS = [
   {
     prefix: 'connection',
     title: 'The inverter',
     intro: 'How the collector reaches the dongle. Changing any of these needs the collector '
       + 'restarted before it takes effect.',
+  },
+  {
+    prefix: 'panels',
+    title: 'Solar panels',
+    intro: 'The array, one line per string — the efficiency model reads exactly what is '
+      + 'entered here, and every value left blank falls to a default the form shows.',
+  },
+  {
+    prefix: 'efficiency',
+    title: 'Efficiency',
+    intro: 'The efficiency model scores what the array actually produced against what the '
+      + 'sun offered.',
+  },
+  {
+    prefix: 'battery',
+    title: 'Battery bank',
+    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
+      + 'fill the gaps and set the heater and idle-draw accounting.',
   },
   {
     prefix: 'collector',
@@ -185,20 +443,18 @@ const GROUPS = [
       + 'at 10 seconds — so the database grows in proportion to how often you ask.',
   },
   {
+    prefix: 'backup',
+    title: 'Backup',
+    intro: 'Where the database is copied to for safekeeping.',
+  },
+  {
+    prefix: 'tariff',
+    title: 'What electricity costs',
+    intro: 'The Costs page prices nothing until these are entered.',
+  },
+  {
     prefix: 'site',
-    title: 'General',
-  },
-  {
-    prefix: 'panels',
-    title: 'Solar panels',
-    intro: 'The array, one line per string — the efficiency model reads exactly what is '
-      + 'entered here, and every value left blank falls to a default the form shows.',
-  },
-  {
-    prefix: 'battery',
-    title: 'Battery bank',
-    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
-      + 'fill the gaps and set the heater and idle-draw accounting.',
+    title: 'Site',
   },
   {
     prefix: 'display',
@@ -236,6 +492,14 @@ const suggestionsOf = (spec) => (Array.isArray(spec.suggestions) ? spec.suggesti
 function control(spec, value) {
   const id = `f_${spec.key.replace(/\W/g, '_')}`;
   const shown = value === null || value === undefined ? '' : String(value);
+  // A setting the registry declares as a boolean gets the one control that
+  // cannot express anything else. Without this it fell through to a text box
+  // holding the word "true", which the service refuses — it wants a JSON
+  // boolean — so the setting was visible, editable, and unsaveable.
+  if (spec.kind === 'bool') {
+    return `<input id="${id}" data-key="${esc(spec.key)}" type="checkbox"`
+      + `${value === true ? ' checked' : ''}>`;
+  }
   if (spec.choices && spec.choices.length) {
     const options = spec.choices.map((c) =>
       `<option value="${esc(c)}"${c === shown ? ' selected' : ''}>${esc(c)}</option>`).join('');
@@ -337,13 +601,17 @@ function render() {
   for (const group of order) {
     const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
     if (!mine.length) continue;
+    // The tab this group's prefix belongs to, or "other" when no tab claims
+    // it — so a setting added to the registry tomorrow still appears under a
+    // catch-all tab rather than silently vanishing.
+    const tabId = tabForPrefix[group.prefix] || 'other';
     // The connection group is the wizard's other shell: the same Manufacturer →
     // Model → Connection picker the first-run wizard shows, mounted from
     // /api/setup so the two cannot drift. It replaces the loose registry
     // controls entirely, and only when the payload is in hand — a build whose
     // /api/setup could not be read falls through to the controls below.
     if (group.prefix === 'connection' && setupPayload) {
-      blocks.push(`<section class="p grp">
+      blocks.push(`<section class="p grp" data-tab="${esc(tabId)}">
           <div class="chead"><h2>${esc(group.title)}</h2></div>
           ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
           <div id="connHost"></div>
@@ -371,7 +639,7 @@ function render() {
           <span class="err" hidden></span>
         </div>`;
     }).join('');
-    blocks.push(`<section class="p grp">
+    blocks.push(`<section class="p grp" data-tab="${esc(tabId)}">
         <div class="chead"><h2>${esc(group.title)}</h2></div>
         ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
         <div class="fields">${controls}</div>
@@ -404,7 +672,146 @@ function render() {
       ? ` ${secret.join(' and ')} come back from the service with their middles replaced. `
         + 'Leave a masked value alone and it is left alone; retype it in full to change it.'
       : '');
+
+  // Build the tab bar and select the initial tab. Done after the form is
+  // populated so drawTabs can tell which tabs have content.
+  drawTabs();
+  selectTab(wantedTab());
 }
+
+// ---------------------------------------------------------------------------
+// Tab switching.
+//
+// Follows the same hash-routed pattern index.html's wireTabs() uses for the
+// dashboard views: the URL fragment is authoritative when present, otherwise
+// the remembered choice from localStorage wins, otherwise the first tab. The
+// hash is updated when a tab is clicked so the target is shareable and the
+// back button works. Tabs with no settings are left out of the bar; the
+// "backup" prefix is named in TABS so that when its settings arrive they
+// land in Collection without a page change.
+// ---------------------------------------------------------------------------
+
+// The "Other" tab id, used when a prefix is not claimed by any defined tab.
+// Separate from the TABS array so the tab-defs slice stays pure for testing.
+const OTHER_TAB_ID = 'other';
+
+// Where the Theme area appears. It is on a tab rather than on its own because
+// it is one more thing about how this installation is shown, next to the
+// temperature unit and the refresh interval it sits with — and General is the
+// tab those are on. Named here because two things need the answer: the tab has
+// to be offered, and the section has to be shown with it.
+const LOOK_TAB_ID = 'general';
+
+// Which tabs actually have content, computed after the form is populated.
+// The About tab always appears; settings tabs only appear if at least one
+// group section bears their data-tab.
+function visibleTabIds() {
+  const ids = new Set();
+  for (const el of $('form').querySelectorAll('.grp[data-tab]')) {
+    ids.add(el.dataset.tab);
+  }
+  // The tab holding the Theme area is offered whatever the registry describes.
+  // Those two controls are this browser's own and exist even if the service
+  // answers with nothing for the prefixes this tab claims — and a tab that
+  // disappears takes the only way to reach them with it.
+  ids.add(LOOK_TAB_ID);
+  // The "other" catch-all only shows when there are unclaimed prefixes.
+  // About always shows — it is not driven by form content.
+  const order = [];
+  for (const tab of TABS) {
+    if (tab.about || ids.has(tab.id)) order.push(tab.id);
+  }
+  if (ids.has(OTHER_TAB_ID)) order.push(OTHER_TAB_ID);
+  return order;
+}
+
+function drawTabs() {
+  const bar = $('tabs');
+  if (!bar) return;
+  const visible = visibleTabIds();
+  bar.innerHTML = visible.map((id) => {
+    const tab = TABS.find((t) => t.id === id);
+    const title = tab ? tab.title : 'Other';
+    return `<button type="button" role="tab" data-tab="${esc(id)}">${esc(title)}</button>`;
+  }).join('');
+  bar.querySelectorAll('button').forEach((btn) => {
+    // The change itself (selectTab) is synchronous — toggling visibility and
+    // updating the hash — so it can run inside the crossfade without holding
+    // anything up; the page's data keeps loading on its own schedule. Re-picking
+    // the tab that is already open changes nothing, and fading the whole page
+    // over a no-op would read as a blink, so that click is left alone.
+    btn.addEventListener('click', () => {
+      if (btn.getAttribute('aria-pressed') !== 'true') {
+        crossfade(() => selectTab(btn.dataset.tab));
+      }
+    });
+  });
+}
+
+function selectTab(id) {
+  // Update tab button states.
+  const bar = $('tabs');
+  if (bar) {
+    bar.querySelectorAll('button').forEach((btn) => {
+      btn.setAttribute('aria-pressed', btn.dataset.tab === id ? 'true' : 'false');
+    });
+  }
+  // Show or hide the form and its groups. Every group stays in the DOM so
+  // unsaved changes survive a tab switch — only visibility changes.
+  const isAbout = (id === 'about');
+  $('form').hidden = isAbout;
+  for (const el of $('form').querySelectorAll('.grp[data-tab]')) {
+    el.hidden = el.dataset.tab !== id;
+  }
+  // Save buttons are part of editing, not part of the About section.
+  const saveBar = $('saveBar');
+  if (saveBar) saveBar.hidden = isAbout;
+  // The About section is only its own tab.
+  const aboutSec = $('aboutSec');
+  if (aboutSec) aboutSec.hidden = !isAbout;
+  // The Theme area is neither part of the form nor part of About, so it is
+  // shown by name rather than by the loop above: it belongs to one tab and
+  // appears with it.
+  const lookSec = $('lookSec');
+  if (lookSec) lookSec.hidden = id !== LOOK_TAB_ID;
+  // The rate-schedule heatmap is the same shape of thing as the Theme area: not
+  // a setting, so it is outside the form the loop above walks, and it appears
+  // with the tab it belongs to.
+  const heatSec = $('heatSec');
+  if (heatSec) heatSec.hidden = id !== 'rate-bands';
+  // The "Where these live" details stay visible regardless.
+
+  // Persist the choice and update the URL without a page reload.
+  try { localStorage.setItem('as.settingsTab', id); } catch (e) { /* private browsing */ }
+  if (location.hash !== '#' + id) {
+    history.replaceState(null, '', '#' + id);
+  }
+}
+
+// Which tab the reader should land on. The URL fragment wins when it names a
+// tab that exists; otherwise the localStorage choice, if it names a tab that
+// is currently visible; otherwise the first visible tab. On the very first
+// visit with no hash and no stored preference this is the Inverter tab.
+function wantedTab() {
+  const visible = visibleTabIds();
+  // Hash is authoritative when it names a visible tab.
+  const hash = location.hash.replace('#', '');
+  if (hash && visible.includes(hash)) return hash;
+  // localStorage remembers the last tab this browser was on.
+  let held = null;
+  try { held = localStorage.getItem('as.settingsTab'); } catch (e) { /* private browsing */ }
+  if (held && visible.includes(held)) return held;
+  // Fall back to the first visible tab.
+  return visible[0] || TABS[0].id;
+}
+
+// Listen for hash changes (back/forward, or a link from another page). The
+// switch crossfades when the browser can; the initial tab shown on load is
+// selected by render() without one.
+window.addEventListener('hashchange', () => {
+  const wanted = wantedTab();
+  crossfade(() => selectTab(wanted));
+});
 
 // ---------------------------------------------------------------------------
 // The rate bands, as controls instead of as a line of syntax.
@@ -1152,6 +1559,30 @@ function splitStringLine(line) {
 // is the stable end-of-slice sentinel and is never called.
 function panelsEditorEnd() {}
 
+// A warning shown on the string row when a generic panel type was chosen
+// instead of entering every electrical figure by hand. The wording names
+// what is actually at risk: a run length entered against a generic module
+// is an estimate resting on an estimate, because the wire loss depends on
+// operating voltage and a generic Vmp is representative of the format
+// rather than measured from the owner's modules.
+function panelWarningText(panelName, rowIndex) {
+  if (!panelName) return '';
+  const cat = (panelState._catalogue || []);
+  const entry = cat.find((e) => e.name === panelName);
+  if (!entry) return '';
+  const defs = (panelState._defaulted || {});
+  const rowDefs = Array.isArray(defs[rowIndex]) ? defs[rowIndex] : [];
+  const haveVmp = rowDefs.includes('vmp');
+  const haveAll = ['vmp', 'voc', 'temp_coeff', 'noct', 'degradation']
+    .every((k) => rowDefs.includes(k));
+  let msg = `${entry.description} — representative figures` + (haveAll ? '.' : ',');
+  if (haveVmp) {
+    msg += ' Vmp is assumed rather than measured from your modules,'
+      + ' so a wire loss computed from it is an estimate resting on an estimate.';
+  }
+  return ` <span class="hint warn-note" style="display:inline-block;margin-top:2px">${esc(msg)}</span>`;
+}
+
 // State of the string editor. Same shape as bandState: holds what was
 // originally in the textarea, and while nothing is touched that exact string
 // goes back.
@@ -1175,7 +1606,29 @@ function panelMarkup(row, i) {
   };
   const val = (key) => esc(adv[key] || '');
 
+  // A panel-type picker above the advanced fields. Offers the catalogue
+  // entries plus a "none" option, and shows a warning when a generic
+  // entry was used — the warning carries what is actually at risk, which
+  // is narrower than "this may be wrong": a generic Vmp makes the wire
+  // loss an estimate resting on an estimate, and the owner should know.
+  const catalogue = (panelState._catalogue || []);
+  const panelOptions = [{name: '', description: 'Enter values below'}].concat(
+    catalogue.map((e) => ({name: e.name, description: e.description})));
+  const chosenPanel = adv.panel || '';
+  const panelSel = panelOptions.map((opt) => {
+    const sel = opt.name === chosenPanel ? ' selected' : '';
+    return `<option value="${esc(opt.name)}"${sel}>${esc(opt.description)}</option>`;
+  }).join('');
+  const panelWarning = chosenPanel ? panelWarningText(chosenPanel, i) : '';
+
   const advRows = [
+    `<div class="span" style="margin-bottom:4px">
+       <span class="cap">Panel type</span>
+       <select data-role="adv" data-key="panel" aria-label="Panel type">
+         ${panelSel}
+       </select>
+       ${panelWarning}
+     </div>`,
     `<div class="span">
        <span class="cap">Temp coefficient</span>
        <input type="text" data-role="adv" data-key="temp_coeff"
@@ -1389,11 +1842,29 @@ function wirePanels(host) {
   }
 }
 
-function mountPanelsEditor(spec) {
+async function mountPanelsEditor(spec) {
   const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
   if (!box) return;
   const area = box.querySelector('[data-key]');
   if (!area) return;
+
+  // Read the parsed strings to learn which fields are defaulted per string
+  // and which catalogue entries exist. The catalogue drives the panel-picker
+  // dropdown; the defaulted sets drive the warning on each row.
+  let catalogue = [];
+  let defaulted = {};
+  try {
+    const r = await fetch('/api/panels');
+    if (r.ok) {
+      const body = await r.json();
+      catalogue = (body && body.catalogue) || [];
+      const strings = (body && body.strings) || [];
+      defaulted = {};
+      strings.forEach((s, idx) => {
+        if (s.defaulted && s.defaulted.length) defaulted[idx] = s.defaulted;
+      });
+    }
+  } catch (e) { /* the editor works without the catalogue; the picker stays empty */ }
 
   const rows = [];
   if (area.value.trim()) {
@@ -1403,7 +1874,7 @@ function mountPanelsEditor(spec) {
       rows.push(splitStringLine(line));
     }
   }
-  panelState = { original: area.value, rows, changed: false };
+  panelState = { original: area.value, rows, changed: false, _catalogue: catalogue, _defaulted: defaulted };
 
   const shell = document.createElement('div');
   shell.className = 'bands';
@@ -1470,6 +1941,15 @@ function mountPanelsEditor(spec) {
 const SITE_LAT = 'site.latitude';
 const SITE_LON = 'site.longitude';
 
+// A postcode-or-place lookup that fills the coordinate boxes from the
+// Open-Meteo geocoding service. Replaces the geolocation control, which
+// never appears at the origins this service is actually served from
+// (plain HTTP at a LAN address — a secure-context API that refuses
+// without asking). The coordinate boxes stay because some countries'
+// postcodes are not covered by the geocoder, and the help text must
+// not describe them as more accurate: moving 4.6 km changes modelled
+// plane-of-array irradiance by 0.006%, against a forecast grid of
+// about 11 km.
 function mountLocation() {
   const lat = fields.find((f) => f.key === SITE_LAT);
   const lon = fields.find((f) => f.key === SITE_LON);
@@ -1477,78 +1957,84 @@ function mountLocation() {
   const anchor = document.querySelector(`.f[data-for="${CSS.escape(SITE_LON)}"]`);
   if (!anchor || !anchor.parentNode) return;
 
-  // Its own row across the grid, and deliberately not a `.f` — that class
-  // means "a control for one setting", and everything which walks the form
-  // looking for a label, a value and an error line would then find a box with
-  // none of the three.
   const geo = document.createElement('div');
   geo.className = 'wide geo';
   const note = document.createElement('span');
   note.className = 'said';
   anchor.parentNode.insertBefore(geo, anchor.nextSibling);
 
-  const usable = window.isSecureContext && navigator.geolocation;
-  if (!usable) {
-    note.className = 'said';
-    note.textContent = 'A browser only shares a location with a page served over HTTPS or '
-      + `opened at localhost. This one is at ${location.origin}, where it refuses without `
-      + `asking, so ${lat.label.toLowerCase()} and ${lon.label.toLowerCase()} have to be `
-      + 'typed in — or the page opened from the machine the service runs on.';
-    geo.appendChild(note);
-    return;
-  }
-
-  const button = document.createElement('button');
-  button.type = 'button';
-  button.className = 'iconbtn';
-  button.textContent = 'Use this device’s location';
-  geo.appendChild(button);
-  geo.appendChild(note);
+  // A text box and a Look-up button. The geocoder returns candidates;
+  // a single one fills the coordinate boxes and names what it matched.
+  // Ambiguity is shown as a short list — nothing is filled until the
+  // owner picks one.
+  geo.innerHTML = `
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+      <input type="text" id="geoQuery" placeholder="Postcode or place name"
+        style="width:220px;background:var(--tint);border:1px solid var(--panel-b);
+          color:var(--ink);border-radius:8px;padding:5px 8px;font:inherit;font-size:13px">
+      <button type="button" id="geoLookup" style="background:var(--tint);
+        border:1px solid var(--panel-b);color:var(--ink);border-radius:8px;
+        padding:5px 12px;font:inherit;font-size:12px;cursor:pointer">Look up</button>
+    </div>
+    <div class="said" id="geoNote" style="font-size:11px;color:var(--ink3)"></div>
+    <div id="geoCandidates" style="margin-top:4px;font-size:12px"></div>`;
 
   const put = (key, value) => {
     const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
     if (!el) return;
-    // Five decimal places is about a metre, and the browser's own figure
-    // carries a dozen digits of arithmetic noise past the point its accuracy
-    // supports. Rounding it is not losing anything that was ever measured.
     el.value = String(Number(value.toFixed(5)));
     el.dispatchEvent(new Event('input', { bubbles: true }));
   };
 
-  button.addEventListener('click', () => {
-    button.disabled = true;
-    note.className = 'said';
-    note.textContent = 'Asking the browser…';
-    navigator.geolocation.getCurrentPosition((position) => {
-      button.disabled = false;
-      put(SITE_LAT, position.coords.latitude);
-      put(SITE_LON, position.coords.longitude);
-      const metres = Number(position.coords.accuracy);
-      note.className = 'said ok';
-      note.textContent = 'Filled in from this device'
-        + (Number.isFinite(metres) ? `, accurate to about ${Math.round(metres)} m.` : '.')
-        + ' Nothing is saved until Save changes.';
-    }, (err) => {
-      button.disabled = false;
-      note.className = 'said warn';
-      // Reported rather than swallowed, and with the browser's own words: a
-      // refusal, a device with no fix and a timeout call for three different
-      // reactions, and the settings page is not the place to guess which.
-      const why = err && err.code === 1 ? 'The browser refused to share a location'
-        : err && err.code === 2 ? 'The device could not work out where it is'
-        : err && err.code === 3 ? 'The browser took too long to answer'
-        : 'The browser would not share a location';
-      const said = err && err.message ? ` (${err.message})` : '';
-      note.textContent = `${why}${said}. Type the coordinates in instead.`;
-    }, { timeout: 15000, maximumAge: 60000 });
-  });
+  $('geoLookup').onclick = async function() {
+    const q = $('geoQuery').value.trim();
+    if (!q) return;
+    const btn = $('geoLookup'), note = $('geoNote'), cand = $('geoCandidates');
+    btn.disabled = true; note.textContent = 'Looking up…'; cand.textContent = '';
+    try {
+      const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
+      const body = await r.json();
+      // The same decision the wizard's box makes — nothing, a single pick, or
+      // a list — so a reply can never mean one thing here and another there.
+      const out = geocodeOutcome((body && body.candidates) || []);
+      if (out.status === 'none') { note.textContent = out.note; btn.disabled = false; return; }
+      if (out.status === 'single') {
+        const c = out.candidate;
+        put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+        note.textContent = `${out.note} Nothing is saved until you save.`;
+        cand.textContent = '';
+        return;
+      }
+      cand.innerHTML = out.candidates.map((c, i) => {
+        return `<button type="button" class="geo-cand" data-idx="${i}"
+          style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+          background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+          color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+          ${esc(placeLabel(c))} (${Number(c.latitude).toFixed(5)}, ${Number(c.longitude).toFixed(5)})</button>`;
+      }).join('');
+      note.textContent = out.note;
+      for (const b of cand.querySelectorAll('.geo-cand')) {
+        b.addEventListener('click', function() {
+          const c = out.candidates[parseInt(this.dataset.idx)];
+          put(SITE_LAT, c.latitude); put(SITE_LON, c.longitude);
+          note.textContent = `${placeLabel(c)} chosen. Nothing is saved until you save.`;
+          cand.textContent = '';
+        });
+      }
+    } catch (e) {
+      note.textContent = 'Could not reach the service.';
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
-function mountExtras() {
+async function mountExtras() {
   const bands = fields.find((f) => f.key === BANDS_KEY);
   if (bands) mountBandEditor(bands);
   const panels = fields.find((f) => f.key === PANELS_KEY);
-  if (panels) mountPanelsEditor(panels);
+  if (panels) await mountPanelsEditor(panels);
   mountLocation();
 }
 
@@ -1568,6 +2054,9 @@ function mountExtras() {
 function currentValue(spec) {
   const el = document.querySelector(`[data-key="${CSS.escape(spec.key)}"]`);
   if (!el) return undefined;
+  // A checkbox holds its answer in `checked`; its `value` is the string "on"
+  // whether it is ticked or not, which would post the same value both ways.
+  if (spec.kind === 'bool') return el.checked;
   const text = el.value;
   if (spec.kind === 'int' || spec.kind === 'float') {
     if (String(text).trim() === '') return isOptional(spec) ? null : undefined;
@@ -1734,6 +2223,9 @@ async function save() {
   const changed = (body && body.changed) || [];
   render();
   applyDisplay(saved);
+  // The tariff may have just changed, so the heatmap is re-read from the
+  // service's own windows rather than trusted to still be right.
+  mountHeatmap();
   if (!changed.length) {
     say('Nothing to change — those were already the stored values.', '');
   } else if (body.restart_required) {
@@ -1799,6 +2291,17 @@ async function load() {
   } catch (e) {
     pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
       + 'service answers.');
+    // No registry means no tab bar, and the Theme area is shown by whichever
+    // tab is current. It answers out of this browser and has nothing to do with
+    // the service, so it stays reachable on the one visit where the page is
+    // otherwise empty rather than disappearing along with the settings.
+    const lookSec = $('lookSec');
+    if (lookSec) lookSec.hidden = false;
+    // The heatmap reads /api/bands on its own and needs no settings registry,
+    // so a failure upstream must not leave it stuck on "Reading the rate
+    // schedule…" — the exact state heatDrawError exists to replace. It draws
+    // from the browser's own zone when the service has not answered.
+    mountHeatmap();
     return;
   }
   // Best-effort: the Connection group renders through the wizard picker when the
@@ -1814,6 +2317,7 @@ async function load() {
   render();
   applyDisplay(saved);
   stamp();
+  mountHeatmap();
 }
 
 function stamp() {
@@ -1879,6 +2383,33 @@ function drawFacts(status, caps) {
     rows.push(factRow(`${prefix}per-module battery`, flagWords(d.per_module_battery)));
     rows.push(factRow(`${prefix}metrics produced`, countWords(d.metrics)));
     rows.push(factRow(`${prefix}per-module metrics`, countWords(d.battery_module_metrics)));
+    // Manufacturer's conversion figures, where the model's spec sheet carries
+    // them. Rendered as fact, never as a setting — nothing computes with them.
+    if (d.conversion) {
+      rows.push('<hr class="facts-rule">');
+      rows.push('<div class="conv-head">What this model is rated at</div>');
+      const c = d.conversion;
+      // Array.includes rather than a Set, because the band-editor test
+      // forbids constructing one in the wiring section below //SLICE_TO.
+      const approx = Array.isArray(c.approximate) ? c.approximate : [];
+      const isApprox = (key) => approx.includes(key);
+      const fmt = (val, key) => isApprox(key) ? `~${val}` : String(val);
+      rows.push(factRow('CEC efficiency',
+        `${fmt(c.cec_pct, 'cec_pct')}%`));
+      rows.push(factRow('PV to grid',
+        `${fmt(c.max_pv_to_grid_pct, 'max_pv_to_grid_pct')}%`));
+      rows.push(factRow('Battery to grid',
+        `${fmt(c.max_battery_to_grid_pct, 'max_battery_to_grid_pct')}%`));
+      rows.push(factRow('PV to battery',
+        `${fmt(c.max_pv_to_battery_pct, 'max_pv_to_battery_pct')}%`));
+      rows.push(factRow('Idle draw normal',
+        `${fmt(c.idle_normal_w, 'idle_normal_w')} W`));
+      rows.push(factRow('Idle draw standby',
+        `${fmt(c.idle_standby_w, 'idle_standby_w')} W`));
+      if (c.citation) {
+        rows.push(factRow('Source', esc(c.citation)));
+      }
+    }
   });
   $('facts').innerHTML = rows.join('');
 }
@@ -1902,10 +2433,89 @@ async function loadFacts() {
       + 'capability nothing declared is shown as undeclared, not as absent.';
 }
 
+// ---------------------------------------------------------------------------
+// Theme: the two choices on this page the registry knows nothing about.
+//
+// Why they are not settings is written beside the section itself. What matters
+// here is that neither control owns its answer — common.js holds the key, the
+// resolver and the writer for both, so the theme glyph in the header and the
+// list below are two views of one value rather than two values that agree
+// until they do not. Choosing here fires themechange and the glyph follows;
+// clicking the glyph fires it and the list follows.
+//
+// Radios rather than a row of pressed buttons, because a radio group already
+// is what this needs: one answer out of a named set, reachable with the arrow
+// keys, and readable by anything that asks the document what is checked. A
+// button styled to look chosen has none of that until it is told each part
+// separately, and the parts that get forgotten are the ones nobody can see.
+// ---------------------------------------------------------------------------
+
+// One group's worth of radios. `named` turns a stored value into the word for
+// it and falls back to the value itself, so a look or a theme added to
+// common.js arrives here labelled by its own name rather than not at all.
+//
+// Which one is the default is inside the label rather than beside it, because a
+// label is what a screen reader reads out for the control: "Glass — the
+// default" is the same sentence the eye gets, where a marker parked outside the
+// label is a fact only sighted readers are told.
+function lookRadios(group, choices, current, named, fallback) {
+  return choices.map((choice) => {
+    const id = `look_${group}_${choice}`;
+    return `<label class="opt" for="${esc(id)}">
+        <input type="radio" id="${esc(id)}" name="${esc(group)}" value="${esc(choice)}"
+          ${choice === current ? 'checked' : ''}>
+        <span>${esc(named[choice] || choice)}</span>
+        ${choice === fallback ? '<span class="was">— the default</span>' : ''}
+      </label>`;
+  }).join('');
+}
+
+// The check is on `el.checked` so only the radio that ended up selected acts;
+// the choice is then handed straight to common.js, which persists it and
+// applies it. Nothing is remembered here — this page is a view of the value and
+// never a second copy of it.
+function wireLook(host, choose) {
+  for (const el of host.querySelectorAll('input')) {
+    el.addEventListener('change', () => { if (el.checked) choose(el.value); });
+  }
+}
+
+function drawLook() {
+  const looks = $('lookAppearance');
+  const modes = $('lookTheme');
+  if (!looks || !modes) return;
+  // The looks are read off the sheet map itself rather than listed again here:
+  // a look this page had not been told about would be a look nobody can pick,
+  // on the one page whose whole job is picking it.
+  looks.innerHTML = lookRadios('appearance', Object.keys(APPEARANCE_SHEET),
+    appearanceChoice(), APPEARANCE_NAMES, APPEARANCE_DEFAULT);
+  modes.innerHTML = lookRadios('colour-mode', THEME_ORDER,
+    themeChoice(), THEME_NAMES, THEME_DEFAULT);
+  wireLook(looks, chooseAppearance);
+  wireLook(modes, chooseTheme);
+}
+
+// The glyph in the header changes the same theme this list does, so the list
+// follows it. Only the checked flag moves: redrawing the group would take the
+// focus with it, and in a radio group the arrow keys move focus and selection
+// together — so redrawing on the change an arrow key just caused would strand
+// the reader somewhere they never arrowed to.
+document.addEventListener('themechange', (event) => {
+  const modes = $('lookTheme');
+  if (!modes) return;
+  for (const el of modes.querySelectorAll('input')) {
+    el.checked = el.value === event.detail.choice;
+  }
+});
+
 // Boot. Everything above is definitions; nothing runs until here. This page
 // does not poll: settings change when somebody changes them, and a background
 // refresh would overwrite a half-typed form.
 drawNav('settings');
+// Drawn before the settings arrive and never again: these two controls are
+// answered by this browser, so they do not wait on the service and a reply that
+// never comes must not take them down with it.
+drawLook();
 $('save').onclick = save;
 $('revert').onclick = () => { render(); clearErrors(); say('', ''); };
 // The form is never submitted: every write goes through save() as JSON. Enter
@@ -1914,6 +2524,286 @@ $('revert').onclick = () => { render(); clearErrors(); say('', ''); };
 $('form').addEventListener('submit', (e) => e.preventDefault());
 load();
 loadFacts();
+
+// ---------------------------------------------------------------------------
+// The rate-schedule heatmap — one grid, 24 hours by 12 months.
+//
+// The Costs page prices from a tariff parsed in exactly one place, the service,
+// and this page must not parse it a second time: the Costs page once did and
+// the two disagreed within a day. So the grid is read from /api/bands, the same
+// windows the dashboard shades its charts with. The service walks the stored
+// tariff and returns every stretch during which a single band was in force;
+// this page only finds which window covers each hour of each month and colours
+// the cell. The pipe-separated grammar never reaches this file.
+//
+// The grid is hourly, so an hour that straddles a boundary is shown as the band
+// in force at the top of the hour — the same resolution the hourly tier uses.
+// An hour no band covers is hatched and named, never left looking like a broken
+// cell: unpriced is a fact about the tariff, not about this page. And a failed
+// read is its own state, visibly different from a tariff nobody entered — a
+// swallowed error that rendered as an empty grid has happened here before.
+// ---------------------------------------------------------------------------
+// >>> rate-schedule-heatmap
+const HEAT_YEAR = new Date().getFullYear();
+const HEAT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const HEAT_HOURS = Array.from({ length: 24 }, (_, h) => h);
+// One hue per band, from the palette's own tokens, in the order the bands first
+// appear. A second encoding only beyond the fifth band: the hue repeats at a
+// lower opacity, and the legend carries the key.
+const HEAT_HUES = ['--pv', '--load', '--batt', '--grid', '--batt-dis'];
+// The 15th of the month, chosen because it clears every clock change this
+// installation's zones make — US, EU and Australian DST all move on other days.
+// That is a fact about the zones served here, not a property of the calendar:
+// Morocco suspends DST mid-month for Ramadan, so a zone whose clock moves on
+// the 15th would probe the wrong hour for that month.
+const HEAT_DAY = 15;
+const HEAT_MINUTES = 1440;
+
+// Whether a band window covers hour ``hour`` of the representative day in month
+// ``month``, in the installation's own wall clock. Both bounds arrive as ISO
+// strings carrying the zone offset, so the date and time before the offset ARE
+// the local clock — no zone arithmetic here, which is the point: the service
+// already did it.
+//
+// The comparison is on a monotonic minute count, not on the day alone. A band
+// that never changes within a month comes back as ONE window spanning the whole
+// month, so its end is the first of the next month — a day number of 1, which a
+// probe on the 15th would read as before its start. The month is folded into
+// the count so the end always sorts after the day it really ends.
+function heatProbe(win, month, hour) {
+  const s = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(win.start);
+  const e = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(win.end);
+  if (!s || !e) return false;
+  const at = (m) => ((Number(m[1]) * 12 + Number(m[2])) * 31 + Number(m[3])) * HEAT_MINUTES
+    + Number(m[4]) * 60 + Number(m[5]);
+  const probe = ((HEAT_YEAR * 12 + month) * 31 + HEAT_DAY) * HEAT_MINUTES + hour * 60;
+  return at(s) <= probe && probe < at(e);
+}
+
+async function heatMonth(month, zone) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const start = `${HEAT_YEAR}-${pad(month)}-01T00:00:00`;
+  const end = month === 12
+    ? `${HEAT_YEAR + 1}-01-01T00:00:00`
+    : `${HEAT_YEAR}-${pad(month + 1)}-01T00:00:00`;
+  // The query string is built here rather than appended, for the reason the
+  // dashboard's comment records: zoneQuery() leads with '?' and lands mid-URL
+  // after an existing query, which 422s the request and renders a chart that
+  // looks exactly like no tariff configured.
+  const url = `/api/bands?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : '');
+  const response = await fetch(url);
+  if (!response.ok) {
+    // A validation refusal arrives as a list of {loc, msg} objects, and an
+    // array wrapped in a new Error renders as the literal "[object Object]"
+    // — so the messages are pulled out and joined into one sentence the card
+    // can show. A string detail (the endpoints' own 400s) is used as it is.
+    let detail = '';
+    try {
+      const body = await response.json();
+      const raw = body && body.detail;
+      if (Array.isArray(raw)) {
+        detail = raw.map((item) => {
+          if (item && typeof item === 'object' && item.msg) return String(item.msg);
+          return String(item);
+        }).join('; ');
+      } else if (typeof raw === 'string') {
+        detail = raw;
+      }
+    } catch (err) { detail = ''; }
+    throw new Error(detail || `the service answered ${response.status}`);
+  }
+  const body = await response.json();
+  if (!body || body.configured === undefined || !Array.isArray(body.windows)) {
+    throw new Error('the rate schedule came back in an unexpected shape');
+  }
+  return body;
+}
+
+let heatGen = 0;     // supersedes a slower earlier load
+let heatCells = null;  // 12x24: null (no band) | {band, price}
+let heatHues = null;   // band name -> {hue, alpha}
+
+async function mountHeatmap() {
+  const host = $('heatHost');
+  if (!host) return;
+  const gen = ++heatGen;
+  let zone = '';
+  try { zone = await siteZone(); } catch (err) { zone = ''; }
+
+  const settled = await Promise.allSettled(HEAT_MONTHS.map((_, m) => heatMonth(m + 1, zone)));
+  if (gen !== heatGen) return;
+
+  const ok = settled.filter((r) => r.status === 'fulfilled');
+  // No tariff is one answer and a failed read is another; the two are drawn
+  // differently below. A month the service answered with configured:false means
+  // the whole tariff is absent, so the grid is legitimately empty.
+  if (ok.length && ok[0].value.configured === false) {
+    heatDrawEmpty();
+    return;
+  }
+  if (!ok.length) {
+    const first = settled.find((r) => r.status === 'rejected');
+    heatDrawError(first ? first.reason : new Error('the service did not answer'));
+    return;
+  }
+  if (ok.length !== settled.length) {
+    const first = settled.find((r) => r.status === 'rejected');
+    heatDrawError(first ? first.reason : new Error('some months could not be read'));
+    return;
+  }
+
+  const cells = [];
+  for (let m = 0; m < 12; m += 1) {
+    const row = [];
+    for (let h = 0; h < 24; h += 1) row.push(null);
+    const windows = settled[m].value.windows;
+    for (let h = 0; h < 24; h += 1) {
+      const win = windows.find((w) => heatProbe(w, m + 1, h));
+      if (win && win.band !== null && win.band !== undefined) {
+        row[h] = { band: win.band, price: win.price_per_kwh };
+      }
+    }
+    cells.push(row);
+  }
+  heatCells = cells;
+  heatHues = heatAssignHues(cells);
+  heatDraw();
+}
+
+function heatAssignHues(cells) {
+  const order = [];
+  for (let m = 0; m < 12; m += 1) {
+    for (let h = 0; h < 24; h += 1) {
+      const cell = cells[m][h];
+      if (cell && order.indexOf(cell.band) < 0) order.push(cell.band);
+    }
+  }
+  const hues = {};
+  order.forEach((name, i) => {
+    const hue = HEAT_HUES[i % HEAT_HUES.length];
+    const cycle = Math.floor(i / HEAT_HUES.length);
+    hues[name] = { hue, alpha: cycle === 0 ? 1 : Math.max(0.45, 1 - cycle * 0.2) };
+  });
+  return hues;
+}
+
+// The band's fill. A full-strength band carries the theme's own token so a
+// change of look or theme re-resolves it; a repeated-hue band is a snapshot of
+// the token faded, and the themechange listener below redraws so it follows.
+function heatFill(entry) {
+  if (!entry) return 'background:var(--tint)';
+  return entry.alpha === 1
+    ? `background:var(${entry.hue})`
+    : `background:${fade(entry.hue, entry.alpha)}`;
+}
+
+function heatRate(price, cur) {
+  if (price === null || price === undefined || !isFinite(price)) return DASH;
+  const sym = String(cur || '$');
+  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
+  return sym + gap + Number(price).toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 5 });
+}
+
+function heatDraw() {
+  const host = $('heatHost');
+  if (!host || !heatCells) return;
+  const cur = currencyNow();
+  const priceOf = {};
+  for (let m = 0; m < 12; m += 1) {
+    for (let h = 0; h < 24; h += 1) {
+      const cell = heatCells[m][h];
+      if (cell && priceOf[cell.band] === undefined) priceOf[cell.band] = cell.price;
+    }
+  }
+
+  const header = '<th scope="col">Month</th>'
+    + HEAT_HOURS.map((h) => `<th scope="col">${h}</th>`).join('');
+  const body = HEAT_MONTHS.map((name, m) => {
+    const cells = [];
+    for (let h = 0; h < 24; h += 1) {
+      const cell = heatCells[m][h];
+      const label = cell ? cell.band : 'no band';
+      const title = cell
+        ? `${cell.band} · ${heatRate(cell.price, cur)}`
+        : 'No band covers this hour — nothing is priced in these hours';
+      cells.push(cell
+        ? `<td style="${heatFill(heatHues[cell.band])}" title="${esc(title)}">`
+          + `<span class="sr-only">${esc(label)}</span></td>`
+        : `<td class="none" title="${esc(title)}">`
+          + `<span class="sr-only">${esc(label)}</span></td>`);
+    }
+    return `<tr><th scope="row">${esc(name)}</th>${cells.join('')}</tr>`;
+  }).join('');
+
+  const legend = heatLegend(priceOf, cur);
+  const cap = 'Each cell is the band in force at the top of that hour, on the 15th of the '
+    + 'month, in the installation’s own wall clock. An hour that straddles a band boundary is '
+    + 'shown as the band at its top; an hour no band covers is hatched, because energy used '
+    + 'then is priced by no band at all. This is the schedule the service reads from the '
+    + 'stored tariff, so it changes when the tariff is saved, not as the editor above is typed.';
+
+  host.innerHTML = `<div class="heat-wrap"><table class="heatmap" `
+    + `aria-label="Which rate band covers each hour of each month">`
+    + `<thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`
+    + legend
+    + `<p class="heatcap">${cap}</p>`;
+}
+
+function heatLegend(priceOf, cur) {
+  const swatches = Object.keys(heatHues).map((name) =>
+    `<span class="heat-key"><i style="${heatFill(heatHues[name])}"></i>`
+    + `${esc(name)} · ${esc(heatRate(priceOf[name], cur))}</span>`).join('');
+  const none = '<span class="heat-key"><i class="none"></i>No band · nothing is priced '
+    + 'in these hours</span>';
+  return `<div class="heat-legend">${swatches}${none}</div>`;
+}
+
+// The legitimate empty state. Drawn only when the service itself says no tariff
+// is configured, so it can never be confused with a read that failed.
+function heatDrawEmpty() {
+  const host = $('heatHost');
+  if (!host) return;
+  const hasText = Boolean(saved[BANDS_KEY] && String(saved[BANDS_KEY]).trim());
+  host.innerHTML = hasText
+    ? '<p class="heat-note warn"><b>The stored tariff cannot be read.</b> A tariff is '
+      + 'entered, but the service does not understand it, so there is no schedule to draw. '
+      + 'The editor above shows it as text.</p>'
+    : '<p class="heat-note">No tariff entered, so there is no schedule to draw. Enter the '
+      + 'rate bands above and save — the grid appears here, and the Costs page starts '
+      + 'pricing.</p>';
+  heatCells = null;
+  heatHues = null;
+}
+
+// The failed read, drawn to look nothing like the empty state above: the grid
+// is missing because the service did not answer, not because nothing is priced.
+function heatDrawError(reason) {
+  const host = $('heatHost');
+  if (!host) return;
+  const raw = reason && reason.message ? reason.message : String(reason);
+  const message = raw.charAt(0).toUpperCase() + raw.slice(1);
+  host.innerHTML = `<div class="heat-err" role="alert">
+      <b>The rate schedule could not be read.</b>
+      <span>${esc(message)}.</span>
+      <p class="heat-note">This is not the same as having no tariff — the grid is missing
+        because the service did not answer, not because nothing is priced. Check that the
+        service is up, then try again.</p>
+      <button type="button" class="iconbtn" id="heatRetry">Try again</button>
+    </div>`;
+  const retry = $('heatRetry');
+  if (retry) retry.addEventListener('click', mountHeatmap);
+  heatCells = null;
+  heatHues = null;
+}
+
+// A change of theme or look re-resolves the palette, and a repeated-hue band is
+// painted from a faded snapshot — redraw from the cached grid, which is cheap
+// and needs no second read of the service.
+document.addEventListener('themechange', () => { if (heatCells) heatDraw(); });
+// <<< rate-schedule-heatmap
 </script>
 </body>
 </html>

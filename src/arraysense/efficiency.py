@@ -118,17 +118,46 @@ def _daylight_weights(
     return weights
 
 
+def _wall_clock_hours(start: datetime, end: datetime) -> int:
+    """How many hour slots the range covers as the wall clock reads them.
+
+    Deliberately *not* elapsed time. Every hour in this module is addressed by
+    its offset from the range's opening edge on the owner's own clock — that is
+    what ``start + timedelta(hours=offset)`` produces and what the row index is
+    built from — so the count of slots has to be read the same way or the two
+    disagree by an hour twice a year. The zone is dropped explicitly rather
+    than subtracted away, because CLAUDE.md records that subtracting two aware
+    datetimes sharing a ``tzinfo`` silently ignores the zone: here that is the
+    answer wanted, and saying so is what stops the next reader from "fixing" it
+    into elapsed time.
+
+    A spring-forward day therefore offers twenty-four slots of which one names
+    an hour that did not happen; no row can carry it, so it is skipped. A
+    fall-back day offers twenty-four for twenty-five real hours and the
+    repeated hour keeps one of its two rows. Both were true before this
+    function existed and neither is what the range length decides.
+    """
+    return round((end.replace(tzinfo=None) - start.replace(tzinfo=None)).total_seconds() / 3600)
+
+
 def _hourly_rows(
     store: SqliteStore,
     day_start: datetime,
     day_end: datetime,
     mppt_indices: list[int],
     tz: tzinfo,
+    span: int,
 ) -> dict[int, dict[str, object]]:
     """Return the hourly-tier rows indexed by hour offset from ``day_start``.
 
     An hour with no inverter reading is a collector gap and is excluded from
     both sides; an hour with no irradiance inputs is one the model cannot run.
+
+    ``span`` is how many hour slots the caller means to score, and rows outside
+    it are dropped. It is a parameter rather than a constant twenty-four
+    because this is asked over a week and a month as well as a day: hard-coding
+    the day threw away every hour after the first, which left the Efficiency
+    page hunting a month's worst hour inside its first morning.
 
     Returns a dict of ``hour_offset -> row`` where row is the decoded query
     result keyed by metric name.
@@ -161,9 +190,64 @@ def _hourly_rows(
         assert isinstance(ts, datetime)
         local = ts.astimezone(tz)
         hour_offset = (local - day_start).days * 24 + local.hour
-        if 0 <= hour_offset < 24:
+        if 0 <= hour_offset < span:
             by_hour[hour_offset] = row
     return by_hour
+
+
+def _fit_baselines(
+    rows_by_hour: dict[int, dict[str, object]],
+    strings: Sequence[StringSpec],
+) -> dict[str, StringBaseline | None]:
+    """Fit each string's ordinary operating point from the rows in hand.
+
+    Split out of ``compute_hours`` so the endpoint that tells an owner their
+    system is calibrated can ask what was actually fitted instead of inferring
+    it. It reported a window whenever any daily row existed, on the stated
+    reasoning that a day whose baseline could not be fitted returns no rows —
+    which is not what happens: an unfitted string simply has its signature test
+    disabled and the day is scored without it, so "Calibrated from <date>"
+    appeared for a system where nothing had been fitted and no curtailment could
+    ever be booked. Every morning on the reference installation is that state.
+
+    Fitting it twice would be worse than not reporting it, so this stays the
+    only place the fit happens and both callers walk through here.
+    """
+    baselines: dict[str, StringBaseline | None] = {}
+    for s in strings:
+        pairs: list[tuple[float, float]] = []
+        for candidate in rows_by_hour.values():
+            volts = candidate.get(f"pv{s.mppt}_voltage_v")
+            amps = candidate.get(f"pv{s.mppt}_current_a")
+            if isinstance(volts, float) and isinstance(amps, float):
+                pairs.append((volts, amps))
+        baselines[s.name] = baseline_for(s.name, pairs)
+    return baselines
+
+
+def fitted_baselines(
+    store: SqliteStore,
+    settings: SettingsStore,
+    start: datetime,
+    end: datetime,
+    strings: Sequence[StringSpec],
+) -> dict[str, StringBaseline | None]:
+    """What the curtailment rule was calibrated against over this range.
+
+    The same rows and the same fit ``compute_hours`` runs on, so a page saying
+    the array is calibrated is reading the calibration rather than guessing from
+    the presence of a summary row. A string with fewer than three producing
+    hours in the range comes back None, which is the honest "nothing was fitted"
+    the endpoint had no way to express.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("start and end must be timezone-aware")
+    if not strings:
+        return {}
+    mppt_indices = sorted({s.mppt for s in strings})
+    span = _wall_clock_hours(start, end)
+    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, start.tzinfo, span)
+    return _fit_baselines(rows_by_hour, strings)
 
 
 @dataclass(frozen=True)
@@ -242,28 +326,20 @@ def compute_hours(
 
     tz = start.tzinfo
     mppt_indices = sorted({s.mppt for s in strings})
-    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz)
+    span = _wall_clock_hours(start, end)
+    rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz, span)
     if not rows_by_hour:
         return []
 
     # Each string against its own operating point, the bank against its own
     # widest charge limit. See curtailment.py for why neither may be a constant.
-    baselines: dict[str, StringBaseline | None] = {}
-    for s in strings:
-        pairs: list[tuple[float, float]] = []
-        for candidate in rows_by_hour.values():
-            volts = candidate.get(f"pv{s.mppt}_voltage_v")
-            amps = candidate.get(f"pv{s.mppt}_current_a")
-            if isinstance(volts, float) and isinstance(amps, float):
-                pairs.append((volts, amps))
-        baselines[s.name] = baseline_for(s.name, pairs)
+    baselines = _fit_baselines(rows_by_hour, strings)
     seen_limits: list[float | None] = []
     for candidate in rows_by_hour.values():
         limit_reading = candidate.get("bms_charge_current_limit_a")
         seen_limits.append(limit_reading if isinstance(limit_reading, float) else None)
     limit_anchor = window_max_limit(seen_limits)
 
-    span = round((end.astimezone(UTC) - start.astimezone(UTC)).total_seconds() / 3600)
     hours: list[HourEfficiency] = []
     for offset in range(span):
         when = start + timedelta(hours=offset)
@@ -314,7 +390,7 @@ def compute_hours(
             string_poa = poa_irradiance(
                 ghi, dni, dhi, elevation, sun_azimuth, s.tilt, s.azimuth, day_of_year
             )
-            cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting)
+            cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting, s.noct)
             exp_kwh = expected_watts(s, string_poa, cell_c, when.astimezone(UTC)) / 1000.0
             act_kwh = act_w / 1000.0
             volts = row.get(f"pv{s.mppt}_voltage_v")
@@ -407,6 +483,13 @@ def compute_day(
 
     rows: list[EfficiencyRow] = []
     for s in strings:
+        # A string the inverter never reported has no row, for the same reason
+        # a day nobody watched has none. Zero expected against zero actual is a
+        # claim that this string was meant to make nothing and made nothing,
+        # and the page renders it as a specific yield of 0.0 kWh/kWp — an
+        # unmeasured third of the array presented as a dead one.
+        if modelled[s.name] == 0:
+            continue
         exp = expected[s.name]
         act = actual[s.name]
         refused = curtailed[s.name]

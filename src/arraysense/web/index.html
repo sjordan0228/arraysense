@@ -166,14 +166,18 @@
      class names cannot reach the bars and rows the rest of the page draws. */
   .dtl{margin-top:10px}
   .dtl .rel{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:10px}
-  .dtl h3{font-size:11px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
+  .dtl h3{font-size:12.5px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
+  /* The heading icon sits on the heading's own line and inherits its ink; only
+     the gap is this rule's to give. It is the icon, never the label, so it
+     stays aria-hidden and the text that names the panel is unchanged. */
+  .dtl h3 .ic{margin-right:6px}
   /* Captions are sentences, not labels. They borrow .lbl for its colour and
      have to undo the rest of it: uppercase with .17em tracking at 9.5px turns
      a diagnosis into shouting nobody reads. */
-  .dtl .cap{display:block;margin-top:9px;line-height:1.5;font-size:10.5px;
+  .dtl .cap{display:block;margin-top:9px;line-height:1.5;font-size:11.5px;
     letter-spacing:0;text-transform:none;color:var(--ink3)}
   .dtl .strrow{display:grid;grid-template-columns:22px 1fr 106px;gap:9px;align-items:center;
-    font-size:11px;color:var(--ink2);margin-bottom:7px}
+    font-size:12px;color:var(--ink2);margin-bottom:7px}
   .dtl .bar{height:15px;border-radius:4px;background:var(--tint);position:relative;overflow:hidden}
   .dtl .bar i{position:absolute;inset:0 auto 0 0;border-radius:4px;display:block}
   .dtl .bar span{position:absolute;right:6px;top:0;line-height:15px;font-size:10px;
@@ -188,8 +192,17 @@
   .dtl .pairbar{display:flex;gap:3px;align-items:flex-end;height:44px;margin:6px 0 3px}
   .dtl .pairbar div{flex:1;border-radius:3px 3px 0 0}
   .dtl .delta{display:flex;align-items:baseline;gap:7px;margin-top:2px}
-  .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;font-variant-numeric:tabular-nums}
-  .dtl .kv{gap:12px}
+  /* The figure never breaks from its unit. These sit in a flex row beside a
+     caption that can be long — "between BMS and inverter" — and without this
+     the unit wraps onto its own line and 0.3 V reads as 0.3 and then V. The
+     caption is the thing that should wrap, so it is the one left free to. */
+  .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;
+    font-variant-numeric:tabular-nums;white-space:nowrap}
+  /* The detail rows are this view's body text, so they sit above the shared
+     .kv size — this is a page somebody reads closely, not a card to glance
+     at. The rows stay flex space-between, so a taller figure changes no
+     layout. */
+  .dtl .kv{gap:12px;font-size:12px}
   .dtl .ok{color:var(--good)}
   .dtl .bd{color:var(--bad);font-weight:700}
   .dtl .pill{display:inline-block;font-size:9.5px;padding:2px 7px;border-radius:20px;
@@ -209,15 +222,29 @@
   .mod .more{display:none}
   :root.dtl-open .mod .more{display:block}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div style="display:flex;align-items:center;gap:12px">
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
       <div class="conn" id="conn"><span class="dot" style="background:var(--ink3)"></span>connecting…</div>
-      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙</button>
+      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings"><svg class="ic" aria-hidden="true"><use href="#ph-gear"></use></svg></button>
     </div>
   </header>
 
@@ -278,7 +305,11 @@
       <!-- Drawn from the inverter's own kWh counters, so the two sides balance
            and the difference between them is real conversion loss rather than
            an artefact of how we added things up. -->
-      <svg id="sankey" viewBox="0 0 900 400" role="img"
+      <!-- A group and not an image. Every ribbon in here is focusable and says
+           its own figure and share, and role="img" prunes a subtree: it would
+           make the whole diagram one unreadable label and leave a keyboard
+           reader tabbing through elements that announce nothing. -->
+      <svg id="sankey" viewBox="0 0 900 400" role="group"
            aria-label="Energy flow through the inverter so far today"></svg>
       <div class="sankwait" id="sankeyWait" hidden>waiting for the inverter's energy counters</div>
     </section>
@@ -296,7 +327,7 @@
   <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span><span id="skyReadout" class="muted"></span></div>
   <div class="toprow">
     <div class="p hero">
-      <div class="lbl">Producing now</div>
+      <div class="lbl"><svg class="ic" style="color:var(--pv)" aria-hidden="true"><use href="#ph-sun"></use></svg>Producing now</div>
       <div class="v" id="pv">—<span> kW</span></div>
       <!-- The inverter's own daily counter, not a figure computed from the
            stored power. Integrating would agree on a clean day and quietly
@@ -308,17 +339,17 @@
       <!-- Today beside each flow comes from the inverter's own daily counters
            for the same reason the solar one does, and it is why there is no
            second request: /api/live already carries every column. -->
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--load)" aria-hidden="true"><use href="#ph-house"></use></svg>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
       <!-- The icon sits beside the power figure rather than replacing the
            percentage: the fill is a shape somebody reads at a glance,
            and the number is what they read when the glance is not enough. One
            encodes, the other confirms, and colour is the third and least of
            them. -->
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--batt)" aria-hidden="true"><use href="#ph-battery-charging"></use></svg>Battery</span>
         <div class="battrow"><span class="batticon" id="battIcon"></span><b id="batt">—</b></div>
         <span class="sub" id="battState">—</span>
         <span class="sub" id="battPack"></span></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--grid)" aria-hidden="true"><use href="#ph-plug"></use></svg>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
   </div>
 
@@ -622,8 +653,12 @@ function showBattery(battery, inverter) {
 
 async function loadLive() {
   try {
+    // fetchLive rather than a fetch of its own: it is the same request, and it
+    // hands the payload to the header strip on the way past. Two requests would
+    // be two readings, and the strip could then print a figure the card
+    // directly below it disagrees with.
     const [live, status, cal] = await Promise.all([
-      fetch('/api/live').then(r => r.json()),
+      fetchLive(),
       fetch('/api/status').then(r => r.json()),
       fetchCalibration(),
     ]);
@@ -909,6 +944,16 @@ function moduleDetail(m) {
 // them is a stored sentence with numbers dropped in, and none of them appears
 // at all when an input is missing — a page whose whole argument is that absent
 // data is not zero cannot afford a derived claim resting on an absent number.
+//
+// Each heading carries an icon, chosen for what the panel is about rather than
+// what it draws. PV Strings takes the solar panel itself — a sun would point at
+// the weather, and this panel is about what the strings did. Backup legs takes
+// the double plug because it is the EPS legs, and Grid & AC the single one.
+// Inverter Temp takes the thermometer, Cable drop the downward trend of voltage
+// lost along the run, and Energy the bolt. BMS takes the circuit board — the
+// battery's own electronics reporting — which is a different thing from the
+// battery, and the summary card already uses ph-battery-charging for that.
+// Status takes the pulse: whether the device is alive and what it is doing.
 // ---------------------------------------------------------------------------
 
 const runtimeStr = (s) => {
@@ -1059,7 +1104,7 @@ function detailStrings(i) {
       <div class="bar${r.p === null ? ' none' : ''}">${fill}<span>${wStr(r.p)}</span></div>
       <span class="sublab">${uStr(r.a, 2, 'A')} · ${uStr(r.v, 0, 'V')}</span></div>`;
   }).join('');
-  return `<div class="p"><h3>PV Strings</h3>${rows}${capOf(stringCaption(s))}</div>`;
+  return `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-solar-panel"></use></svg>PV Strings</h3>${rows}${capOf(stringCaption(s))}</div>`;
 }
 
 // The two legs of a split-phase backup circuit are wired independently and
@@ -1136,7 +1181,7 @@ function detailLegs(i) {
     ${capHasMetric(caps, 'eps_l1_power_w') && capHasMetric(caps, 'eps_l2_power_w')
         && capHasMetric(caps, 'eps_l1_apparent_power_va') && capHasMetric(caps, 'eps_l2_apparent_power_va')
         ? capOf(pfCap) : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Backup legs</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-plugs"></use></svg>Backup legs</h3>${body}</div>`;
 }
 
 // Full scale for the heatsink bars, in Celsius. The conversion for display
@@ -1188,7 +1233,7 @@ function detailHeat(i) {
     ${capHasMetric(caps, 'radiator1_temperature_c') && capHasMetric(caps, 'radiator2_temperature_c')
         ? capOf(spread) : ''}
     `;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Inverter Temp</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-thermometer-simple"></use></svg>Inverter Temp</h3>${body}</div>`;
 }
 
 // The BMS measures at the cells and the inverter at its own terminals, so the
@@ -1209,7 +1254,7 @@ function detailDrop(i) {
     ${capRow(caps, 'battery_voltage_inv_sample_v', 'At the terminals', uStr(inv, 1, 'V'))}
     ${both && d !== null ? capOf('Watch this widen under load — that points at a lug or a busbar') : ''}
     `;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Cable drop</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-trend-down"></use></svg>Cable drop</h3>${body}</div>`;
 }
 
 // State of charge as a percentage hides how much energy that is, and hides
@@ -1317,7 +1362,7 @@ function detailEnergy(i, mods) {
     ${capHasModuleMetric(caps, 'remaining_capacity_ah') ? capOf(cap) : ''}
     ${capHasMetric(caps, 'battery_max_cell_voltage_v') && capHasMetric(caps, 'battery_min_cell_voltage_v') ? capOf(cellCap) : ''}
     ${capHasMetric(caps, 'battery_module_count') ? capOf(countCap) : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Energy</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-lightning"></use></svg>Energy</h3>${body}</div>`;
 }
 
 function detailBms(i) {
@@ -1343,7 +1388,7 @@ function detailBms(i) {
         && numOrNull(i.bms_discharge_current_limit_a) === null ? ''
         : capOf('Limits fall when the pack is cold or near full — that is what stalls a charge')
       }`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>BMS</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-circuitry"></use></svg>BMS</h3>${body}</div>`;
 }
 
 // Grid, AC and status hold no two numbers that mean something together, so
@@ -1366,7 +1411,7 @@ function detailGrid(i) {
         ? capOf('Both of those are grid-direction figures and read zero on this '
           + 'installation: nothing is sold back, and the bank charges from the array '
           + 'rather than from the mains. Neither is the inverter idling.') : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Grid &amp; AC</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-plug"></use></svg>Grid &amp; AC</h3>${body}</div>`;
 }
 
 function detailStatus(i) {
@@ -1384,7 +1429,7 @@ function detailStatus(i) {
         { metric: 'bus_voltage_1_v', label: '1', v: b1 },
         { metric: 'bus_voltage_2_v', label: '2', v: b2 },
       ]), 'DC bus', (v) => uStr(v, 1), 'V', ' / ')}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Status</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-pulse"></use></svg>Status</h3>${body}</div>`;
 }
 
 // Present or absent, from the declaration; the panels themselves stay
@@ -1556,9 +1601,12 @@ function drawBattery(points) {
 }
 
 // Today's energy as a flow diagram, from the inverter's own counters. The two
-// sides balance by construction — everything entering the inverter leaves it —
-// so the gap between them is conversion loss, which is a real quantity and not
-// a rounding artefact. A line chart cannot show that at all.
+// sides are assumed to balance — everything entering the inverter leaves it —
+// and the difference is drawn as conversion loss. That identity is the
+// diagram's premise, not a guarantee: counters on different buses can disagree,
+// and when they do the loss is clamped at nothing and the surplus rides on the
+// sink side, whose shares can then sum past 100%. A line chart cannot show
+// that at all.
 function drawSankey(i) {
   const g = (k) => numOrNull(i[k]);
   const solar = g('pv_energy_today_kwh');
@@ -1571,7 +1619,7 @@ function drawSankey(i) {
   // Every term is required. Standing a zero in for a missing counter would
   // unbalance the diagram and present the imbalance as loss.
   if ([solar, gridIn, battIn, battOut, house].some((v) => v === null)) {
-    $('sankey').innerHTML = '';
+    sankeyClear($('sankey'));
     $('sankeyWait').hidden = false;
     $('flowTotal').textContent = '';
     return;
@@ -1581,43 +1629,95 @@ function drawSankey(i) {
   const inTotal = solar + gridIn + battOut;
   const loss = Math.max(0, inTotal - (house + battIn + gridOut));
   $('flowTotal').textContent = `${inTotal.toFixed(1)} kWh through the inverter today`;
-  if (inTotal <= 0) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+  if (inTotal <= 0) { sankeyClear($('sankey')); $('sankeyWait').hidden = false; return; }
 
-  const W = 900, XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
+  // What is on each path this minute, from the same payload the counters came
+  // in. The widths are the day; these are the moment, and they are what paces
+  // the flow travelling along each ribbon — so a ribbon fat with this morning's
+  // sun sits still at dusk while the bank's ribbon moves.
+  //
+  // Both signed readings are split by direction rather than taken as they come:
+  // grid_power_w is positive importing and negative exporting, battery_power_w
+  // positive charging and negative discharging, and each ribbon wants the half
+  // that belongs to it. A path in the other direction carries nothing, which is
+  // a reading of zero and not an absence — but an unreported one stays null.
+  const rising = (v) => v === null ? null : Math.max(0, v);
+  const falling = (v) => v === null ? null : Math.max(0, -v);
+  const gridNow = g('grid_power_w');
+  const battNow = g('battery_power_w');
+
+  const XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
   const scale = (BOT - TOP) / inTotal;
   const stack = (items, x) => {
     let y = TOP;
-    const out = items.filter(([, v]) => v > 0.05).map(([name, v, col]) => {
-      const n = { name, v, col, x, y, h: v * scale };
-      y += n.h + 10;
-      return n;
+    const out = items.filter((n) => n.v > 0.05).map((n) => {
+      const node = Object.assign({ x, y, h: n.v * scale }, n);
+      y += node.h + 10;
+      return node;
     });
     const shift = (BOT - (y - 10)) / 2;
     out.forEach((n) => { n.y += shift; });
     return out;
   };
-  const src = stack([['Solar', solar, 'var(--pv)'], ['Grid', gridIn, 'var(--grid)'],
-                     ['Battery out', battOut, 'var(--batt)']], X1);
-  const hub = stack([['Inverter', inTotal, 'var(--ink3)']], X2 - 60);
-  const snk = stack([['House', house, 'var(--load)'], ['Battery in', battIn, 'var(--batt)'],
-                     ['Exported', gridOut, 'var(--grid)'], ['Losses', loss, 'var(--ink3)']], X3);
+  const src = stack([
+    { name: 'Solar', v: solar, col: 'var(--pv)', rate: rising(g('pv_total_power_w')) },
+    { name: 'Grid', v: gridIn, col: 'var(--grid)', rate: rising(gridNow) },
+    { name: 'Battery out', v: battOut, col: 'var(--batt)', rate: falling(battNow) },
+  ], X1);
+  const hub = stack([{ name: 'Inverter', v: inTotal, col: 'var(--ink3)' }], X2 - 60);
+  const snk = stack([
+    { name: 'House', v: house, col: 'var(--load)', rate: rising(g('load_power_w')) },
+    { name: 'Battery in', v: battIn, col: 'var(--batt)', rate: rising(battNow) },
+    { name: 'Exported', v: gridOut, col: 'var(--grid)', rate: falling(gridNow) },
+    // Conversion loss is the one quantity here nobody meters: it is what the two
+    // sides do not account for. So it is hatched rather than filled — the
+    // texture this site already spends on "not measured" — and it has no live
+    // rate to pace it, because deriving an instantaneous loss from four power
+    // readings taken at slightly different moments would be a new figure
+    // invented at the last step of a diagram whose whole claim is that it comes
+    // off the inverter's own counters.
+    { name: 'Losses', v: loss, col: 'var(--ink3)', rate: null, hatch: true },
+  ], X3);
+  if (!hub.length) { sankeyClear($('sankey')); $('sankeyWait').hidden = false; return; }
 
-  const ribbon = (x0, y0, x1, y1, h, col) => {
-    const mx = (x0 + x1) / 2;
-    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
-      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
-      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
-      + `fill="${col}" fill-opacity="0.34"/>`;
-  };
-  let out = '';
-  if (!hub.length) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+  // The two halves of the diagram, as ribbons. Both share of the same total,
+  // assuming the identity holds — everything entering the inverter equals
+  // everything leaving it — so each side normally sums to 100% and a percentage
+  // means the same thing wherever it is read. When the counters disagree the
+  // loss clamps to zero and the sink side's shares sum past 100%; the tooltip
+  // then reads a figure that is honest about the counters.
+  const ribbons = [];
   let hy = hub[0].y;
-  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col); hy += n.h; }
+  for (const n of src) {
+    ribbons.push({
+      x0: n.x + XW, y0: n.y, x1: hub[0].x, y1: hy, h: n.h, side: 'in',
+      col: n.col, rate: n.rate, hatch: n.hatch,
+      title: `${n.name} → Inverter`, value: `${n.v.toFixed(1)} kWh`,
+      share: sankeyShare(n.v, inTotal),
+    });
+    hy += n.h;
+  }
   hy = hub[0].y;
-  for (const n of snk) { out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col); hy += n.h; }
+  for (const n of snk) {
+    ribbons.push({
+      x0: hub[0].x + XW, y0: hy, x1: n.x, y1: n.y, h: n.h, side: 'out',
+      col: n.col, rate: n.rate, hatch: n.hatch,
+      title: `Inverter → ${n.name}`, value: `${n.v.toFixed(1)} kWh`,
+      share: sankeyShare(n.v, inTotal),
+    });
+    hy += n.h;
+  }
+
+  let out = '';
   for (const n of [...src, ...hub, ...snk]) {
     out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
       + `rx="3" fill="${n.col}"/>`;
+    // The node carries the same texture its ribbon does, so the two read as one
+    // quantity rather than as a solid block feeding a hatched stream.
+    if (n.hatch) {
+      out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
+        + `rx="3" fill="url(#${SANKEY_HATCH_ID})"/>`;
+    }
     const right = n.x > 500;
     const isHub = n.name === 'Inverter';
     const tx = isHub ? n.x + XW / 2 : right ? n.x - 9 : n.x + XW + 9;
@@ -1629,7 +1729,12 @@ function drawSankey(i) {
         + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
         + `${n.v.toFixed(1)} kWh</text>`;
   }
-  $('sankey').innerHTML = `<g class="sank">${out}</g>`;
+  sankeyRender($('sankey'), ribbons, out, {
+    hub: 'var(--ink3)',
+    measure: 'Today',
+    total: `${inTotal.toFixed(1)} kWh`,
+    pace: 'live',
+  });
 }
 
 // Two views of the same poll: what is happening now, and where the day's energy
@@ -1654,7 +1759,10 @@ function wireTabs() {
     const held = localStorage.getItem('as.tab');
     return held === 'flow' || held === 'viewFlow' ? 'flow' : 'now';
   };
-  window.addEventListener('hashchange', () => show(wanted()));
+  // Switching views is the one same-document navigation this page makes, so it
+  // is the one that may crossfade. The first paint of the page — the show()
+  // below, on boot — is not a switch and gets no fade.
+  window.addEventListener('hashchange', () => crossfade(() => show(wanted())));
   show(wanted());
 }
 
@@ -1839,6 +1947,12 @@ function drawForecast(fc) {
     height: 180,
     unit: 'kW',
     opts: chartBase({
+      // Not in the page's sync group. Every other chart on this page follows
+      // the selected window; this one is pinned to the fixed calendar day the
+      // forecast answers for, so an instant a cursor names on it has no home
+      // on the neighbours' ranges and vice versa — the one chart on the page
+      // whose crosshair genuinely has nothing to say elsewhere.
+      sync: false,
       scales: {
         x: { time: true, min: dayStartSec, max: dayEndSec },
         y: { range: powerRange },
@@ -1976,8 +2090,88 @@ function showWizard(payload) {
         inverter, which model, and how it is wired — and it will start collecting.
         Everything here can be changed later on the settings page.</p>
       <div id="wizardHost"></div>
+      <!-- A skippable postcode step. The location is the one thing the
+           service cannot reconstruct on its own — the weather poller
+           records nothing without it, and recovery needs an explicit
+           backfill — so it is worth offering before the first start. -->
+      <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
+        <div style="font-size:14px;font-weight:600;margin-bottom:8px">Where is this installation?</div>
+        <p style="font-size:11px;color:var(--ink3);margin:0 0 10px;max-width:65ch">
+          Enter a postcode or place name so the weather service knows which sky
+          to watch. You can set this later on the settings page — skip it now
+          and the collector starts, but the forecast and the performance model
+          stay blank until a location is entered.
+        </p>
+        <div><input id="wizPostcode" type="text" placeholder="e.g. 76226"
+          style="width:220px;background:var(--tint);border:1px solid var(--panel-b);
+            color:var(--ink);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px">
+          <button type="button" id="wizGeocode" style="margin-left:6px;background:var(--pv);
+            border-color:transparent;color:#1a1204;border-radius:8px;padding:6px 14px;
+            font-weight:600;font-size:13px;cursor:pointer">Look up</button>
+          <span id="wizGeoNote" style="font-size:11px;color:var(--ink3);margin-left:8px"></span>
+        </div>
+        <div id="wizCandidates" style="margin-top:6px;font-size:12px"></div>
+      </div>
     </section>`;
-  mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: applyAndWatch });
+  // Wrap the onApply to carry the postcode result alongside the setup body.
+  // The first-run side reads latitude/longitude/timezone from the
+  // POST body and writes them into the brand-new settings table before
+  // the config file replaces the target.
+  let wizLat = null, wizLon = null, wizTz = null;
+  const _wizOriginalApply = applyAndWatch;
+  function wizApply(body, ui) {
+    if (wizLat != null) body.latitude = wizLat;
+    if (wizLon != null) body.longitude = wizLon;
+    if (wizTz != null) body.timezone = wizTz;
+    return _wizOriginalApply(body, ui);
+  }
+  const setupShell = mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: wizApply });
+  // The postcode lookup. Reads nothing and writes nothing — it only resolves
+  // a name to coordinates, and the apply carries them. The decision is made
+  // by the shared geocodeOutcome in common.js, so the wizard and the settings
+  // page can never disagree about what a reply means.
+  $('wizGeocode').onclick = async function() {
+    const q = $('wizPostcode').value.trim();
+    if (!q) return;
+    const btn = $('wizGeocode'), note = $('wizGeoNote'), cand = $('wizCandidates');
+    btn.disabled = true; note.textContent = 'Looking up…'; cand.textContent = '';
+    try {
+      const r = await fetch('/api/geocode?q=' + encodeURIComponent(q));
+      if (!r.ok) { note.textContent = 'The geocoding service could not be reached.'; btn.disabled = false; return; }
+      const body = await r.json();
+      const out = geocodeOutcome((body && body.candidates) || []);
+      if (out.status === 'none') { note.textContent = out.note; btn.disabled = false; return; }
+      if (out.status === 'single') {
+        const c = out.candidate;
+        wizLat = c.latitude; wizLon = c.longitude; wizTz = c.timezone || null;
+        note.textContent = out.note;
+        cand.textContent = '';
+        return;
+      }
+      // Ambiguity is shown, never resolved silently. Nothing is stored until
+      // one is chosen.
+      cand.innerHTML = out.candidates.map((c, i) => {
+        return `<button type="button" class="wiz-cand" data-idx="${i}"
+          style="display:block;margin:3px 0;padding:4px 8px;cursor:pointer;
+          background:var(--tint);border:1px solid var(--panel-b);border-radius:6px;
+          color:var(--ink);font:inherit;font-size:12px;text-align:left;width:100%">
+          ${esc(placeLabel(c))} (${Number(c.latitude).toFixed(5)}, ${Number(c.longitude).toFixed(5)})</button>`;
+      }).join('');
+      note.textContent = out.note;
+      for (const b of cand.querySelectorAll('.wiz-cand')) {
+        b.addEventListener('click', function() {
+          const c = out.candidates[parseInt(this.dataset.idx)];
+          wizLat = c.latitude; wizLon = c.longitude; wizTz = c.timezone || null;
+          note.textContent = `${placeLabel(c)} chosen.`;
+          cand.textContent = '';
+        });
+      }
+    } catch (e) {
+      note.textContent = 'Could not reach the service.';
+    } finally {
+      btn.disabled = false;
+    }
+  };
 }
 
 // Apply, then watch the restart. The service writes the config and restarts

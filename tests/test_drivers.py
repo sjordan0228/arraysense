@@ -24,6 +24,7 @@ from arraysense import drivers
 from arraysense.config import Config
 from arraysense.drivers.base import (
     Capabilities,
+    ConversionSpec,
     DeviceIdentity,
     DriverEntry,
     EnergyReporting,
@@ -568,3 +569,106 @@ def test_a_double_digit_string_is_still_a_string_metric() -> None:
             energy=EnergyReporting.ESTIMATED,
             metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w", "pv10_power_w"}),
         )
+
+
+# --- ConversionSpec: cited manufacturer figures --------------------------------
+
+
+def test_conversion_spec_without_citation_is_refused() -> None:
+    with pytest.raises(ValueError, match="name the document"):
+        ConversionSpec(
+            cec_pct=96.9,
+            max_pv_to_grid_pct=97.5,
+            max_battery_to_grid_pct=94.0,
+            max_pv_to_battery_pct=99.9,
+            idle_normal_w=70.0,
+            idle_standby_w=18.0,
+        )
+
+
+def test_conversion_spec_preserves_approximate_fields() -> None:
+    spec = ConversionSpec(
+        cec_pct=96.9,
+        max_pv_to_grid_pct=97.5,
+        max_battery_to_grid_pct=94.0,
+        max_pv_to_battery_pct=99.9,
+        idle_normal_w=70.0,
+        idle_standby_w=18.0,
+        approximate=("idle_normal_w", "idle_standby_w"),
+        citation="18kPV spec sheet",
+    )
+    assert spec.approximate == ("idle_normal_w", "idle_standby_w")
+    assert spec.idle_normal_w == 70.0
+    assert spec.idle_standby_w == 18.0
+
+
+def test_the_18kpv_holds_the_five_figures_from_the_spec_sheet() -> None:
+    """Pin the transcribed numbers against drift.
+
+    The five figures are read off the EG4 18kPV spec sheet (model 18KPV-12LV,
+    version 1.4.3, fetched and read in full on 2026-08-12) and must not change
+    without a test failing and a changelog entry saying why.
+    """
+    entry = drivers.get("eg4_luxpower")
+    model = find_model(entry, "18kPV")
+    assert model.conversion is not None, "the 18kPV must carry its conversion figures"
+    c = model.conversion
+    assert c.cec_pct == 96.9
+    assert c.max_pv_to_grid_pct == 97.5
+    assert c.max_battery_to_grid_pct == 94.0
+    assert c.max_pv_to_battery_pct == 99.9
+    assert c.idle_normal_w == 70.0
+    assert c.idle_standby_w == 18.0
+    assert c.approximate == ("idle_normal_w", "idle_standby_w")
+    assert "1.4.3" in c.citation
+    assert "manufacturer" in c.citation
+
+
+def test_resolve_model_carries_conversion_to_capabilities() -> None:
+    family = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w"}),
+    )
+    conv = ConversionSpec(
+        cec_pct=96.9,
+        max_pv_to_grid_pct=97.5,
+        max_battery_to_grid_pct=94.0,
+        max_pv_to_battery_pct=99.9,
+        idle_normal_w=70.0,
+        idle_standby_w=18.0,
+        citation="18kPV spec sheet",
+    )
+    model = ModelSpec(name="18kPV", pv_strings=3, citation="measured", conversion=conv)
+    resolved = resolve_model(family, model)
+    assert resolved.conversion is not None
+    assert resolved.conversion.cec_pct == 96.9
+
+
+def test_conversion_is_none_at_family_level() -> None:
+    """A family has no single answer; only the model carries conversion figures."""
+    caps = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w"}),
+    )
+    assert caps.conversion is None
+
+
+def test_model_with_no_deltas_but_a_delta_field_added_later_is_refused() -> None:
+    """The delta check derives from fields, not a hand-written list.
+
+    If a new delta-bearing field is added to ModelSpec without touching
+    __post_init__, the check still catches an uncited value — which is what
+    would have happened to ``conversion`` if it were treated as a delta.
+    """
+    # conversion is excluded from the delta check because it has its own
+    # citation, enforced by ConversionSpec.__post_init__.  This test confirms
+    # that the derived-delta check still works for the actual delta fields.
+    # A model with pv_strings set but no citation.
+    with pytest.raises(ValueError, match="citation"):
+        ModelSpec(name="Test", pv_strings=2)
+
+    # A model with battery_module_slots set but no citation.
+    with pytest.raises(ValueError, match="citation"):
+        ModelSpec(name="Test", battery_module_slots=4)

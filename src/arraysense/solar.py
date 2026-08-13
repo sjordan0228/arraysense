@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime
 
-from arraysense.panels import StringSpec
+from arraysense.panels import DEFAULT_NOCT, StringSpec
 
 # PVWatts' default derate stack — wiring, connections, mismatch, light-induced
 # degradation, availability — the losses every installation has and none of
@@ -205,7 +205,52 @@ def poa_irradiance(
     return max(beam + circumsolar + isotropic + ground, 0.0)
 
 
-def cell_temperature(poa: float, air_c: float, wind_ms: float, mounting: str) -> float:
+# The conditions NOCT is defined at, per IEC 61215: 800 W/m2 on the module,
+# 20 C air, 1 m/s wind, open circuit. They are what lets a datasheet figure and
+# a Faiman coefficient pair be read as statements about the same thing.
+_NOCT_IRRADIANCE = 800.0
+_NOCT_AIR_C = 20.0
+_NOCT_WIND_MS = 1.0
+
+
+def _faiman_u0(mounting: str, noct: float) -> tuple[float, float]:
+    """This mounting's Faiman coefficients, adjusted for a declared NOCT.
+
+    Faiman at NOCT conditions gives ``T_cell - T_air = 800 / (u0 + u1)``, so
+    every mounting's coefficient pair already implies a NOCT: 45.1 C for the
+    open rack, 65.7 C for a close roof. The open-rack figure is the grammar's
+    own default to within a tenth of a degree, which is what makes the two
+    reconcilable rather than merely combinable.
+
+    The declaration is therefore read as a *difference* from the default, not as
+    an absolute. A module whose datasheet says 48 C runs three degrees hotter at
+    NOCT conditions than the ordinary module the mounting's pair describes,
+    wherever it is mounted — so a close-roof array keeps its whole mounting
+    penalty, which is the larger of the two terms and the one the owner did not
+    get wrong. Reading the declaration as the absolute cell temperature would
+    erase that penalty for anybody who typed their datasheet in correctly.
+
+    A declaration equal to the default returns the mounting's pair unchanged and
+    exactly, so an installation that declares nothing sees no figure move.
+    """
+    u0, u1 = _FAIMAN.get(mounting, _FAIMAN["open_rack"])
+    rise = _NOCT_IRRADIANCE / (u0 + u1) + (noct - DEFAULT_NOCT)
+    # The rise can go to zero or below for an extreme NOCT declaration
+    # (the grammar's own minimum of 20 C on an open rack produces 0.13).
+    # The floor exists solely to prevent a division by zero — it is never
+    # reached by a real datasheet value (41-48 C) on any mounting, and
+    # when it is reached it models the module as sitting near air
+    # temperature, not as running hot.
+    return _NOCT_IRRADIANCE / max(rise, 1.0) - u1, u1
+
+
+def cell_temperature(
+    poa: float,
+    air_c: float,
+    wind_ms: float,
+    mounting: str,
+    noct: float = DEFAULT_NOCT,
+) -> float:
     """How hot the modules are, from the sun on them and the wind over them.
 
     A panel in full sun runs twenty-five to thirty-five degrees above the air
@@ -217,8 +262,13 @@ def cell_temperature(poa: float, air_c: float, wind_ms: float, mounting: str) ->
     Faiman's model, because it takes exactly the inputs a free weather service
     provides: irradiance, air temperature, wind speed. Wind arrives in m/s; the
     weather client converts it once, at the boundary, for this.
+
+    ``noct`` shifts the mounting's coefficients to the module actually
+    installed. It defaults to the grammar's own default, which returns the
+    mounting's pair unchanged, so a string that declares nothing is modelled
+    exactly as it was before this argument existed.
     """
-    u0, u1 = _FAIMAN.get(mounting, _FAIMAN["open_rack"])
+    u0, u1 = _faiman_u0(mounting, noct)
     return air_c + poa / (u0 + u1 * wind_ms)
 
 

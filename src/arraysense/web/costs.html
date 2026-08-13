@@ -68,8 +68,20 @@
     box-shadow:inset 0 0 0 1px var(--tint-2)}
   .tw{overflow-x:auto}
   .hours{font-size:9.5px;color:var(--ink3);letter-spacing:.03em;margin-top:2px}
-  .bandbar{height:4px;border-radius:2px;background:var(--tint);margin-top:5px;overflow:hidden}
-  .bandbar i{display:block;height:100%;width:0;border-radius:2px;background:var(--grid)}
+  /* The inline cost bar. Every fill starts at the same zero on the same
+     full-width track, so the rows compare at a glance. The fill is the grid
+     accent — this is what the owner paid the grid — and the track is the
+     neutral the page gives an empty length. */
+  .bandbar{height:5px;border-radius:3px;background:var(--tint-2);margin-top:6px;overflow:hidden}
+  .bandbar i{display:block;height:100%;width:0;border-radius:0 3px 3px 0;background:var(--grid)}
+  /* The table's figures line up only if the digits do not change width as the
+     values move, so they are set in tabular figures. The face is deliberately
+     the page's own rather than a mono stack: --font-mono exists only under
+     Glass, so naming it here sent Classic's figures to the system mono — a
+     face change that was never asked for — and tabular figures alone already
+     deliver the alignment. The band name keeps the page face too; it is a
+     word, not a number. */
+  #bandTable td:nth-child(n+2){font-variant-numeric:tabular-nums}
   td.part{position:relative}
   td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
   /* A marked segment of a split bar. Two things the table's dot cannot do here.
@@ -101,13 +113,29 @@
   .assume li{margin-bottom:6px}
   .assume ul{margin:0;padding-left:17px}
 </style>
+<!-- The default look, and then whatever this browser has chosen instead. The
+     <link> is written here rather than created by the script below it because
+     only a stylesheet the parser finds holds the first paint back: inserted by
+     a script it would arrive after the page was painted, so every navigation
+     would show the wrong look and restyle under the reader. It sits at the foot
+     of the head because it layers over everything above it. The script leaves
+     it alone on Glass and removes it on Classic, before the body exists and so
+     before any paint — but not before the file has been fetched in full, which
+     is what Classic pays on every load and was accepted rather than missed.
+     common.js owns the rest, and says why there. -->
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
 </head>
 <body>
 <div class="sunglow"></div>
 <main>
   <header>
     <h1>Solar ArraySense</h1>
-    <div class="conn" id="stamp"></div>
+    <!-- The pill is wrapped, not left bare, so the buttons common.js mounts have
+         a place of their own. See .hright in common.js for what breaks without it. -->
+    <div class="hright">
+      <div class="conn" id="stamp"></div>
+    </div>
   </header>
 
   <nav class="nav" id="nav" aria-label="Views"></nav>
@@ -160,7 +188,10 @@
     <!-- The same diagram the dashboard draws in kilowatt-hours, in money: the
          house's demand priced at the tariff on the left, and on the right the
          part that was actually paid for against the part the system covered. -->
-    <svg id="sankey" viewBox="0 0 900 400" role="img"
+    <!-- A group and not an image, for the reason the dashboard's copy gives:
+         each ribbon is focusable and carries its own sentence, and role="img"
+         would prune every one of them out of the accessibility tree. -->
+    <svg id="sankey" viewBox="0 0 900 400" role="group"
          aria-label="What the month's electricity would have cost at grid rates, and how much of it was paid"></svg>
     <div class="sankwait" id="sankeyWait" hidden></div>
     <span class="cap" id="sankeyCap" hidden>
@@ -589,7 +620,7 @@ function drawSankey(p) {
   // Nothing drawn means nothing to explain either: a caption describing two
   // sides of a diagram that is not there is furniture, not information.
   const hold = (message) => {
-    svg.innerHTML = '';
+    sankeyClear(svg);
     wait.innerHTML = message;
     wait.hidden = false;
     $('sankeyCap').hidden = true;
@@ -655,21 +686,34 @@ function drawSankey(p) {
   ], X3);
   if (!hub.length || !src.length) { hold('nothing to draw yet'); return; }
 
-  const ribbon = (x0, y0, x1, y1, h, col, op) => {
-    const mx = (x0 + x1) / 2;
-    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
-      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
-      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
-      + `fill="${col}" fill-opacity="${op}"/>`;
-  };
-  let out = '';
+  // Both sides are shares of the same figure — what the house would have cost at
+  // grid rates — so a band's share on the left and the saving's share on the
+  // right are read against the same denominator.
+  const ribbons = [];
   let hy = hub[0].y;
-  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col, 0.34); hy += n.h; }
-  hy = hub[0].y;
-  for (const n of snk) {
-    out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col, n.hollow ? 0.09 : 0.34);
+  for (const n of src) {
+    ribbons.push({
+      x0: n.x + XW, y0: n.y, x1: hub[0].x, y1: hy, h: n.h, side: 'in', col: n.col,
+      title: `${n.name} → House at grid rates`, value: money(n.v, cur),
+      share: sankeyShare(n.v, total),
+    });
     hy += n.h;
   }
+  hy = hub[0].y;
+  for (const n of snk) {
+    ribbons.push({
+      x0: hub[0].x + XW, y0: hy, x1: n.x, y1: n.y, h: n.h, side: 'out', col: n.col,
+      // The hollow ribbon keeps the weight it had. Money that never left the
+      // house is the one quantity on this page that was not spent, and a full
+      // gradient would give it the presence of a payment.
+      alpha: n.hollow ? 0.26 : 1,
+      title: `House at grid rates → ${n.name}`, value: money(n.v, cur),
+      share: sankeyShare(n.v, total),
+    });
+    hy += n.h;
+  }
+
+  let out = '';
   for (const n of [...src, ...hub, ...snk]) {
     const shape = n.hollow
       ? `fill="${n.col}" fill-opacity="0.13" stroke="${n.col}" stroke-opacity="0.55" `
@@ -692,7 +736,15 @@ function drawSankey(p) {
         + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
         + `${esc(money(n.v, cur))}</text>`;
   }
-  svg.innerHTML = `<g class="sank">${out}</g>`;
+  // No pace from a live reading here, and none invented: this diagram prices a
+  // month that has already happened. The flow says which way the money went and
+  // nothing more, at one steady speed for every ribbon.
+  sankeyRender(svg, ribbons, out, {
+    hub: 'var(--ink3)',
+    measure: 'This month',
+    total: money(total, cur),
+    pace: 'steady',
+  });
 }
 
 // Two bars over the same width: the share of the energy each band took, and

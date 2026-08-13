@@ -12,10 +12,12 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from arraysense.models import BatteryModuleSample, Sample
+from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -141,6 +143,141 @@ def test_maintenance_connection_keeps_per_connection_safety_pragmas(tmp_path: Pa
 
     assert maintenance_pragmas["foreign_keys"] == (1,)
     assert maintenance_pragmas["busy_timeout"] == (5000,)
+
+
+def _poll_in_flight(cur: sqlite3.Cursor, epoch: int, device: str) -> None:
+    """Write the three parts of one poll — inverter row, serials, module row.
+
+    The collector's append is all three inside one transaction; replaying them
+    through a cursor keeps the transaction open so a second writer can
+    interleave with a poll mid-flight.
+    """
+    cur.execute(
+        "INSERT INTO inverter_raw (timestamp, device, pv_total_power_w) VALUES (?, ?, ?)",
+        (epoch, device, 9000),
+    )
+    cur.execute(
+        "INSERT OR IGNORE INTO serials (device, serial) VALUES (?, ?)", (device, "BA00000001")
+    )
+    cur.execute("SELECT id FROM serials WHERE device = ? AND serial = ?", (device, "BA00000001"))
+    row = cur.fetchone()
+    assert row is not None
+    cur.execute(
+        "INSERT INTO module_raw (timestamp, device, module_id, soc_pct) VALUES (?, ?, ?, ?)",
+        (epoch, device, row[0], 64),
+    )
+
+
+def test_a_failed_backfill_on_the_shared_connection_rolls_back_the_poll(tmp_path: Path) -> None:
+    """Pin the failure the write connection exists to prevent, so it cannot return unseen.
+
+    The collector appends on the event loop while the backfill appends on
+    FastAPI's threadpool. On one sqlite3.Connection ``with conn:`` is
+    transaction state rather than a lock, so a backfill transaction that
+    raised part-way — a busy backup or a full disk raises ``database is
+    locked``; this replay fails it at its last statement instead — rolled the
+    collector's in-flight poll back with it: the inverter row, the module rows
+    and the serials registration all vanished together. The test beside this
+    one asserts the same failure on ``write_connection`` leaves the poll
+    intact; this test pins what the shared connection actually did.
+    """
+    path = tmp_path / "shared.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    # The failure the production defect arrives as: the append dies part-way —
+    # here at its last statement, queueing the hour for promotion — after its
+    # row has already been written inside the transaction.
+    store._conn.execute(
+        "CREATE TRIGGER reject_pending BEFORE INSERT ON rollup_pending "
+        "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+    )
+    with store._conn:  # the collector's poll, in flight
+        _poll_in_flight(store._conn.cursor(), int(when.timestamp()), TEST_DEVICE)
+        # The backfill, on the same connection: its failure is the poll's.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.append(
+                Sample(
+                    timestamp=datetime(2020, 1, 1, 12, 0, tzinfo=UTC),
+                    readings={"ghi_wm2": 900.0},
+                )
+            )
+
+    conn = _open_db(path)
+    polls = conn.execute(
+        "SELECT COUNT(*) FROM inverter_raw WHERE pv_total_power_w IS NOT NULL"
+    ).fetchone()[0]
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    serials = conn.execute("SELECT COUNT(*) FROM serials").fetchone()[0]
+    conn.close()
+    store.close()
+    assert polls == 0, "a shared rollback no longer destroys the poll — the pinned hazard changed"
+    assert modules == 0
+    assert serials == 0
+
+
+def test_a_failed_backfill_on_its_own_connection_leaves_the_poll_in_flight_intact(
+    tmp_path: Path,
+) -> None:
+    """A backfill that fails mid-transaction must roll back nothing but itself.
+
+    The same failure replayed with the backfill on ``write_connection`` — its
+    own connection, so its commit and its rollback are its own. The writer
+    blocks behind the collector's open transaction until the commit, exactly
+    as the two contend in production, and then dies part-way on the trigger;
+    the poll it rode alongside must come through whole, inverter row, module
+    rows and serials registration together.
+    """
+    import threading
+
+    path = tmp_path / "isolated.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store._conn.execute(
+        "CREATE TRIGGER reject_pending BEFORE INSERT ON rollup_pending "
+        "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"
+    )
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def run_backfill() -> None:
+        started.set()
+        try:
+            with store.write_connection() as writer:
+                writer.append(
+                    Sample(
+                        timestamp=datetime(2020, 1, 1, 12, 0, tzinfo=UTC),
+                        readings={"ghi_wm2": 900.0},
+                    )
+                )
+        except sqlite3.IntegrityError as exc:
+            errors.append(exc)
+
+    with store._conn:  # the collector's poll, in flight on the primary connection
+        _poll_in_flight(store._conn.cursor(), int(when.timestamp()), TEST_DEVICE)
+        thread = threading.Thread(target=run_backfill)
+        thread.start()
+        started.wait(timeout=5)
+        # The poll commits while the backfill is blocked mid-append on the
+        # write lock — the interleaving that used to cost the whole poll.
+    thread.join(timeout=10)
+
+    conn = _open_db(path)
+    poll = conn.execute(
+        "SELECT pv_total_power_w FROM inverter_raw WHERE timestamp = ? AND device = ?",
+        (int(when.timestamp()), TEST_DEVICE),
+    ).fetchone()
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    serials = conn.execute("SELECT COUNT(*) FROM serials").fetchone()[0]
+    site = conn.execute("SELECT COUNT(*) FROM inverter_raw WHERE ghi_wm2 IS NOT NULL").fetchone()[0]
+    conn.close()
+    store.close()
+    assert [type(e).__name__ for e in errors] == ["IntegrityError"], (
+        f"the backfill did not fail as designed: {[type(e).__name__ for e in errors]}"
+    )
+    assert poll == (9000,), "the backfill's rollback erased the inverter row"
+    assert modules == 1, "the backfill's rollback erased the module rows"
+    assert serials == 1, "the backfill's rollback erased the serials registration"
+    assert site == 0, "the failed site append left half of itself behind"
 
 
 def test_appended_reading_is_stored_scaled(tmp_path: Path) -> None:
@@ -804,6 +941,89 @@ def test_a_pack_serial_belongs_to_its_own_inverter(tmp_path: Path) -> None:
     assert [(r["serial"], r["soc_pct"]) for r in theirs] == [("P1", 90.0)]
 
 
+def test_latest_modules_holds_a_silent_pack_and_excludes_other_banks(tmp_path: Path) -> None:
+    # A pack that fell off the CAN bus keeps its final reading standing, with no
+    # time bound; a second inverter's packs are a second bank and never appear
+    # beside this one; a pack that never reported (EEE here) is absent rather
+    # than present with zeroes.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    for serial in ("AAA", "BBB", "CCC", "DDD"):
+        store.append(
+            Sample(
+                timestamp=_ts() - timedelta(days=7),
+                readings={},
+                battery_modules=(BatteryModuleSample(serial=serial, slot=1, soc_pct=50.0),),
+            )
+        )
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="BBB", slot=2, soc_pct=91.0),
+                BatteryModuleSample(serial="CCC", slot=3, soc_pct=92.0),
+                BatteryModuleSample(serial="DDD", slot=4, soc_pct=93.0),
+            ),
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=_ts() + timedelta(seconds=1),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="X1", slot=1, soc_pct=1.0),
+                BatteryModuleSample(serial="X2", slot=2, soc_pct=2.0),
+            ),
+        ),
+        device=OTHER_DEVICE,
+    )
+    rows = store.latest_modules(["soc_pct"])
+    store.close()
+    assert [(r["serial"], r["soc_pct"]) for r in rows] == [
+        ("AAA", 50.0),  # silent for a week; its last reading still stands
+        ("BBB", 91.0),
+        ("CCC", 92.0),
+        ("DDD", 93.0),
+    ]
+    assert rows[0]["timestamp"] == _ts() - timedelta(days=7)
+
+
+def test_latest_modules_plan_does_not_scan_the_module_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The live view asks for this on every refresh, and module_raw grows by four
+    # rows every poll while the answer stays one row per pack. A plan that scans
+    # the module table makes the endpoint cost grow with the history; each
+    # pack's newest row has to be reached through the indexes alone. The query
+    # is captured from the store itself, so this pins the shape the method runs
+    # rather than a copy of it that could drift.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=_ts(),
+            readings={},
+            battery_modules=(
+                BatteryModuleSample(serial="AAA", slot=1, soc_pct=50.0),
+                BatteryModuleSample(serial="BBB", slot=2, soc_pct=60.0),
+            ),
+        )
+    )
+    real_execute = store._conn.execute
+    captured: list[tuple[str, tuple[object, ...]]] = []
+
+    def capture(sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
+        captured.append((sql, params))
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(store, "_conn", SimpleNamespace(execute=capture, close=store._conn.close))
+    store.latest_modules(["soc_pct"])
+    (sql, params) = captured[0]
+    plan = real_execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    store.close()
+    text = " ".join(str(r[-1]) for r in plan).upper()
+    assert "SCAN" not in text, plan
+
+
 def test_a_flagged_reading_is_attributed_to_the_inverter_that_produced_it(
     tmp_path: Path,
 ) -> None:
@@ -886,6 +1106,19 @@ def test_an_undeclared_registry_metric_reads_back_as_none(tmp_path: Path) -> Non
     assert rows[0]["load_power_w"] is None
     assert latest is not None
     assert latest["load_power_w"] is None
+
+
+def test_peak_of_an_undeclared_metric_reads_back_as_none(tmp_path: Path) -> None:
+    # The same contract query() and latest() keep. A driver may declare
+    # per-string power and no array total — Capabilities permits it — and the
+    # forecast's cold start asks for the total on every tick. Raising there
+    # takes the whole forecast down with a traceback every interval, where the
+    # honest answer is that this database has never held such a reading.
+    store = SqliteStore(str(tmp_path / "narrow.db"), device=TEST_DEVICE, metrics=_DECLARED)
+    store.append(Sample(timestamp=_ts(), readings={"pv_total_power_w": 500.0}))
+    got = store.peak("load_power_w", _ts() - timedelta(days=30), _ts())
+    store.close()
+    assert got is None
 
 
 def test_an_undeclared_module_metric_reads_back_as_none(tmp_path: Path) -> None:
@@ -1218,6 +1451,141 @@ def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
     assert reading["error"] is None
 
 
+def test_query_skips_a_row_carrying_none_of_the_asked_metrics(tmp_path: Path) -> None:
+    # The two-writer guard latest() keeps, applied to query() — issue #159.
+    # The weather poller lands a row whose inverter columns are all null; a
+    # request for inverter metrics that returned it put a null into every
+    # inverter series every fifteen minutes, an absence drawn where data
+    # exists. A row carrying none of the asked metrics is not a reading of
+    # them and must not come back.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0, "battery_soc_pct": 64.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w", "battery_soc_pct"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    )
+    store.close()
+    assert [r["timestamp"] for r in rows] == [datetime(2026, 8, 6, 12, 0, tzinfo=UTC)]
+    assert rows[0]["pv_total_power_w"] == 5000.0
+
+
+def test_query_still_returns_a_recorded_gap_row(tmp_path: Path) -> None:
+    # Recency is not health: a recorded gap answers every request, whatever
+    # metrics it was asked for, because an outage smoothed into a straight
+    # segment is an outage nobody ever notices. This is the assertion that
+    # stops the guard going too far — never make a real outage invisible while
+    # removing the phantom breaks.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 5, tzinfo=UTC),
+    )
+    store.close()
+    assert [r["error"] for r in rows] == [None, "ConnectionError: nobody answered"]
+    assert rows[1]["timestamp"] == datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
+
+
+def test_query_mixed_families_returns_every_writer(tmp_path: Path) -> None:
+    # The guard is per row, not per family: a request naming metrics from both
+    # writers gets every row, because each row carries one of the asked
+    # metrics. That is why the graphs page asks for the two families in two
+    # requests rather than relying on the guard to split them — it cannot, and
+    # the weather rows would still land between the inverter ones.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4},
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w", "outside_temperature_c"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    )
+    store.close()
+    assert [(r["timestamp"], r["pv_total_power_w"], r["outside_temperature_c"]) for r in rows] == [
+        (datetime(2026, 8, 6, 12, 0, tzinfo=UTC), 5000.0, None),
+        (datetime(2026, 8, 6, 12, 15, tzinfo=UTC), None, 37.4),
+    ]
+
+
+def test_query_splits_the_two_writers_by_family(tmp_path: Path) -> None:
+    # The two-writer tier served whole, the way /graphs now asks: interleaved
+    # inverter and weather rows, and each request comes back with only the
+    # family it named. This is the end-to-end shape behind issue #159 and the
+    # blank weather section.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+            readings={"pv_total_power_w": 5100.0},
+        )
+    )
+    start = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 6, 12, 45, tzinfo=UTC)
+    inv = store.query(["pv_total_power_w"], start, end)
+    sky = store.query(["outside_temperature_c", "cloud_cover_pct"], start, end)
+    # And, asked together, the families do not carry each other's columns: the
+    # weather row decodes with pv null and the inverter rows with the sky null.
+    both = store.query(["pv_total_power_w", "outside_temperature_c"], start, end)
+    store.close()
+    assert [r["timestamp"] for r in inv] == [
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    ]
+    assert [r["timestamp"] for r in sky] == [datetime(2026, 8, 6, 12, 15, tzinfo=UTC)]
+    assert [(r["pv_total_power_w"], r["outside_temperature_c"]) for r in both] == [
+        (5000.0, None),
+        (None, 37.4),
+        (5100.0, None),
+    ]
+
+
 def test_forecast_serves_the_newest_revision_of_each_hour(tmp_path: Path) -> None:
     # The page draws one prediction, so the read answers with one: the newest
     # figure for each hour, whenever it was made. A forecast made yesterday for
@@ -1458,3 +1826,355 @@ def test_an_efficiency_day_keeps_its_calendar_date_east_of_utc(tmp_path: Path) -
     store.close()
     assert len(got) == 1
     assert got[0].day.date() == day.date(), "the day slipped to the one before"
+
+
+# --- Two writers, one key -------------------------------------------------
+#
+# The raw tier is keyed (timestamp, device) at one-second resolution and has two
+# writers: the inverter poll loop, and the weather poller on its own fifteen-
+# minute clock. Nothing coordinates the two clocks, so a sky reading lands on a
+# second an inverter poll already owns often enough to matter — measured at
+# roughly one tick in ten. Each of these tests replays one of those collisions.
+
+
+def _sky() -> dict[str, float]:
+    """One tick of the site metrics, as the weather poller reports them."""
+    return {
+        "outside_temperature_c": 31.5,
+        "cloud_cover_pct": 40.0,
+        "ghi_wm2": 812.0,
+        "dni_wm2": 640.0,
+        "dhi_wm2": 190.0,
+        "wind_speed_ms": 4.5,
+    }
+
+
+def _module() -> BatteryModuleSample:
+    return BatteryModuleSample(serial="BA00000001", slot=1, soc_pct=64.0, voltage_v=53.2)
+
+
+def _row(conn: sqlite3.Connection, *columns: str) -> tuple[object, ...]:
+    return conn.execute(f"SELECT {', '.join(columns)} FROM inverter_raw").fetchone()  # type: ignore[no-any-return]
+
+
+def test_a_sky_reading_on_a_polls_second_leaves_the_poll_intact(tmp_path: Path) -> None:
+    """The weather tick landing on an inverter's second must not blank the poll.
+
+    While the upsert replaced every column, the sky reading's NULLs overwrote
+    ninety-one inverter columns and left a row claiming the inverter reported
+    nothing at an instant where its own battery modules still held full
+    readings.
+    """
+    path = tmp_path / "collide.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={"pv_total_power_w": 9000.0, "battery_soc_pct": 64.0},
+            battery_modules=(_module(),),
+        )
+    )
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    pv, soc, ghi, temperature = _row(
+        conn, "pv_total_power_w", "battery_soc_pct", "ghi_wm2", "outside_temperature_c"
+    )
+    modules = conn.execute("SELECT COUNT(*) FROM module_raw").fetchone()[0]
+    conn.close()
+    assert pv is not None, "the sky reading erased the inverter's own reading"
+    assert soc is not None
+    assert ghi is not None, "the sky reading did not land"
+    assert temperature is not None
+    assert modules == 1, "the module rows were orphaned from their inverter row"
+
+
+def test_a_poll_on_the_skys_second_leaves_the_sky_intact(tmp_path: Path) -> None:
+    """The same collision the other way round: the poll must not blank the sky."""
+    path = tmp_path / "collide-reverse.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 9000.0}))
+    store.close()
+
+    conn = _open_db(path)
+    pv, ghi, wind = _row(conn, "pv_total_power_w", "ghi_wm2", "wind_speed_ms")
+    conn.close()
+    assert pv is not None
+    assert ghi is not None, "the poll erased the sky reading"
+    assert wind is not None
+
+
+def test_a_sky_reading_does_not_erase_a_recorded_gap(tmp_path: Path) -> None:
+    """The one that matters most: an outage must survive the weather.
+
+    A gap row is the only record that the inverter went quiet. The sky reading
+    used to clear the error along with everything else, which turns a recorded
+    outage into an ordinary row with an irradiance value beside it — an outage
+    smoothed into a straight segment is an outage nobody ever notices.
+    """
+    path = tmp_path / "gap.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    reason = "TimeoutError: no reply from inverter"
+    store.append(Sample.failed(when, reason))
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    error, ghi = _row(conn, "error", "ghi_wm2")
+    conn.close()
+    assert error == reason, "the outage was erased by a weather tick"
+    assert ghi is not None, "the sky reading did not land"
+
+
+def test_a_gap_still_writes_null_over_its_own_readings(tmp_path: Path) -> None:
+    """Within one writer's columns, replace still means replace.
+
+    A poll that reached the inverter and got nothing is a measurement of
+    absence, so it must be able to write NULL over what stood there. Merging
+    inverter columns would resurrect a reading that is no longer true — the
+    same class of lie as rendering absent data as zero.
+    """
+    path = tmp_path / "replace.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 9000.0}))
+    store.append(Sample(timestamp=when, readings={"battery_soc_pct": 64.0}))
+    store.close()
+
+    conn = _open_db(path)
+    pv, soc = _row(conn, "pv_total_power_w", "battery_soc_pct")
+    conn.close()
+    assert pv is None, "an inverter write merged rather than replaced its own columns"
+    assert soc is not None
+
+
+def test_two_site_writes_at_one_instant_merge(tmp_path: Path) -> None:
+    """The archive answers one hour in two pieces, and both must survive.
+
+    ``fetch_archive_hours`` splits each label into the means over the hour just
+    gone and the readings taken at the label itself, and the two land on the
+    same second from different requests — one day's request writes the hour's
+    temperature, the next day's writes that same hour's irradiance. Replacing
+    the whole site set would make the second erase the first, which is how the
+    backfill destroyed the weather it had just written.
+    """
+    path = tmp_path / "archive.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(timestamp=when, readings={"outside_temperature_c": 31.5, "cloud_cover_pct": 40.0})
+    )
+    store.append(Sample(timestamp=when, readings={"ghi_wm2": 812.0, "dni_wm2": 640.0}))
+    store.close()
+
+    conn = _open_db(path)
+    temperature, ghi = _row(conn, "outside_temperature_c", "ghi_wm2")
+    conn.close()
+    assert temperature is not None, "the second archive write erased the first"
+    assert ghi is not None
+
+
+def test_a_sky_reading_does_not_clear_the_inverters_bounds_flags(tmp_path: Path) -> None:
+    """One writer's retry must not erase the other's record of a fault.
+
+    ``invalid_readings`` records nothing about which writer filed a row, so the
+    metric name is the only thing that keeps the two apart. Clearing every flag
+    for the instant let a weather tick delete an inverter fault it never saw.
+    """
+    path = tmp_path / "flags.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 99000.0}))
+    store.append(Sample(timestamp=when, readings=_sky()))
+    store.close()
+
+    conn = _open_db(path)
+    flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
+    conn.close()
+    assert flagged == ["pv_total_power_w"], "the weather tick cleared the inverter's flag"
+
+
+def test_a_gap_does_not_overwrite_a_reading_at_the_same_second(tmp_path: Path) -> None:
+    """A poll that measured nothing must never delete one that measured something.
+
+    The tier's key is whole seconds and the dongle answers an eleven-second
+    interval in twelve to seventeen, so the failure that follows a slow read
+    can land on the second that read was stamped with. The reading is the thing
+    that cannot be taken again.
+    """
+    path = tmp_path / "gap-over-reading.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={"pv_total_power_w": 9000.0},
+            battery_modules=(_module(),),
+        )
+    )
+    store.append(Sample.failed(when, "TimeoutError: no reply from inverter"))
+    store.close()
+
+    conn = _open_db(path)
+    pv, error = _row(conn, "pv_total_power_w", "error")
+    conn.close()
+    assert pv == 9000, "the gap deleted a reading that had been taken"
+    assert error is None, "an outage was recorded over an instant that holds a measurement"
+
+
+def test_a_gap_still_lands_where_nothing_was_read(tmp_path: Path) -> None:
+    """The guard protects readings, and must not quietly stop recording outages.
+
+    Both cases an outage can arrive at: a second nothing has written at all,
+    and one carrying only a sky reading — the inverter was unreachable then
+    too, and the weather poller kept its own clock through it.
+    """
+    path = tmp_path / "gap-lands.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    empty_second = _ts()
+    sky_second = _ts() + timedelta(seconds=1)
+    store.append(Sample.failed(empty_second, "TimeoutError: first"))
+    store.append(Sample(timestamp=sky_second, readings=_sky()))
+    store.append(Sample.failed(sky_second, "TimeoutError: second"))
+    store.close()
+
+    conn = _open_db(path)
+    rows = dict(conn.execute("SELECT timestamp, error FROM inverter_raw"))
+    ghi = conn.execute(
+        "SELECT ghi_wm2 FROM inverter_raw WHERE timestamp = ?", (int(sky_second.timestamp()),)
+    ).fetchone()[0]
+    conn.close()
+    assert rows[int(empty_second.timestamp())] == "TimeoutError: first"
+    assert rows[int(sky_second.timestamp())] == "TimeoutError: second"
+    assert ghi is not None, "recording the outage erased the sky reading beside it"
+
+
+def test_a_refused_gap_leaves_the_readings_bounds_flag_alone(tmp_path: Path) -> None:
+    """The evidence about a reading outlives the failure that followed it.
+
+    A flag describes a measurement, and a gap that may not replace that
+    measurement must not delete what was recorded about it either — an
+    implausible reading is kept and flagged precisely so a decode fault can be
+    diagnosed six months later.
+    """
+    path = tmp_path / "flag-survives.db"
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    when = _ts()
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 99000.0}))
+    store.append(Sample.failed(when, "TimeoutError: no reply from inverter"))
+    store.close()
+
+    conn = _open_db(path)
+    flagged = [r[0] for r in conn.execute("SELECT metric FROM invalid_readings")]
+    conn.close()
+    assert flagged == ["pv_total_power_w"], "the refused gap deleted the reading's flag"
+
+
+# --- what each tier actually holds --------------------------------------------
+#
+# Tier selection scored tiers on point count alone and never asked whether the
+# tier it picked holds the range at all, so a window older than the raw tier's
+# floor came back empty and one straddling it came back half its length. The
+# answer to "what does this tier hold" has to come from here; the choosing lives
+# in store.tiers.
+
+
+def test_tier_spans_report_what_each_tier_holds(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    first = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    last = datetime(2026, 8, 6, 12, 30, tzinfo=UTC)
+    for when in (first, last):
+        store.append(Sample(timestamp=when, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(
+        store._conn, int(first.timestamp()) - 3600, int(last.timestamp()) + 3600
+    )
+
+    spans = store.tier_spans()
+    store.close()
+    assert spans["full"] == (first, last)
+    # The hourly bucket is labelled by the hour it starts, not by the readings
+    # inside it.
+    assert spans["hourly"] == (
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+    )
+    # Nothing built the minute tier, and a tier holding nothing says so rather
+    # than reporting a span it does not have.
+    assert spans["minute"] is None
+
+
+def test_tier_spans_are_narrowed_to_one_inverter(tmp_path: Path) -> None:
+    # Two inverters in one stack keep separate histories, and a span that mixed
+    # them would offer one unit's rows as the other's coverage.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    mine = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    theirs = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=mine, readings={"pv_total_power_w": 1000.0}))
+    store.append(
+        Sample(timestamp=theirs, readings={"pv_total_power_w": 900.0}),
+        device="CE87654321",
+    )
+    spans = store.tier_spans()
+    other = store.tier_spans(device="CE87654321")
+    store.close()
+    assert spans["full"] == (mine, mine)
+    assert other["full"] == (theirs, theirs)
+
+
+def test_module_tier_spans_are_the_module_tables(tmp_path: Path) -> None:
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    when = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(
+        Sample(
+            timestamp=when,
+            readings={},
+            battery_modules=(BatteryModuleSample(serial="BA12345678", slot=1, soc_pct=55.0),),
+        )
+    )
+    spans = store.tier_spans(module=True)
+    store.close()
+    assert spans["full"] == (when, when)
+    assert spans["hourly"] is None
+    # Module data has no minute tier at all; naming one would be a tier that
+    # cannot be queried.
+    assert "minute" not in spans
+
+
+def test_the_hourly_span_is_the_tier_span(tmp_path: Path) -> None:
+    # One answer, one query: the efficiency backfill's question is the coverage
+    # question narrowed to one tier.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    when = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=when, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(store._conn, int(when.timestamp()) - 3600, int(when.timestamp()) + 3600)
+    span = store.hourly_span()
+    spans = store.tier_spans()
+    store.close()
+    assert span == spans["hourly"]
+
+
+def test_site_only_rows_do_not_stretch_the_claimed_span(tmp_path: Path) -> None:
+    # The archive backfill writes one sky reading per past hour into raw, and
+    # merge_site_hours folds those into hourly. A site-only row can land years
+    # before any inverter history, and it must not stretch what the tier claims
+    # to hold for an inverter chart: the tier cannot answer an inverter query
+    # with it. Coverage measured from the outermost row would hand the raw tier
+    # a floor that holds nothing but sky, and the minute tier's span reads as
+    # covering years of inverter history the backfill never wrote.
+    store = SqliteStore(str(tmp_path / "spans.db"), device=TEST_DEVICE)
+    sky_at = datetime(2024, 11, 1, 15, 0, tzinfo=UTC)
+    inverter_at = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=sky_at, readings={"outside_temperature_c": 15.0}))
+    store.append(Sample(timestamp=inverter_at, readings={"pv_total_power_w": 1000.0}))
+    rebuild_inverter_hourly(
+        store._conn, int(sky_at.timestamp()) - 3600, int(inverter_at.timestamp()) + 3600
+    )
+    spans = store.tier_spans()
+    store.close()
+    assert spans["full"] == (inverter_at, inverter_at)
+    assert spans["hourly"] == (inverter_at, inverter_at)

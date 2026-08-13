@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime
 import gzip
 import os
 import shutil
@@ -1365,3 +1366,469 @@ def test_check_backup_dir_accepts_a_writable_directory(tmp_path: Any) -> None:
     writable = tmp_path / "writable"
     writable.mkdir()
     assert manage._check_backup_dir(str(writable)) is True
+
+
+# --- The schedule, which now lives in the settings ---------------------------
+
+
+def _settings_reply(**values: Any) -> dict[str, Any]:
+    """What GET /api/settings answers with, shaped as the service shapes it."""
+    return {"fields": [], "values": values}
+
+
+def _a_database(path: Any) -> None:
+    """A real database with the one table the backup checks for."""
+    conn = sqlite3.connect(str(path))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.commit()
+    conn.close()
+
+
+def test_the_cli_fallback_constants_match_the_registry_defaults() -> None:
+    """manage.py cannot import the registry — it runs on the distribution's
+    3.8 while the package needs 3.12 — so it keeps its own copy of the
+    defaults. This is the only thing stopping that copy from drifting into a
+    second source of truth, which is what the registry exists to prevent."""
+    from arraysense import settings as registry
+
+    for constant, key in (
+        (manage.BACKUP_ENABLED, registry.BACKUP_ENABLED_KEY),
+        (manage.BACKUP_DIR, registry.BACKUP_DIRECTORY_KEY),
+        (manage.BACKUP_KEEP, registry.BACKUP_KEEP_KEY),
+        (manage.BACKUP_HOUR, registry.BACKUP_HOUR_KEY),
+        (manage.BACKUP_MINUTE, registry.BACKUP_MINUTE_KEY),
+    ):
+        assert constant == registry.lookup_setting(key).default, key
+    # And the mapping the CLI reads them through names the same keys, so a
+    # renamed setting fails here rather than silently falling back forever.
+    assert set(manage.BACKUP_FALLBACK) == {
+        registry.BACKUP_ENABLED_KEY,
+        registry.BACKUP_DIRECTORY_KEY,
+        registry.BACKUP_KEEP_KEY,
+        registry.BACKUP_HOUR_KEY,
+        registry.BACKUP_MINUTE_KEY,
+    }
+
+
+def test_the_backup_settings_are_read_from_the_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{
+                "backup.enabled": False,
+                "backup.directory": "/srv/copies",
+                "backup.keep": 30,
+                "backup.hour": 22,
+                "backup.minute": 45,
+                "site.timezone": "America/Denver",
+            }
+        ),
+    )
+    conf, reason = manage.backup_settings(8080)
+    assert reason == ""
+    assert conf["backup.enabled"] is False
+    assert conf["backup.directory"] == "/srv/copies"
+    assert conf["backup.keep"] == 30
+    assert conf["backup.hour"] == 22
+    assert conf["backup.minute"] == 45
+    assert conf["site.timezone"] == "America/Denver"
+
+
+def test_a_service_that_is_not_answering_falls_back_and_says_which(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A silent fallback is a second source of truth pretending to be the
+    first. Whoever reads the output has to be able to tell which one answered."""
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    conf, reason = manage.backup_settings(8080)
+    assert conf["backup.directory"] == manage.BACKUP_DIR
+    assert conf["backup.keep"] == manage.BACKUP_KEEP
+    assert reason
+    assert "8080" in reason
+
+
+def test_a_setting_the_service_did_not_report_falls_back_by_itself(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older service knows nothing of these keys. Each missing one falls
+    back on its own and is named, rather than the whole reply being discarded."""
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(**{"backup.directory": "/srv/copies"}),
+    )
+    conf, reason = manage.backup_settings(8080)
+    assert conf["backup.directory"] == "/srv/copies"
+    assert conf["backup.keep"] == manage.BACKUP_KEEP
+    assert "backup.keep" in reason
+
+
+def test_an_out_of_range_hour_is_refused_rather_than_believed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An hour of 99 is a time that never arrives, so a backup that believed
+    it would simply never run again."""
+    monkeypatch.setattr(
+        manage, "_probe", lambda url, timeout: _settings_reply(**{"backup.hour": 99})
+    )
+    conf, reason = manage.backup_settings(8080)
+    assert conf["backup.hour"] == manage.BACKUP_HOUR
+    assert "backup.hour" in reason
+
+
+def test_the_timezone_is_read_from_the_database_when_the_service_is_down(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the service is unreachable, the configured timezone must be read
+    directly from the database. Silently using the machine's clock when a
+    different zone is configured would name archives for the wrong calendar
+    day — a three-day outage would write an archive named for a day that has
+    not yet begun, holding the previous day's data."""
+    db = tmp_path / "live.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute(schema.ddl_for("inverter_raw"))
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)",
+        ("site.timezone", "America/Los_Angeles"),
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: str(db))
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+
+    conf, reason = manage.backup_settings(8080)
+    # The configured timezone survived the outage
+    assert conf["site.timezone"] == "America/Los_Angeles"
+    # It was read from the database, so no warning about it
+    assert "could not be read" not in reason
+
+
+def test_the_machine_clock_is_used_when_neither_service_nor_database_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When both the service and the database are unreachable, the machine's
+    clock is the only clock available — but the output must say so rather than
+    silently implying the configured zone was used."""
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/nonexistent/db.db")
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+
+    conf, reason = manage.backup_settings(8080)
+    assert conf["site.timezone"] == ""
+    assert "timezone" in reason.lower()
+    assert "machine" in reason.lower()
+
+
+def test_the_day_is_the_installations_own_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Half past eleven on the twelfth in New York is the thirteenth in UTC.
+    The date the archive is named for, and the date checked for "has today
+    already run", are both local-calendar questions — the same cut energy.py
+    makes."""
+    instant = datetime.datetime(2026, 8, 13, 3, 30, tzinfo=datetime.UTC)
+    local = manage._at_zone(instant, "America/New_York")
+    assert local.date().isoformat() == "2026-08-12"
+    assert (local.hour, local.minute) == (23, 30)
+
+
+def test_a_time_that_has_not_arrived_is_not_due() -> None:
+    zone = "America/New_York"
+    early = manage._at_zone(
+        datetime.datetime(2026, 8, 12, 6, 0, tzinfo=datetime.UTC), zone
+    )  # 02:00 local
+    assert manage._time_has_passed(early, 3, 15) is False
+    late = manage._at_zone(
+        datetime.datetime(2026, 8, 12, 8, 0, tzinfo=datetime.UTC), zone
+    )  # 04:00 local
+    assert manage._time_has_passed(late, 3, 15) is True
+
+
+def test_a_spring_forward_day_does_not_skip_the_backup() -> None:
+    """On 8 March 2026 New York's clocks go 02:00 to 03:00 and a 02:30 backup
+    time never arrives. The question is whether the local clock has passed the
+    configured time today, not whether that exact instant existed — a 23-hour
+    day must still get its backup."""
+    just_after = manage._at_zone(
+        datetime.datetime(2026, 3, 8, 7, 5, tzinfo=datetime.UTC), "America/New_York"
+    )
+    assert (just_after.hour, just_after.minute) == (3, 5)
+    assert manage._time_has_passed(just_after, 2, 30) is True
+
+
+def test_a_fall_back_day_does_not_write_two_backups(tmp_path: Any) -> None:
+    """On 1 November 2026 New York lives 01:00 to 02:00 twice. The configured
+    time passes twice, and the only thing standing between that and two
+    backups for one calendar day is that today's archive already exists."""
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    zone = "America/New_York"
+    first = manage._at_zone(datetime.datetime(2026, 11, 1, 5, 20, tzinfo=datetime.UTC), zone)
+    second = manage._at_zone(datetime.datetime(2026, 11, 1, 6, 20, tzinfo=datetime.UTC), zone)
+    assert (first.hour, first.minute) == (1, 20)
+    assert (second.hour, second.minute) == (1, 20)
+    assert first.date() == second.date()
+    assert manage._time_has_passed(first, 1, 15) is True
+    assert manage._time_has_passed(second, 1, 15) is True
+
+    stamp = first.date().isoformat()
+    assert manage._already_written(str(dest), stamp) is False
+    (dest / manage.archive_name(stamp)).write_bytes(b"today's backup")
+    assert manage._already_written(str(dest), stamp) is True
+
+
+def test_a_scheduled_run_before_the_configured_time_does_nothing_at_all(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """This fires ninety-six times a day. A run that is not due must leave no
+    trace, or the journal is full of a backup that did not happen.
+
+    The configured time (04:30) is later than the simulated moment (03:20),
+    and is reachable at the 04:30 quarter-hour firing — unlike 23:59, which
+    no quarter-hour firing ever reaches within the same calendar day."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{
+                "backup.directory": str(dest),
+                "backup.hour": 4,
+                "backup.minute": 30,
+            }
+        ),
+    )
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 3, 20))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    assert capsys.readouterr().out == ""
+    assert list(dest.glob("*.gz")) == []
+
+
+def test_a_scheduled_run_after_the_configured_time_writes_one_backup(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{"backup.directory": str(dest), "backup.hour": 3, "backup.minute": 15}
+        ),
+    )
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 3, 20))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    assert [p.name for p in dest.glob("*.gz")] == ["arraysense-2026-08-12.db.gz"]
+
+
+def test_a_second_scheduled_run_the_same_day_does_nothing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{"backup.directory": str(dest), "backup.hour": 3, "backup.minute": 15}
+        ),
+    )
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 3, 20))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    written = dest / "arraysense-2026-08-12.db.gz"
+    stamped = written.stat().st_mtime_ns
+    capsys.readouterr()
+
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    assert capsys.readouterr().out == ""
+    assert written.stat().st_mtime_ns == stamped, "the day's archive was rewritten"
+
+
+def test_a_disabled_backup_skips_the_scheduled_run_silently(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{"backup.enabled": False, "backup.directory": str(dest)}
+        ),
+    )
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 23, 0))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    assert capsys.readouterr().out == ""
+    assert list(dest.glob("*.gz")) == []
+
+
+def test_a_hand_run_backs_up_whatever_the_schedule_says(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--scheduled is for the timer. Somebody typing the command wants a
+    backup now, and a disabled schedule is not a refusal to make one."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{
+                "backup.enabled": False,
+                "backup.directory": str(dest),
+                "backup.hour": 23,
+                "backup.minute": 59,
+            }
+        ),
+    )
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 3, 20))
+    assert manage.cmd_backup([]) == 0
+    assert [p.name for p in dest.glob("*.gz")] == ["arraysense-2026-08-12.db.gz"]
+
+
+def test_a_hand_run_writes_where_the_settings_say(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The destination is a setting now, so a bare `arraysense backup` must
+    honour it rather than the constant it used to be."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(**{"backup.directory": str(configured)}),
+    )
+    assert manage.cmd_backup([]) == 0
+    assert len(list(configured.glob("*.gz"))) == 1
+
+
+def test_a_flag_still_beats_the_setting(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "live.db"
+    _a_database(source)
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    asked_for = tmp_path / "asked_for"
+    asked_for.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(**{"backup.directory": str(configured)}),
+    )
+    assert manage.cmd_backup(["--dir", str(asked_for)]) == 0
+    assert len(list(asked_for.glob("*.gz"))) == 1
+    assert list(configured.glob("*.gz")) == []
+
+
+def test_every_settable_backup_time_produces_exactly_one_archive_per_day(
+    tmp_path: Any,
+) -> None:
+    """For every (hour, minute) pair the registry allows, the quarter-hour
+    firing schedule must produce exactly one backup per calendar day.
+
+    Without this invariant, hour=23 with minute in 46..59 never fires —
+    the timer runs at 00, 15, 30, 45 past the hour, so 23:45 is the last
+    firing of the day and 00:00 is on a different calendar date, leaving
+    no quarter-hour on or after the configured time within the same day.
+
+    This is a bounded version of the full simulation that found the bug:
+    all 1440 settable times driven over a 96-slot quarter-hour day."""
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    base = datetime.datetime(2026, 8, 12, 0, 0)
+    for hour in range(24):
+        for minute in range(60):
+            written = 0
+            for slot in range(96):  # 96 quarter-hour slots
+                now = base + datetime.timedelta(minutes=slot * 15)
+                if manage._time_has_passed(now, hour, minute):
+                    stamp = now.date().isoformat()
+                    if not manage._already_written(str(dest), stamp):
+                        (dest / manage.archive_name(stamp)).write_bytes(b"x")
+                        written += 1
+            assert written == 1, f"hour={hour}, minute={minute}: expected 1 backup, got {written}"
+            # Clean up for next iteration
+            for f in dest.glob("*.gz"):
+                f.unlink()
+
+
+def test_a_scheduled_run_for_23_50_runs_at_23_45(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catch-up path: a time the quarter-hour schedule would otherwise
+    skip must still produce exactly one archive on the right date."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(
+            **{
+                "backup.directory": str(dest),
+                "backup.hour": 23,
+                "backup.minute": 50,
+            }
+        ),
+    )
+    # 23:45 local — the last quarter-hour of the day
+    monkeypatch.setattr(manage, "_local_now", lambda name: datetime.datetime(2026, 8, 12, 23, 45))
+    assert manage.cmd_backup(["--scheduled"]) == 0
+    names = [p.name for p in dest.glob("*.gz")]
+    assert names == ["arraysense-2026-08-12.db.gz"], names
+
+
+def test_a_run_that_used_the_fallback_says_so_in_its_output(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """A backup written under the built-in defaults must not read as one
+    written under the settings somebody edited."""
+    source = tmp_path / "live.db"
+    _a_database(source)
+    dest = tmp_path / "backups"
+    dest.mkdir()
+    monkeypatch.setattr(manage, "_database_path", lambda: str(source))
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout: None)
+    assert manage.cmd_backup(["--dir", str(dest)]) == 0
+    assert "built-in" in capsys.readouterr().out
+
+
+def test_uninstall_names_the_backup_directory_that_is_actually_configured(
+    monkeypatch: pytest.MonkeyPatch, capsys: Any
+) -> None:
+    """The destination is a setting, so naming the built-in default would send
+    somebody to an empty directory while the copies they were told about sit on
+    a disk somewhere else."""
+    monkeypatch.setattr(
+        manage,
+        "_probe",
+        lambda url, timeout: _settings_reply(**{"backup.directory": "/mnt/usb/copies"}),
+    )
+    monkeypatch.setattr(manage, "_confirm", lambda _p: False)
+    assert manage.cmd_uninstall(["--purge"]) == 0
+    out = capsys.readouterr().out
+    assert "/mnt/usb/copies" in out
+    assert manage.BACKUP_DIR not in out

@@ -45,21 +45,95 @@ PAGES = {
 # the chart factory. Served once so the pages cannot drift apart.
 SHARED_SCRIPT = "common.js"
 
-# Revalidate rather than re-download. The pages and the shared script change
-# together and are cached separately, so a browser is free to pair a fresh page
-# with a stale script unless told to check. The vendored chart library is
-# deliberately not in this set: it is versioned by its filename and never
-# changes under the same name.
+# The appearance sheets, one file per look, layered over the base styling common.js
+# injects. Classic is the absence of any of them, so this set holds only the
+# alternatives. Adding one needs no new routing code — a filename here is enough
+# for it to be served — but the look itself is not complete until common.js names
+# it too, in APPEARANCE_SHEET and APPEARANCE_NAMES, which is what puts it on the
+# Settings page with a word for it. The tests hold all three to the same set.
+#
+# These are pages, not vendored files, and the difference is the caching rule
+# below. A theme sheet is edited under its own name for as long as the look is
+# maintained, so a browser holding yesterday's copy shows yesterday's design
+# against today's markup — the same class of failure as a stale common.js, and
+# harder to read, because a design that is merely wrong looks like a design.
+# Serving it from /vendor/ would invite exactly that: that route sets no
+# cache-control at all, which leaves the browser to invent a freshness lifetime
+# of its own from how long ago the file was last modified, and so to go on
+# using its copy without asking.
+#
+# A browser on Classic pays for this file and gets nothing for it. The <link>
+# is in the markup — it has to be, or the first paint is in the wrong look —
+# and the inline script that removes it comes after, where a synchronous script
+# cannot run until the stylesheet ahead of it has loaded. So Classic fetches
+# the whole sheet on every page load, waits for it, and throws it away, with no
+# 304 to soften it (see _file_route). That is accepted rather than overlooked:
+# it is a small file on a home network, and the complete fix is to keep the
+# choice in a cookie so the server can render the right link, which is a larger
+# change than the cost justifies. A separate issue carries it.
+THEME_SHEETS = ("theme-glass.css",)
+
+# Ask again rather than assume. The pages, the shared script and the theme
+# sheets change together and are cached separately, so a browser is free to pair
+# a fresh page with a stale script unless told to check. The vendored chart
+# library and the fonts are deliberately not in this set: this project replaces
+# those files rather than editing them, so a browser may keep its copy for as
+# long as it likes.
 NO_CACHE = {"Cache-Control": "no-cache"}
 
 # uPlot is vendored rather than fetched from a CDN. The service runs on a home
 # network that may have no route to the internet at all, and a chart library
 # that silently fails to load leaves a blank panel with no clue why. Named
 # explicitly for the same reason the pages are.
+#
+# The fonts are here for the same network reason and belong under the same
+# caching rule: nothing in this project edits a released binary, so what changes
+# is which release is vendored, and that is a job for a new filename.
+#
+# None of these names carry a version, uPlot's included, so nothing mechanical
+# enforces that — drop a newer release in under an old name and a browser
+# already holding the old bytes goes on drawing them, for as long as the
+# freshness it invented lasts, which grows with the age of the file it is
+# holding. Replacing one of these means giving the new file a name of its own.
+# theme-glass.css records which upstream release each font came from and the
+# hash of the bytes, which is how a maintainer can tell what is on disk.
+#
+# Each ships beside its licence, as uPlot does — the OFL requires the notice to
+# travel with the font, and a vendored file whose licence stayed behind is the
+# one way vendoring becomes a problem.
+#
+# Space Grotesk is one variable file because upstream releases one; JetBrains
+# Mono is four static files because upstream releases no variable webfont at
+# all. The stylesheet's @font-face blocks say the same thing and have to keep
+# saying it: a range declared over a static file is a weight the browser fakes.
+#
+# The Phosphor icon sprite is here for the same network reason, and it is
+# replaced the same way uPlot is — a newer upstream drop arrives under a name
+# of its own, never overwriting this one, because a browser already holding the
+# old bytes goes on drawing them. Its MIT licence rides beside it like the
+# others, so the notice travels with the file it licenses.
+#
+# Provenance, written down for the same reason the fonts carry it: phosphor.svg
+# is drawn from @phosphor-icons/core@2.1.1 (github.com/phosphor-icons/core),
+# its <symbol> paths taken from that package's regular/ SVGs — ph-gear's path
+# data matches regular/gear.svg byte for byte. phosphor.LICENSE is that
+# package's MIT notice unaltered, "Copyright (c) 2023 Phosphor Icons". A
+# maintainer comparing against the phosphor-icons/web repository instead will
+# find a differently-dated notice and may mistake it for an alteration; the
+# core package is the source this file came from.
 VENDORED = {
     "uPlot.iife.min.js": "text/javascript",
     "uPlot.min.css": "text/css",
     "uPlot.LICENSE": "text/plain",
+    "SpaceGrotesk-wght.woff2": "font/woff2",
+    "SpaceGrotesk.LICENSE": "text/plain",
+    "JetBrainsMono-Light.woff2": "font/woff2",
+    "JetBrainsMono-Regular.woff2": "font/woff2",
+    "JetBrainsMono-Medium.woff2": "font/woff2",
+    "JetBrainsMono-Bold.woff2": "font/woff2",
+    "JetBrainsMono.LICENSE": "text/plain",
+    "phosphor.svg": "image/svg+xml",
+    "phosphor.LICENSE": "text/plain",
 }
 
 
@@ -67,7 +141,7 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     """Build a handler that serves one fixed file, or 404s when it is not there.
 
     Read from disk on each request rather than cached at import: editing a page
-    during development should not need a restart, and these are a few kilobytes.
+    during development should not need a restart, and the read is a local one.
 
     The existence check is why this is a helper rather than four FileResponses.
     Starlette raises from inside the response when the file has gone, which
@@ -75,13 +149,19 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     has written yet, or one left out of a deployment, is a missing page and not
     a broken server.
 
-    Every page and the shared script are sent ``no-cache``, which asks the
-    browser to revalidate rather than forbidding it to store anything: the file
-    still comes back 304 and unchanged most of the time, so the cost is one
-    conditional request. Without it the pages and common.js are cached
-    independently, and a browser holding yesterday's common.js against today's
-    page calls a helper that does not exist yet. That happened: the chart threw,
-    and the page reported it as the history being unavailable.
+    Every page, the shared script and each theme sheet are sent ``no-cache``,
+    which asks the browser to check with the service on every load rather than
+    forbidding it to store anything. Nothing here answers that check cheaply:
+    Starlette's ``FileResponse`` sends an etag and a last-modified but reads
+    neither ``If-None-Match`` nor ``If-Modified-Since``, so the reply is always
+    the whole file and never a 304. That is still the right trade here, but it
+    is not free and the figure is not small: common.js alone is over 130 kB and
+    the larger pages around 110 kB, sent in full on every load. What it prevents
+    is worse over a home network than the bytes are.
+    Without it the pages and common.js are cached independently, and a browser
+    holding yesterday's common.js against today's page calls a helper that does
+    not exist yet. That happened: the chart threw, and the page reported it as
+    the history being unavailable.
     """
 
     async def serve() -> FileResponse:
@@ -157,7 +237,7 @@ def install_text_guard(app: FastAPI) -> None:
 
 
 def mount_pages(app: FastAPI) -> None:
-    """Attach the pages, shared script and vendored files to an app.
+    """Attach the pages, shared script, theme sheets and vendored files to an app.
 
     Split from create_app so first-run setup mode serves the same pages
     byte-identically: a second page-mounting loop would drift from this one
@@ -174,6 +254,11 @@ def mount_pages(app: FastAPI) -> None:
     app.get(f"/{SHARED_SCRIPT}", include_in_schema=False, name=SHARED_SCRIPT)(
         _file_route(web / SHARED_SCRIPT, "text/javascript")
     )
+
+    for sheet in THEME_SHEETS:
+        app.get(f"/{sheet}", include_in_schema=False, name=sheet)(
+            _file_route(web / sheet, "text/css")
+        )
 
     @app.get("/vendor/{name}", include_in_schema=False)
     async def vendored(name: str) -> FileResponse:

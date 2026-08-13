@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import errno
+import os
+import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from arraysense.settings import (
+    BACKUP_DIRECTORY_KEY,
+    BACKUP_ENABLED_KEY,
+    BACKUP_HOUR_KEY,
+    BACKUP_KEEP_KEY,
+    BACKUP_MINUTE_KEY,
     CONFIG_VERSION_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
@@ -14,6 +23,7 @@ from arraysense.settings import (
     SETTING_TIMEZONE,
     SETTINGS,
     SettingsStore,
+    check_backup_directory,
     describe,
     lookup_setting,
 )
@@ -607,3 +617,142 @@ def test_the_array_help_names_every_key_the_parser_accepts() -> None:
     help_text = lookup_setting("panels.strings").help
     missing = sorted(k for k in KNOWN_STRING_KEYS if k not in help_text)
     assert not missing, f"the array help never mentions {missing}"
+
+
+# --- The daily backup -------------------------------------------------------
+
+
+BACKUP_KEYS = (
+    BACKUP_ENABLED_KEY,
+    BACKUP_DIRECTORY_KEY,
+    BACKUP_KEEP_KEY,
+    BACKUP_HOUR_KEY,
+    BACKUP_MINUTE_KEY,
+)
+
+
+def test_the_backup_settings_read_their_registered_defaults(settings: SettingsStore) -> None:
+    """A fresh install must back up on the schedule the units shipped with.
+
+    These were compiled-in constants, so an installation that has stored
+    nothing has to behave exactly as it did before they became settings.
+    """
+    assert settings.get(BACKUP_ENABLED_KEY) is True
+    assert settings.get(BACKUP_DIRECTORY_KEY) == "/var/backups/arraysense"
+    assert settings.get(BACKUP_KEEP_KEY) == 14
+    assert settings.get(BACKUP_HOUR_KEY) == 3
+    assert settings.get(BACKUP_MINUTE_KEY) == 15
+
+
+def test_the_backup_settings_render_from_the_registry_alone() -> None:
+    """settings.html builds every control from describe() and nothing else.
+
+    A setting absent from this payload is a setting with no control, and the
+    fix is always the registry entry -- a page taught about one key by hand is
+    the drift the registry exists to prevent.
+    """
+    described = {field["key"]: field for field in describe()}
+    for key in BACKUP_KEYS:
+        assert key in described, f"{key} would not appear on the settings page"
+        assert described[key]["label"], f"{key} would render with no label"
+        assert described[key]["help"], f"{key} would render with no explanation"
+
+
+def test_the_backup_schedule_is_bounded_to_a_real_clock_time() -> None:
+    """An hour of 24 or a minute of 60 is a time that never arrives.
+
+    The scheduled run compares the wall clock against these two numbers, so a
+    value outside the clock is a backup that silently never becomes due.
+    """
+    hour = lookup_setting(BACKUP_HOUR_KEY)
+    assert (hour.lower, hour.upper) == (0, 23)
+    minute = lookup_setting(BACKUP_MINUTE_KEY)
+    assert (minute.lower, minute.upper) == (0, 59)
+
+
+def test_keeping_zero_backups_is_refused(settings: SettingsStore) -> None:
+    """Rotation keeps the newest N; at zero it deletes every copy there is."""
+    with pytest.raises(ValueError):
+        settings.set(BACKUP_KEEP_KEY, 0)
+
+
+def test_a_writable_directory_is_accepted(tmp_path: Path) -> None:
+    """The happy path has to be confirmed: a false refusal here is an
+    installation that cannot configure a backup at all."""
+    assert check_backup_directory(str(tmp_path)) == str(tmp_path)
+
+
+def test_a_destination_that_does_not_exist_is_refused_by_name(tmp_path: Path) -> None:
+    """Naming the path and the command that creates it, because the directory
+    is deliberately not created here -- whoever runs first would own it."""
+    missing = tmp_path / "nowhere"
+    with pytest.raises(ValueError) as caught:
+        check_backup_directory(str(missing))
+    assert str(missing) in str(caught.value)
+    assert "install -d" in str(caught.value)
+
+
+def test_a_relative_destination_is_refused(tmp_path: Path) -> None:
+    """systemd runs the backup with no working directory of its own, so a
+    relative path resolves somewhere nobody chose."""
+    with pytest.raises(ValueError) as caught:
+        check_backup_directory("backups")
+    assert "absolute" in str(caught.value)
+
+
+def test_an_empty_destination_is_refused() -> None:
+    """The empty string is not "leave it alone"; it is a path the backup would
+    join a filename onto and write into the current directory."""
+    with pytest.raises(ValueError):
+        check_backup_directory("   ")
+
+
+def test_a_file_where_the_directory_should_be_is_refused(tmp_path: Path) -> None:
+    not_a_dir = tmp_path / "file"
+    not_a_dir.write_text("")
+    with pytest.raises(ValueError) as caught:
+        check_backup_directory(str(not_a_dir))
+    assert "not a directory" in str(caught.value)
+
+
+def test_a_directory_the_service_cannot_write_is_refused(tmp_path: Path) -> None:
+    """root creating the directory first is how this has already failed: the
+    service runs as arraysense and can never write there."""
+    if os.geteuid() == 0:
+        pytest.skip("root can write to a 0500 directory")
+    unwritable = tmp_path / "unwritable"
+    unwritable.mkdir(mode=0o500)
+    try:
+        with pytest.raises(ValueError) as caught:
+            check_backup_directory(str(unwritable))
+        assert "chown" in str(caught.value)
+    finally:
+        unwritable.chmod(0o700)
+
+
+def test_a_read_only_sandbox_is_named_as_the_sandbox(tmp_path: Path, monkeypatch: Any) -> None:
+    """The failure found on a real machine, reported as "another backup is
+    running", which was false.
+
+    Under ProtectSystem=strict a path outside the unit's writable set fails
+    with "Read-only file system" however good the permissions are, and the
+    only remedy is a drop-in naming the directory. A rejection that blamed
+    ownership would send the owner chasing a chown that changes nothing.
+    """
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        raise OSError(errno.EROFS, "Read-only file system")
+
+    monkeypatch.setattr(tempfile, "mkstemp", refuse)
+    with pytest.raises(ValueError) as caught:
+        check_backup_directory(str(tmp_path))
+    message = str(caught.value)
+    assert "ReadWritePaths" in message
+    assert "ProtectSystem=strict" in message
+
+
+def test_the_probe_leaves_nothing_behind(tmp_path: Path) -> None:
+    """A check that littered the destination would leave the rotation counting
+    files that are not backups."""
+    check_backup_directory(str(tmp_path))
+    assert list(tmp_path.iterdir()) == []

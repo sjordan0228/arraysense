@@ -107,24 +107,28 @@ _CHART_HUES = {
 }
 
 
-def test_the_power_flow_chart_fills_only_the_grid_series() -> None:
-    # Band shading is drawn behind the series, and it cannot be read under two
-    # competing area fills — on a sunny day the solar area covers most of the
-    # plot. Grid keeps its fill for a reason recorded beside gridFill: when the
-    # house runs on the grid, import equals house load to the watt, so a grid
-    # *line* lies exactly under the home line and vanishes beneath it. Solar has
-    # no such coincidence, so as a line it stays legible.
+def test_the_power_flow_chart_fills_grid_and_leaves_solar_and_home_lines_to_the_look() -> None:
+    # Solar and home are lines on the power-flow chart; grid is the one series
+    # with a fill of its own, named here, and that is what stops it vanishing
+    # under home when the house runs on the grid. The washes under solar and
+    # home are the look's to give — trace() lays a soft --series-wash gradient
+    # beneath every line, and this chart names no fill for either — so the
+    # tariff shading drawn behind the chart still reads: compositing an even
+    # layer scales a step beneath it by one minus its alpha, and the wash's
+    # strongest value is 0.20, which leaves the band edges at four-fifths of
+    # their contrast.
     # Scoped to the power-flow chart's own builder rather than the whole page:
-    # the rule protects the tariff shading drawn behind THIS chart, and the
-    # forecast chart fills its actual series legitimately — nothing is shaded
-    # beneath it, and its solid-against-hatch mass is the owner's chosen way to
-    # tell a measurement from a prediction.
+    # pvFill is legitimately used on the forecast chart and the graphs page,
+    # and nothing here forbids it anywhere else.
     page = _web("index.html")
     start = page.index("function drawPower(")
     end = page.index("function drawBatt", start)
     flow = page[start:end]
     assert "gridFill" in flow, "grid lost the fill that stops it vanishing under home"
-    assert "pvFill" not in flow, "solar is still filled, so shading cannot be read beneath it"
+    assert "trace('Solar'" in flow and "trace('Home'" in flow, (
+        "solar or home is no longer drawn as a line on the power-flow chart"
+    )
+    assert "pvFill" not in flow, "the power-flow chart names the old full-area solar fill"
 
 
 def test_pv_fill_is_kept_available_even_though_unused() -> None:
@@ -287,6 +291,88 @@ def test_the_theme_is_applied_after_the_constants_it_reads() -> None:
     assert declared < applied, (
         "applyStoredTheme() is called above the constants it reads; the resolver "
         "will hit the temporal dead zone and quietly fall back to 'system'"
+    )
+
+
+def test_the_look_and_the_colour_mode_are_not_settings_in_the_database() -> None:
+    # Both are per-browser on purpose: one household can want the wall tablet
+    # dark and glassy and the laptop following the room, and a registry entry is
+    # one value for the whole installation, so saving it on either device would
+    # drag the other with it. The Settings page carries the two controls anyway,
+    # which is exactly the shape somebody later "tidies up" into the registry —
+    # so the decision is pinned here rather than left to the comment beside it.
+    from arraysense.settings import SETTINGS
+
+    for spec in SETTINGS:
+        tail = spec.key.split(".")[-1]
+        assert tail not in {"appearance", "look", "theme", "colour_mode", "color_mode"}, (
+            f"{spec.key} would put a per-browser choice in the database, where it "
+            "becomes one look for every device that opens this installation"
+        )
+
+
+def test_each_per_browser_choice_has_exactly_one_writer() -> None:
+    # The theme is now changed from two places — the glyph in every header and
+    # the list on the Settings page — and the look will be the moment a second
+    # control wants it. A control that writes the key itself is a second source
+    # of truth, and the failure is the quiet kind: two controls showing
+    # different answers for one browser, each of them certain.
+    common = _web("common.js")
+    for key in ("THEME_KEY", "APPEARANCE_KEY"):
+        writes = common.count(f"localStorage.setItem({key}")
+        assert writes == 1, f"{key} is written from {writes} places in common.js, not one"
+    # And not from a page at all, under the constant's name or its own.
+    from arraysense.api.app import PAGES
+
+    for name in PAGES.values():
+        page = _web(name)
+        for spelling in (
+            "localStorage.setItem(THEME_KEY",
+            "localStorage.setItem(APPEARANCE_KEY",
+            "arraysense-theme",
+            "arraysense-appearance",
+        ):
+            assert spelling not in page, f"{name} writes a per-browser choice behind common.js"
+
+
+def _js_map_keys(source: str, name: str) -> list[str]:
+    """The keys of a single-line object literal declared as `const <name> = {…}`."""
+    start = source.index(f"const {name} = {{")
+    body = source[start : source.index("};", start)]
+    return re.findall(r"[{,]\s*([A-Za-z_][A-Za-z0-9_]*)\s*:", body)
+
+
+def test_every_look_and_theme_a_control_can_offer_has_a_word_for_it() -> None:
+    # The Settings page lists the looks off APPEARANCE_SHEET's own keys and the
+    # themes off THEME_ORDER, and labels each from the name maps beside them —
+    # which is what lets a third look appear on the page with no edit to it. The
+    # failure that shape allows is a look with no entry in the names: a radio
+    # labelled "glass2", or worse an empty one, on the page whose job is
+    # choosing between them.
+    common = _web("common.js")
+    for offered, names in (
+        ("APPEARANCE_SHEET", "APPEARANCE_NAMES"),
+        ("THEME_GLYPH", "THEME_NAMES"),
+    ):
+        assert set(_js_map_keys(common, offered)) == set(_js_map_keys(common, names)), (
+            f"{offered} and {names} name different sets, so a control rendered from "
+            "the first would show a choice the second cannot label"
+        )
+    order = re.search(r"const THEME_ORDER = \[([^\]]*)\]", common)
+    assert order is not None
+    assert set(re.findall(r"'([a-z]+)'", order.group(1))) == set(
+        _js_map_keys(common, "THEME_NAMES")
+    )
+
+
+def test_the_theme_area_is_outside_the_form_that_is_redrawn() -> None:
+    # render() replaces the form's innerHTML on load and after every save. The
+    # Theme controls are not registry fields and are not rebuilt by it, so
+    # inside the form they would be wiped by the first save and not come back
+    # until a reload — which reads as the page having lost them.
+    page = _web("settings.html")
+    assert page.index('id="lookSec"') > page.index("</form>"), (
+        "the Theme area sits inside the form render() rebuilds, so a save deletes it"
     )
 
 

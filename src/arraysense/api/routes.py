@@ -28,6 +28,7 @@ import asyncio
 import logging
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
@@ -53,17 +54,26 @@ from arraysense.costs import (
     price_period,
     unpriced_minutes,
 )
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day, compute_hours
+from arraysense.curtailment import StringBaseline
+from arraysense.efficiency import (
+    CONFIG_VERSION_KEY,
+    EfficiencyRow,
+    compute_day,
+    compute_hours,
+    fitted_baselines,
+)
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
+    BACKUP_DIRECTORY_KEY,
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     WEATHER_INTERVAL_KEY,
     SettingsStore,
+    check_backup_directory,
     check_serial_device,
     describe,
     lookup_setting,
@@ -78,12 +88,18 @@ from arraysense.tariff import (
     EnergyShortfall,
     PeriodEnergy,
     Tariff,
+    # Private to tariff.py, and imported here rather than rewritten: CLAUDE.md
+    # names this and costs._real_minutes as the only two places a duration is
+    # allowed to be measured, because the one that does not go through them is
+    # the one that reads a 23-hour day as 24.
+    _elapsed,
     apportion_fixed,
     estimate_bill,
     load_tariff,
     merge_shortfalls,
 )
 from arraysense.weather import fetch_archive_hours
+from arraysense.weather.open_meteo import geocode
 
 if TYPE_CHECKING:
     # For the annotation only. Nothing here calls into the collector: the
@@ -174,6 +190,41 @@ def _request_zone(store: SqliteStore, tz: str | None) -> ZoneInfo:
     """
     configured = SettingsStore(store).get(SETTING_TIMEZONE)
     return resolve_zone(tz, configured if isinstance(configured, str) else None)
+
+
+def _energy_so_far_kwh(
+    hourly_means: Sequence[tuple[datetime, float]],
+    now: datetime,
+) -> float | None:
+    """Energy from a run of hourly mean powers, with the open hour left open.
+
+    Each hourly row is a mean over the readings inside its bucket, so its energy
+    is that mean times the hour — except for the hour in progress, which is a
+    mean over the part of it that has happened. The maintenance pass rebuilds
+    the hourly tier through the open bucket deliberately, so the current hour is
+    always there and always short; multiplying it by a whole hour claims energy
+    nobody has made yet, and the overstatement is largest at the top of the hour
+    and worth 9-10 kWh against a 77 kWh day on the reference array.
+
+    None when there is nothing to add up: a dash, never a zero, because zero is
+    a claim the array produced nothing.
+
+    What this still cannot see is an hour the collector covered only in part —
+    a mean over five minutes of an hour it was up for reads as an hour. The
+    hourly tier's ``sample_count`` is the only witness to that, and turning it
+    into minutes needs a cadence figure that is 11 s configured, 12 s achieved
+    and 16 s averaged over a long window, so it would trade a bounded error for
+    an unbounded guess.
+    """
+    if not hourly_means:
+        return None
+    total_wh = 0.0
+    for hour, mean_w in hourly_means:
+        # Both are UTC here, but the duration goes through _elapsed anyway: it
+        # is the habit that keeps the one that matters from being the exception.
+        elapsed_hours = _elapsed(hour, now) / 3600.0
+        total_wh += mean_w * min(max(elapsed_hours, 0.0), 1.0)
+    return total_wh / 1000.0
 
 
 def _weather_interval(store: SqliteStore) -> float:
@@ -283,6 +334,53 @@ def _check_range(start: datetime, end: datetime) -> None:
     """Reject a range that ends before it starts."""
     if end <= start:
         raise HTTPException(status_code=400, detail="end must be after start")
+
+
+@contextmanager
+def _inside_the_calendar() -> Iterator[None]:
+    """Turn a walk that steps off the end of the calendar into a 400.
+
+    Every one of these endpoints walks its range a day or a month at a time, and
+    a bound near year 1 or year 9999 makes the next step land outside anything a
+    ``datetime`` can hold. That is the caller's mistake — a mistyped year in a
+    date field reaches it — and every other malformed input on the same
+    endpoints already answers 400 or 422: an unknown metric, a blank device, a
+    reversed range, an unknown zone, a bad period. Only this shape told somebody
+    who typed a date wrongly that the server was broken, and left a traceback in
+    the log of an unattended service saying so.
+
+    ``OverflowError`` is always a calendar-bounds problem — the guard can prove
+    it — so it carries a prefix saying so.  ``ValueError`` is passed through
+    with its original detail because it can come from a domain check inside a
+    calendar-walking function (a costed period that is too long, a reversed
+    range) and those messages are already specific enough on their own.  This
+    guard should only wrap calendar-walking code, never business logic, so a
+    ``ValueError`` from an unrelated cause does not become a client error here.
+    """
+    try:
+        yield
+    except OverflowError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"the range steps outside the calendar: {exc}",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _cadence_seconds(poll_interval: float) -> int:
+    """The poll interval as whole seconds, never zero.
+
+    ``select_tier`` is right to call a cadence of zero a programming error — it
+    divides by it — but a sub-second interval is a legal file config: Config
+    accepts anything above zero and only the settings overlay is bounded at one
+    second, so ``poll_interval = 0.5`` in config.toml reached ``int()``, came out
+    zero, and turned every chart on the Graphs page and the whole of the battery
+    history into a 500 with nothing in it naming the interval. A poll faster
+    than the tier resolution can express is one second's worth of cadence for
+    the purpose of choosing a tier.
+    """
+    return max(1, int(poll_interval))
 
 
 def _row_time(row: Mapping[str, Any] | None) -> datetime | None:
@@ -405,6 +503,21 @@ def _staleness(service: CollectorService, store: SqliteStore, now: datetime) -> 
         # beside any other verdict attaches an old cause to a new condition.
         "reason": s.last_error if verdict in _NAMED_FAULTS else None,
     }
+
+
+@router.get("/geocode")
+async def geocode_route(q: str, country: str | None = None) -> dict[str, Any]:
+    """Resolve a postcode or place name to coordinates via Open-Meteo geocoding.
+
+    Reads nothing and writes nothing — needs no store. Returns a list of
+    candidates, empty when the service finds nothing, absent when the fetch
+    itself failed. A page must show every candidate so the owner picks;
+    a single candidate already fills the boxes.
+    """
+    results = geocode(q.strip(), country.strip() if country else None)
+    if results is None:
+        raise HTTPException(status_code=502, detail="geocoding service unreachable")
+    return {"query": q.strip(), "candidates": results}
 
 
 @router.get("/status")
@@ -593,21 +706,31 @@ async def capabilities(request: Request) -> dict[str, Any]:
             "battery_module_metrics": None,
         }
         if declared is not None:
-            entry.update(
-                {
-                    "pv_strings": declared.pv_strings,
-                    "energy": declared.energy.value,
-                    "backup_output": declared.backup_output,
-                    "generator_input": declared.generator_input,
-                    "split_phase": declared.split_phase,
-                    "three_phase": declared.three_phase,
-                    "parallel_capable": declared.parallel_capable,
-                    "per_module_battery": declared.per_module_battery,
-                    "transport": declared.transport,
-                    "metrics": list(inverter_metric_columns(declared.metrics)),
-                    "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            capabilities_update: dict[str, Any] = {
+                "pv_strings": declared.pv_strings,
+                "energy": declared.energy.value,
+                "backup_output": declared.backup_output,
+                "generator_input": declared.generator_input,
+                "split_phase": declared.split_phase,
+                "three_phase": declared.three_phase,
+                "parallel_capable": declared.parallel_capable,
+                "per_module_battery": declared.per_module_battery,
+                "transport": declared.transport,
+                "metrics": list(inverter_metric_columns(declared.metrics)),
+                "battery_module_metrics": list(module_metric_columns(declared.metrics)),
+            }
+            if declared.conversion is not None:
+                capabilities_update["conversion"] = {
+                    "cec_pct": declared.conversion.cec_pct,
+                    "max_pv_to_grid_pct": declared.conversion.max_pv_to_grid_pct,
+                    "max_battery_to_grid_pct": declared.conversion.max_battery_to_grid_pct,
+                    "max_pv_to_battery_pct": declared.conversion.max_pv_to_battery_pct,
+                    "idle_normal_w": declared.conversion.idle_normal_w,
+                    "idle_standby_w": declared.conversion.idle_standby_w,
+                    "approximate": list(declared.conversion.approximate),
+                    "citation": declared.conversion.citation,
                 }
-            )
+            entry.update(capabilities_update)
         devices.append(entry)
     return {"devices": devices}
 
@@ -773,6 +896,40 @@ def _reject_undeclared_mppts(request: Request, wanted: dict[str, Any]) -> None:
             )
 
 
+def _reject_unwritable_backup_dir(request: Request, wanted: dict[str, Any]) -> None:
+    """Refuse a backup destination this service cannot write to.
+
+    The registry cannot ask this. Its ``check=`` callbacks are functions of the
+    text and answer the same on every machine, while whether a directory can be
+    written is a fact about the disk and the sandbox in front of it. So it is
+    asked here, at the only moment somebody is present to read the remedy —
+    a backup that first discovers the problem at 03:15 discovers it alone.
+
+    Only when the value changes. The page posts what was edited, but nothing
+    stops a client posting the whole form, and an installation whose backup
+    disk has gone missing must still be able to change its tariff. Refusing
+    every save over a fault the save did not introduce would lock the settings
+    page over a broken backup.
+
+    Raises ValueError, which the route maps to 400 with the rest.
+    """
+    wanted_dir = wanted.get(BACKUP_DIRECTORY_KEY)
+    if not isinstance(wanted_dir, str):
+        return
+    settings = SettingsStore(request.app.state.store)
+    if settings.get(BACKUP_DIRECTORY_KEY) == wanted_dir:
+        return
+    try:
+        check_backup_directory(wanted_dir)
+    except ValueError as exc:
+        # Named the way the registry names its own failures. The settings page
+        # finds the field a rejection belongs to by looking for the key in the
+        # message, so a bare message lands in the page banner instead of under
+        # the box that caused it — measured in a browser, where a remedy three
+        # sections away from its own control is a remedy nobody reads.
+        raise ValueError(f"{BACKUP_DIRECTORY_KEY}: {exc}") from exc
+
+
 @router.put("/settings")
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
@@ -794,6 +951,7 @@ async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, 
         # written. Inside the try so its ValueError maps to 400 like the rest.
         _reject_unbootable_connection(request, wanted)
         _reject_undeclared_mppts(request, wanted)
+        _reject_unwritable_backup_dir(request, wanted)
         changed = settings.update(wanted)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -891,7 +1049,8 @@ def costs(
     # be measured *from*, rather than starting at whatever row happens to fall
     # inside it. Without the lead, the first stretch of every month is short by
     # however long it took the first sample to arrive.
-    lead = start - COUNTER_LEAD
+    with _inside_the_calendar():
+        lead = start - COUNTER_LEAD
     # Minute first, then coarser, then raw. Hourly has to be in the chain and
     # not just as a last resort: the minute tier is kept for a year, so a month
     # older than that has nothing there while the hourly tier holds it back to
@@ -905,13 +1064,12 @@ def costs(
         rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
         if rows:
             break
-    try:
+    with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     result = price_period(tariff, energy, fixed_charge=_month_charge(tariff, start, zone))
     bill = estimate_bill(tariff, energy)
+    unpriced = round(unpriced_minutes(tariff, start, end, zone))
 
     # The page needs more than the priced totals to be honest about them: the
     # hours each band covers so it can be labelled, the house energy behind the
@@ -928,7 +1086,7 @@ def costs(
         "rows": _band_rows(tariff, energy, result),
         "measured_minutes": energy.measured_minutes,
         "elapsed_minutes": energy.elapsed_minutes,
-        "unpriced_minutes": round(unpriced_minutes(tariff, start, end, zone)),
+        "unpriced_minutes": unpriced,
         # Per counter: what the figures hold, what the meter counted that they
         # do not, and whether some loss has no statable size. The labels on
         # every money figure are worded from this, never from the minutes
@@ -1060,9 +1218,15 @@ def history(
     """
     _check_range(start, end)
     names = _parse_metrics(metrics, _INVERTER_NAMES, "inverter")
-    cadence = int(request.app.state.config.poll_interval)
+    cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence)
-    rows = store.query(names, start, end, tier=tier, device=_device(device))
+    # A mistyped year reaches ``int(start.timestamp())`` in the store and raises
+    # OverflowError (or ValueError on some platforms).  Neither of these endpoints
+    # goes through ``read_energy`` or ``band_intervals``, so they need their own
+    # guard.  The fix at d7c3dcb missed them because the audit swept only the
+    # endpoints the calendar-walk wrappers already covered.
+    with _inside_the_calendar():
+        rows = store.query(names, start, end, tier=tier, device=_device(device))
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
@@ -1087,9 +1251,12 @@ def battery_history(
     """
     _check_range(start, end)
     names = _parse_metrics(metrics, set(module_metric_columns()), "module")
-    cadence = int(request.app.state.config.poll_interval)
+    cadence = _cadence_seconds(request.app.state.config.poll_interval)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, module=True)
-    rows = store.query_modules(names, start, end, tier=tier, serial=serial, device=_device(device))
+    with _inside_the_calendar():
+        rows = store.query_modules(
+            names, start, end, tier=tier, serial=serial, device=_device(device)
+        )
     return {"tier": tier, "count": len(rows), "points": [_isoformat_row(r) for r in rows]}
 
 
@@ -1149,7 +1316,8 @@ def energy(
     start, end = with_zone(start, zone), with_zone(end, zone)
     _check_range(start, end)
 
-    read = read_energy(store, start, end, period=period, zone=zone)
+    with _inside_the_calendar():
+        read = read_energy(store, start, end, period=period, zone=zone)
 
     tariff, stored = (None, "")
     if priced:
@@ -1172,7 +1340,8 @@ def energy(
         # of the next, and pricing hours still in the future leaves the whole
         # month unmeasured and shows a dash beside a month that plainly used
         # electricity.
-        priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
+        with _inside_the_calendar():
+            priced_buckets = bucket_energy(tariff, read.rows, read.edges, zone, until=end)
         for index, split in enumerate(priced_buckets):
             splits[read.edges[index]] = split
             money[read.edges[index]] = price_period(
@@ -1531,11 +1700,10 @@ def bands(
     # the server's. ``band_intervals`` says so with a ValueError, which would
     # otherwise leave FastAPI to answer 500 — telling somebody who asked for five
     # years that the service is broken. ``/api/costs`` converts the same error
-    # for the same reason.
-    try:
+    # for the same reason, and a range that runs off the calendar entirely is
+    # the same mistake one step further out.
+    with _inside_the_calendar():
         intervals = band_intervals(tariff, start, end, zone)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     windows = [
         {
@@ -1638,15 +1806,14 @@ def forecast(
     # Actual production so far. Null when no hour has a reading yet — a dash,
     # never zero, because zero means the array produced nothing and that is a
     # different statement from "nobody has looked yet".
-    actual_by_hour: dict[datetime, float] = {}
-    actual_wh = 0.0
-    for row in actual_rows:
-        if not row.get("error") and row.get("pv_total_power_w") is not None:
-            ts = cast(datetime, row["timestamp"])
-            w = cast(float, row["pv_total_power_w"])
-            actual_by_hour[ts] = w
-            actual_wh += w
-    actual_so_far_kwh: float | None = actual_wh / 1000.0 if actual_by_hour else None
+    actual_so_far_kwh = _energy_so_far_kwh(
+        [
+            (cast(datetime, row["timestamp"]), cast(float, row["pv_total_power_w"]))
+            for row in actual_rows
+            if not row.get("error") and row.get("pv_total_power_w") is not None
+        ],
+        now,
+    )
 
     return {
         "configured": True,
@@ -1697,6 +1864,13 @@ def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict
     Resumable by construction — rows are keyed by timestamp, so re-running a
     range rewrites the same hours rather than duplicating them, and a failure
     reports the last day that landed so the next run can carry on from there.
+
+    The appends run on FastAPI's threadpool while the collector appends on
+    the event loop, so they take ``write_connection`` — a store bound to its
+    own connection — rather than the primary one, or the read view above,
+    whose contract forbids writers. On one connection ``with conn:`` is
+    transaction state rather than a lock, and an append that failed here
+    would roll the collector's in-flight poll back with it.
     """
     settings = SettingsStore(store)
     latitude = settings.get(SETTING_LATITUDE)
@@ -1723,29 +1897,30 @@ def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict
     days = 0
     last_day: str | None = None
     current = start
-    while current <= end:
-        samples = fetch_archive_hours(latitude, longitude, current, current)
-        if samples is None:
-            # The fetch failed. Stop here and report where, rather than
-            # marching on and leaving holes nobody can see.
-            break
-        if not samples:
-            # The archive simply had nothing for this day. Step over it.
-            logger.info("archive holds no readings for %s; skipping", current)
+    with request.app.state.store.write_connection() as writer:
+        while current <= end:
+            samples = fetch_archive_hours(latitude, longitude, current, current)
+            if samples is None:
+                # The fetch failed. Stop here and report where, rather than
+                # marching on and leaving holes nobody can see.
+                break
+            if not samples:
+                # The archive simply had nothing for this day. Step over it.
+                logger.info("archive holds no readings for %s; skipping", current)
+                days += 1
+                last_day = current.isoformat()
+                current += timedelta(days=1)
+                continue
+            for sample in samples:
+                try:
+                    writer.append(sample)
+                except sqlite3.Error as exc:
+                    logger.warning("backfill could not store an hour: %s", exc)
+                    break
+                written += 1
             days += 1
             last_day = current.isoformat()
             current += timedelta(days=1)
-            continue
-        for sample in samples:
-            try:
-                store.append(sample)
-            except sqlite3.Error as exc:
-                logger.warning("backfill could not store an hour: %s", exc)
-                break
-            written += 1
-        days += 1
-        last_day = current.isoformat()
-        current += timedelta(days=1)
     return {"days": days, "hours_written": written, "last_day": last_day}
 
 
@@ -1777,11 +1952,26 @@ def panels(request: Request, store: _ReadStore) -> dict[str, Any]:
             "battery.installed",
         )
     }
+    from arraysense.panels import PANEL_CATALOGUE
+
     declared = getattr(request.app.state.service.source, "capabilities", None)
     return {
         "strings": [{**asdict(s), "defaulted": sorted(s.defaulted)} for s in strings],
         "battery": battery,
         "declared_mppts": declared.pv_strings if declared is not None else None,
+        "catalogue": [
+            {
+                "name": e.name,
+                "description": e.description,
+                "vmp": e.vmp,
+                "voc": e.voc,
+                "temp_coeff": e.temp_coeff,
+                "noct": e.noct,
+                "degradation": e.degradation,
+                "citation": e.citation,
+            }
+            for e in PANEL_CATALOGUE
+        ],
     }
 
 
@@ -1809,16 +1999,23 @@ def _daily_range(
     # Month: the calendar month that contains day_start, from its first day
     # through the first day of the following month.
     if period == "month":
-        first_of_month = day_start.replace(day=1)
-        if first_of_month.month == 12:
-            next_month = first_of_month.replace(year=first_of_month.year + 1, month=1, day=1)
-        else:
-            next_month = first_of_month.replace(month=first_of_month.month + 1, day=1)
-        days_count = (next_month - first_of_month).days
-        return [
-            (first_of_month + timedelta(days=i), first_of_month + timedelta(days=i + 1))
-            for i in range(days_count)
-        ]
+        try:
+            first_of_month = day_start.replace(day=1)
+            if first_of_month.month == 12:
+                next_month = first_of_month.replace(year=first_of_month.year + 1, month=1, day=1)
+            else:
+                next_month = first_of_month.replace(month=first_of_month.month + 1, day=1)
+            days_count = (next_month - first_of_month).days
+            return [
+                (first_of_month + timedelta(days=i), first_of_month + timedelta(days=i + 1))
+                for i in range(days_count)
+            ]
+        except ValueError:
+            # ``replace(year=10000)`` raises ValueError rather than OverflowError
+            # because the constructor rejects the year before any arithmetic
+            # happens.  Convert it so the single ``_inside_the_calendar`` guard
+            # catches every shape the same mistake can take.
+            raise OverflowError("date value out of range") from None
     return []
 
 
@@ -1849,21 +2046,40 @@ def _hourly_efficiency_for_range(
     ]
 
 
-def _baseline_info(daily_rows: list[EfficiencyRow]) -> dict[str, Any]:
-    """Build the baseline block from the computed rows.
+_NO_BASELINE: dict[str, Any] = {"window_start": None, "window_end": None, "samples": None}
 
-    Reports the window the first day's rows cover.  Sample count is absent
-    because the daily summary rows do not carry it — a day whose baseline
-    could not be fitted returns no rows at all, so the presence of rows is
-    itself the signal that the system is calibrated.
+
+def _baseline_info(
+    baselines: Mapping[str, StringBaseline | None],
+    range_start: datetime,
+    range_end: datetime,
+) -> dict[str, Any]:
+    """What the curtailment rule was actually calibrated against, or nothing.
+
+    This used to report a window whenever any daily row existed, reasoning that
+    a day whose baseline could not be fitted returns no rows. It does not:
+    ``baseline_for`` returns None for a string with fewer than three producing
+    hours, ``compute_hours`` then disables the signature test for that string
+    and scores the day anyway, and the page said "Calibrated from <date>" for a
+    system where nothing had been fitted and where curtailment could never be
+    booked. On the reference installation that is the state every morning until
+    the third producing hour lands.
+
+    The window is the range the fit ran over rather than the first day of the
+    period, which was never when anything was fitted either, and ``samples`` is
+    the pairs behind the thinnest string's fit — the evidence the claim rests
+    on, which the page had no way to show while it was always null.
     """
-    if not daily_rows:
-        return {"window_start": None, "window_end": None, "samples": None}
-    first_day = daily_rows[0].day
+    fitted = [b for b in baselines.values() if b is not None]
+    if not fitted or len(fitted) < len(baselines):
+        # One unfitted string is enough to withhold the claim: it is exactly the
+        # string whose curtailment cannot be seen, and a window covering it
+        # would say the opposite.
+        return dict(_NO_BASELINE)
     return {
-        "window_start": first_day.isoformat(),
-        "window_end": (first_day + timedelta(days=1)).isoformat(),
-        "samples": None,
+        "window_start": range_start.isoformat(),
+        "window_end": range_end.isoformat(),
+        "samples": min(b.samples for b in fitted),
     }
 
 
@@ -1914,7 +2130,8 @@ def efficiency(
         raise HTTPException(status_code=400, detail=f"start must be YYYY-MM-DD: {exc}") from exc
 
     day_start = datetime.combine(start_date, datetime.min.time(), tzinfo=zone)
-    days = _daily_range(day_start, period)
+    with _inside_the_calendar():
+        days = _daily_range(day_start, period)
     if not days:
         raise HTTPException(
             status_code=400, detail=f"could not compute range for period={period!r}"
@@ -1942,7 +2159,7 @@ def efficiency(
             "hours": None,
             "days": [],
             "worst_hour": None,
-            "baseline": {"window_start": None, "window_end": None, "samples": None},
+            "baseline": dict(_NO_BASELINE),
         }
 
     config_version_raw = settings.get(CONFIG_VERSION_KEY)
@@ -1977,7 +2194,7 @@ def efficiency(
             "hours": None,
             "days": [],
             "worst_hour": None,
-            "baseline": {"window_start": None, "window_end": None, "samples": None},
+            "baseline": dict(_NO_BASELINE),
         }
 
     # Aggregate: group by string_name.  The total row has string_name == "".
@@ -1985,7 +2202,35 @@ def efficiency(
     for r in daily_rows:
         by_string.setdefault(r.string_name, []).append(r)
 
-    total_kwp = sum(_string_kwp(s) for s in strings)
+    # The array's yield is its output over the nameplate that produced it, and a
+    # string the inverter never reported produced no part of the numerator — so
+    # it must be no part of the denominator either. Dividing two strings' output
+    # by three strings' kWp understates the array by a third and says nothing:
+    # the reference installation served 3.621 kWh/kWp for a day PV3 was never
+    # read, against 14.04 kWp of which only 9.36 was measured.
+    scored_names = {r.string_name for r in daily_rows if r.string_name}
+    described_names = {s.name for s in strings}
+    total_kwp = sum(_string_kwp(s) for s in strings if s.name in scored_names)
+
+    # How much of the period the total was actually totalled over. A day the
+    # engine could not model returns no rows at all, so it simply vanishes from
+    # the aggregate: the week of a five-day outage was reported as the week's
+    # figures, with a specific yield understated in exact proportion to the days
+    # missing and nothing in the summary to say so. Only days that have begun
+    # count as owed — a week asked for on its Tuesday is not missing Thursday.
+    days_expected = sum(1 for ds, _ in days if ds <= now)
+    days_scored = len({r.day for r in by_string.get("", [])})
+
+    # A string read on some days and silent on others produces rows for only the
+    # days it was read.  Counting it as "scored" because it appears at all is how
+    # a week of four West-string days plus seven South-string days reported
+    # itself complete, with a specific yield understated in exact proportion to
+    # the days West was absent.  The total is only complete when every described
+    # string was scored on every expected day.
+    string_days: dict[str, int] = {}
+    for s in strings:
+        string_days[s.name] = len({r.day for r in by_string.get(s.name, [])})
+    any_string_incomplete = any(d < days_expected for d in string_days.values())
 
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
         expected = sum(r.expected_kwh for r in rows)
@@ -2005,6 +2250,11 @@ def efficiency(
         # Per-string kWp for per-string yield; total for total.
         kwp = total_kwp if name == "" else sum(_string_kwp(s) for s in strings if s.name == name)
         sy: float | None = actual / kwp if kwp > 0.0 else None
+        # The total is incomplete when any string is incomplete.  A per-string
+        # row is incomplete when its own days fall short of what the period owes,
+        # even if the string appeared on SOME days — four days scored of seven is
+        # a partial figure presented as complete without this check.
+        my_days = string_days.get(name, 0) if name else days_scored
         return {
             "expected_kwh": round(expected, 3),
             "actual_kwh": round(actual, 3),
@@ -2014,10 +2264,26 @@ def efficiency(
             "pr": round(pr, 4) if pr is not None else None,
             "specific_yield": round(sy, 3) if sy is not None else None,
             "tolerance_pct": _METER_TOLERANCE_PCT,
-            "partial": any(r.partial for r in rows),
+            # Four different incompletenesses, and the flag has to carry all of
+            # them. ``r.partial`` is a within-day figure — how much of a day's
+            # daylight the engine could model — and it is blind to a day that
+            # produced no row to carry a flag on, to a string the inverter was
+            # silent about for the whole period, and to a string that reported on
+            # some days but not all of them.
+            "partial": (
+                any(r.partial for r in rows)
+                or my_days < days_expected
+                or (name == "" and any_string_incomplete)
+            ),
+            "days_scored": my_days,
+            "days_expected": days_expected,
         }
 
-    summary = _summarise("", by_string.get("", []))
+    summary = {
+        **_summarise("", by_string.get("", [])),
+        "strings_scored": len(scored_names),
+        "strings_described": len(described_names),
+    }
 
     # Per-string summaries
     string_summaries: list[dict[str, Any]] = []
@@ -2072,7 +2338,19 @@ def efficiency(
     if period != "day":
         hours = None
 
-    baseline = _baseline_info(daily_rows)
+    # Baselines are fitted per day by ``compute_hours`` inside ``compute_day``,
+    # so a period longer than a day has no single fit to report — the range-wide
+    # ``fitted_baselines`` can report itself calibrated on a week whose Tuesday
+    # had too few producing hours for its own fit to succeed, and the page would
+    # print a window that was not the evidence any of its numbers rested on.
+    if period == "day":
+        baseline = _baseline_info(
+            fitted_baselines(store, settings, range_start, range_end, strings),
+            range_start,
+            range_end,
+        )
+    else:
+        baseline = dict(_NO_BASELINE)
 
     return {
         "configured": True,

@@ -329,6 +329,40 @@ def test_the_backup_unit_makes_no_false_clock_claim() -> None:
     assert "After=arraysense.service time-sync.target" not in text
 
 
+def _packaging(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "packaging" / name).read_text()
+
+
+def test_the_backup_timer_asks_often_and_lets_the_settings_decide() -> None:
+    """The schedule moved into the settings, so the timer's job is only to ask.
+
+    A daily OnCalendar would put the hour back in a file only root can edit,
+    which is the thing the setting replaced. Persistent stays: a machine that
+    was off must back up when it returns rather than skip the day.
+    """
+    text = _packaging("arraysense-backup.timer")
+    assert "OnCalendar=*-*-* *:00/15:00" in text
+    assert "Persistent=true" in text
+    # Jitter would make the configured minute a lie for no benefit — nothing
+    # here contends for a network resource, and the CLI decides when to run.
+    # The directive, not the word: the comment explains its own absence.
+    assert not [line for line in text.splitlines() if line.startswith("RandomizedDelaySec")]
+
+
+def test_the_backup_unit_runs_the_scheduled_mode() -> None:
+    """Without --scheduled the unit would back up every fifteen minutes."""
+    assert "manage.py backup --scheduled" in _packaging("arraysense-backup.service")
+
+
+def test_the_service_can_prove_the_default_backup_directory_is_writable() -> None:
+    """The settings write path refuses a destination it cannot write to, and
+    under ProtectSystem=strict a directory outside the unit's writable set is
+    read-only however good its permissions are. Without this line the service
+    would refuse its own default destination. The leading '-' keeps a machine
+    that never installed the backup fragments from failing to start."""
+    assert "ReadWritePaths=-/var/backups/arraysense" in _packaging("arraysense.service")
+
+
 def test_unit_text_reads_the_unit_from_the_clone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
