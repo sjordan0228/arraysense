@@ -7,6 +7,19 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.2 — 13 August 2026
+
+A performance ratio that was roughly double for one wiring arrangement.
+
+### Fixed
+
+- **Performance ratios for two strings sharing one MPPT are corrected.** The
+  inverter reports one MPPT total, but the old scorer counted that reading once
+  for each configured string, so affected past ratios were roughly double. The
+  corrected scorer groups those strings under their one measured input and
+  queues historical days for recomputation; installations with one string per
+  MPPT keep the same rows and figures.
+
 ## 1.0.1 — 13 August 2026
 
 Says which dongle, because "WiFi dongle" was not specific enough to buy from.

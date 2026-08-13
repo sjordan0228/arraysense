@@ -716,6 +716,19 @@ class TestEfficiencyMaintenance:
         store.close()
         assert rows == []
 
+    async def test_an_algorithm_change_reopens_stored_efficiency_days(self, tmp_path: Path) -> None:
+        """The MPPT grouping change raises the scorer's minimum version to two."""
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        svc, store = self._configured(tmp_path)
+        settings = SettingsStore(store)
+        settings.set(CONFIG_VERSION_KEY, 1)
+
+        await svc.maintain_efficiency()
+
+        assert settings.get(CONFIG_VERSION_KEY) == 2
+        store.close()
+
 
 class TestEfficiencyBackfill:
     """The bounded historical backfill, and the days it must not touch twice."""

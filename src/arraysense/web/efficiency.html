@@ -52,6 +52,7 @@
     vertical-align:middle;margin-left:6px;min-width:20px}
   .strtable .prbar i{display:block;height:100%;border-radius:2px;
     background:linear-gradient(90deg,rgba(207,123,38,.7),rgba(207,123,38,.25))}
+  .strtable .groupnote{display:block;margin-top:3px;font-size:11px;line-height:1.4;color:var(--ink3)}
   /* Worst hour — named plainly, no drama. */
   .worst{margin-top:14px}
   .worst .when{font-size:13px;font-weight:500}
@@ -403,8 +404,14 @@ function renderStrings(strings, tolerancePct) {
     const prCell = prPct !== null
       ? `${prPct}%${tol}<span class="prbar"><i style="width:${barWidth}%"></i></span>`
       : DASH;
+    // >>> eff-mppt-group-note
+    const groupNote = Array.isArray(s.members)
+      ? `<span class="groupnote">${esc(s.members.join(' + '))} share MPPT ${esc(String(s.mppt))}; `
+        + 'the inverter reports one figure for this group, not one per string.</span>'
+      : '';
+    // <<< eff-mppt-group-note
     return `<tr>
-      <td>${esc(s.name)}</td>
+      <td>${esc(s.name)}${groupNote}</td>
       <td>${esc(uStr(s.expected_kwh, 1, 'kWh'))}</td>
       <td>${esc(uStr(s.actual_kwh, 1, 'kWh'))}</td>
       <td>${esc(uStr(s.curtailed_kwh, 1, 'kWh'))}</td>

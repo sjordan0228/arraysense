@@ -476,7 +476,7 @@ class CollectorService:
         # cheap (a single-row read) and the method is a no-op after the first
         # call, so it is safe to leave in the periodic path rather than wiring a
         # one-shot trigger.
-        if settings.ensure_efficiency_version(1):
+        if settings.ensure_efficiency_version(2):
             # The version just advanced — re-read it so the rows we are about to
             # write carry the new version rather than the one they would match
             # and never recompute.
