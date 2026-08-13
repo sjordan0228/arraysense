@@ -7,6 +7,56 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.12.0 — 13 August 2026
+
+The database stops growing without end, if you ask it to.
+
+### Added
+
+- **Data retention, on the Settings page under Collection.** The schema has
+  declared thirty days of full-cadence readings and a year of minute readings
+  since it was written, and nothing ever read that declaration: no tier was
+  pruned and the database grew about 5.3 MB a day without bound. It is enforced
+  now — and **off until you switch it on**, because deleting readings cannot be
+  undone and that decision belongs to whoever owns the history. Three settings:
+  whether to enforce it at all, how long to keep raw, and how long to keep
+  minute. The two day counts default to what the schema declares, so the field
+  the whole thing turned on finally has a reader.
+
+- **A dry run that answers before you arm anything.** `arraysense
+  --prune-dry-run` reports exactly what would be removed, tier by tier, and
+  removes nothing — and it answers while retention is still switched off,
+  because a preview you can only see after enabling the thing that deletes is
+  not a preview. `arraysense --prune` runs one pass by hand under the same
+  gates.
+
+### Notes
+
+- Nothing is deleted unless a backup archive exists that is at least as new as
+  the cutoff. Every candidate row is older than that cutoff, so an archive at
+  or after it already contains them — the guarantee is arithmetic rather than a
+  hopeful freshness window. A missing or stale backup stops retention and says
+  so in the log rather than proceeding.
+
+- A tier is never dropped before the coarser tiers behind it hold every bucket
+  it covers, checked bucket by bucket rather than by comparing endpoints: a
+  span says only that the ends straddle the range, and a hole in the middle
+  would pass it while the raw rows that could refill it were deleted. Raw needs
+  both the minute and the hourly tier, because the hourly rebuild reads raw and
+  not minute. Hourly data is kept indefinitely and is never pruned — nothing is
+  coarser, so no check could ever clear it.
+
+- Deletion runs in small batches, each in its own transaction, with the whole
+  pass capped. The reference installation keeps its database on a USB SSD that
+  has dropped off the bus once under sustained writes, and one long delete is
+  exactly the shape of that incident. Measured on the bench: 229,373 rows
+  removed while the collector polled every second cost it not one poll.
+
+- Freed pages are reused rather than returned to the filesystem, so the file
+  stops growing rather than shrinking. `VACUUM` is deliberately not run — it
+  needs roughly twice the database in free space and holds the write lock for
+  minutes on a Raspberry Pi.
+
 ## 0.11.0 — 13 August 2026
 
 The Graphs page stops being one long scroll.

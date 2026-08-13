@@ -371,7 +371,7 @@ const TABS = [
   {
     id: 'collection',
     title: 'Collection',
-    prefixes: ['collector', 'backup'],
+    prefixes: ['collector', 'backup', 'retention'],
   },
   {
     id: 'rate-bands',
@@ -440,6 +440,11 @@ const GROUPS = [
     prefix: 'backup',
     title: 'Backup',
     intro: 'Where the database is copied to for safekeeping.',
+  },
+  {
+    prefix: 'retention',
+    title: 'Data retention',
+    intro: 'How long covered readings are kept. Retention needs a current backup before it can delete anything.',
   },
   {
     prefix: 'tariff',

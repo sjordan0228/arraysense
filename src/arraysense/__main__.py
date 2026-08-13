@@ -22,6 +22,8 @@ import signal
 import sqlite3
 import sys
 from collections.abc import AsyncIterator
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import uvicorn
@@ -35,6 +37,7 @@ from arraysense.config import DEFAULT_PATH, Config, effective, load
 from arraysense.metrics import SITE_METRICS
 from arraysense.settings import SettingsStore
 from arraysense.store.migrate import migrate_devices, needs_device_migration
+from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
@@ -59,6 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stamp a database written before device identity with the configured "
         "inverter serial, then exit",
+    )
+    prune = parser.add_mutually_exclusive_group()
+    prune.add_argument(
+        "--prune-dry-run",
+        action="store_true",
+        help="report one retention pass without deleting rows, then exit",
+    )
+    prune.add_argument(
+        "--prune",
+        action="store_true",
+        help="run one retention pass by hand, then exit",
     )
     parser.add_argument("--version", action="version", version=f"arraysense {__version__}")
     return parser
@@ -307,6 +321,41 @@ def run_migration(config: Config) -> int:
     return 0
 
 
+def _print_retention_report(report: RetentionReport) -> None:
+    """Print every table's result so a manual deletion has an audit trail."""
+    if report.reason is not None:
+        print(f"retention: {report.reason}")
+    for table in report.tables:
+        oldest = table.oldest.isoformat() if table.oldest is not None else "none"
+        blocked = table.blocked or "none"
+        print(
+            f"{table.table}: cutoff={table.cutoff.isoformat()} rows={table.rows} "
+            f"oldest={oldest} blocked={blocked}"
+        )
+
+
+def run_prune(config: Config, *, dry_run: bool) -> int:
+    """Run the same guarded retention pass the collector schedules hourly."""
+    _app, store, _service = build_app(config)
+    try:
+        policy = policy_from_settings(SettingsStore(store))
+        # A preview is the decision aid for enabling retention, so it evaluates
+        # the same backup, coverage and batching gates even while the real,
+        # destructive schedule remains disabled.
+        if dry_run:
+            policy = replace(policy, enabled=True)
+        report = run_retention(
+            store._conn,
+            policy,
+            now=datetime.now(tz=UTC),
+            dry_run=dry_run,
+        )
+    finally:
+        store.close()
+    _print_retention_report(report)
+    return 0
+
+
 def _schedule_setup_restart() -> None:
     """Exit cleanly in a moment, after the apply response has gone out.
 
@@ -530,6 +579,13 @@ def main(argv: list[str] | None = None) -> int:
             return run_migration(config)
         except (OSError, sqlite3.Error, RuntimeError) as exc:
             logger.error("migration failed, database unchanged: %s", exc)
+            return 1
+
+    if args.prune or args.prune_dry_run:
+        try:
+            return run_prune(config, dry_run=args.prune_dry_run)
+        except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+            logger.error("retention prune failed; database may have been partially pruned: %s", exc)
             return 1
 
     if needs_device_migration(config.database_path):

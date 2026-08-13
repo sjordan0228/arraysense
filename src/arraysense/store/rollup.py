@@ -202,6 +202,17 @@ def _floor_div(column: str, divisor: int) -> str:
     return f"({column} - (({column} % {divisor}) + {divisor}) % {divisor}) / {divisor}"
 
 
+def bucket_sql(column: str, seconds: int) -> str:
+    """Return SQL placing an epoch column at the start of its UTC bucket.
+
+    Retention has to prove that a coarse row exists for every source bucket
+    before raw data is removed. Keeping its boundary expression here means it
+    cannot quietly disagree with the rebuilds below zero, where SQLite's
+    ordinary integer division truncates toward zero rather than flooring.
+    """
+    return f"({_floor_div(column, seconds)} * {seconds})"
+
+
 def _agg_expr(column: str, aggregation: str, last_rn: str) -> str:
     """Return the SQL aggregate producing one metric's rolled-up value.
 

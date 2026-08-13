@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
 from arraysense.panels import EXAMPLE_STRINGS, parse_strings
+from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, Tier
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
 if TYPE_CHECKING:
@@ -66,6 +67,32 @@ BACKUP_DIRECTORY_KEY = "backup.directory"
 BACKUP_KEEP_KEY = "backup.keep"
 BACKUP_HOUR_KEY = "backup.hour"
 BACKUP_MINUTE_KEY = "backup.minute"
+RETENTION_ENABLED_KEY = "retention.enabled"
+RETENTION_RAW_DAYS_KEY = "retention.raw_days"
+RETENTION_MINUTE_DAYS_KEY = "retention.minute_days"
+
+
+def _tier_keep_days(tiers: tuple[Tier, ...], name: str) -> int:
+    """Read one finite retention default from the schema's tier declaration.
+
+    The schema is where the intended lifetime belongs. Settings only decide
+    whether it is enforced, so repeating its numbers here would make an edit to
+    the schema silently leave new installations on the old retention period.
+    """
+    for tier in tiers:
+        if tier.name == name:
+            if not isinstance(tier.keep_days, int):
+                raise ValueError(f"tier {name!r} has no finite retention period")
+            return tier.keep_days
+    raise ValueError(f"tier {name!r} is not declared")
+
+
+_INVERTER_RAW_KEEP_DAYS = _tier_keep_days(INVERTER_TIERS, "full")
+_MODULE_RAW_KEEP_DAYS = _tier_keep_days(MODULE_TIERS, "full")
+if _INVERTER_RAW_KEEP_DAYS != _MODULE_RAW_KEEP_DAYS:
+    raise RuntimeError("the raw inverter and module tiers must share one retention setting")
+RETENTION_RAW_DAYS_DEFAULT = _INVERTER_RAW_KEEP_DAYS
+RETENTION_MINUTE_DAYS_DEFAULT = _tier_keep_days(INVERTER_TIERS, "minute")
 
 
 # Deliberately loose. The full grammar of an address admits quoted local parts
@@ -573,6 +600,47 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help=(
             "Minutes past the hour. A machine that was asleep at that time "
             "backs up when it wakes, rather than skipping the day."
+        ),
+    ),
+    # --- Retention ----------------------------------------------------------
+    # Raw history is useful only until the coarser copies behind it hold every
+    # bucket, and deleting it is irreversible. It therefore stays opt-in until
+    # an owner has chosen to let the scheduled backup satisfy that gate.
+    SettingSpec(
+        key=RETENTION_ENABLED_KEY,
+        kind="bool",
+        default=False,
+        label="Enforce data retention",
+        help=(
+            "Delete old raw readings only after a current backup exists and "
+            "the minute and hourly tiers already hold every bucket. It is off "
+            "by default because deletion cannot be undone."
+        ),
+    ),
+    SettingSpec(
+        key=RETENTION_RAW_DAYS_KEY,
+        kind="int",
+        default=RETENTION_RAW_DAYS_DEFAULT,
+        lower=2,
+        upper=3650,
+        unit="days",
+        label="Raw data kept",
+        help=(
+            "How long full-cadence inverter and battery-module readings are "
+            "kept before their covered coarse copies can replace them."
+        ),
+    ),
+    SettingSpec(
+        key=RETENTION_MINUTE_DAYS_KEY,
+        kind="int",
+        default=RETENTION_MINUTE_DAYS_DEFAULT,
+        lower=7,
+        upper=3650,
+        unit="days",
+        label="Minute data kept",
+        help=(
+            "How long minute-resolution inverter readings are kept before "
+            "their covered hourly copies can replace them."
         ),
     ),
     # --- Tariff -------------------------------------------------------------
