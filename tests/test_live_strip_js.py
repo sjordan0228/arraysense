@@ -273,7 +273,11 @@ def test_apply_live_consults_the_stale_info() -> None:
     const kw = (v) => String(v);
     const ageEl = { textContent: '', hidden: true };
     const cells = {};
-    for (const f of STRIP_FIGURES) cells[`[data-fig="${f.key}"]`] = { textContent: '' };
+    for (const f of STRIP_FIGURES) {
+      const cell = { textContent: '', _classes: {} };
+      cell.classList = { toggle: (name, on) => { cell._classes[name] = on; } };
+      cells[`[data-fig="${f.key}"]`] = cell;
+    }
     const strip = {
       hidden: false,
       classList: { toggle: (name, on) => { strip._stale = on; } },
@@ -311,12 +315,60 @@ def test_apply_live_consults_the_stale_info() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_measured_zero_is_dimmed_and_an_absent_value_is_not() -> None:
+    # The strip's is-zero mark is this project's founding distinction made
+    # visible: a measured 0 W is a reading and recedes; an absent value is a
+    # dash and is never marked. The cells below carry a real classList so the
+    # toggle is observable — key the toggle on null instead of 0 and a measured
+    # zero dims while every dash dims too, and this test fails.
+    body = """
+    const DASH = '—';
+    const kw = (v) => String(v);
+    const ageEl = { textContent: '', hidden: true };
+    const cells = {};
+    for (const f of STRIP_FIGURES) {
+      const cell = { textContent: '', _classes: {} };
+      cell.classList = { toggle: (name, on) => { cell._classes[name] = on; } };
+      cells[`[data-fig="${f.key}"]`] = cell;
+    }
+    const strip = {
+      hidden: false,
+      classList: { toggle: (name, on) => { strip._stale = on; } },
+      querySelector: (sel) => sel === '.nsage' ? ageEl : (cells[sel] || null),
+      setAttribute: (k, v) => { strip[k] = v; },
+      removeAttribute: (k) => { delete strip[k]; },
+      title: '',
+    };
+    const document = {
+      getElementById: (id) => id === 'nowstrip' ? strip : null,
+      documentElement: { setAttribute: () => {}, removeAttribute: () => {} },
+    };
+    liveStaleInfo = null;
+    applyLive({ inverter: {
+      pv_total_power_w: 0,      // measured zero: idle PV at night
+      load_power_w: 4210,
+      battery_power_w: -900,
+      grid_power_w: null,       // absent: no grid reading was taken
+    }, mode: { mode: 'On grid', known: true } });
+    const pv = cells['[data-fig="pv"]'];
+    const grid = cells['[data-fig="grid"]'];
+    console.log([
+      pv.textContent, pv._classes['is-zero'] === true,
+      grid.textContent === DASH, grid._classes['is-zero'] === false,
+    ].map(String).join(' '));
+    """
+    assert _run(body) == "0 true true true"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_status_outage_does_not_un_stale_the_strip() -> None:
     # The strip is marked stale by the last reachable /api/status reply. When
     # the endpoint then becomes unreachable the outage must not clear that mark
     # — absence of a verdict is not a verdict of fresh — or the strip would
     # reclaim "Live power" in the same moment the banner said the service was
-    # not answering.
+    # not answering. The connection pill's pulse rides the same verdict: an
+    # outage that confirms nothing takes the pulse away, so a dead collector can
+    # never keep breathing.
     body = """
     const zoneQuery = () => '';
     const noteZone = () => {};
@@ -329,7 +381,9 @@ def test_a_status_outage_does_not_un_stale_the_strip() -> None:
       removeAttribute: (k) => { delete strip[k]; },
       title: '',
     };
-    const documentElement = { setAttribute: () => {}, removeAttribute: () => {} };
+    const documentElement = { _attrs: {},
+      setAttribute: (k, v) => { documentElement._attrs[k] = v; },
+      removeAttribute: (k) => { delete documentElement._attrs[k]; } };
     const document = {
       getElementById: (id) => id === 'nowstrip' ? strip : null,
       querySelector: () => null,
@@ -342,10 +396,58 @@ def test_a_status_outage_does_not_un_stale_the_strip() -> None:
       liveStaleInfo = { short: '3 hours ago', long: 'Last reading 14:32, 3 hours ago.' };
       strip._stale = true;
       await checkStale();
-      console.log(String(strip._stale), strip['aria-label'] === 'Live power' ? 'live' : 'stale');
+      console.log(String(strip._stale), strip['aria-label'] === 'Live power' ? 'live' : 'stale',
+        'data-conn-live' in documentElement._attrs ? 'pulse' : 'no-pulse');
     })();
     """
-    assert _run(body) == "true stale"
+    assert _run(body) == "true stale no-pulse"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_live_status_sets_the_pulse() -> None:
+    # The dot breathes only while the collector is genuinely live — running,
+    # connected, not handed over, and not stale. A status reply that says all
+    # four sets data-conn-live on the root; paintConn is what the CSS styles
+    # the pulse from, so losing the write would freeze every dot on every page
+    # and no rendering test would notice.
+    body = """
+    const zoneQuery = () => '';
+    const noteZone = () => {};
+    const $ = () => null;
+    const ageEl = { textContent: '', hidden: true };
+    const strip = {
+      classList: { toggle: (name, on) => { strip._stale = on; } },
+      querySelector: (sel) => sel === '.nsage' ? ageEl : null,
+      setAttribute: (k, v) => { strip[k] = v; },
+      removeAttribute: (k) => { delete strip[k]; },
+      title: '',
+    };
+    const documentElement = { _attrs: {},
+      setAttribute: (k, v) => { documentElement._attrs[k] = v; },
+      removeAttribute: (k) => { delete documentElement._attrs[k]; } };
+    const document = {
+      getElementById: (id) => id === 'nowstrip' ? strip : null,
+      querySelector: () => null,
+      body: null,
+      documentElement,
+    };
+    globalThis.fetch = () => Promise.resolve({
+      ok: true,
+      headers: { get: () => '' },
+      json: async () => ({
+        running: true, connected: true, yielding: false,
+        staleness: { stale: false, reading_at: '1970-01-01T00:00:00Z', age_seconds: 8 },
+      }),
+    });
+    (async () => {
+      staleMisses = 0;
+      liveStaleInfo = null;
+      await checkStale();
+      console.log('data-conn-live' in documentElement._attrs ? 'pulse' : 'no-pulse',
+        String(strip._stale === false));
+    })();
+    """
+    assert _run(body) == "pulse true"
 
 
 # --- where the treatment lives -------------------------------------------

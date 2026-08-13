@@ -1163,6 +1163,28 @@ def test_the_vendored_licence_ships_with_it(client: Any) -> None:
     assert "MIT" in r.text
 
 
+def test_the_phosphor_sprite_is_served(client: Any) -> None:
+    # The icons are injected from one vendored sprite for the same network
+    # reason the chart library is. Served as anything but an SVG the icons
+    # silently fail to mount, which a page answers by dropping the symbol
+    # rather than by saying why.
+    r = client.get("/vendor/phosphor.svg")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "image/svg+xml"
+    assert "ph-gear" in r.text
+
+
+def test_the_phosphor_licence_ships_with_it(client: Any) -> None:
+    # Phosphor is MIT, and the notice that must travel with it is the core
+    # package's "Copyright (c) 2023 Phosphor Icons" — the phosphor-icons/web
+    # repository carries a differently-dated notice, so asserting the wording
+    # guards against a maintainer comparing against the wrong repo.
+    r = client.get("/vendor/phosphor.LICENSE")
+    assert r.status_code == 200
+    assert "MIT License" in r.text
+    assert "Copyright (c) 2023 Phosphor Icons" in r.text
+
+
 def test_an_unknown_vendored_name_is_a_404(client: Any) -> None:
     assert client.get("/vendor/anything.js").status_code == 404
 

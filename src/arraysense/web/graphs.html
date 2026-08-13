@@ -21,6 +21,15 @@
      can be: a label line and a short plot, repeated. */
   .band{margin-bottom:7px}
   .band:last-child{margin-bottom:0}
+  /* Section groups get more air and a top rule so each group stands apart
+     without adding a new colour. --tint is a neutral surface shade, not one of
+     the five measured data hues, so no collision with a series is at stake.
+     The first group sits straight under the toolbar, which is its own divider,
+     so it gets neither the margin nor the rule above it — and the selector has
+     to be :first-of-type, because <header> and the toolbar are the earlier
+     siblings :first-child would never get past. */
+  section.p{margin-top:18px;padding-top:14px;border-top:1px solid var(--tint)}
+  section.p:first-of-type{margin-top:0;padding-top:0;border-top:none}
   /* Indented past the y axis so the name sits over the plot rather than over
      the tick labels, and lines up with the "nothing recorded" message that
      replaces the plot when there is nothing to draw. */
@@ -31,8 +40,10 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
   .bandread{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-    font-variant-numeric:tabular-nums;font-size:10px;color:var(--ink3);
+    font-variant-numeric:tabular-nums;font-size:13px;color:var(--ink);
     white-space:nowrap;text-align:right;overflow:hidden;text-overflow:ellipsis}
+  .bandread .cur{font-size:15px;font-weight:600}
+  .bandread .peak{font-size:11px;color:var(--ink2)}
   .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
   .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
 </style>
@@ -610,6 +621,11 @@ function paintBand(b, xs, cols) {
     height: BAND_H + (isLast(b) ? AXIS_H : 0),
     unit: unitOf(b),
     opts: chartBase({
+      // Every band on this page is drawn over the same x range, so a cursor on
+      // any one of them must put the crosshair at the same instant on all the
+      // rest — that is the whole reason the page is small multiples. chartBase
+      // syncs every chart by default; the y scale is deliberately left out of
+      // CHART_SYNC, so a band's own value never rides another band's axis.
       scales: { x: { time: true }, y: { range: b.signed ? mirrored : k.range } },
       // The blank axis keeps the vertical gridlines and the plot's bottom
       // margin on every band, so the bands stay aligned with the one that does
@@ -663,7 +679,16 @@ function updateBandReadout(id, values, fmt, signed, who) {
   if (latest === null && peak === null) { el.textContent = DASH; return; }
   const latestStr = latest === null ? DASH : fmt(latest);
   const peakStr = peak === null ? DASH : fmt(peak);
-  el.textContent = (who ? who + ' ' : '') + latestStr + ' · peak ' + peakStr;
+  // The readout is markup now, so every interpolated part is escaped. The line
+  // label and the formatted values are the app's own today — fixed labels and
+  // the formatters this file shares with the other pages — but anything that
+  // joins a write through innerHTML passes through esc(), because the day one
+  // of these carries markup the escape is the whole difference between drawing
+  // it and executing it. esc() exists on this page for the rest of its markup;
+  // it belongs in front of the interpolations that join this line too.
+  const prefix = who ? esc(who) + ' ' : '';
+  el.innerHTML = prefix + '<span class="cur">' + esc(latestStr) + '</span>'
+    + ' · <span class="peak">peak ' + esc(peakStr) + '</span>';
 }
 
 // A band's own values, converted into the unit it is drawn in. tempOf answers

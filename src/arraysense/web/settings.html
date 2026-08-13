@@ -175,6 +175,53 @@
   .grp[hidden]{display:none}
   /* The empty-tab note, rendered when a tab with no settings is deep-linked. */
   .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:8px 0}
+
+  /* --- The rate-schedule heatmap ----------------------------------------- */
+  /* Not a settings group: a read-only picture of the stored tariff, shown on
+     the Rate bands tab beneath the editor. It draws from /api/bands and never
+     parses the tariff itself, so it lives outside the form render() rebuilds,
+     the way the Theme area does. */
+  .heat .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
+    margin:0 0 14px}
+  .heat-wrap{overflow-x:auto}
+  .heatmap{border-collapse:separate;border-spacing:2px;width:auto;min-width:100%;
+    font-size:12px}
+  /* The shared table rules are for figures; this grid is a picture. The cells
+     keep their own size and the month column its own width, and no cell carries
+     the page-wide bottom border. */
+  .heatmap th,.heatmap td{padding:0;border:0;text-align:center}
+  .heatmap thead th{font-size:9px;font-weight:600;letter-spacing:.04em;color:var(--ink3);
+    padding:2px 0 5px;text-transform:none}
+  .heatmap tbody th{font-size:10.5px;font-weight:600;color:var(--ink2);text-align:left;
+    padding-right:9px;white-space:nowrap;text-transform:none;letter-spacing:0}
+  .heatmap td{width:26px;height:17px;border-radius:3.5px;background:var(--tint);
+    box-shadow:inset 0 0 0 1px var(--panel-b)}
+  /* An hour no band covers is hatched — the site's own word for absent — never
+     a colour of its own and never left looking like a broken cell. */
+  .heatmap td.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 2px,
+    transparent 2px 5px);box-shadow:inset 0 0 0 1px var(--panel-b)}
+  .heatmap td:hover{box-shadow:inset 0 0 0 2px var(--ink3)}
+  .heat-legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px;font-size:11.5px;
+    color:var(--ink2)}
+  .heat-key{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .heat-key i{width:17px;height:12px;border-radius:2.5px;display:inline-block;
+    box-shadow:inset 0 0 0 1px var(--panel-b)}
+  .heat-key i.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 2px,
+    transparent 2px 5px)}
+  .heatcap{font-size:11px;color:var(--ink3);line-height:1.6;max-width:86ch;margin-top:12px}
+  .heat-note{font-size:12px;line-height:1.6;color:var(--ink2);max-width:82ch;margin:4px 0 0;
+    border-left:3px solid var(--ink3);padding-left:12px}
+  .heat-note.warn{border-left-color:var(--warn)}
+  .heat-note.warn b{color:var(--warn)}
+  .heat-err{margin-top:6px;font-size:12px;line-height:1.6;color:var(--ink2);max-width:82ch}
+  .heat-err b{color:var(--bad);display:block;margin-bottom:4px;font-weight:600}
+  .heat-err .iconbtn{margin-top:12px}
+  /* The name each cell carries for a screen reader. The colour is the visual
+     encoding; the text inside the cell is the accessibility encoding, and a
+     legend, a hover title and this table together mean a band's identity never
+     rests on its hue alone. */
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+    clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap;border:0;font-size:12px}
 </style>
 <!-- The default look, and then whatever this browser has chosen instead. The
      <link> is written here rather than created by the script below it because
@@ -208,6 +255,21 @@
   <div class="tabs" id="tabs" role="tablist" aria-label="Settings sections"></div>
 
   <form id="form" autocomplete="off"></form>
+
+  <!-- The schedule the Costs page prices by, drawn from the service's own band
+       windows. Not a setting and deliberately outside the form: it is read from
+       the stored tariff and never edits it, and a save rebuilding the form must
+       not wipe it — the same reason the Theme area sits outside. It belongs to
+       the Rate bands tab and is shown and hidden with it. -->
+  <section class="p heat" id="heatSec" hidden>
+    <div class="chead"><h2>When each rate applies</h2>
+      <span class="legend muted">the schedule the Costs page prices by</span>
+    </div>
+    <p class="intro">Which band covers which hour of which month, read from the same
+      service-side band windows the dashboard shades its charts with — the tariff itself
+      is parsed only on the service, never here.</p>
+    <div id="heatHost"><p class="heat-note">Reading the rate schedule…</p></div>
+  </section>
 
   <section class="p" id="saveBar">
     <div class="actions">
@@ -673,7 +735,16 @@ function drawTabs() {
     return `<button type="button" role="tab" data-tab="${esc(id)}">${esc(title)}</button>`;
   }).join('');
   bar.querySelectorAll('button').forEach((btn) => {
-    btn.addEventListener('click', () => selectTab(btn.dataset.tab));
+    // The change itself (selectTab) is synchronous — toggling visibility and
+    // updating the hash — so it can run inside the crossfade without holding
+    // anything up; the page's data keeps loading on its own schedule. Re-picking
+    // the tab that is already open changes nothing, and fading the whole page
+    // over a no-op would read as a blink, so that click is left alone.
+    btn.addEventListener('click', () => {
+      if (btn.getAttribute('aria-pressed') !== 'true') {
+        crossfade(() => selectTab(btn.dataset.tab));
+      }
+    });
   });
 }
 
@@ -703,6 +774,11 @@ function selectTab(id) {
   // appears with it.
   const lookSec = $('lookSec');
   if (lookSec) lookSec.hidden = id !== LOOK_TAB_ID;
+  // The rate-schedule heatmap is the same shape of thing as the Theme area: not
+  // a setting, so it is outside the form the loop above walks, and it appears
+  // with the tab it belongs to.
+  const heatSec = $('heatSec');
+  if (heatSec) heatSec.hidden = id !== 'rate-bands';
   // The "Where these live" details stay visible regardless.
 
   // Persist the choice and update the URL without a page reload.
@@ -729,10 +805,12 @@ function wantedTab() {
   return visible[0] || TABS[0].id;
 }
 
-// Listen for hash changes (back/forward, or a link from another page).
+// Listen for hash changes (back/forward, or a link from another page). The
+// switch crossfades when the browser can; the initial tab shown on load is
+// selected by render() without one.
 window.addEventListener('hashchange', () => {
   const wanted = wantedTab();
-  selectTab(wanted);
+  crossfade(() => selectTab(wanted));
 });
 
 // ---------------------------------------------------------------------------
@@ -2145,6 +2223,9 @@ async function save() {
   const changed = (body && body.changed) || [];
   render();
   applyDisplay(saved);
+  // The tariff may have just changed, so the heatmap is re-read from the
+  // service's own windows rather than trusted to still be right.
+  mountHeatmap();
   if (!changed.length) {
     say('Nothing to change — those were already the stored values.', '');
   } else if (body.restart_required) {
@@ -2216,6 +2297,11 @@ async function load() {
     // otherwise empty rather than disappearing along with the settings.
     const lookSec = $('lookSec');
     if (lookSec) lookSec.hidden = false;
+    // The heatmap reads /api/bands on its own and needs no settings registry,
+    // so a failure upstream must not leave it stuck on "Reading the rate
+    // schedule…" — the exact state heatDrawError exists to replace. It draws
+    // from the browser's own zone when the service has not answered.
+    mountHeatmap();
     return;
   }
   // Best-effort: the Connection group renders through the wizard picker when the
@@ -2231,6 +2317,7 @@ async function load() {
   render();
   applyDisplay(saved);
   stamp();
+  mountHeatmap();
 }
 
 function stamp() {
@@ -2437,6 +2524,286 @@ $('revert').onclick = () => { render(); clearErrors(); say('', ''); };
 $('form').addEventListener('submit', (e) => e.preventDefault());
 load();
 loadFacts();
+
+// ---------------------------------------------------------------------------
+// The rate-schedule heatmap — one grid, 24 hours by 12 months.
+//
+// The Costs page prices from a tariff parsed in exactly one place, the service,
+// and this page must not parse it a second time: the Costs page once did and
+// the two disagreed within a day. So the grid is read from /api/bands, the same
+// windows the dashboard shades its charts with. The service walks the stored
+// tariff and returns every stretch during which a single band was in force;
+// this page only finds which window covers each hour of each month and colours
+// the cell. The pipe-separated grammar never reaches this file.
+//
+// The grid is hourly, so an hour that straddles a boundary is shown as the band
+// in force at the top of the hour — the same resolution the hourly tier uses.
+// An hour no band covers is hatched and named, never left looking like a broken
+// cell: unpriced is a fact about the tariff, not about this page. And a failed
+// read is its own state, visibly different from a tariff nobody entered — a
+// swallowed error that rendered as an empty grid has happened here before.
+// ---------------------------------------------------------------------------
+// >>> rate-schedule-heatmap
+const HEAT_YEAR = new Date().getFullYear();
+const HEAT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const HEAT_HOURS = Array.from({ length: 24 }, (_, h) => h);
+// One hue per band, from the palette's own tokens, in the order the bands first
+// appear. A second encoding only beyond the fifth band: the hue repeats at a
+// lower opacity, and the legend carries the key.
+const HEAT_HUES = ['--pv', '--load', '--batt', '--grid', '--batt-dis'];
+// The 15th of the month, chosen because it clears every clock change this
+// installation's zones make — US, EU and Australian DST all move on other days.
+// That is a fact about the zones served here, not a property of the calendar:
+// Morocco suspends DST mid-month for Ramadan, so a zone whose clock moves on
+// the 15th would probe the wrong hour for that month.
+const HEAT_DAY = 15;
+const HEAT_MINUTES = 1440;
+
+// Whether a band window covers hour ``hour`` of the representative day in month
+// ``month``, in the installation's own wall clock. Both bounds arrive as ISO
+// strings carrying the zone offset, so the date and time before the offset ARE
+// the local clock — no zone arithmetic here, which is the point: the service
+// already did it.
+//
+// The comparison is on a monotonic minute count, not on the day alone. A band
+// that never changes within a month comes back as ONE window spanning the whole
+// month, so its end is the first of the next month — a day number of 1, which a
+// probe on the 15th would read as before its start. The month is folded into
+// the count so the end always sorts after the day it really ends.
+function heatProbe(win, month, hour) {
+  const s = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(win.start);
+  const e = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(win.end);
+  if (!s || !e) return false;
+  const at = (m) => ((Number(m[1]) * 12 + Number(m[2])) * 31 + Number(m[3])) * HEAT_MINUTES
+    + Number(m[4]) * 60 + Number(m[5]);
+  const probe = ((HEAT_YEAR * 12 + month) * 31 + HEAT_DAY) * HEAT_MINUTES + hour * 60;
+  return at(s) <= probe && probe < at(e);
+}
+
+async function heatMonth(month, zone) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const start = `${HEAT_YEAR}-${pad(month)}-01T00:00:00`;
+  const end = month === 12
+    ? `${HEAT_YEAR + 1}-01-01T00:00:00`
+    : `${HEAT_YEAR}-${pad(month + 1)}-01T00:00:00`;
+  // The query string is built here rather than appended, for the reason the
+  // dashboard's comment records: zoneQuery() leads with '?' and lands mid-URL
+  // after an existing query, which 422s the request and renders a chart that
+  // looks exactly like no tariff configured.
+  const url = `/api/bands?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : '');
+  const response = await fetch(url);
+  if (!response.ok) {
+    // A validation refusal arrives as a list of {loc, msg} objects, and an
+    // array wrapped in a new Error renders as the literal "[object Object]"
+    // — so the messages are pulled out and joined into one sentence the card
+    // can show. A string detail (the endpoints' own 400s) is used as it is.
+    let detail = '';
+    try {
+      const body = await response.json();
+      const raw = body && body.detail;
+      if (Array.isArray(raw)) {
+        detail = raw.map((item) => {
+          if (item && typeof item === 'object' && item.msg) return String(item.msg);
+          return String(item);
+        }).join('; ');
+      } else if (typeof raw === 'string') {
+        detail = raw;
+      }
+    } catch (err) { detail = ''; }
+    throw new Error(detail || `the service answered ${response.status}`);
+  }
+  const body = await response.json();
+  if (!body || body.configured === undefined || !Array.isArray(body.windows)) {
+    throw new Error('the rate schedule came back in an unexpected shape');
+  }
+  return body;
+}
+
+let heatGen = 0;     // supersedes a slower earlier load
+let heatCells = null;  // 12x24: null (no band) | {band, price}
+let heatHues = null;   // band name -> {hue, alpha}
+
+async function mountHeatmap() {
+  const host = $('heatHost');
+  if (!host) return;
+  const gen = ++heatGen;
+  let zone = '';
+  try { zone = await siteZone(); } catch (err) { zone = ''; }
+
+  const settled = await Promise.allSettled(HEAT_MONTHS.map((_, m) => heatMonth(m + 1, zone)));
+  if (gen !== heatGen) return;
+
+  const ok = settled.filter((r) => r.status === 'fulfilled');
+  // No tariff is one answer and a failed read is another; the two are drawn
+  // differently below. A month the service answered with configured:false means
+  // the whole tariff is absent, so the grid is legitimately empty.
+  if (ok.length && ok[0].value.configured === false) {
+    heatDrawEmpty();
+    return;
+  }
+  if (!ok.length) {
+    const first = settled.find((r) => r.status === 'rejected');
+    heatDrawError(first ? first.reason : new Error('the service did not answer'));
+    return;
+  }
+  if (ok.length !== settled.length) {
+    const first = settled.find((r) => r.status === 'rejected');
+    heatDrawError(first ? first.reason : new Error('some months could not be read'));
+    return;
+  }
+
+  const cells = [];
+  for (let m = 0; m < 12; m += 1) {
+    const row = [];
+    for (let h = 0; h < 24; h += 1) row.push(null);
+    const windows = settled[m].value.windows;
+    for (let h = 0; h < 24; h += 1) {
+      const win = windows.find((w) => heatProbe(w, m + 1, h));
+      if (win && win.band !== null && win.band !== undefined) {
+        row[h] = { band: win.band, price: win.price_per_kwh };
+      }
+    }
+    cells.push(row);
+  }
+  heatCells = cells;
+  heatHues = heatAssignHues(cells);
+  heatDraw();
+}
+
+function heatAssignHues(cells) {
+  const order = [];
+  for (let m = 0; m < 12; m += 1) {
+    for (let h = 0; h < 24; h += 1) {
+      const cell = cells[m][h];
+      if (cell && order.indexOf(cell.band) < 0) order.push(cell.band);
+    }
+  }
+  const hues = {};
+  order.forEach((name, i) => {
+    const hue = HEAT_HUES[i % HEAT_HUES.length];
+    const cycle = Math.floor(i / HEAT_HUES.length);
+    hues[name] = { hue, alpha: cycle === 0 ? 1 : Math.max(0.45, 1 - cycle * 0.2) };
+  });
+  return hues;
+}
+
+// The band's fill. A full-strength band carries the theme's own token so a
+// change of look or theme re-resolves it; a repeated-hue band is a snapshot of
+// the token faded, and the themechange listener below redraws so it follows.
+function heatFill(entry) {
+  if (!entry) return 'background:var(--tint)';
+  return entry.alpha === 1
+    ? `background:var(${entry.hue})`
+    : `background:${fade(entry.hue, entry.alpha)}`;
+}
+
+function heatRate(price, cur) {
+  if (price === null || price === undefined || !isFinite(price)) return DASH;
+  const sym = String(cur || '$');
+  const gap = /[A-Za-z0-9]$/.test(sym) ? ' ' : '';
+  return sym + gap + Number(price).toLocaleString(undefined,
+    { minimumFractionDigits: 2, maximumFractionDigits: 5 });
+}
+
+function heatDraw() {
+  const host = $('heatHost');
+  if (!host || !heatCells) return;
+  const cur = currencyNow();
+  const priceOf = {};
+  for (let m = 0; m < 12; m += 1) {
+    for (let h = 0; h < 24; h += 1) {
+      const cell = heatCells[m][h];
+      if (cell && priceOf[cell.band] === undefined) priceOf[cell.band] = cell.price;
+    }
+  }
+
+  const header = '<th scope="col">Month</th>'
+    + HEAT_HOURS.map((h) => `<th scope="col">${h}</th>`).join('');
+  const body = HEAT_MONTHS.map((name, m) => {
+    const cells = [];
+    for (let h = 0; h < 24; h += 1) {
+      const cell = heatCells[m][h];
+      const label = cell ? cell.band : 'no band';
+      const title = cell
+        ? `${cell.band} · ${heatRate(cell.price, cur)}`
+        : 'No band covers this hour — nothing is priced in these hours';
+      cells.push(cell
+        ? `<td style="${heatFill(heatHues[cell.band])}" title="${esc(title)}">`
+          + `<span class="sr-only">${esc(label)}</span></td>`
+        : `<td class="none" title="${esc(title)}">`
+          + `<span class="sr-only">${esc(label)}</span></td>`);
+    }
+    return `<tr><th scope="row">${esc(name)}</th>${cells.join('')}</tr>`;
+  }).join('');
+
+  const legend = heatLegend(priceOf, cur);
+  const cap = 'Each cell is the band in force at the top of that hour, on the 15th of the '
+    + 'month, in the installation’s own wall clock. An hour that straddles a band boundary is '
+    + 'shown as the band at its top; an hour no band covers is hatched, because energy used '
+    + 'then is priced by no band at all. This is the schedule the service reads from the '
+    + 'stored tariff, so it changes when the tariff is saved, not as the editor above is typed.';
+
+  host.innerHTML = `<div class="heat-wrap"><table class="heatmap" `
+    + `aria-label="Which rate band covers each hour of each month">`
+    + `<thead><tr>${header}</tr></thead><tbody>${body}</tbody></table></div>`
+    + legend
+    + `<p class="heatcap">${cap}</p>`;
+}
+
+function heatLegend(priceOf, cur) {
+  const swatches = Object.keys(heatHues).map((name) =>
+    `<span class="heat-key"><i style="${heatFill(heatHues[name])}"></i>`
+    + `${esc(name)} · ${esc(heatRate(priceOf[name], cur))}</span>`).join('');
+  const none = '<span class="heat-key"><i class="none"></i>No band · nothing is priced '
+    + 'in these hours</span>';
+  return `<div class="heat-legend">${swatches}${none}</div>`;
+}
+
+// The legitimate empty state. Drawn only when the service itself says no tariff
+// is configured, so it can never be confused with a read that failed.
+function heatDrawEmpty() {
+  const host = $('heatHost');
+  if (!host) return;
+  const hasText = Boolean(saved[BANDS_KEY] && String(saved[BANDS_KEY]).trim());
+  host.innerHTML = hasText
+    ? '<p class="heat-note warn"><b>The stored tariff cannot be read.</b> A tariff is '
+      + 'entered, but the service does not understand it, so there is no schedule to draw. '
+      + 'The editor above shows it as text.</p>'
+    : '<p class="heat-note">No tariff entered, so there is no schedule to draw. Enter the '
+      + 'rate bands above and save — the grid appears here, and the Costs page starts '
+      + 'pricing.</p>';
+  heatCells = null;
+  heatHues = null;
+}
+
+// The failed read, drawn to look nothing like the empty state above: the grid
+// is missing because the service did not answer, not because nothing is priced.
+function heatDrawError(reason) {
+  const host = $('heatHost');
+  if (!host) return;
+  const raw = reason && reason.message ? reason.message : String(reason);
+  const message = raw.charAt(0).toUpperCase() + raw.slice(1);
+  host.innerHTML = `<div class="heat-err" role="alert">
+      <b>The rate schedule could not be read.</b>
+      <span>${esc(message)}.</span>
+      <p class="heat-note">This is not the same as having no tariff — the grid is missing
+        because the service did not answer, not because nothing is priced. Check that the
+        service is up, then try again.</p>
+      <button type="button" class="iconbtn" id="heatRetry">Try again</button>
+    </div>`;
+  const retry = $('heatRetry');
+  if (retry) retry.addEventListener('click', mountHeatmap);
+  heatCells = null;
+  heatHues = null;
+}
+
+// A change of theme or look re-resolves the palette, and a repeated-hue band is
+// painted from a faded snapshot — redraw from the cached grid, which is cheap
+// and needs no second read of the service.
+document.addEventListener('themechange', () => { if (heatCells) heatDraw(); });
+// <<< rate-schedule-heatmap
 </script>
 </body>
 </html>

@@ -106,6 +106,21 @@ NO_CACHE = {"Cache-Control": "no-cache"}
 # Mono is four static files because upstream releases no variable webfont at
 # all. The stylesheet's @font-face blocks say the same thing and have to keep
 # saying it: a range declared over a static file is a weight the browser fakes.
+#
+# The Phosphor icon sprite is here for the same network reason, and it is
+# replaced the same way uPlot is — a newer upstream drop arrives under a name
+# of its own, never overwriting this one, because a browser already holding the
+# old bytes goes on drawing them. Its MIT licence rides beside it like the
+# others, so the notice travels with the file it licenses.
+#
+# Provenance, written down for the same reason the fonts carry it: phosphor.svg
+# is drawn from @phosphor-icons/core@2.1.1 (github.com/phosphor-icons/core),
+# its <symbol> paths taken from that package's regular/ SVGs — ph-gear's path
+# data matches regular/gear.svg byte for byte. phosphor.LICENSE is that
+# package's MIT notice unaltered, "Copyright (c) 2023 Phosphor Icons". A
+# maintainer comparing against the phosphor-icons/web repository instead will
+# find a differently-dated notice and may mistake it for an alteration; the
+# core package is the source this file came from.
 VENDORED = {
     "uPlot.iife.min.js": "text/javascript",
     "uPlot.min.css": "text/css",
@@ -117,6 +132,8 @@ VENDORED = {
     "JetBrainsMono-Medium.woff2": "font/woff2",
     "JetBrainsMono-Bold.woff2": "font/woff2",
     "JetBrainsMono.LICENSE": "text/plain",
+    "phosphor.svg": "image/svg+xml",
+    "phosphor.LICENSE": "text/plain",
 }
 
 

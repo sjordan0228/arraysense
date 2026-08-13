@@ -166,14 +166,14 @@
      class names cannot reach the bars and rows the rest of the page draws. */
   .dtl{margin-top:10px}
   .dtl .rel{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:10px}
-  .dtl h3{font-size:11px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
+  .dtl h3{font-size:12.5px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
   /* Captions are sentences, not labels. They borrow .lbl for its colour and
      have to undo the rest of it: uppercase with .17em tracking at 9.5px turns
      a diagnosis into shouting nobody reads. */
-  .dtl .cap{display:block;margin-top:9px;line-height:1.5;font-size:10.5px;
+  .dtl .cap{display:block;margin-top:9px;line-height:1.5;font-size:11.5px;
     letter-spacing:0;text-transform:none;color:var(--ink3)}
   .dtl .strrow{display:grid;grid-template-columns:22px 1fr 106px;gap:9px;align-items:center;
-    font-size:11px;color:var(--ink2);margin-bottom:7px}
+    font-size:12px;color:var(--ink2);margin-bottom:7px}
   .dtl .bar{height:15px;border-radius:4px;background:var(--tint);position:relative;overflow:hidden}
   .dtl .bar i{position:absolute;inset:0 auto 0 0;border-radius:4px;display:block}
   .dtl .bar span{position:absolute;right:6px;top:0;line-height:15px;font-size:10px;
@@ -189,7 +189,11 @@
   .dtl .pairbar div{flex:1;border-radius:3px 3px 0 0}
   .dtl .delta{display:flex;align-items:baseline;gap:7px;margin-top:2px}
   .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;font-variant-numeric:tabular-nums}
-  .dtl .kv{gap:12px}
+  /* The detail rows are this view's body text, so they sit above the shared
+     .kv size — this is a page somebody reads closely, not a card to glance
+     at. The rows stay flex space-between, so a taller figure changes no
+     layout. */
+  .dtl .kv{gap:12px;font-size:12px}
   .dtl .ok{color:var(--good)}
   .dtl .bd{color:var(--bad);font-weight:700}
   .dtl .pill{display:inline-block;font-size:9.5px;padding:2px 7px;border-radius:20px;
@@ -231,7 +235,7 @@
          a place of their own. See .hright in common.js for what breaks without it. -->
     <div class="hright">
       <div class="conn" id="conn"><span class="dot" style="background:var(--ink3)"></span>connecting…</div>
-      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings">⚙</button>
+      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings"><svg class="ic" aria-hidden="true"><use href="#ph-gear"></use></svg></button>
     </div>
   </header>
 
@@ -1736,7 +1740,10 @@ function wireTabs() {
     const held = localStorage.getItem('as.tab');
     return held === 'flow' || held === 'viewFlow' ? 'flow' : 'now';
   };
-  window.addEventListener('hashchange', () => show(wanted()));
+  // Switching views is the one same-document navigation this page makes, so it
+  // is the one that may crossfade. The first paint of the page — the show()
+  // below, on boot — is not a switch and gets no fade.
+  window.addEventListener('hashchange', () => crossfade(() => show(wanted())));
   show(wanted());
 }
 
@@ -1921,6 +1928,12 @@ function drawForecast(fc) {
     height: 180,
     unit: 'kW',
     opts: chartBase({
+      // Not in the page's sync group. Every other chart on this page follows
+      // the selected window; this one is pinned to the fixed calendar day the
+      // forecast answers for, so an instant a cursor names on it has no home
+      // on the neighbours' ranges and vice versa — the one chart on the page
+      // whose crosshair genuinely has nothing to say elsewhere.
+      sync: false,
       scales: {
         x: { time: true, min: dayStartSec, max: dayEndSec },
         y: { range: powerRange },
