@@ -31,6 +31,18 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
   .f input:focus,.f select:focus,.f textarea:focus{outline:2px solid var(--pv);outline-offset:1px;
     border-color:transparent}
+  /* A native select draws the browser's own chrome and the shared rule above
+     goes partly unapplied, so it reads foreign next to the inputs. appearance:none
+     hands the whole box back to that rule — same border, radius, background, text
+     and font as the text inputs — and the only thing drawn for it is a small
+     down-caret, built from two gradient halves in the page's own --ink2 so
+     neither theme needs a colour of its own. The element is still the native
+     <select>: the list it opens and its keyboard behaviour are untouched. */
+  .f select{appearance:none;-webkit-appearance:none;cursor:pointer;padding-right:28px;
+    background-image:linear-gradient(45deg,transparent 50%,var(--ink2) 50%),
+      linear-gradient(135deg,transparent 50%,var(--ink2) 50%);
+    background-position:right 15px center,right 10px center;
+    background-size:5px 5px,5px 5px;background-repeat:no-repeat,no-repeat}
   .f .help{font-size:11px;color:var(--ink3);line-height:1.55}
   /* A field the server rejected. The message sits with the control that caused
      it: a single banner saying "invalid" leaves the reader hunting ten fields
@@ -90,7 +102,12 @@
   .mons{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
   .mons button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
     border-radius:7px;padding:3px 8px;font:inherit;font-size:11.5px;cursor:pointer;line-height:1.4}
-  .mons button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  /* A chosen month fills amber rather than grey, so the season a band covers
+     reads at a glance — twelve grey pills showed the writing, not the schedule.
+     The dark text is the pair the amber Save button already uses: the theme's
+     own --ink is white in the dark theme and would vanish on the amber. */
+  .mons button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
+    color:#1a1204;font-weight:600}
   .mons .season{font-size:11px;color:var(--ink3);margin-left:4px}
   .bandacts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
   .bandacts .iconbtn{font-size:11.5px;padding:3px 9px}
@@ -146,7 +163,12 @@
     color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
     line-height:1.45;cursor:pointer}
   .tabs button:hover{color:var(--ink2)}
-  .tabs button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink);font-weight:500}
+  /* The active tab is amber on purpose, and it is not the same "selected" as
+     the nav pill above it. The pill says which page this is and stays grey;
+     the tab says which section of this page is open. The tab is deliberately
+     the louder of the two so the two levels read as different questions. */
+  .tabs button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
+    color:#1a1204;font-weight:600}
   .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   /* A group whose tab is not the active one, hidden rather than removed so the
      controls keep their values and the dirty check still sees them. */

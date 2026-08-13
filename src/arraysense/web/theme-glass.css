@@ -190,6 +190,35 @@
      white ground reads as a printing fault rather than as light. */
   --stroke-glow: light-dark(oklch(70% 0.09 70 / 0.16), oklch(88% 0.10 70 / 0.30));
 
+  /* What a series lays under itself. The glow above lifts a line off the pane;
+     this gives it something to stand on, so a trace reads as a quantity with a
+     body rather than as a hairline. common.js multiplies the series' own token
+     by this, so the wash is always the line's own hue and never a sixth colour.
+
+     A bare number and not a colour, which puts it in --bloom's position exactly:
+     light-dark() carries a pair of colours and there is no one-declaration form
+     for a number, so the light value is stated in both light selectors below or
+     an explicit choice of light and the device's own preference disagree.
+
+     Deliberately far below the fills the pages name for themselves — gridFill
+     opens at 0.42 and pvFill at 0.5 — because those two carry an argument and
+     this carries none. Grid is an area on the dashboard because a grid *line*
+     lies under the home line to the watt and vanishes beneath it; the wash must
+     stay light enough that the distinction between that fill and this one is
+     still the first thing the eye gets.
+
+     It also lies over the tariff band shading on that chart, which is read by
+     luminance and by nothing else, so what it costs is arithmetic rather than
+     an assumption. Compositing an even layer of alpha a over both sides of an
+     edge scales the step across it by (1 − a), and the wash fades from 0.20 at
+     the top of the plot to nothing at its foot — so the shading keeps 0.80 of
+     its contrast where the wash is strongest and more of it everywhere below.
+     That is why the wash is capped where it is.
+
+     The light one is lower than the dark: a dark wash on a light pane reads
+     heavier than a light one on a dark pane at the same alpha. */
+  --series-wash: 0.20;
+
   /* The page and its ambient light. Deeper than the base sheet's so the
      translucent panels have something to be translucent against, and warmest at
      the top right — the glow belongs to the room the numbers describe. */
@@ -200,12 +229,31 @@
   --sky-5: light-dark(#fdf5e9, #8a5330);
   --sun: light-dark(oklch(88% 0.12 74 / 0.34), oklch(82% 0.15 72 / 0.34));
   --dusk: light-dark(oklch(80% 0.09 268 / 0.28), oklch(62% 0.14 268 / 0.30));
-  --page:
-    radial-gradient(120% 90% at 82% -10%, var(--sun), transparent 58%),
+  /* The sky the ambient light is cast onto, named on its own because the page
+     is now painted twice — once warm and once cool — and a second copy of five
+     stops is a copy that drifts the first time one of them is nudged. */
+  --sky:
     linear-gradient(168deg, var(--sky-1) 0%, var(--sky-2) 32%, var(--sky-3) 58%,
                     var(--sky-4) 84%, var(--sky-5) 100%);
+  /* The same sky after sundown. The last two stops are the warm horizon, and
+     they fold back onto the indigo two stops above them rather than onto
+     anything new: no colour appears here that the page was not already painted
+     in, so the cool state is this design at another hour and not a second one.
+     Without it the corner reads as dusk while the foot of the page is still
+     lit, which is a page in two minds rather than a page with a mood. */
+  --sky-night:
+    linear-gradient(168deg, var(--sky-1) 0%, var(--sky-2) 32%, var(--sky-3) 58%,
+                    var(--sky-3) 84%, var(--sky-2) 100%);
+  --corner-warm: radial-gradient(120% 90% at 82% -10%, var(--sun), transparent 58%);
+  --corner-cool: radial-gradient(120% 90% at 82% -10%, var(--dusk), transparent 58%);
+  --page: var(--corner-warm), var(--sky);
   --glow: radial-gradient(circle, var(--sun), transparent 68%);
   --glow-cool: radial-gradient(circle, var(--dusk), transparent 70%);
+  /* How long the room takes to change light. Long enough to read as weather
+     rather than as a switch — the state behind it changes on the collector's
+     clock, not on a click — and short enough that a reader who came back to the
+     tab is not watching a stale mood settle. */
+  --mood-fade: 1200ms;
 
   /* The chart grid recedes to a whisper. The zero rule and the crosshair are
      deliberately left as the base sheet set them: a signed reading is signed
@@ -240,12 +288,28 @@
   :root:not([data-theme]) { --bloom: 28%; }
 }
 
+/* The light wash, in the same two selectors and for the same reason as --bloom:
+   a number has no light-dark() form to reach for. Lower than the dark value
+   because this one is a dark colour laid on a bright pane, where the same alpha
+   reads as more. */
+:root[data-theme="light"] { --series-wash: 0.14; }
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) { --series-wash: 0.14; }
+}
+
 /* ---------------------------------------------------------------------------
  * The ambient light. The existing .sunglow div is the warm sun in the top-right
  * corner and is simply made larger and softer; a second, cooler pool is added
  * on body::before at the opposite corner so the page has a direction of light
  * rather than a single lamp. Both are fixed, so scrolling moves the panels
  * through the light instead of dragging the light along.
+ *
+ * And the light follows the system. common.js writes data-glow onto the root
+ * from the mode the service already judged — warm while the array carries the
+ * house, cool when the bank or the grid does — so the page's mood is the
+ * inverter's, not a second opinion formed in the browser. Everything below
+ * turns on that one attribute; with it absent the page is lit exactly as it was
+ * before any of this, which is what a reading nobody could take is entitled to.
  * ------------------------------------------------------------------------- */
 
 body {
@@ -256,6 +320,10 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The corner lamp itself paints nothing now: it is the frame, and its two
+   pseudo-elements are the warm bulb and the cool one, crossfaded. Opacity could
+   not have been put on the div — it applies to the whole subtree, so fading the
+   frame would have taken both bulbs with it. */
 .sunglow {
   width: min(62vw, 720px);
   height: min(62vw, 720px);
@@ -263,18 +331,52 @@ body {
   top: -22vw;
   filter: blur(40px);
   opacity: 0.95;
+  background: none;
+  z-index: 1;
 }
+
+.sunglow::before,
+.sunglow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  transition: opacity var(--mood-fade) ease;
+}
+.sunglow::before { background: var(--glow); }
+.sunglow::after { background: var(--glow-cool); opacity: 0; }
+:root[data-glow="cool"] .sunglow::before { opacity: 0; }
+:root[data-glow="cool"] .sunglow::after { opacity: 1; }
 
 body::before {
   content: "";
   position: fixed;
   inset: 0;
-  z-index: 0;
+  z-index: 1;
   pointer-events: none;
   background:
     var(--glow-cool) -18vw 62vh / min(70vw, 780px) min(70vw, 780px) no-repeat;
   filter: blur(50px);
 }
+
+/* The cool sky, laid under the two lamps and faded in. It has to be a whole
+   second page rather than a swap of --page, because a background-image does not
+   transition: changing the token would snap the corner from amber to indigo in
+   one frame. So the cool version is painted on its own layer, opaque, over the
+   warm one, and the change of light is that layer's opacity — which does. The
+   geometry underneath is identical, so nothing moves; only the colour of the
+   light does. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--mood-fade) ease;
+  background: var(--corner-cool), var(--sky-night);
+}
+:root[data-glow="cool"] body::after { opacity: 1; }
 
 main { z-index: 1; }
 
@@ -362,6 +464,14 @@ h1 {
    page — good, amber or bad — so nothing here may restate it; the ring is
    neutral and only the size of the lamp changes. */
 .conn .dot { width: 9px; height: 9px; outline: 3px solid var(--tint-2); }
+
+/* The live figures. The real mono face rather than the system fallback, and the
+   labels in the UI face so the row reads as words annotating numbers rather
+   than as one undifferentiated block of monospace. The hues arrive inline from
+   the palette, so nothing here may restate them. */
+.nowstrip { font-family: var(--font-mono); gap: 17px; }
+.nowstrip b { font-size: 12.5px; font-weight: 500; letter-spacing: -0.01em; }
+.nowstrip u { font-family: var(--font-ui); font-weight: 600; }
 
 .iconbtn, .themebtn {
   border: 0;
@@ -529,6 +639,27 @@ table td,
   filter: drop-shadow(0 0 6px var(--stroke-glow));
 }
 
+/* The two Sankeys. The picture, the flow along it and everything hovering one
+ * ribbon does are the base stylesheet's, because they are how the diagram says
+ * what it says — Classic gets the whole of it. What is added here is the
+ * atmosphere the rest of this file gives: the ribbons carry the same bloom the
+ * chart strokes do, so the moving band inside one reads as light travelling
+ * through it rather than as a lighter stripe painted on it.
+ *
+ * The filter sits on each ribbon rather than on the whole diagram, so the node
+ * labels beside them stay sharp: a bloom over 11px type is what turns a figure
+ * into a smudge.
+ *
+ * Dimming one ribbon to lift another is a change of light here as well as of
+ * opacity — the raised one keeps its glow and the rest lose theirs, which is the
+ * second encoding the palette rule asks for, in a look that can afford it. */
+.sank .rib {
+  filter: drop-shadow(0 0 5px var(--stroke-glow));
+  transition: opacity 0.13s ease, filter 0.13s ease;
+}
+.sank.dim .rib { filter: none; }
+.sank.dim .rib.on { filter: drop-shadow(0 0 9px var(--stroke-glow)); }
+
 .u-select {
   background: color-mix(in oklab, var(--pv) 16%, transparent);
   border-radius: 6px;
@@ -609,6 +740,15 @@ table td,
 @media (prefers-reduced-motion: reduce) {
   .iconbtn, .themebtn, .nav a, .rng button { transition: none; }
   .iconbtn:hover, .themebtn:hover { transform: none; }
+  /* The room still changes light — the state is information and opting out of
+     motion is not opting out of being told. It simply changes at once, with no
+     large slow crossfade across the whole viewport. */
+  .sunglow::before, .sunglow::after, body::after { transition: none; }
+  /* The base sheet already stops the ribbons transitioning; this takes back the
+     transition added here beside the ribbon glow, which loads later and would
+     otherwise win the cascade and fade anyway. The flow itself is switched off
+     in the base sheet, so Classic opts out with it. */
+  .sank .rib { transition: none; }
 }
 
 /* Small screens get the same material with less of it: the blur is expensive on

@@ -292,7 +292,11 @@
       <!-- Drawn from the inverter's own kWh counters, so the two sides balance
            and the difference between them is real conversion loss rather than
            an artefact of how we added things up. -->
-      <svg id="sankey" viewBox="0 0 900 400" role="img"
+      <!-- A group and not an image. Every ribbon in here is focusable and says
+           its own figure and share, and role="img" prunes a subtree: it would
+           make the whole diagram one unreadable label and leave a keyboard
+           reader tabbing through elements that announce nothing. -->
+      <svg id="sankey" viewBox="0 0 900 400" role="group"
            aria-label="Energy flow through the inverter so far today"></svg>
       <div class="sankwait" id="sankeyWait" hidden>waiting for the inverter's energy counters</div>
     </section>
@@ -636,8 +640,12 @@ function showBattery(battery, inverter) {
 
 async function loadLive() {
   try {
+    // fetchLive rather than a fetch of its own: it is the same request, and it
+    // hands the payload to the header strip on the way past. Two requests would
+    // be two readings, and the strip could then print a figure the card
+    // directly below it disagrees with.
     const [live, status, cal] = await Promise.all([
-      fetch('/api/live').then(r => r.json()),
+      fetchLive(),
       fetch('/api/status').then(r => r.json()),
       fetchCalibration(),
     ]);
@@ -1570,9 +1578,12 @@ function drawBattery(points) {
 }
 
 // Today's energy as a flow diagram, from the inverter's own counters. The two
-// sides balance by construction — everything entering the inverter leaves it —
-// so the gap between them is conversion loss, which is a real quantity and not
-// a rounding artefact. A line chart cannot show that at all.
+// sides are assumed to balance — everything entering the inverter leaves it —
+// and the difference is drawn as conversion loss. That identity is the
+// diagram's premise, not a guarantee: counters on different buses can disagree,
+// and when they do the loss is clamped at nothing and the surplus rides on the
+// sink side, whose shares can then sum past 100%. A line chart cannot show
+// that at all.
 function drawSankey(i) {
   const g = (k) => numOrNull(i[k]);
   const solar = g('pv_energy_today_kwh');
@@ -1585,7 +1596,7 @@ function drawSankey(i) {
   // Every term is required. Standing a zero in for a missing counter would
   // unbalance the diagram and present the imbalance as loss.
   if ([solar, gridIn, battIn, battOut, house].some((v) => v === null)) {
-    $('sankey').innerHTML = '';
+    sankeyClear($('sankey'));
     $('sankeyWait').hidden = false;
     $('flowTotal').textContent = '';
     return;
@@ -1595,43 +1606,95 @@ function drawSankey(i) {
   const inTotal = solar + gridIn + battOut;
   const loss = Math.max(0, inTotal - (house + battIn + gridOut));
   $('flowTotal').textContent = `${inTotal.toFixed(1)} kWh through the inverter today`;
-  if (inTotal <= 0) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+  if (inTotal <= 0) { sankeyClear($('sankey')); $('sankeyWait').hidden = false; return; }
 
-  const W = 900, XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
+  // What is on each path this minute, from the same payload the counters came
+  // in. The widths are the day; these are the moment, and they are what paces
+  // the flow travelling along each ribbon — so a ribbon fat with this morning's
+  // sun sits still at dusk while the bank's ribbon moves.
+  //
+  // Both signed readings are split by direction rather than taken as they come:
+  // grid_power_w is positive importing and negative exporting, battery_power_w
+  // positive charging and negative discharging, and each ribbon wants the half
+  // that belongs to it. A path in the other direction carries nothing, which is
+  // a reading of zero and not an absence — but an unreported one stays null.
+  const rising = (v) => v === null ? null : Math.max(0, v);
+  const falling = (v) => v === null ? null : Math.max(0, -v);
+  const gridNow = g('grid_power_w');
+  const battNow = g('battery_power_w');
+
+  const XW = 26, TOP = 46, BOT = 356, X1 = 70, X2 = 404, X3 = 700;
   const scale = (BOT - TOP) / inTotal;
   const stack = (items, x) => {
     let y = TOP;
-    const out = items.filter(([, v]) => v > 0.05).map(([name, v, col]) => {
-      const n = { name, v, col, x, y, h: v * scale };
-      y += n.h + 10;
-      return n;
+    const out = items.filter((n) => n.v > 0.05).map((n) => {
+      const node = Object.assign({ x, y, h: n.v * scale }, n);
+      y += node.h + 10;
+      return node;
     });
     const shift = (BOT - (y - 10)) / 2;
     out.forEach((n) => { n.y += shift; });
     return out;
   };
-  const src = stack([['Solar', solar, 'var(--pv)'], ['Grid', gridIn, 'var(--grid)'],
-                     ['Battery out', battOut, 'var(--batt)']], X1);
-  const hub = stack([['Inverter', inTotal, 'var(--ink3)']], X2 - 60);
-  const snk = stack([['House', house, 'var(--load)'], ['Battery in', battIn, 'var(--batt)'],
-                     ['Exported', gridOut, 'var(--grid)'], ['Losses', loss, 'var(--ink3)']], X3);
+  const src = stack([
+    { name: 'Solar', v: solar, col: 'var(--pv)', rate: rising(g('pv_total_power_w')) },
+    { name: 'Grid', v: gridIn, col: 'var(--grid)', rate: rising(gridNow) },
+    { name: 'Battery out', v: battOut, col: 'var(--batt)', rate: falling(battNow) },
+  ], X1);
+  const hub = stack([{ name: 'Inverter', v: inTotal, col: 'var(--ink3)' }], X2 - 60);
+  const snk = stack([
+    { name: 'House', v: house, col: 'var(--load)', rate: rising(g('load_power_w')) },
+    { name: 'Battery in', v: battIn, col: 'var(--batt)', rate: rising(battNow) },
+    { name: 'Exported', v: gridOut, col: 'var(--grid)', rate: falling(gridNow) },
+    // Conversion loss is the one quantity here nobody meters: it is what the two
+    // sides do not account for. So it is hatched rather than filled — the
+    // texture this site already spends on "not measured" — and it has no live
+    // rate to pace it, because deriving an instantaneous loss from four power
+    // readings taken at slightly different moments would be a new figure
+    // invented at the last step of a diagram whose whole claim is that it comes
+    // off the inverter's own counters.
+    { name: 'Losses', v: loss, col: 'var(--ink3)', rate: null, hatch: true },
+  ], X3);
+  if (!hub.length) { sankeyClear($('sankey')); $('sankeyWait').hidden = false; return; }
 
-  const ribbon = (x0, y0, x1, y1, h, col) => {
-    const mx = (x0 + x1) / 2;
-    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
-      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
-      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
-      + `fill="${col}" fill-opacity="0.34"/>`;
-  };
-  let out = '';
-  if (!hub.length) { $('sankey').innerHTML = ''; $('sankeyWait').hidden = false; return; }
+  // The two halves of the diagram, as ribbons. Both share of the same total,
+  // assuming the identity holds — everything entering the inverter equals
+  // everything leaving it — so each side normally sums to 100% and a percentage
+  // means the same thing wherever it is read. When the counters disagree the
+  // loss clamps to zero and the sink side's shares sum past 100%; the tooltip
+  // then reads a figure that is honest about the counters.
+  const ribbons = [];
   let hy = hub[0].y;
-  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col); hy += n.h; }
+  for (const n of src) {
+    ribbons.push({
+      x0: n.x + XW, y0: n.y, x1: hub[0].x, y1: hy, h: n.h, side: 'in',
+      col: n.col, rate: n.rate, hatch: n.hatch,
+      title: `${n.name} → Inverter`, value: `${n.v.toFixed(1)} kWh`,
+      share: sankeyShare(n.v, inTotal),
+    });
+    hy += n.h;
+  }
   hy = hub[0].y;
-  for (const n of snk) { out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col); hy += n.h; }
+  for (const n of snk) {
+    ribbons.push({
+      x0: hub[0].x + XW, y0: hy, x1: n.x, y1: n.y, h: n.h, side: 'out',
+      col: n.col, rate: n.rate, hatch: n.hatch,
+      title: `Inverter → ${n.name}`, value: `${n.v.toFixed(1)} kWh`,
+      share: sankeyShare(n.v, inTotal),
+    });
+    hy += n.h;
+  }
+
+  let out = '';
   for (const n of [...src, ...hub, ...snk]) {
     out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
       + `rx="3" fill="${n.col}"/>`;
+    // The node carries the same texture its ribbon does, so the two read as one
+    // quantity rather than as a solid block feeding a hatched stream.
+    if (n.hatch) {
+      out += `<rect x="${n.x}" y="${n.y.toFixed(1)}" width="${XW}" height="${n.h.toFixed(1)}" `
+        + `rx="3" fill="url(#${SANKEY_HATCH_ID})"/>`;
+    }
     const right = n.x > 500;
     const isHub = n.name === 'Inverter';
     const tx = isHub ? n.x + XW / 2 : right ? n.x - 9 : n.x + XW + 9;
@@ -1643,7 +1706,12 @@ function drawSankey(i) {
         + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
         + `${n.v.toFixed(1)} kWh</text>`;
   }
-  $('sankey').innerHTML = `<g class="sank">${out}</g>`;
+  sankeyRender($('sankey'), ribbons, out, {
+    hub: 'var(--ink3)',
+    measure: 'Today',
+    total: `${inTotal.toFixed(1)} kWh`,
+    pace: 'live',
+  });
 }
 
 // Two views of the same poll: what is happening now, and where the day's energy

@@ -30,6 +30,9 @@
   .bandlab .bs{font-size:9.5px;color:var(--ink3);letter-spacing:.02em;
     font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap;
     overflow:hidden;text-overflow:ellipsis}
+  .bandread{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-variant-numeric:tabular-nums;font-size:10px;color:var(--ink3);
+    white-space:nowrap;text-align:right;overflow:hidden;text-overflow:ellipsis}
   .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
   .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
 </style>
@@ -560,7 +563,8 @@ function isLast(b) {
 
 const bandHtml = (b) => `<div class="band">
   <div class="bandlab"><span class="bn">${esc(b.label)}</span>
-    <span class="bs">${esc(b.source || b.metric || '')}</span></div>
+    <span class="bs">${esc(b.source || b.metric || '')}</span>
+    <span class="bandread" id="${esc(b.id)}Read">—</span></div>
   <div class="chart" id="${esc(b.id)}Wrap" role="img"
        aria-label="${esc(b.label)} over the selected range"></div>
 </div>`;
@@ -584,7 +588,13 @@ const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
 function paintBand(b, xs, cols) {
   const k = kindOf(b);
   const lines = linesOf(b);
-  if (!anyReading(...cols)) { chartMessage(b.id, 'nothing recorded in this range'); return; }
+  if (!anyReading(...cols)) {
+    chartMessage(b.id, 'nothing recorded in this range');
+    // The previous window's "latest · peak" must not survive above a chart
+    // that now says nothing was recorded, so the readout is cleared with it.
+    updateBandReadout(b.id, []);
+    return;
+  }
   const fmt = b.fmt || k.fmt;
   // Every trace in the readout, in the order they are stacked, so a pack's
   // three temperatures are read off one hover rather than three.
@@ -617,6 +627,43 @@ function paintBand(b, xs, cols) {
       plugins,
     }),
   }, [xs, ...cols]);
+  // Update the band readout with the latest and peak values.
+  updateBandReadout(b.id, cols[0], fmt, b.signed === true, lines.length > 1 ? lines[0].label : null);
+}
+
+// Update the band readout element with the latest and peak values from the data
+// column. Absent data shows an em-dash, never zero. With nothing to read at
+// all the readout is the bare dash — a range with no readings must not keep the
+// previous range's figures above it.
+//
+// On a signed band the peak is the largest excursion by magnitude, keeping its
+// sign, so the formatter still reads "charging" or "discharging" for the
+// extreme it names. On an unsigned band it is the plain maximum. A band that
+// carries more than one line names which line the figures belong to (`who`), so
+// a pack's readout never reads as the band's own number when it is one of three.
+function updateBandReadout(id, values, fmt, signed, who) {
+  const el = $(id + 'Read');
+  if (!el) return;
+  let latest = null;
+  let peak = null;
+  for (let i = values.length - 1; i >= 0; i--) {
+    if (values[i] !== null && isFinite(values[i])) {
+      latest = values[i];
+      break;
+    }
+  }
+  for (const v of values) {
+    if (v !== null && isFinite(v)) {
+      const wins = signed
+        ? peak === null || Math.abs(v) > Math.abs(peak)
+        : peak === null || v > peak;
+      if (wins) peak = v;
+    }
+  }
+  if (latest === null && peak === null) { el.textContent = DASH; return; }
+  const latestStr = latest === null ? DASH : fmt(latest);
+  const peakStr = peak === null ? DASH : fmt(peak);
+  el.textContent = (who ? who + ' ' : '') + latestStr + ' · peak ' + peakStr;
 }
 
 // A band's own values, converted into the unit it is drawn in. tempOf answers
