@@ -192,7 +192,12 @@
   .dtl .pairbar{display:flex;gap:3px;align-items:flex-end;height:44px;margin:6px 0 3px}
   .dtl .pairbar div{flex:1;border-radius:3px 3px 0 0}
   .dtl .delta{display:flex;align-items:baseline;gap:7px;margin-top:2px}
-  .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;font-variant-numeric:tabular-nums}
+  /* The figure never breaks from its unit. These sit in a flex row beside a
+     caption that can be long — "between BMS and inverter" — and without this
+     the unit wraps onto its own line and 0.3 V reads as 0.3 and then V. The
+     caption is the thing that should wrap, so it is the one left free to. */
+  .dtl .delta em{font-style:normal;font-size:21px;font-weight:300;
+    font-variant-numeric:tabular-nums;white-space:nowrap}
   /* The detail rows are this view's body text, so they sit above the shared
      .kv size — this is a page somebody reads closely, not a card to glance
      at. The rows stay flex space-between, so a taller figure changes no

@@ -80,6 +80,10 @@ and one that had been drawing a chart with no line in it.
 
 - The Graphs page scrolled sideways on a phone.
 
+- **A figure could break from its unit.** The cable-drop reading on the
+  Inverter view sat beside a caption long enough to squeeze it, so 0.3 V
+  wrapped and read as 0.3 and then V on the line below.
+
 ### Known
 
 - There is still no authentication. Anything on the network can read the
