@@ -601,6 +601,24 @@ class SqliteStore:
         notices. Rows from a rollup tier carry ``sample_count`` as well, so a bucket
         built from three readings can be told from one built from three hundred.
 
+        A row that carries *none* of the requested metrics and no error is not
+        a reading of them and is not returned, because two writers share this
+        tier: the weather poller lands a row every fifteen minutes whose
+        inverter columns are all null, and returning it would punch a hole in
+        every inverter series where data exists — the exact mistake this
+        project forbids, and the same guard ``latest`` keeps. The mirror holds
+        too: a request for the sky's metrics walks past the inverter rows to
+        the weather ones. Gap rows still answer every request, because recency
+        is not health and a real outage must keep showing as a break.
+
+        With *no* metrics named there is nothing to witness a reading, so what
+        comes back is the gap rows alone rather than every row in the range.
+        That is a narrow answer to a question nobody currently asks — the API
+        rejects an empty metric list before reaching here, and the gap search
+        uses ``latest`` — but it is worth stating, because "all the rows" is the
+        reading somebody would assume and a timeline built on it would be
+        nothing but outages.
+
         One device, always: ``device`` defaults to the one this store was opened
         for, and there is no way to ask for all of them at once. Two inverters'
         power readings interleaved in one series is not a chart of anything, and
@@ -625,9 +643,22 @@ class SqliteStore:
         selected = ["timestamp", *(self._selected(table, n) for n in names), "error"] + (
             ["sample_count"] if counted else []
         )
+        # A row that carries none of the requested metrics and no error is not
+        # a reading of them and must not be returned — two writers share this
+        # tier, so the weather poller's sky row would otherwise punch a null
+        # into every inverter series every fifteen minutes, exactly as it once
+        # blanked the live view (see ``latest``). A gap row still answers,
+        # because recency is not health and a real outage must keep showing as
+        # a break. Only columns the table actually has bear on the question: a
+        # registry metric this device never declared selects as ``NULL AS name``
+        # and no row can carry it, so it is not a witness here.
+        witness = [n for n in names if n in self._present[table]]
+        terms = [*(f"{n} IS NOT NULL" for n in witness), "error IS NOT NULL"]
+        carries = " AND (" + " OR ".join(terms) + ")"
         rows = self._conn.execute(
             f"SELECT {', '.join(selected)} FROM {table} "
-            "WHERE timestamp BETWEEN ? AND ? AND device = ? ORDER BY timestamp",
+            "WHERE timestamp BETWEEN ? AND ? AND device = ? "
+            f"{carries} ORDER BY timestamp",
             (int(start.timestamp()), int(end.timestamp()), self._device(device)),
         ).fetchall()
         return [self._decode_row(columns, row, names) for row in rows]

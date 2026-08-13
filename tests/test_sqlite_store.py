@@ -1451,6 +1451,141 @@ def test_latest_without_gaps_walks_past_a_newer_gap_row(tmp_path: Path) -> None:
     assert reading["error"] is None
 
 
+def test_query_skips_a_row_carrying_none_of_the_asked_metrics(tmp_path: Path) -> None:
+    # The two-writer guard latest() keeps, applied to query() — issue #159.
+    # The weather poller lands a row whose inverter columns are all null; a
+    # request for inverter metrics that returned it put a null into every
+    # inverter series every fifteen minutes, an absence drawn where data
+    # exists. A row carrying none of the asked metrics is not a reading of
+    # them and must not come back.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0, "battery_soc_pct": 64.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w", "battery_soc_pct"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    )
+    store.close()
+    assert [r["timestamp"] for r in rows] == [datetime(2026, 8, 6, 12, 0, tzinfo=UTC)]
+    assert rows[0]["pv_total_power_w"] == 5000.0
+
+
+def test_query_still_returns_a_recorded_gap_row(tmp_path: Path) -> None:
+    # Recency is not health: a recorded gap answers every request, whatever
+    # metrics it was asked for, because an outage smoothed into a straight
+    # segment is an outage nobody ever notices. This is the assertion that
+    # stops the guard going too far — never make a real outage invisible while
+    # removing the phantom breaks.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 1, tzinfo=UTC),
+            readings={},
+            error="ConnectionError: nobody answered",
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 5, tzinfo=UTC),
+    )
+    store.close()
+    assert [r["error"] for r in rows] == [None, "ConnectionError: nobody answered"]
+    assert rows[1]["timestamp"] == datetime(2026, 8, 6, 12, 1, tzinfo=UTC)
+
+
+def test_query_mixed_families_returns_every_writer(tmp_path: Path) -> None:
+    # The guard is per row, not per family: a request naming metrics from both
+    # writers gets every row, because each row carries one of the asked
+    # metrics. That is why the graphs page asks for the two families in two
+    # requests rather than relying on the guard to split them — it cannot, and
+    # the weather rows would still land between the inverter ones.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4},
+        )
+    )
+    rows = store.query(
+        ["pv_total_power_w", "outside_temperature_c"],
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    )
+    store.close()
+    assert [(r["timestamp"], r["pv_total_power_w"], r["outside_temperature_c"]) for r in rows] == [
+        (datetime(2026, 8, 6, 12, 0, tzinfo=UTC), 5000.0, None),
+        (datetime(2026, 8, 6, 12, 15, tzinfo=UTC), None, 37.4),
+    ]
+
+
+def test_query_splits_the_two_writers_by_family(tmp_path: Path) -> None:
+    # The two-writer tier served whole, the way /graphs now asks: interleaved
+    # inverter and weather rows, and each request comes back with only the
+    # family it named. This is the end-to-end shape behind issue #159 and the
+    # blank weather section.
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+            readings={"pv_total_power_w": 5000.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 15, tzinfo=UTC),
+            readings={"outside_temperature_c": 37.4, "cloud_cover_pct": 0.0},
+        )
+    )
+    store.append(
+        Sample(
+            timestamp=datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+            readings={"pv_total_power_w": 5100.0},
+        )
+    )
+    start = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 6, 12, 45, tzinfo=UTC)
+    inv = store.query(["pv_total_power_w"], start, end)
+    sky = store.query(["outside_temperature_c", "cloud_cover_pct"], start, end)
+    # And, asked together, the families do not carry each other's columns: the
+    # weather row decodes with pv null and the inverter rows with the sky null.
+    both = store.query(["pv_total_power_w", "outside_temperature_c"], start, end)
+    store.close()
+    assert [r["timestamp"] for r in inv] == [
+        datetime(2026, 8, 6, 12, 0, tzinfo=UTC),
+        datetime(2026, 8, 6, 12, 30, tzinfo=UTC),
+    ]
+    assert [r["timestamp"] for r in sky] == [datetime(2026, 8, 6, 12, 15, tzinfo=UTC)]
+    assert [(r["pv_total_power_w"], r["outside_temperature_c"]) for r in both] == [
+        (5000.0, None),
+        (None, 37.4),
+        (5100.0, None),
+    ]
+
+
 def test_forecast_serves_the_newest_revision_of_each_hour(tmp_path: Path) -> None:
     # The page draws one prediction, so the read answers with one: the newest
     # figure for each hour, whenever it was made. A forecast made yesterday for
