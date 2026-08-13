@@ -234,6 +234,17 @@ def full_charge_windows(
         if last is not None and when - last > max_gap:
             # Time passed that we have no readings for. What the bank did in
             # the hole is unknown, so the run ends here and a new one begins.
+            #
+            # This is the only thing that ends a run for silence now. The store
+            # stopped returning rows carrying none of the asked-for metrics —
+            # the weather poller writes into the same tier and its rows have no
+            # battery columns — so a minute the bank said nothing arrives as a
+            # hole in time rather than as a row of nulls that ended the run
+            # outright. A silence shorter than max_gap is therefore bridged
+            # where it used to split. That is the rule this function already
+            # states, applied consistently, but the direction is worth naming:
+            # it errs toward believing a charge completed across a short
+            # silence, where before it erred toward discarding a real one.
             close()
             start = None
         if start is None:

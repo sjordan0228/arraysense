@@ -482,15 +482,24 @@ async function loadCaps() {
   bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)));
 }
 
-// Every inverter metric the kept bands read, asked for in one request. Built
-// from what is plotted rather than kept beside it and allowed to drift.
+// What the kept bands read, split by which writer's clock the metric lives on.
+// The inverter is polled every 11 s and answers about every 12 s, and the
+// weather poller runs every 15 minutes,
+// and the two families must not share one request or one x axis: a request
+// that names metrics from both returns every row of either, so the sky's rows
+// still land between the inverter's and still break every inverter series
+// (see load(), and the query guard that cannot help a mixed ask). Built from
+// what is plotted rather than kept beside it and allowed to drift.
 //
-// Site metrics (weather) are always present here because the caps filter never
-// drops site bands — they are exempt. The weather section hides when the
-// fetched window carries no data rather than the bands being removed, so the
-// metrics must still be fetched: without the fetch the page cannot tell that
-// data has appeared and the section would stay hidden forever.
-const metricsAsk = () => [...new Set(bands.flatMap(neededBy))].join(',');
+// Site bands are never dropped by the caps filter — they are exempt — so the
+// site ask is stable. The weather section hides when the fetched window
+// carries no data rather than the bands being removed, so the site metrics
+// must still be fetched: without the fetch the page cannot tell that data has
+// appeared and the section would stay hidden forever.
+const siteMetricsAsk = () =>
+  [...new Set(BANDS.filter((b) => b.site).flatMap(neededBy))].join(',');
+const inverterMetricsAsk = () =>
+  [...new Set(bands.filter((b) => !b.site).flatMap(neededBy))].join(',');
 
 // What a pack band holds, in the order the columns are stacked into the data.
 // Both drawn traces are temperatures of the same battery from the same BMS, so
@@ -596,7 +605,7 @@ const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
 // band is drawn in, and a band with nothing in any of its columns says so
 // rather than drawing an empty plot — a flat line on an axis is a reading of
 // nothing, and nothing recorded is not that.
-function paintBand(b, xs, cols) {
+function paintBand(b, xs, cols, sync) {
   const k = kindOf(b);
   const lines = linesOf(b);
   if (!anyReading(...cols)) {
@@ -621,11 +630,18 @@ function paintBand(b, xs, cols) {
     height: BAND_H + (isLast(b) ? AXIS_H : 0),
     unit: unitOf(b),
     opts: chartBase({
-      // Every band on this page is drawn over the same x range, so a cursor on
-      // any one of them must put the crosshair at the same instant on all the
-      // rest — that is the whole reason the page is small multiples. chartBase
-      // syncs every chart by default; the y scale is deliberately left out of
-      // CHART_SYNC, so a band's own value never rides another band's axis.
+      // Every band in one family is drawn over the same x range, so a cursor
+      // on any one of them must put the crosshair at the same instant on all
+      // the rest — that is the whole reason the page is small multiples. The
+      // sync group is the family's x array, not the whole page: the weather
+      // bands and the per-pack bands arrive from their own endpoints on their
+      // own clocks, and a chart may only sync with charts whose x window its
+      // own data lives in, or a drag on one family pushes another's axis to a
+      // range it has no points in. The inverter bands take the page's default
+      // group (sync is undefined); the other two families name their own. The
+      // y scale is deliberately left out of CHART_SYNC, so a band's own value
+      // never rides another band's axis.
+      sync,
       scales: { x: { time: true }, y: { range: b.signed ? mirrored : k.range } },
       // The blank axis keeps the vertical gridlines and the plot's bottom
       // margin on every band, so the bands stay aligned with the one that does
@@ -703,8 +719,26 @@ function drawInverter(body) {
   if (!body) return;
   const f = frame(body.points || []);
   // The spread bands sit in this section but are not inverter registers; they
-  // are painted from the module endpoint by drawSpreads.
-  for (const b of bands) if (!b.derived) paintBand(b, f.xs, [valuesFor(b, f)]);
+  // are painted from the module endpoint by drawSpreads. The weather bands
+  // are a third clock again and are painted by drawWeather from the site
+  // response, never from this frame.
+  for (const b of bands) if (!b.derived && !b.site) paintBand(b, f.xs, [valuesFor(b, f)]);
+}
+
+// The weather bands draw from their own frame, built from the site response.
+// Sharing the inverter response's frame is what left them blank: their
+// readings land one every fifteen minutes among two thousand inverter rows,
+// so no two of them are ever adjacent and uPlot has no segment to draw. A
+// frame over the sky's own rows gives the two bands a series of adjacent
+// instants. The synced crosshair still lands on them, because uPlot syncs on
+// the x value rather than on a shared array of instants — see CHART_SYNC.
+function drawWeather(body) {
+  if (!body) return;
+  const f = frame(body.points || []);
+  // The weather bands' own group: they share the sky's x array with each other
+  // and with nobody else on the page, so a zoom on an inverter band must not
+  // push their axis to a window the sky has no rows in.
+  for (const b of bands) if (b.site) paintBand(b, f.xs, [valuesFor(b, f)], { key: 'graphs-weather' });
 }
 
 // One spread series: the distance between the highest and lowest pack at each
@@ -748,7 +782,9 @@ function drawSpreads(points, serials) {
     if (!b.derived) continue;
     const s = spreadOf(points, serials, b.derived, b.scale);
     if (!s.xs.length) { chartMessage(b.id, 'needs two or more packs reporting'); continue; }
-    paintBand(b, s.xs, [s.values]);
+    // Spreads are drawn from the module rows, so they share the packs' group:
+    // same x array, same clock, and a zoom on one must ride across the other.
+    paintBand(b, s.xs, [s.values], { key: 'graphs-packs' });
   }
 }
 
@@ -822,7 +858,10 @@ function drawPacks(body) {
     // tempOf answers an absent reading with null, so absent survives the
     // conversion — the same guarantee valuesFor() relies on for the inverter
     // bands, and the reason a silent pack cannot arrive on the axis at zero.
-    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)));
+    // The per-pack bands share the module rows' x array with the spreads, so
+    // they get the packs' group rather than the page default the inverter
+    // bands sit in.
+    paintBand(b, series.xs, raw.map((col) => col.map(tempOf)), { key: 'graphs-packs' });
   });
   // The spreads are drawn from the same rows, up in the Battery section: they
   // are a property of the bank rather than of any one pack, so they belong
@@ -871,13 +910,20 @@ async function load() {
   const end = new Date();
   const start = new Date(end.getTime() - range.seconds * 1000);
   const when = `start=${start.toISOString()}&end=${end.toISOString()}`;
-  // Two asks, because the two endpoints choose from two different lists of
-  // tiers and one width cannot be right for both.
+  // Three asks. The two /api/history calls split the band metrics by which
+  // writer's clock they live on — the inverter's and the weather poller's —
+  // because the two families share a tier but not sample instants, and one
+  // request for both would return every row of either and put each weather
+  // row's nulls into every inverter series (issue #159). The pack ask is the
+  // third, on its own width because it chooses from a different pair of
+  // tiers. Each response names the tier it got; the inverter and the sky ask
+  // with the same width, so they land on the same one.
   const width = widthFor(range.seconds);
   const packWidth = moduleWidthFor(range.seconds);
   const problems = [];
-  const [inv, packs] = await Promise.all([
-    get(`/api/history?${when}&metrics=${metricsAsk()}&width=${width}`).catch(() => null),
+  const [inv, site, packs] = await Promise.all([
+    get(`/api/history?${when}&metrics=${inverterMetricsAsk()}&width=${width}`).catch(() => null),
+    get(`/api/history?${when}&metrics=${siteMetricsAsk()}&width=${width}`).catch(() => null),
     get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
       .catch(() => null),
   ]);
@@ -885,6 +931,7 @@ async function load() {
   // owner's zoom with it over a problem that usually lasts one request, and
   // what is on screen is still the last thing the inverter actually said.
   if (!inv) problems.push('history unavailable — showing the last successful read');
+  if (!site) problems.push('site weather unavailable — showing the last successful read');
   if (!packs) problems.push('per-pack temperature unavailable');
   // A rollup is not among them. On the longer spans it is exactly what this
   // page asked to have chosen for it, and each side names the tier it got
@@ -896,6 +943,7 @@ async function load() {
   resolution(inv);
   packResolution(packs);
   drawInverter(inv);
+  drawWeather(site);
   drawPacks(packs);
   // The data-in-window rule for site metrics: hide the weather section when the
   // fetched window carries no non-null value for either site metric. An install
@@ -903,9 +951,11 @@ async function load() {
   // — an empty chart reads as a fault — and an install where the weather poller
   // stopped a month ago degrades right when the owner scrolls to a window
   // before it stopped. Only on a successful fetch: a failed poll must not tear
-  // the section down over a problem that usually lasts one request.
-  if (inv) {
-    const hasWeather = (inv.points || []).some(
+  // the section down over a problem that usually lasts one request. The site
+  // response carries only weather rows (and gap rows), so this is a question
+  // about whether the window holds any.
+  if (site) {
+    const hasWeather = (site.points || []).some(
       (p) => numOrNull(p.outside_temperature_c) !== null
           || numOrNull(p.cloud_cover_pct) !== null,
     );

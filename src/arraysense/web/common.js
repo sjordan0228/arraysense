@@ -1790,13 +1790,13 @@ function drawRanges(el, current, onPick) {
 // off every chart at once.
 // ---------------------------------------------------------------------------
 
-// One sync group across a page's charts, so a cursor on any of them puts the
+// Sync groups across a page's charts, so a cursor on any of them puts the
 // crosshair at the same instant on the others. Zoom rides the same channel:
 // a drag-select on one window zooms them all and a double-click resets them
 // together, which is the only way the comparison stays honest.
 //
-// Every chart is in the group by default; chartBase merges CHART_SYNC into
-// the cursor of every chart it builds. uPlot syncs through the x-scale value
+// Every chart is in a group by default; chartBase merges CHART_SYNC into the
+// cursor of every chart it builds. uPlot syncs through the x-scale value
 // (posToVal on the sending chart, valToPos on the rest), so a crosshair lands
 // at the same instant wherever that instant exists in the other chart's range
 // — the sync never depends on the charts being the same size or covering the
@@ -1804,12 +1804,49 @@ function drawRanges(el, current, onPick) {
 // to chartBase; the forecast chart on the dashboard is the one deliberate
 // opt-out, because its range is a fixed calendar day while its neighbours
 // follow the selected window.
-const SYNC_KEY = 'arraysense';
+//
+// The group is per page, and within a page per x array, and that split is the
+// point. Charts on the same page drawn from the same x array track together;
+// charts drawn from different x arrays must not, because zooming is synced as
+// the *values* of the dragged window, and a band whose data lives on its own
+// clock or its own tier — the graphs page's weather bands arrive every fifteen
+// minutes, its per-pack bands from a separate endpoint — receives a window it
+// has no points in and its y axis collapses to uPlot's un-ranged default. One
+// global key once put all three of the graphs page's families into that trap
+// together. Only within one document: uPlot's group registry is module state,
+// rebuilt on every load, so charts on different pages could never have synced
+// with each other whatever key they named. Keying per page is defence in depth
+// and a statement of intent, not a fix for cross-page leakage.
+// >>> sync-groups
+const SYNC_PREFIX = 'arraysense';
 
-// The one sync declaration. The x scale is the shared range every band on the
-// Graphs page is drawn over; the y scale is deliberately not in the list, so a
-// band's own value never rides another band's axis.
-const CHART_SYNC = { key: SYNC_KEY, setSeries: false, scales: ['x', null] };
+// The group a chart joins when it names no key: one per page, taken from the
+// path the chart is served under. The default group is the page's main x
+// array; a page that draws more than one family passes each other family its
+// own key (see syncKeyFor). Pure so the key resolution can run under node,
+// where there is no location to read.
+function pageSyncKeyFor(pathname) {
+  const page = pathname === '/' ? 'dashboard' : pathname.replace(/\.html$/, '').replace(/^\//, '');
+  return `${SYNC_PREFIX}-${page}`;
+}
+
+
+// What sync key a chart joins, from the chartBase `sync` option and the page
+// it is built on. `false` (or null) opts out entirely — the forecast chart is
+// the one deliberate opt-out. `{ key }` names a family group, for a page whose
+// charts are drawn from more than one x array. Anything else — undefined,
+// true, an empty object — falls back to the page's default group.
+function syncKeyFor(sync, pathname) {
+  if (sync === false || sync === null) return null;
+  if (sync && sync.key) return sync.key;
+  return pageSyncKeyFor(pathname);
+}
+// <<< sync-groups
+
+// The sync declaration a chart joins with. The x scale is the shared range a
+// band is drawn over; the y scale is deliberately not in the list, so a band's
+// own value never rides another band's axis. The key is added per chart.
+const CHART_SYNC = { setSeries: false, scales: ['x', null] };
 
 // uPlot paints on a canvas and a canvas has no idea what var(--pv) means, so
 // the palette has to be resolved to real colours. It is read back out of the
@@ -2656,18 +2693,21 @@ const chartBase = (extra) => {
       y: false,
     },
   }, extra);
-  // Crosshair sync is the default: every chart joins the page's group, so a
+  // Crosshair sync is the default: every chart joins its page's group, so a
   // cursor on any one of them puts the crosshair at the same instant on the
   // rest and a drag-select zooms them together. A chart that must not
   // participate passes `sync: false` — the forecast chart on the dashboard is
   // the one deliberate opt-out, because it is pinned to a fixed calendar day
-  // while its neighbours follow the selected window. `sync` is chartBase's own
-  // option and must not ride into uPlot's opts, so it is merged into the cursor
-  // and removed.
-  if (out.sync === false || out.sync === null) {
+  // while its neighbours follow the selected window. A page whose charts are
+  // drawn from more than one x array passes `sync: { key }` so each family
+  // gets a group of its own; see syncKeyFor. `sync` is chartBase's own option
+  // and must not ride into uPlot's opts, so it is merged into the cursor and
+  // removed.
+  const key = syncKeyFor(out.sync, window.location.pathname);
+  if (key === null) {
     delete out.cursor.sync;
   } else {
-    out.cursor = Object.assign({}, out.cursor, { sync: out.sync || CHART_SYNC });
+    out.cursor = Object.assign({}, out.cursor, { sync: Object.assign({}, CHART_SYNC, { key }) });
   }
   delete out.sync;
   return out;
