@@ -7,6 +7,45 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.0 — 13 August 2026
+
+The first release meant for somebody else's inverter.
+
+Nothing about how it reads hardware changed in this release. What changed is that
+the project now says plainly what it supports, what it does not, and on what
+evidence — which is the part that was missing for anyone arriving without having
+built it.
+
+### Added
+
+- **A front page that shows the thing working.** Six screenshots from the reference
+  installation, live rather than mocked: the dashboard, the energy-flow Sankey, the
+  per-pack temperature bands, the performance-ratio scoring, the monthly cost
+  breakdown and thirty days of history. Hardware serials are replaced with the
+  documented placeholders, because the repository is public and a serial baked into
+  an image is not something the pre-push secret scan can see.
+
+- **Supported hardware is listed by the evidence behind it** rather than as a flat
+  list. The 18kPV is measured; the 12kPV, FlexBOSS21 and FlexBOSS18 are confirmed
+  upstream by device type code; the 6000XP carries a warning rather than a promise,
+  because it is an off-grid family where several registers mean something else and
+  readings may be wrong rather than missing.
+
+- **A hardware request form**, so asking for a family that is not supported yet
+  collects the things that actually decide it — the device type code, how the unit
+  is wired, and whether the person asking can test against their own hardware.
+  Other families are intended; what gates them is evidence, not interest.
+
+- **Installation documentation carries the wizard**, both steps, so the first-run
+  experience can be read before committing to it. It also names the simulated
+  driver, which lets the whole application be evaluated with no inverter attached.
+
+### Notes
+
+- This is 1.0.0 in the sense the version scheme promises: the storage schema is no
+  longer expected to change between minor versions. Data retention landed in 0.12.0
+  and remains off by default.
+
 ## 0.12.0 — 13 August 2026
 
 The database stops growing without end, if you ask it to.
