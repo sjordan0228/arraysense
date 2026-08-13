@@ -277,6 +277,24 @@ const BASE_CSS = `
   .nav a[aria-current="page"]{background:var(--tint-3);color:var(--ink);font-weight:500}
   .nav a:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .view[hidden]{display:none}
+  /* Tabs, one per section of a page. The Settings page and the Graphs page both
+     break a long document into tabs, so the look and the pressed state are one
+     copy here rather than two page stylesheets that would drift. */
+  .tabs{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
+  .tabs button{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
+    line-height:1.45;cursor:pointer}
+  .tabs button:hover{color:var(--ink2)}
+  /* The active tab is amber on purpose, and it is not the same "selected" as
+     the nav pill above it. The pill says which page this is and stays grey;
+     the tab says which section of this page is open. The tab is deliberately
+     the louder of the two so the two levels read as different questions. */
+  .tabs button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
+    color:#1a1204;font-weight:600}
+  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* A panel a tab has switched away from, hidden rather than removed so the
+     charts inside keep their data and their zoom. */
+  .p[hidden]{display:none}
   /* The stale-data banner. It sits directly under the nav on every page — the
      slot the dashboard's calibration advisory already uses — so a warning
      appearing never pushes the navigation down the screen, and it is shaped
