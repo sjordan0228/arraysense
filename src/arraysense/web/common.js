@@ -1021,6 +1021,7 @@ const STALE_POLL_MS = 30 * 1000;
 // three of the five pages already declare a top-level function by that name —
 // and a `const` here against a `function` there is not shadowing but a
 // SyntaxError that stops the whole page script from running.
+// >>> live-strip
 const msOrNull = (iso) => {
   const t = Date.parse(iso || '');
   return Number.isFinite(t) ? t : null;
@@ -1317,7 +1318,10 @@ async function checkStale() {
   } else {
     staleMisses = 0;
   }
-  liveStaleInfo = liveStaleFrom(status);
+  // An unreachable status is not a verdict of fresh: a strip already marked
+  // stale by the last reachable reply must not be un-marked by an outage that
+  // only stopped the service from answering.
+  liveStaleInfo = status === null ? liveStaleInfo : liveStaleFrom(status);
   // The strip and the glow answer on the status poll's own clock, not on the
   // next live poll's: a collector that has just gone stale must not keep its
   // "Live" label or its warm glow for the interval the live loop takes to
@@ -1349,7 +1353,6 @@ function startStaleWatch() {
 // money.
 // ---------------------------------------------------------------------------
 
-// >>> live-strip
 // The four flows, in the order the dashboard's own cards run, so a reader
 // moving between pages finds them in the same places. Each names the registry
 // metric it prints and the palette token it takes its colour from — the token
@@ -1359,9 +1362,10 @@ function startStaleWatch() {
 //
 // Only the bank is `signed`, and that is not an oversight. The dashboard prints
 // a leading + on a charging bank because "1.20 kW" beside a battery says
-// nothing about which way it is going; the other three read the same way there
-// as here, and a strip that dressed them differently would stop being the same
-// figures the cards show.
+// nothing about which way it is going; the other three carry no sign there and
+// none here. Above a kilowatt the strip prints the same number the cards do;
+// below it, kw() keeps whole watts, which is how a 421 W panel reads in the
+// strip while the card beside it says "0.42 kW".
 const STRIP_FIGURES = [
   { key: 'pv',   label: 'PV',   metric: 'pv_total_power_w', token: '--pv',   signed: false },
   { key: 'load', label: 'Home', metric: 'load_power_w',     token: '--load', signed: false },
@@ -1401,7 +1405,6 @@ function glowState(mode) {
   if (!mode || !mode.known) return null;
   return GLOW_BY_MODE[mode.mode] || null;
 }
-// <<< live-strip
 
 // How stale the last /api/status poll found the collector, or null while it is
 // current. The strip and the glow are fed from the same verdict the stale
@@ -1442,8 +1445,8 @@ const LIVE_POLL_MS = 30 * 1000;
 //
 // The loop stands down one request late. Its first tick fires before the
 // dashboard has made its own call, because that one waits on /api/setup first —
-// so a dashboard load costs one extra request against an endpoint whose median
-// is 9 ms, and buys the strip filling in before the cards do rather than after.
+// so a dashboard load costs one extra request against an endpoint cheap to
+// answer, and buys the strip filling in before the cards do rather than after.
 let liveFedByPage = false;
 
 // The strip, built here rather than in six headers, the way the theme button is.
@@ -1505,11 +1508,14 @@ function applyLive(payload) {
   const stale = liveStaleInfo;
   const strip = document.getElementById('nowstrip');
   if (strip) {
-    // A payload at all is what says this installation has live readings to
-    // show, so the strip stays out of the header until one arrives and a
-    // service in first-run setup mode never grows a row of dashes. Once shown
-    // it stays: a reading that goes absent shows the dash, because the strip
-    // vanishing and the strip saying "not measured" are different claims.
+    // The strip appears on the first payload, whatever it holds. An empty store
+    // answers /api/live with a payload whose inverter is null, and a row of
+    // four dashes is the honest rendering of an installation with nothing read
+    // yet. What keeps the strip out of the header is first-run setup mode,
+    // which serves no /api/live at all and so never hands applyLive a payload.
+    // Once shown it stays: a reading that goes absent shows the dash, because
+    // the strip vanishing and the strip saying "not measured" are different
+    // claims.
     if (answered) strip.hidden = false;
     paintStale(strip, stale);
     for (const spec of STRIP_FIGURES) {
@@ -1530,6 +1536,7 @@ function applyLive(payload) {
   if (glow) document.documentElement.setAttribute('data-glow', glow);
   else document.documentElement.removeAttribute('data-glow');
 }
+// <<< live-strip
 
 // Whether this service has a live endpoint at all. First-run setup mode serves
 // the wizard and /api/setup and nothing else, so a 404 is an installation with
@@ -2351,13 +2358,14 @@ const carried = () => ({ show: false, scale: 'y', spanGaps: false });
 // Kept, and no longer used on the Power flow chart. Solar and home read as
 // lines there now, each carrying the look's own --series-wash beneath it
 // rather than a fill of its own — and that wash is safe over the tariff
-// shading, which was measured at 0.88 of its Classic strength under it. The
-// old full-coverage area would not be: on a sunny day it covers most of the
-// plot and hides the bands entirely, which is why this volume reading gave
-// way and survives only where it still earns its coverage, on the forecast
-// chart and the graphs page's solar bands. Filled to the zero line rather
-// than the floor of the chart, or a negative axis would put the fill on the
-// wrong side of nothing.
+// shading: an even layer scales a step beneath it by one minus its alpha, and
+// the wash fades from 0.20 at the top to nothing at the foot, so every band
+// edge keeps at least four-fifths of its contrast. The old full-coverage area
+// would not be: on a sunny day it covers most of the plot and hides the bands
+// entirely, which is why this volume reading gave way and survives only where
+// it still earns its coverage, on the forecast chart and the graphs page's
+// solar bands. Filled to the zero line rather than the floor of the chart, or
+// a negative axis would put the fill on the wrong side of nothing.
 function pvFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
   grad.addColorStop(0, fade('--pv', .5));

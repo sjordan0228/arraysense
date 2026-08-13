@@ -208,16 +208,12 @@
      still the first thing the eye gets.
 
      It also lies over the tariff band shading on that chart, which is read by
-     luminance and by nothing else, so what it costs was measured rather than
-     assumed. Sampling the power chart's own canvas either side of a band edge,
-     at a point under the solar fill and clear of every stroke: the step across
-     the edge measured 18.0 in Classic, where there is no wash, and 15.8 with
-     this one over it — 0.88 of the contrast kept, at 39% of the way down the
-     plot where the wash's own alpha has faded to 0.12. That is the arithmetic
-     of compositing an even layer over both sides of an edge, which scales the
-     difference by one minus its alpha, and it is why the wash is capped where
-     it is: 0.80 of the shading survives at the very top of the plot and more of
-     it everywhere below.
+     luminance and by nothing else, so what it costs is arithmetic rather than
+     an assumption. Compositing an even layer of alpha a over both sides of an
+     edge scales the step across it by (1 − a), and the wash fades from 0.20 at
+     the top of the plot to nothing at its foot — so the shading keeps 0.80 of
+     its contrast where the wash is strongest and more of it everywhere below.
+     That is why the wash is capped where it is.
 
      The light one is lower than the dark: a dark wash on a light pane reads
      heavier than a light one on a dark pane at the same alpha. */

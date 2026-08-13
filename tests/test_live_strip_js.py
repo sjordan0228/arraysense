@@ -16,6 +16,13 @@ with nothing said about it here fails rather than silently lighting the page as
 if the sun were out.
 
 The pure halves run under node, the way the wizard and series-wash slices do.
+The staleness verdict is the one thing this strip shipped broken: three-day-old
+readings stayed up under a "Live power" label while the banner said the
+collector had stopped. The slice therefore extends past the figures to the
+verdict machinery — liveStaleFrom, paintStale, the stale branch of applyLive,
+and checkStale's handling of an unreachable status — and those tests run the
+real functions under node with a mocked DOM, so a regression there fails here.
+
 The stylesheets are checked as text, since a sheet cannot be executed — and
 Classic is checked for the *absence* of the treatment, because Classic keeping
 the look it has is the whole of what "the glow lives in theme-glass.css" means.
@@ -114,9 +121,36 @@ def test_every_figure_names_a_metric_the_registry_serves() -> None:
 def test_the_figures_take_the_validated_palette_and_add_nothing() -> None:
     # The four hues were found by searching against a protan, deutan and tritan
     # checker. A fifth introduced here would be one nobody measured, on a strip
-    # that is on every page.
+    # that is on every page. Checked in both places a colour can reach the page:
+    # the STRIP_FIGURES table names the tokens, and mountLiveStrip — where they
+    # reach the DOM — is executed under node and must hand every figure a var()
+    # of its own token rather than a literal, so a hard-coded hex in the builder
+    # cannot pass a check that only read the table.
     tokens = re.findall(r"token: '(--[a-z-]+)'", _slice())
     assert tokens == ["--pv", "--load", "--batt", "--grid"]
+    if NODE is None:
+        pytest.skip("node not installed; cannot execute the strip builder")
+    body = """
+    const esc = (s) => String(s);
+    const DASH = '—';
+    const header = {
+      querySelector: (sel) => sel === '.nowstrip' ? null : (sel === '.hright' ? {} : null),
+      insertBefore: () => {},
+    };
+    const document = {
+      querySelector: (sel) => sel === 'header' ? header : null,
+      createElement: () => ({
+        className: '', id: '', hidden: false,
+        setAttribute: () => {}, innerHTML: '',
+      }),
+    };
+    const html = mountLiveStrip().innerHTML;
+    const wanted = ['--pv', '--load', '--batt', '--grid'];
+    const all = wanted.every((t) => html.includes('var(' + t + ')'));
+    const hex = /#[0-9a-fA-F]{3,8}/.test(html);
+    console.log(String(all), String(!hex));
+    """
+    assert _run(body) == "true true"
 
 
 # --- the light ------------------------------------------------------------
@@ -166,6 +200,152 @@ def test_every_mode_the_service_can_name_has_an_ambience() -> None:
             )
             continue
         assert member.value in named, f"arraysense.mode.Mode.{member.name} has no ambience"
+
+
+# --- the staleness verdict -----------------------------------------------
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_live_stale_from_answers_null_for_an_unreachable_status() -> None:
+    # Absence of a verdict is not a verdict of fresh: a status poll that could
+    # not be reached must answer null (so nothing is painted from it) rather
+    # than an invented "fresh". Only a reply that names the collector stale
+    # produces a stale verdict.
+    body = """
+    const say = (status) => {
+      const v = liveStaleFrom(status);
+      return v === null ? 'null' : v.short;
+    };
+    console.log([
+      say(null), say(undefined), say({}), say({ staleness: {} }),
+      say({ staleness: { stale: false, reading_at: '1970-01-01T00:00:00Z', age_seconds: 10800 } }),
+      say({ staleness: { stale: true, reading_at: '1970-01-01T00:00:00Z', age_seconds: 10800 } }),
+    ].join(' | '));
+    """
+    assert _run(body) == "null | null | null | null | null | 3 hours ago"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_paint_stale_applies_the_verdict() -> None:
+    # The strip's staleness is painted from the verdict and from nothing else:
+    # a stale verdict marks the strip, a null one clears it back to "Live
+    # power". If paintStale stopped applying the verdict the strip would read
+    # live while the banner beside it said the collector had stopped — the
+    # exact defect these tests are the regression guard for.
+    body = """
+    const ageEl = { textContent: '', hidden: true };
+    const strip = {
+      classList: { toggle: (name, on) => { strip._stale = on; } },
+      querySelector: (sel) => sel === '.nsage' ? ageEl : null,
+      setAttribute: (k, v) => { strip[k] = v; },
+      removeAttribute: (k) => { delete strip[k]; },
+      title: '',
+    };
+    const out = [];
+    paintStale(strip, { short: '3 hours ago', long: 'Last reading 14:32, 3 hours ago.' });
+    out.push(
+      strip._stale,
+      strip['aria-label'] === 'Power readings — Last reading 14:32, 3 hours ago.',
+      ageEl.textContent === 'stale · 3 hours ago',
+      ageEl.hidden === false,
+    );
+    paintStale(strip, null);
+    out.push(
+      strip._stale === false,
+      strip['aria-label'] === 'Live power',
+      ageEl.textContent === '',
+      ageEl.hidden === true,
+    );
+    console.log(out.map(String).join(' '));
+    """
+    assert _run(body) == "true true true true true true true true"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_apply_live_consults_the_stale_info() -> None:
+    # applyLive repaints the strip from whatever the status watch last decided.
+    # A stale verdict already painted must survive a fresh live payload — the
+    # readings are real, just not recent — and a clear verdict must restore the
+    # live label. If applyLive stopped consulting liveStaleInfo, the strip and
+    # the banner would disagree.
+    body = """
+    const DASH = '—';
+    const kw = (v) => String(v);
+    const ageEl = { textContent: '', hidden: true };
+    const cells = {};
+    for (const f of STRIP_FIGURES) cells[`[data-fig="${f.key}"]`] = { textContent: '' };
+    const strip = {
+      hidden: false,
+      classList: { toggle: (name, on) => { strip._stale = on; } },
+      querySelector: (sel) => sel === '.nsage' ? ageEl : (cells[sel] || null),
+      setAttribute: (k, v) => { strip[k] = v; },
+      removeAttribute: (k) => { delete strip[k]; },
+      title: '',
+    };
+    const documentElement = {
+      setAttribute: (k, v) => { documentElement[k] = v; },
+      removeAttribute: (k) => { delete documentElement[k]; },
+    };
+    const document = { getElementById: (id) => id === 'nowstrip' ? strip : null, documentElement };
+    const payload = {
+      inverter: {
+        pv_total_power_w: 4210, load_power_w: 700,
+        battery_power_w: -900, grid_power_w: 1100,
+      },
+      mode: { mode: 'Solar', known: true },
+    };
+    const out = [];
+    liveStaleInfo = { short: '3 hours ago', long: 'Last reading 14:32, 3 hours ago.' };
+    applyLive(payload);
+    out.push(strip._stale === true, String(strip['aria-label']).startsWith('Power readings'));
+    liveStaleInfo = null;
+    applyLive(payload);
+    out.push(
+      strip._stale === false,
+      strip['aria-label'] === 'Live power',
+      documentElement['data-glow'] === 'warm',
+    );
+    console.log(out.map(String).join(' '));
+    """
+    assert _run(body) == "true true true true true"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_status_outage_does_not_un_stale_the_strip() -> None:
+    # The strip is marked stale by the last reachable /api/status reply. When
+    # the endpoint then becomes unreachable the outage must not clear that mark
+    # — absence of a verdict is not a verdict of fresh — or the strip would
+    # reclaim "Live power" in the same moment the banner said the service was
+    # not answering.
+    body = """
+    const zoneQuery = () => '';
+    const noteZone = () => {};
+    const $ = () => null;
+    const ageEl = { textContent: '', hidden: true };
+    const strip = {
+      classList: { toggle: (name, on) => { strip._stale = on; } },
+      querySelector: (sel) => sel === '.nsage' ? ageEl : null,
+      setAttribute: (k, v) => { strip[k] = v; },
+      removeAttribute: (k) => { delete strip[k]; },
+      title: '',
+    };
+    const documentElement = { setAttribute: () => {}, removeAttribute: () => {} };
+    const document = {
+      getElementById: (id) => id === 'nowstrip' ? strip : null,
+      querySelector: () => null,
+      body: null,
+      documentElement,
+    };
+    globalThis.fetch = () => Promise.reject(new Error('unreachable'));
+    (async () => {
+      staleMisses = STALE_TOLERATED_MISSES + 1;
+      liveStaleInfo = { short: '3 hours ago', long: 'Last reading 14:32, 3 hours ago.' };
+      strip._stale = true;
+      await checkStale();
+      console.log(String(strip._stale), strip['aria-label'] === 'Live power' ? 'live' : 'stale');
+    })();
+    """
+    assert _run(body) == "true stale"
 
 
 # --- where the treatment lives -------------------------------------------

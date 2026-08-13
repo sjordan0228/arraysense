@@ -78,9 +78,15 @@ def test_the_base_stylesheet_gives_classic_no_wash() -> None:
     # Classic is the absence of a look, and its charts are lines with the two
     # fills the pages ask for by name. The wash arrives with a look or not at
     # all, so the base declaration has to be zero.
+    #
+    # Searched inside the BASE_CSS template literal rather than the whole file:
+    # INK_FALLBACK also spells the token ('--series-wash':'0'), so deleting the
+    # real declaration while leaving the fallback behind would pass a whole-file
+    # search and Classic would silently take whatever the look sheets declare.
     common = COMMON.read_text()
-    declared = re.findall(r"--series-wash\s*:\s*([0-9.]+)", common)
-    assert declared, "common.js no longer declares --series-wash at all"
+    base = common.split("const BASE_CSS = `", 1)[1].split("`;", 1)[0]
+    declared = re.findall(r"--series-wash\s*:\s*([0-9.]+)", base)
+    assert declared, "the base stylesheet no longer declares --series-wash"
     assert all(float(v) == 0 for v in declared), (
         f"the base stylesheet gives Classic a wash: {declared}"
     )

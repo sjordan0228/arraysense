@@ -1580,10 +1580,10 @@ function drawBattery(points) {
 // Today's energy as a flow diagram, from the inverter's own counters. The two
 // sides are assumed to balance — everything entering the inverter leaves it —
 // and the difference is drawn as conversion loss. That identity is the
-// diagram's premise, not a guarantee: the counters can disagree (this hardware
-// is documented to), and when they do the loss is clamped at nothing and the
-// surplus rides on the sink side, whose shares can then sum past 100%. A line
-// chart cannot show that at all.
+// diagram's premise, not a guarantee: counters on different buses can disagree,
+// and when they do the loss is clamped at nothing and the surplus rides on the
+// sink side, whose shares can then sum past 100%. A line chart cannot show
+// that at all.
 function drawSankey(i) {
   const g = (k) => numOrNull(i[k]);
   const solar = g('pv_energy_today_kwh');

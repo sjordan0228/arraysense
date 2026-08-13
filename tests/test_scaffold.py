@@ -113,9 +113,10 @@ def test_the_power_flow_chart_fills_grid_and_leaves_solar_and_home_lines_to_the_
     # under home when the house runs on the grid. The washes under solar and
     # home are the look's to give — trace() lays a soft --series-wash gradient
     # beneath every line, and this chart names no fill for either — so the
-    # tariff shading drawn behind the chart still reads: the wash was measured
-    # at 0.88 of its Classic strength under it, which is the measured reason
-    # the owner kept the washes.
+    # tariff shading drawn behind the chart still reads: compositing an even
+    # layer scales a step beneath it by one minus its alpha, and the wash's
+    # strongest value is 0.20, which leaves the band edges at four-fifths of
+    # their contrast.
     # Scoped to the power-flow chart's own builder rather than the whole page:
     # pvFill is legitimately used on the forecast chart and the graphs page,
     # and nothing here forbids it anywhere else.
