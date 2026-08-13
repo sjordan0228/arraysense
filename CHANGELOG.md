@@ -7,6 +7,44 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.11.0 — 13 August 2026
+
+The Graphs page stops being one long scroll.
+
+### Added
+
+- **Six tabs on the Graphs page** — All, Solar, Battery, Packs, AC, Weather —
+  so reaching the band you want no longer means passing twenty you do not. All
+  is the default and is the old page exactly, so nobody loses the scroll they
+  are used to. The grouping is not new: every band already recorded the section
+  it belongs to, and this draws what that table has always said.
+
+- **Weather can be pinned**, staying in view under whichever tab is selected.
+  This is the point of the change rather than a convenience: a dip in solar
+  output is a cloud or a fault, and the two look identical without the sky
+  beside them — so a tab that hid Weather while you studied Solar would have
+  taken away the thing that makes Solar readable. The pin is remembered per
+  browser, like the theme and the look.
+
+- **Each tab has an address.** `/graphs#battery` opens on Battery, the way
+  `/settings#rate-bands` already did, so a window worth looking at is a link
+  worth sending.
+
+- A tab that has nothing to show now says so. The Weather section hides itself
+  when the window holds no sky readings — an empty chart reads as a fault — but
+  that left a deep link to it as a toolbar over blank space on an installation
+  whose poller had never run.
+
+### Fixed
+
+- **A chart could be built with no width and draw nothing.** Charts are kept
+  when you switch away rather than destroyed, so a window you dragged out
+  survives — but uPlot measures its container when it is constructed, and one of
+  the three paths that reveals a section was still painting before unhiding it.
+  A chart built into a hidden box draws its grid and no line, with an axis
+  collapsed to nothing, and no test can see it: the canvas exists and is the
+  right size. It is simply empty.
+
 ## 0.10.0 — 13 August 2026
 
 The dashboard gets a look of its own, and a way to change it. Behind that, the
