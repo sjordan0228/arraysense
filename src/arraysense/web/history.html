@@ -685,7 +685,14 @@ function drawChart(rows) {
         trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
         trace('Grid used', '--grid', 1.3, { dash: [4, 3] }),
         trace('Grid exported', '--grid', 1.3, { fill: exportFill, fillTo: () => 0 }),
-        trace('Home', '--load', 2.1),
+        // No wash under home, and this is the one chart that asks for that. The
+        // factory gives every undashed series a gradient of its own colour, but
+        // home is drawn last and its whole extent lies inside solar's area fill
+        // — a blue wash laid over that much orange neutralises both, and the
+        // volume the array harvested turns the colour of neither series. The
+        // form the paragraph above describes is the argument: solar is the
+        // area, home is the line.
+        trace('Home', '--load', 2.1, { fill: null }),
         carried(),
         carried(),
       ],

@@ -176,7 +176,10 @@
     <!-- The same diagram the dashboard draws in kilowatt-hours, in money: the
          house's demand priced at the tariff on the left, and on the right the
          part that was actually paid for against the part the system covered. -->
-    <svg id="sankey" viewBox="0 0 900 400" role="img"
+    <!-- A group and not an image, for the reason the dashboard's copy gives:
+         each ribbon is focusable and carries its own sentence, and role="img"
+         would prune every one of them out of the accessibility tree. -->
+    <svg id="sankey" viewBox="0 0 900 400" role="group"
          aria-label="What the month's electricity would have cost at grid rates, and how much of it was paid"></svg>
     <div class="sankwait" id="sankeyWait" hidden></div>
     <span class="cap" id="sankeyCap" hidden>
@@ -605,7 +608,7 @@ function drawSankey(p) {
   // Nothing drawn means nothing to explain either: a caption describing two
   // sides of a diagram that is not there is furniture, not information.
   const hold = (message) => {
-    svg.innerHTML = '';
+    sankeyClear(svg);
     wait.innerHTML = message;
     wait.hidden = false;
     $('sankeyCap').hidden = true;
@@ -671,21 +674,34 @@ function drawSankey(p) {
   ], X3);
   if (!hub.length || !src.length) { hold('nothing to draw yet'); return; }
 
-  const ribbon = (x0, y0, x1, y1, h, col, op) => {
-    const mx = (x0 + x1) / 2;
-    return `<path d="M${x0},${y0.toFixed(1)} C${mx},${y0.toFixed(1)} ${mx},${y1.toFixed(1)} `
-      + `${x1},${y1.toFixed(1)} L${x1},${(y1 + h).toFixed(1)} C${mx},${(y1 + h).toFixed(1)} `
-      + `${mx},${(y0 + h).toFixed(1)} ${x0},${(y0 + h).toFixed(1)} Z" `
-      + `fill="${col}" fill-opacity="${op}"/>`;
-  };
-  let out = '';
+  // Both sides are shares of the same figure — what the house would have cost at
+  // grid rates — so a band's share on the left and the saving's share on the
+  // right are read against the same denominator.
+  const ribbons = [];
   let hy = hub[0].y;
-  for (const n of src) { out += ribbon(n.x + XW, n.y, hub[0].x, hy, n.h, n.col, 0.34); hy += n.h; }
-  hy = hub[0].y;
-  for (const n of snk) {
-    out += ribbon(hub[0].x + XW, hy, n.x, n.y, n.h, n.col, n.hollow ? 0.09 : 0.34);
+  for (const n of src) {
+    ribbons.push({
+      x0: n.x + XW, y0: n.y, x1: hub[0].x, y1: hy, h: n.h, side: 'in', col: n.col,
+      title: `${n.name} → House at grid rates`, value: money(n.v, cur),
+      share: sankeyShare(n.v, total),
+    });
     hy += n.h;
   }
+  hy = hub[0].y;
+  for (const n of snk) {
+    ribbons.push({
+      x0: hub[0].x + XW, y0: hy, x1: n.x, y1: n.y, h: n.h, side: 'out', col: n.col,
+      // The hollow ribbon keeps the weight it had. Money that never left the
+      // house is the one quantity on this page that was not spent, and a full
+      // gradient would give it the presence of a payment.
+      alpha: n.hollow ? 0.26 : 1,
+      title: `House at grid rates → ${n.name}`, value: money(n.v, cur),
+      share: sankeyShare(n.v, total),
+    });
+    hy += n.h;
+  }
+
+  let out = '';
   for (const n of [...src, ...hub, ...snk]) {
     const shape = n.hollow
       ? `fill="${n.col}" fill-opacity="0.13" stroke="${n.col}" stroke-opacity="0.55" `
@@ -708,7 +724,15 @@ function drawSankey(p) {
         + `<text x="${tx}" y="${(ty + 13).toFixed(1)}" text-anchor="${anchor}" class="nv">`
         + `${esc(money(n.v, cur))}</text>`;
   }
-  svg.innerHTML = `<g class="sank">${out}</g>`;
+  // No pace from a live reading here, and none invented: this diagram prices a
+  // month that has already happened. The flow says which way the money went and
+  // nothing more, at one steady speed for every ribbon.
+  sankeyRender(svg, ribbons, out, {
+    hub: 'var(--ink3)',
+    measure: 'This month',
+    total: money(total, cur),
+    pace: 'steady',
+  });
 }
 
 // Two bars over the same width: the share of the energy each band took, and

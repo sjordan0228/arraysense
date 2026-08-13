@@ -107,24 +107,27 @@ _CHART_HUES = {
 }
 
 
-def test_the_power_flow_chart_fills_only_the_grid_series() -> None:
-    # Band shading is drawn behind the series, and it cannot be read under two
-    # competing area fills — on a sunny day the solar area covers most of the
-    # plot. Grid keeps its fill for a reason recorded beside gridFill: when the
-    # house runs on the grid, import equals house load to the watt, so a grid
-    # *line* lies exactly under the home line and vanishes beneath it. Solar has
-    # no such coincidence, so as a line it stays legible.
+def test_the_power_flow_chart_fills_grid_and_leaves_solar_and_home_lines_to_the_look() -> None:
+    # Solar and home are lines on the power-flow chart; grid is the one series
+    # with a fill of its own, named here, and that is what stops it vanishing
+    # under home when the house runs on the grid. The washes under solar and
+    # home are the look's to give — trace() lays a soft --series-wash gradient
+    # beneath every line, and this chart names no fill for either — so the
+    # tariff shading drawn behind the chart still reads: the wash was measured
+    # at 0.88 of its Classic strength under it, which is the measured reason
+    # the owner kept the washes.
     # Scoped to the power-flow chart's own builder rather than the whole page:
-    # the rule protects the tariff shading drawn behind THIS chart, and the
-    # forecast chart fills its actual series legitimately — nothing is shaded
-    # beneath it, and its solid-against-hatch mass is the owner's chosen way to
-    # tell a measurement from a prediction.
+    # pvFill is legitimately used on the forecast chart and the graphs page,
+    # and nothing here forbids it anywhere else.
     page = _web("index.html")
     start = page.index("function drawPower(")
     end = page.index("function drawBatt", start)
     flow = page[start:end]
     assert "gridFill" in flow, "grid lost the fill that stops it vanishing under home"
-    assert "pvFill" not in flow, "solar is still filled, so shading cannot be read beneath it"
+    assert "trace('Solar'" in flow and "trace('Home'" in flow, (
+        "solar or home is no longer drawn as a line on the power-flow chart"
+    )
+    assert "pvFill" not in flow, "the power-flow chart names the old full-area solar fill"
 
 
 def test_pv_fill_is_kept_available_even_though_unused() -> None:

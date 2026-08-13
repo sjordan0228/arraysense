@@ -72,6 +72,15 @@ const LIGHT_TOKEN_BLOCK = `
   }
 `;
 
+// The dash the Sankey ribbons flow along, in the diagrams' own user units — both
+// draw into a 900x400 viewBox, so one pair of numbers describes both. They are
+// declared up here because the stylesheet below needs them and so does the
+// keyframe that scrolls them: a dash pattern and the offset that advances it by
+// exactly one cycle are the same number written twice, and written twice they
+// eventually differ by one and the flow visibly stutters once per cycle.
+const SANKEY_DASH = 12;
+const SANKEY_GAP = 46;
+
 const BASE_CSS = `
     /* The efficiency budget bar. Texture and order carry the meaning; see
        drawWaterfall for why hue deliberately does not. */
@@ -120,6 +129,14 @@ const BASE_CSS = `
     --theme:dark;
     --zero-rule:rgba(255,255,255,.28);
     --wash-rgb:255,255,255;
+    /* How much of its own colour a series lays under itself on the canvas — a
+       bare alpha, because the chart code multiplies the series' own hue by it
+       rather than painting anything of its own, so a wash can never introduce a
+       colour the palette was not measured for. Zero here: Classic is the base
+       look, and its charts are lines with the two fills the pages ask for by
+       name, which is what they have always been. A look that wants the wash
+       states its own value and takes it back on its own. */
+    --series-wash:0;
     /* Tints laid over a panel — track backgrounds, input fills, pressed states.
        They are the surface's own colour at low opacity, so on a light panel a
        white one is invisible and they have to invert with the theme. */
@@ -163,6 +180,36 @@ const BASE_CSS = `
      Every page needs it, which is why it lives here rather than in six page
      stylesheets. */
   .hright{display:flex;align-items:center;gap:12px}
+  /* The live figures in the header. Four readings, on every page, so the answer
+     to "what is it doing right now" survives leaving the dashboard — the Costs
+     page and the Settings page are both places somebody stands while the sun is
+     doing something.
+     Its own child of <header>, not part of .hright: that group holds the
+     controls this browser owns, and these are readings from the inverter. It
+     sits between the title and those controls, so the header's flex-wrap gives
+     it a line of its own on a narrow screen instead of squeezing the pill and
+     the two buttons.
+     Mono and tabular so a figure changing does not shift the two beside it,
+     which is what makes a strip somebody glances at readable at all. The label
+     carries the identity and the colour only repeats it: the four hues are
+     validated against protanopia, deuteranopia and tritanopia — those three,
+     not every form, because that is what was actually run — but a reader who
+     cannot separate them still reads this correctly from the word. */
+  .nowstrip{display:flex;align-items:baseline;gap:15px;flex-wrap:wrap;min-width:0;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-variant-numeric:tabular-nums;line-height:1.25}
+  /* display:flex would otherwise beat the browser's own [hidden] rule, and the
+     strip is hidden until an installation proves it has live readings at all. */
+  .nowstrip[hidden]{display:none}
+  /* The strip when the collector is stale. The readings are real, just not
+     recent, so they stay up — dimmed, with the age said once beside them —
+     rather than being dashed as if nobody had measured them. */
+  .nowstrip.stale .nsfig{opacity:.5}
+  .nowstrip .nsage{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--warn)}
+  .nsfig{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+  .nsfig u{text-decoration:none;font-size:9px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--ink3)}
+  .nsfig b{font-weight:500;font-size:12px}
   /* The theme button. Sized and shaped like the settings gear beside it, because
      they are the same kind of thing: a control that belongs to this browser
      rather than a reading from the inverter. */
@@ -259,6 +306,45 @@ const BASE_CSS = `
     color:var(--ink2);border-radius:7px;padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
   .chartbar button:hover{background:var(--tint-3);color:var(--ink)}
   .chartbar button[hidden]{display:none}
+  /* --- The two Sankeys -----------------------------------------------------
+     The dashboard draws today's energy through the inverter and the Costs page
+     draws the month's money at grid rates. They are one picture of two
+     quantities — sources, a junction, sinks, bezier ribbons between them — so
+     everything about a ribbon that is not its geometry is declared once here
+     rather than in two page stylesheets that would drift.
+
+     Hovering or focusing one ribbon dims the rest. Not to nothing: a path is
+     still a path while another is being read, and a diagram that blanked would
+     lose the shape the reader is comparing against.
+
+     The flow is a dashed stroke down the ribbon's own centre line, clipped to
+     the band. How fast it moves is written inline per ribbon, because that
+     carries a reading — how much is on that path this minute — and a stylesheet
+     cannot know it.
+
+     Reduced motion drops the moving layer rather than freezing it. A stopped
+     dash pattern is a texture, and texture already says something specific in
+     this diagram: it is what marks the losses ribbon as a residual rather than
+     a measurement. */
+  .sankhost{position:relative}
+  .sank .rib{transition:opacity .13s}
+  .sank.dim .rib{opacity:.2}
+  .sank.dim .rib.on{opacity:1}
+  /* The focus ring is drawn on the band rather than left to outline, which on an
+     SVG group Chrome paints from the wrong box entirely — a stray vertical rule
+     halfway across the diagram, nowhere near the ribbon that has focus. Stroking
+     the path is also the truer ring: it follows the ribbon's own curve instead
+     of boxing it. */
+  .sank .rib:focus{outline:none}
+  .sank .rib:focus-visible .rband{stroke:var(--pv);stroke-width:2.5}
+  .sank .rflow{fill:none;pointer-events:none;
+    stroke-dasharray:${SANKEY_DASH} ${SANKEY_GAP};animation-name:sankflow;
+    animation-timing-function:linear;animation-iteration-count:infinite}
+  @keyframes sankflow{to{stroke-dashoffset:-${SANKEY_DASH + SANKEY_GAP}}}
+  @media(prefers-reduced-motion:reduce){
+    .sank .rflow{display:none}
+    .sank .rib{transition:none}
+  }
   .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
   .kv u{text-decoration:none;color:var(--ink3)}
   .kv b{font-weight:500;font-variant-numeric:tabular-nums}
@@ -1202,6 +1288,8 @@ async function checkStale() {
       // which serves the wizard and /api/setup only. There is no collector to
       // be stale about, so hide the banner rather than escalate a missing
       // endpoint into "the service is not answering" over the setup form.
+      liveStaleInfo = null;
+      paintStale(document.getElementById('nowstrip'), null);
       showStale(null);
       staleMisses = 0;
       return;
@@ -1229,6 +1317,14 @@ async function checkStale() {
   } else {
     staleMisses = 0;
   }
+  liveStaleInfo = liveStaleFrom(status);
+  // The strip and the glow answer on the status poll's own clock, not on the
+  // next live poll's: a collector that has just gone stale must not keep its
+  // "Live" label or its warm glow for the interval the live loop takes to
+  // notice. The glow comes back the same way — applyLive restores it from the
+  // next fresh reading.
+  paintStale(document.getElementById('nowstrip'), liveStaleInfo);
+  if (liveStaleInfo) document.documentElement.removeAttribute('data-glow');
   showStale(staleState(status, now));
 }
 
@@ -1243,6 +1339,257 @@ function startStaleWatch() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// The header's live figures, and the light in the corner. Both answer the same
+// question — what is the system doing this minute — so both are fed from one
+// /api/live response and neither interprets it. The figures are the readings as
+// they arrive; the ambience is the mode arraysense.mode already judged. A
+// browser deciding for itself what "producing" means would be a second reading
+// of the same five numbers, which is the mistake the Costs page paid for in
+// money.
+// ---------------------------------------------------------------------------
+
+// >>> live-strip
+// The four flows, in the order the dashboard's own cards run, so a reader
+// moving between pages finds them in the same places. Each names the registry
+// metric it prints and the palette token it takes its colour from — the token
+// goes into the element as a var() reference rather than being restated in a
+// stylesheet, so the strip cannot come to disagree with the squares beside the
+// cards about which hue means which flow.
+//
+// Only the bank is `signed`, and that is not an oversight. The dashboard prints
+// a leading + on a charging bank because "1.20 kW" beside a battery says
+// nothing about which way it is going; the other three read the same way there
+// as here, and a strip that dressed them differently would stop being the same
+// figures the cards show.
+const STRIP_FIGURES = [
+  { key: 'pv',   label: 'PV',   metric: 'pv_total_power_w', token: '--pv',   signed: false },
+  { key: 'load', label: 'Home', metric: 'load_power_w',     token: '--load', signed: false },
+  { key: 'batt', label: 'Batt', metric: 'battery_power_w',  token: '--batt', signed: true  },
+  { key: 'grid', label: 'Grid', metric: 'grid_power_w',     token: '--grid', signed: false },
+];
+
+// One figure's reading, or null. Absent, non-numeric, boolean and NaN all
+// answer null, and null prints a dash. A strip showing 0 W for a flow nobody
+// reported would be this project's founding bug, in the one place that is on
+// every page.
+function stripReading(inverter, metric) {
+  const raw = inverter && typeof inverter === 'object' ? inverter[metric] : undefined;
+  return typeof raw === 'number' && isFinite(raw) ? raw : null;
+}
+
+// Which light the page stands in, from the mode the service named. Warm while
+// the array is carrying the house, cool when the bank or the grid is — the room
+// follows the sun, so a glance from across it says something before a single
+// figure is read.
+//
+// Every member of arraysense.mode.Mode is here except UNKNOWN, which is left
+// out rather than mapped. A mode nobody could judge is not a state, and
+// lighting the room from it would assert something no reading supports; it
+// answers null, and null leaves the page in the light it is designed in — the
+// same light Classic shows and the same light every page shows before its first
+// response.
+const GLOW_BY_MODE = {
+  'Solar': 'warm',
+  'Solar and battery': 'warm',
+  'Battery discharging': 'cool',
+  'On grid': 'cool',
+  'Importing': 'cool',
+};
+
+function glowState(mode) {
+  if (!mode || !mode.known) return null;
+  return GLOW_BY_MODE[mode.mode] || null;
+}
+// <<< live-strip
+
+// How stale the last /api/status poll found the collector, or null while it is
+// current. The strip and the glow are fed from the same verdict the stale
+// banner draws — status.staleness.stale — so the header cannot call the system
+// "live" while the banner beside it says the opposite, and neither defines
+// staleness a second way.
+let liveStaleInfo = null;
+
+// The staleness of one /api/status reply, as the strip wants it: null when the
+// collector is current (or the reply says nothing), otherwise the age in the
+// banner's own words. The short form fits beside the figures; the long one is
+// the banner's exact sentence, for hover and for a screen reader. The guard is
+// staleBehind's own — age and reading_at come together or not at all.
+function liveStaleFrom(status) {
+  const s = status && status.staleness;
+  if (!s || !s.stale) return null;
+  const at = msOrNull(s.reading_at);
+  const age = Number(s.age_seconds);
+  const hasAge = at !== null && Number.isFinite(age);
+  const short = hasAge ? elapsedWords(age * 1000) + ' ago' : staleBehind(s);
+  return { short, long: staleBehind(s) };
+}
+
+// How often a page that does not already watch /api/live asks for it. Thirty
+// seconds is the clock the stale watch already keeps on every page, so a page
+// carrying the strip makes two requests where it made one rather than many —
+// the strip is ambient context, and the dashboard is where a second-by-second
+// reading belongs. It is also far slower than the collector, which is
+// configured at 11 s and achieves about 12 s on the reference installation, so
+// the figures are never more than a couple of readings behind what exists.
+const LIVE_POLL_MS = 30 * 1000;
+
+// Whether a page has taken the request over. The dashboard already polls
+// /api/live for its cards and calls fetchLive() rather than reaching for the
+// endpoint itself, so the strip is fed from the very payload the cards are
+// drawn from: one reading on the page, and no way for the header to print a
+// figure the card below it contradicts.
+//
+// The loop stands down one request late. Its first tick fires before the
+// dashboard has made its own call, because that one waits on /api/setup first —
+// so a dashboard load costs one extra request against an endpoint whose median
+// is 9 ms, and buys the strip filling in before the cards do rather than after.
+let liveFedByPage = false;
+
+// The strip, built here rather than in six headers, the way the theme button is.
+// A page that grows a header gets it for nothing and a page cannot forget it.
+//
+// It needs somewhere to sit that is not .hright, and the presence of that group
+// is also the test for whether this page has a collector behind it at all: the
+// first-run wizard replaces <main> with a bare title, and an installation still
+// being set up serves no /api/live to fill a strip from.
+//
+// How the strip presents its staleness. The same verdict that drives the
+// banner, painted here so both the live loop and the status loop can reach it:
+// checkStale applies it the moment /api/status answers, so a collector that
+// goes stale cannot keep its "Live" label or its warm glow for the interval
+// until the next live poll, and applyLive applies it again on every reading.
+function paintStale(strip, stale) {
+  if (!strip) return;
+  strip.classList.toggle('stale', Boolean(stale));
+  const ageEl = strip.querySelector('.nsage');
+  if (ageEl) {
+    ageEl.textContent = stale ? `stale · ${stale.short}` : '';
+    ageEl.hidden = !stale;
+  }
+  // The label says what the figures are. "Live power" is only true while the
+  // collector is current; stale, it says so and names the age.
+  strip.setAttribute('aria-label', stale ? `Power readings — ${stale.long}` : 'Live power');
+  if (stale) strip.title = stale.long;
+  else strip.removeAttribute('title');
+}
+
+function mountLiveStrip() {
+  const header = document.querySelector('header');
+  if (!header || header.querySelector('.nowstrip')) return null;
+  const right = header.querySelector('.hright');
+  if (!right) return null;
+  const strip = document.createElement('div');
+  strip.className = 'nowstrip';
+  strip.id = 'nowstrip';
+  strip.hidden = true;
+  strip.setAttribute('role', 'group');
+  strip.setAttribute('aria-label', 'Live power');
+  strip.innerHTML = STRIP_FIGURES.map((f) =>
+    `<span class="nsfig"><u>${esc(f.label)}</u>` +
+    `<b data-fig="${esc(f.key)}" style="color:var(${esc(f.token)})">${DASH}</b></span>`
+  ).join('') + '<span class="nsage" hidden></span>';
+  header.insertBefore(strip, right);
+  return strip;
+}
+
+// One payload, both readouts. Called with null when the request failed or the
+// service answered something other than a reading.
+function applyLive(payload) {
+  const answered = payload !== null && typeof payload === 'object';
+  const inverter = answered ? payload.inverter : null;
+  // The same verdict the stale banner draws. While the collector is stale the
+  // strip must not read as live: the readings are real, just not recent, so
+  // they stay up, muted, with the age said once — and the glow falls back to
+  // its neutral state rather than claiming the array is producing.
+  const stale = liveStaleInfo;
+  const strip = document.getElementById('nowstrip');
+  if (strip) {
+    // A payload at all is what says this installation has live readings to
+    // show, so the strip stays out of the header until one arrives and a
+    // service in first-run setup mode never grows a row of dashes. Once shown
+    // it stays: a reading that goes absent shows the dash, because the strip
+    // vanishing and the strip saying "not measured" are different claims.
+    if (answered) strip.hidden = false;
+    paintStale(strip, stale);
+    for (const spec of STRIP_FIGURES) {
+      const cell = strip.querySelector(`[data-fig="${spec.key}"]`);
+      if (!cell) continue;
+      const value = stripReading(inverter, spec.metric);
+      cell.textContent = value === null
+        ? DASH
+        : (spec.signed && value >= 0 ? '+' : '') + kw(value);
+    }
+  }
+  // The attribute is set for every look, not only for Glass. Classic declares
+  // no rule against it and so is unchanged by it, and the state being in the
+  // document either way is what lets a look be swapped mid-session without the
+  // page's mood having to be recomputed to follow. A stale collector lights
+  // nothing: the room follows the sun only while the readings are current.
+  const glow = stale ? null : glowState(answered ? payload.mode : null);
+  if (glow) document.documentElement.setAttribute('data-glow', glow);
+  else document.documentElement.removeAttribute('data-glow');
+}
+
+// Whether this service has a live endpoint at all. First-run setup mode serves
+// the wizard and /api/setup and nothing else, so a 404 is an installation with
+// no collector rather than a failure — the same reading the stale banner takes
+// of a missing /api/status. Recording it stops the loop below from spending a
+// request every thirty seconds, for as long as the wizard is open, asking a
+// question this service has no way to answer. Leaving setup mode reloads the
+// page, so there is nothing to un-set.
+let liveEndpointAbsent = false;
+
+// The single request. Everything that reads /api/live goes through here, so
+// the strip is fed by whatever asked and never by a request of its own.
+async function readLive() {
+  let payload = null;
+  try {
+    const response = await fetch('/api/live');
+    if (response.ok) payload = await response.json();
+    else if (response.status === 404) liveEndpointAbsent = true;
+  } catch (err) {
+    // Blank the strip before rethrowing. A reading the service has stopped
+    // confirming must not go on being shown as current in a header that
+    // carries no timestamp of its own — and the caller's own error handling
+    // still runs, because nothing is swallowed here.
+    applyLive(null);
+    throw err;
+  }
+  applyLive(payload);
+  return payload;
+}
+
+// What a page calls instead of fetching /api/live for itself. The claim is made
+// before the request is sent rather than when it lands, so the loop below is
+// already standing down while the first answer is still in flight.
+function fetchLive() {
+  liveFedByPage = true;
+  return readLive();
+}
+
+async function pollLive() {
+  if (liveFedByPage || liveEndpointAbsent) return;
+  try {
+    await readLive();
+  } catch (err) {
+    // readLive has already blanked the strip. Nothing is swallowed that the
+    // reader can act on: the stale banner is what reports a service that has
+    // stopped answering, and it is on this page too.
+  }
+}
+
+function startLiveWatch() {
+  if (!mountLiveStrip()) return;
+  pollLive();
+  setInterval(pollLive, LIVE_POLL_MS);
+  // A backgrounded tab has its timers throttled, so the figures a reader comes
+  // back to can be minutes old — the same reason the stale watch does this.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) pollLive();
+  });
+}
+
 // common.js is loaded from <head>, so on most pages there is no <nav> to hang
 // the banner under yet.
 //
@@ -1254,10 +1601,12 @@ if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => {
     startStaleWatch();
     mountThemeButton();
+    startLiveWatch();
   });
 } else {
   startStaleWatch();
   mountThemeButton();
+  startLiveWatch();
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,6 +1662,9 @@ const INK_FALLBACK = {
   // Reached only when there is no computed style at all, which is the dark
   // theme's case by definition — with a stylesheet the media query answers.
   '--theme':'dark', '--zero-rule':'rgba(255,255,255,.28)', '--wash-rgb':'255,255,255',
+  // No stylesheet means no look, and the wash belongs to a look. Zero draws the
+  // charts the way they were drawn before it existed.
+  '--series-wash':'0',
 };
 const inkCache = {};
 function ink(name) {
@@ -1911,28 +2263,101 @@ function readout(id, rows) {
 
 const dots = (name) => ({ size: 4.5, width: 0, stroke: () => ink(name), fill: () => ink(name) });
 
+// The wash a line stands on.
+//
+// A stroke on a pane of glass is a hairline with nothing beneath it, and at a
+// glance three of them read as three lines rather than as three quantities. A
+// gradient of the series' *own* colour, strongest at the top of the plot and
+// gone by the foot of it, gives a trace some mass without giving it a hue: the
+// wash is fade()d from the same token the stroke reads, so it cannot introduce
+// a colour nobody measured, and it cannot disagree with the line above it.
+//
+// How strong it is comes from --series-wash rather than from a number here,
+// which is what makes it a property of the look rather than of the chart:
+// Classic declares zero and keeps the charts it has always had, and a look that
+// wants the wash states its own value per theme. A bare number and not a colour
+// for the same reason --bloom is one — and because a token this file hands to a
+// canvas has to be something a canvas can parse. light-dark() is not, and
+// color-mix() is worse than it looks: an unregistered custom property is not
+// resolved by getComputedStyle, so the function would arrive at fillStyle as
+// text and be dropped without a word. The mixing happens in fade(), in numbers,
+// and what reaches the canvas is a plain rgba().
+
+// >>> series-wash
+// How much of its own colour a series lays under itself, from the token's raw
+// text. Anything unreadable is no wash at all rather than a guess: a chart that
+// invented a fill because a token was missing would be drawing something the
+// data never said. Clamped because the browser will not do it for us in any way
+// that helps: Chrome takes rgba(...,1.6) as fully opaque and rgba(...,-0.3) as
+// fully clear, both without complaint, so a look that typed 2 where it meant
+// 0.2 would lay a solid slab of the series colour over the whole plot and hide
+// the shading, the zero rule and every line drawn before it.
+function washStrength(raw) {
+  const value = parseFloat(raw);
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
+}
+// <<< series-wash
+
+// A series' wash as uPlot wants it: a function, called on every draw. That is
+// what makes the gradient follow a change of theme or of look — repaintPalette
+// drops the resolved palette and redraws, and this reads ink() again on the way
+// through. A gradient built once at construction would keep the palette it was
+// born under for the life of the page, which is the trap bandShade's
+// getWindows() exists for, in a different coat.
+//
+// null rather than a gradient nobody can see when there is no wash to draw:
+// null is exactly what a series with no fill hands uPlot today, so Classic gets
+// back the chart it had rather than a fill costing a paint for nothing.
+function seriesWash(name) {
+  return (u) => {
+    const alpha = washStrength(ink('--series-wash'));
+    if (alpha <= 0) return null;
+    const { top, height } = u.bbox;
+    const grad = u.ctx.createLinearGradient(0, top, 0, top + height);
+    grad.addColorStop(0, fade(name, alpha));
+    // The same hue at no opacity, rather than the word `transparent`: the ramp
+    // is then one colour losing its opacity instead of two colours meeting.
+    grad.addColorStop(1, fade(name, 0));
+    return grad;
+  };
+}
+
 // Points are left to uPlot's own judgement rather than switched off: it draws
 // them only once the samples are far enough apart to have room, which is
 // exactly when a single reading standing alone between two gaps would
 // otherwise be a line segment of zero length and so invisible.
-const trace = (label, name, width, extra) => Object.assign({
-  label, scale: 'y', spanGaps: false, width,
-  stroke: () => ink(name), points: dots(name),
-}, extra);
+//
+// The signature is unchanged and so is the precedence: `extra` is assigned last,
+// so a page that names its own fill still gets it, and one that wants a bare
+// line back passes `fill: null`.
+function trace(label, name, width, extra) {
+  // A dashed stroke is the page saying this is the lighter of two related
+  // series — the forecast's prediction beside its measurement, History's grid
+  // used above the solar area it crosses — and a wash beneath it would hand
+  // back exactly the mass the dash was chosen to give up. So the dash decides;
+  // a page that wants both still names its own fill, as the prediction does.
+  const dashed = !!(extra && extra.dash);
+  return Object.assign({
+    label, scale: 'y', spanGaps: false, width,
+    stroke: () => ink(name), points: dots(name),
+  }, dashed ? null : { fill: seriesWash(name), fillTo: () => 0 }, extra);
+}
 
 // Carried along for the readout only, never drawn: the battery chart answers
 // "and what was the state of charge then", and the state of charge chart
 // answers the reverse. A hidden series takes no part in ranging its scale.
 const carried = () => ({ show: false, scale: 'y', spanGaps: false });
 
-// Kept, and no longer used on the Power flow chart. Solar read as volume there
-// rather than as a line, which was the better picture of a harvest — but two
-// area fills leave no room for the tariff shading behind them, and on a sunny
-// day this one covers most of the plot. Grid keeps its fill because a grid line
-// vanishes under the home line; solar has no such problem, so solar gave way.
-// Left defined because the volume reading is a real if minor loss and may be
-// wanted back. Filled to the zero line rather than the floor of the chart, or a
-// negative axis would put the fill on the wrong side of nothing.
+// Kept, and no longer used on the Power flow chart. Solar and home read as
+// lines there now, each carrying the look's own --series-wash beneath it
+// rather than a fill of its own — and that wash is safe over the tariff
+// shading, which was measured at 0.88 of its Classic strength under it. The
+// old full-coverage area would not be: on a sunny day it covers most of the
+// plot and hides the bands entirely, which is why this volume reading gave
+// way and survives only where it still earns its coverage, on the forecast
+// chart and the graphs page's solar bands. Filled to the zero line rather
+// than the floor of the chart, or a negative axis would put the fill on the
+// wrong side of nothing.
 function pvFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
   grad.addColorStop(0, fade('--pv', .5));
@@ -1940,12 +2365,14 @@ function pvFill(u) {
   return grad;
 }
 
-// Grid import is filled, and it is now the only series here that is. When
+// Grid import keeps the one explicit fill on the Power flow chart. When
 // the house runs on the grid, import *equals* house load to the watt, so a grid
 // line lies exactly under the home line and vanishes beneath it. An area cannot
 // vanish that way — the body of it shows below the coincident line even where
 // the two edges are identical. A dashed line was tried first and was too faint
-// to see at all, which is the honest reason this is a fill.
+// to see at all, which is the honest reason this is a fill. Solar and home are
+// lines; whatever lies under them is the look's own wash, not a fill this chart
+// names.
 function gridFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
   grad.addColorStop(0, fade('--grid', .42));
@@ -2407,6 +2834,320 @@ function mountSetup(host, payload, opts) {
 
   render();
   return { read: () => ({ ...state }), status };
+}
+
+// ---------------------------------------------------------------------------
+// The two Sankeys.
+//
+// The dashboard draws today's energy through the inverter; the Costs page draws
+// the month's demand priced at the tariff. They are the same drawing of two
+// different quantities, and everything a ribbon does beyond its geometry lives
+// here: the gradient along it, the flow travelling down it, the hover and focus
+// that isolate one path, and the share of the whole it carries. Each page keeps
+// its own geometry and its own nodes, because only the page knows what it is
+// measuring; it hands over a list of ribbons and the markup for its nodes.
+//
+// The share is not derived here. A page passes the value it drew the ribbon
+// from and the total it scaled the diagram by, so the percentage in the tooltip
+// is arithmetic over the very numbers the picture is drawn from. This project
+// has already paid, in money, for computing a figure a second way.
+//
+// Token colours are written into the markup rather than resolved here, so the
+// diagram follows a theme change without being redrawn. The gradients and the
+// flow strokes carry theirs in a style attribute; the node rects carry theirs
+// as a plain fill attribute.
+// ---------------------------------------------------------------------------
+
+// >>> sankey-flow
+// One dash cycle takes this long on the busiest path in the frame, and this long
+// on a path barely moving. Both are seconds, and the range is deliberately
+// narrow: the reader is meant to notice that one ribbon is livelier than
+// another, not to try to read a rate off it.
+const SANKEY_FAST_S = 2.4;
+const SANKEY_SLOW_S = 9.0;
+
+// A ribbon's share of what the diagram shows. Both figures come from the page
+// that drew the ribbon, so this divides two numbers already on the screen. A
+// total of nothing has no shares in it and answers null rather than a division.
+function sankeyShare(value, total) {
+  if (typeof value !== 'number' || !isFinite(value)) return null;
+  if (typeof total !== 'number' || !isFinite(total) || total <= 0) return null;
+  return value / total;
+}
+
+// That share as text. A sliver genuinely present but too small to round to a
+// tenth is written as under one rather than as 0%, which would say the path
+// carried none of it — the same distinction between small and absent that the
+// em dash keeps everywhere else on this site.
+function sankeyPercent(share) {
+  if (typeof share !== 'number' || !isFinite(share)) return null;
+  const pct = share * 100;
+  if (pct > 0 && pct < 0.05) return '<0.1%';
+  return (pct >= 9.95 ? pct.toFixed(0) : pct.toFixed(1)) + '%';
+}
+
+// How fast a ribbon's flow travels and how strongly it shows, from the power on
+// that path this minute measured against the busiest path in the same frame.
+// Relative, and deliberately so: an absolute scale would need a peak nobody has
+// measured for this installation, and the tooltip carries the watts themselves
+// for a reader who wants the figure rather than the impression.
+//
+// A path with nothing on it does not move, and neither does one with no reading
+// at all. The two do not look alike: an unmeasured rate is hatched, the way the
+// losses ribbon is (see sankeyRender), while a measured zero stays still. The
+// tooltip still prints the rate as a dash when it is unknown and as a number
+// when it is zero.
+function sankeyMotion(rate, peak) {
+  if (typeof rate !== 'number' || !isFinite(rate) || rate <= 0) return null;
+  if (typeof peak !== 'number' || !isFinite(peak) || peak <= 0) return null;
+  const share = Math.min(1, rate / peak);
+  return {
+    seconds: SANKEY_SLOW_S - (SANKEY_SLOW_S - SANKEY_FAST_S) * share,
+    opacity: 0.09 + 0.19 * share,
+  };
+}
+// <<< sankey-flow
+
+// What a diagram with no "now" flows at. The Costs page prices a month that has
+// already happened: there is no live reading to pace it, so every ribbon moves
+// at one unhurried speed and the motion says only which way the money went.
+// Pacing those ribbons by their own size instead would encode nothing the width
+// does not already say, in a channel a reader would reasonably read as live.
+const SANKEY_STEADY = { seconds: 6.4, opacity: 0.12 };
+
+// The hatch that marks a quantity nobody measured. Forty-five degrees, the
+// page's own foreground ink, a line every fifth unit — the vocabulary the Costs
+// bars and the dashboard's unknown tracks already use, because a second texture
+// meaning "this one is a residual" is one a reader has to learn twice. Opacity
+// rather than a colour of its own: --ink inverts with the theme, and the
+// validated palette gains nothing it was never checked for.
+const SANKEY_HATCH_ID = 'sank-hatch';
+const SANKEY_HATCH =
+  `<pattern id="${SANKEY_HATCH_ID}" patternUnits="userSpaceOnUse" width="5" height="5"`
+  + ' patternTransform="rotate(45)">'
+  + '<line x1="0" y1="0" x2="0" y2="5" style="stroke:var(--ink);stroke-width:1;'
+  + 'stroke-opacity:.38"/></pattern>';
+
+// The band: out along the top edge and back along the bottom, which is the
+// path both pages drew before this and is unchanged by it.
+function sankeyBand(n) {
+  const mx = (n.x0 + n.x1) / 2;
+  const t0 = n.y0.toFixed(1), t1 = n.y1.toFixed(1);
+  const b0 = (n.y0 + n.h).toFixed(1), b1 = (n.y1 + n.h).toFixed(1);
+  return `M${n.x0},${t0} C${mx},${t0} ${mx},${t1} ${n.x1},${t1} `
+    + `L${n.x1},${b1} C${mx},${b1} ${mx},${b0} ${n.x0},${b0} Z`;
+}
+
+// How much of a band's thickness the flow takes. Short of the whole, so the
+// pulse travels *inside* the ribbon and the band keeps its own edges — at full
+// width the dashes read as stripes painted across it rather than as something
+// moving through it.
+const SANKEY_CORE = 0.62;
+
+// The line down the middle of that band, which the flow is stroked along. It
+// has to be clipped to the band as well: a thick stroke offsets square to its
+// own tangent and the band's two edges do not, so on a ribbon climbing steeply
+// the stroke would swell past the shape it belongs to.
+function sankeyCentre(n) {
+  const mx = (n.x0 + n.x1) / 2;
+  const a = (n.y0 + n.h / 2).toFixed(1), b = (n.y1 + n.h / 2).toFixed(1);
+  return `M${n.x0},${a} C${mx},${a} ${mx},${b} ${n.x1},${b}`;
+}
+
+// Source to destination along the ribbon, in the two nodes' own colours, so a
+// band reads as one flow leaving somewhere and arriving somewhere else. The
+// crossover sits hard against the junction rather than half way: every ribbon on
+// one side of the hub ends in the same neutral, and a fade beginning in the
+// middle would erase the boundaries between them exactly where the picture has
+// to show how the junction divides. `alpha` scales the whole ramp for a ribbon
+// that is deliberately faint, which is how the Costs page keeps money it never
+// spent looking like an outline rather than a payment.
+function sankeyGradient(id, n, hub) {
+  const k = typeof n.alpha === 'number' ? n.alpha : 1;
+  const stops = n.side === 'in'
+    ? [[0, n.col, 0.44], [0.86, n.col, 0.32], [1, hub, 0.24]]
+    : [[0, hub, 0.24], [0.14, n.col, 0.32], [1, n.col, 0.44]];
+  return `<linearGradient id="${id}" gradientUnits="userSpaceOnUse" `
+    + `x1="${n.x0}" y1="0" x2="${n.x1}" y2="0">`
+    + stops.map(([at, col, a]) =>
+      `<stop offset="${at}" style="stop-color:${col};stop-opacity:${(a * k).toFixed(3)}"/>`).join('')
+    + '</linearGradient>';
+}
+
+// What hovering or focusing a ribbon says, as the tooltip's markup and as the
+// one sentence a screen reader is given for the same element. Built together so
+// the two cannot come to say different things.
+function sankeyTipParts(n, o) {
+  const pct = sankeyPercent(n.share);
+  const rows = [[o.measure, n.value]];
+  if (pct !== null) rows.push([`Share of ${o.total}`, pct]);
+  // Only a diagram with a live reading behind it claims one. An unknown rate is
+  // a dash, never a zero: a path the inverter reported nothing for and a path
+  // carrying nothing are different facts.
+  if (o.pace === 'live') {
+    rows.push(['Right now', n.rate === null || n.rate === undefined ? DASH : kw(n.rate)]);
+  }
+  return {
+    html: `<div class="when">${esc(n.title)}</div>`
+      + rows.map(([k, v]) => `<div class="row"><u>${esc(k)}</u><b>${esc(v)}</b></div>`).join(''),
+    label: [n.title, ...rows.map(([k, v]) => `${k}: ${v}`)].join('. ') + '.',
+  };
+}
+
+// What the reader was looking at before a redraw. The dashboard rebuilds this
+// diagram on every poll, and a tooltip that vanished five seconds into being
+// read would be worse than none — so the ribbon under the pointer is remembered
+// by name rather than by position, since a ribbon too small to draw drops out of
+// the list and shifts every index after it.
+function sankeyHeld(svg) {
+  const key = svg.getAttribute('data-sank-on');
+  if (!key) return null;
+  const host = svg.parentElement;
+  const tip = host ? host.querySelector('.sanktip') : null;
+  const active = document.activeElement;
+  return {
+    key,
+    focused: !!(active && svg.contains(active) && active.classList
+      && active.classList.contains('rib')),
+    left: tip ? tip.style.left : '',
+    top: tip ? tip.style.top : '',
+  };
+}
+
+// Hover, focus and the readout they share. Bound to the elements just drawn, so
+// a redraw rebinds rather than leaks: the previous ribbons and their listeners
+// go together.
+//
+// Keyboard reaches this the same way the pointer does. Each ribbon is focusable
+// and carries the whole sentence as its accessible name, so the diagram is
+// walkable with Tab whether or not the tooltip is what the reader is using.
+function sankeyWire(svg, tips, held) {
+  const host = svg.parentElement;
+  if (!host) return;
+  host.classList.add('sankhost');
+  let tip = host.querySelector('.sanktip');
+  if (!tip) {
+    tip = document.createElement('div');
+    // The chart readout's own class, so the two look like one thing: this is
+    // the same gesture answered in the same way in a different picture.
+    tip.className = 'tip sanktip';
+    host.appendChild(tip);
+  }
+  const group = svg.querySelector('.sank');
+  const ribs = Array.from(svg.querySelectorAll('.rib'));
+
+  const place = (at) => {
+    const b = host.getBoundingClientRect();
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    const x = Math.max(4, Math.min(at.x - b.left + 14, b.width - w - 4));
+    const above = at.y - b.top - h - 12;
+    tip.style.left = `${Math.round(x)}px`;
+    tip.style.top = `${Math.round(above < 4 ? at.y - b.top + 18 : above)}px`;
+  };
+  const clear = () => {
+    if (group) group.classList.remove('dim');
+    for (const r of ribs) r.classList.remove('on');
+    tip.classList.remove('on');
+    svg.removeAttribute('data-sank-on');
+  };
+  // `at` of null leaves the readout where it is, which is what a redraw under a
+  // motionless pointer wants: the numbers change, the box does not jump.
+  const show = (rib, at) => {
+    tip.innerHTML = tips[Number(rib.getAttribute('data-rib'))] || '';
+    if (group) group.classList.add('dim');
+    for (const r of ribs) r.classList.toggle('on', r === rib);
+    svg.setAttribute('data-sank-on', rib.getAttribute('data-key'));
+    if (at) place(at);
+    tip.classList.add('on');
+  };
+  const middle = (rib) => {
+    const r = rib.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  };
+
+  for (const rib of ribs) {
+    rib.addEventListener('pointerenter', (e) => show(rib, { x: e.clientX, y: e.clientY }));
+    rib.addEventListener('pointermove', (e) => show(rib, { x: e.clientX, y: e.clientY }));
+    rib.addEventListener('pointerleave', clear);
+    rib.addEventListener('focus', () => show(rib, middle(rib)));
+    rib.addEventListener('blur', clear);
+  }
+
+  if (!held) return;
+  const again = ribs.find((r) => r.getAttribute('data-key') === held.key);
+  if (!again) return;
+  show(again, null);
+  tip.style.left = held.left;
+  tip.style.top = held.top;
+  if (held.focused) again.focus({ preventScroll: true });
+}
+
+// Draw one Sankey: the ribbons from `ribbons`, the nodes from `nodes` exactly as
+// the page rendered them, and the interaction over both.
+//
+// A ribbon is { x0, y0, x1, y1, h, col, side, title, value, share, rate, hatch,
+// alpha }: geometry, the node colour it belongs to, which side of the junction
+// it is on, and the three things the readout says. `opts` carries what is true
+// of the whole diagram — the junction's colour, what one ribbon's figure is
+// called, the total it is a share of, and whether the pace comes from a live
+// reading or is simply steady.
+function sankeyRender(svg, ribbons, nodes, opts) {
+  const o = opts || {};
+  const hub = o.hub || 'var(--ink3)';
+  const peak = ribbons.reduce((m, n) =>
+    typeof n.rate === 'number' && isFinite(n.rate) && n.rate > m ? n.rate : m, 0);
+  // One clock for every ribbon, and a negative delay that starts each animation
+  // that far into its cycle. At (t mod D) into a cycle of D the phase is the
+  // same whenever the element was created, so a diagram rebuilt on the next poll
+  // picks its dashes up where the last drawing left them — without this the
+  // dashboard's five-second redraw snaps every ribbon back to the start.
+  const clock = (typeof performance === 'object' ? performance.now() : Date.now()) / 1000;
+  const defs = [SANKEY_HATCH];
+  const body = [];
+  const tips = [];
+  ribbons.forEach((n, i) => {
+    const d = sankeyBand(n);
+    defs.push(sankeyGradient(`skg${i}`, n, hub));
+    let inner = `<path class="rband" d="${d}" style="fill:url(#skg${i})"/>`;
+    // A live ribbon whose rate is not measured takes the same texture as the
+    // losses ribbon: stillness (a measured 0 W) and absence (no reading at
+    // all) must not look alike on a diagram whose whole point is telling
+    // them apart. The hatch is the site's existing word for "not measured".
+    const unmeasured = o.pace === 'live' && (n.rate === null || n.rate === undefined);
+    if (n.hatch || unmeasured) inner += `<path class="rhatch" d="${d}" fill="url(#${SANKEY_HATCH_ID})"/>`;
+    const motion = o.pace === 'live' ? sankeyMotion(n.rate, peak) : SANKEY_STEADY;
+    if (motion) {
+      // The flow is dimmed with the band it runs inside. Left at full strength
+      // over the Costs page's deliberately faint "kept" ribbon it was brighter
+      // than the ribbon itself, which made money that was never spent the most
+      // present thing on the diagram.
+      const lit = motion.opacity * (typeof n.alpha === 'number' ? n.alpha : 1);
+      defs.push(`<clipPath id="skc${i}"><path d="${d}"/></clipPath>`);
+      inner += `<path class="rflow" d="${sankeyCentre(n)}" clip-path="url(#skc${i})" `
+        + `stroke-width="${(n.h * SANKEY_CORE).toFixed(1)}" style="stroke:${n.col};`
+        + `stroke-opacity:${lit.toFixed(3)};`
+        + `animation-duration:${motion.seconds.toFixed(2)}s;`
+        + `animation-delay:-${(clock % motion.seconds).toFixed(2)}s"/>`;
+    }
+    const parts = sankeyTipParts(n, o);
+    tips.push(parts.html);
+    body.push(`<g class="rib" data-rib="${i}" data-key="${esc(n.title)}" tabindex="0" `
+      + `role="img" aria-label="${esc(parts.label)}">${inner}</g>`);
+  });
+  const held = sankeyHeld(svg);
+  svg.innerHTML = `<defs>${defs.join('')}</defs>`
+    + `<g class="sank">${body.join('')}${nodes}</g>`;
+  sankeyWire(svg, tips, held);
+}
+
+// Nothing to draw. The readout goes with the picture: a tooltip left lit over an
+// empty box would be describing a ribbon that is no longer there.
+function sankeyClear(svg) {
+  svg.innerHTML = '';
+  svg.removeAttribute('data-sank-on');
+  const host = svg.parentElement;
+  const tip = host ? host.querySelector('.sanktip') : null;
+  if (tip) tip.classList.remove('on');
 }
 
 // ---------------------------------------------------------------------------
