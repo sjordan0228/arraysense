@@ -27,11 +27,14 @@ SD cards wear out under sustained writes, and a card that fails takes the
 database with it. The tool this project replaces wrote about 400 GB a year to
 the card on the reference installation. ArraySense writes less than that, but
 it writes continuously, every poll, every day. The reference database stands at
-264 MB after 668 days of hourly history and 34.5 days of raw collection, and it
-grows about 5.3 MB per day — no tier is pruned today, so the database grows
-without bound until [#135](https://github.com/sjordan0228/arraysense/issues/135)
-lands. That is small enough that the risk sounds theoretical, and continuous
-enough to be real.
+264 MB after 668 days of hourly history and 34.5 days of raw collection. Retention
+is off by default, so it currently grows about 5.3 MB per day. When enabled it keeps
+raw data for 30 days and minute data for a year, only after a backup and complete
+coarser-tier coverage prove the rows are safe to remove. SQLite reuses the released
+pages, so the file stops growing at its retained size rather than shrinking; it
+deliberately does not run `VACUUM`, which needs roughly twice the database size free
+and can hold the Pi's write lock for minutes. That is small enough that the risk sounds
+theoretical, and continuous enough to be real.
 
 Put the database on a USB SSD and point `database_path` at it. On the reference
 machine the database directory is `/mnt/ssd/arraysense`, the same path the

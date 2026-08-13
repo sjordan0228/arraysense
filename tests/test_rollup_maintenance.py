@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import os
 import sqlite3
 import threading
 import time
@@ -17,6 +19,12 @@ from arraysense.collector import service as service_module
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.models import Sample
+from arraysense.settings import (
+    BACKUP_DIRECTORY_KEY,
+    RETENTION_ENABLED_KEY,
+    RETENTION_RAW_DAYS_KEY,
+    SettingsStore,
+)
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -151,6 +159,35 @@ async def test_an_empty_database_is_not_an_error(tmp_path: Path) -> None:
     store = _store(tmp_path)
     service = CollectorService(source=FakeSource(), store=store, interval=3600)
     await service.maintain_rollups(now=datetime.now(tz=UTC))
+    store.close()
+
+
+async def test_retention_maintenance_logs_every_coverage_block(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A stalled retention pass must be visible without someone running the CLI."""
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    store.append(Sample(timestamp=now - timedelta(days=3), readings={"pv_total_power_w": 4000.0}))
+    SettingsStore(store).update(
+        {
+            RETENTION_ENABLED_KEY: True,
+            RETENTION_RAW_DAYS_KEY: 2,
+            BACKUP_DIRECTORY_KEY: str(tmp_path),
+        }
+    )
+    archive = tmp_path / "arraysense-current.db.gz"
+    archive.touch()
+    os.utime(archive, (now.timestamp(), now.timestamp()))
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    with caplog.at_level(logging.WARNING, logger="arraysense.collector.service"):
+        await service.maintain_retention(now=now)
+
+    assert (
+        "retention blocked for inverter_raw: inverter_minute does not cover every source bucket"
+        in caplog.text
+    )
     store.close()
 
 

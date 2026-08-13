@@ -28,6 +28,7 @@ from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
 from arraysense.models import Sample
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
+from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.rollup import (
     promote_pending_hours,
     rebuild_inverter_hourly,
@@ -71,6 +72,19 @@ HOURLY_REBUILD_WINDOW = 3 * 3600
 # cadence that would rebuild the same buckets three hundred times an hour for a
 # minute bucket that changes five times.
 ROLLUP_INTERVAL = 60.0
+
+# Retention is deliberately slower than rollups. A raw row must see its minute
+# and hourly witnesses first, and an hourly check alongside every poll would
+# make the backup gate a source of needless filesystem traffic.
+RETENTION_INTERVAL = 3600.0
+
+
+def _log_retention_blocks(report: RetentionReport) -> None:
+    """Record every table that prevented an unattended retention pass progressing."""
+    for table in report.tables:
+        if table.blocked is not None:
+            logger.warning("retention blocked for %s: %s", table.table, table.blocked)
+
 
 # How many of the missed days each backfill pass scores, newest first. Replayed
 # over the reference installation's 671-day span, sixty a pass took thirteen
@@ -363,6 +377,33 @@ class CollectorService:
                 await asyncio.to_thread(_rebuild_on_own_connection)
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
+
+    async def maintain_retention(self, now: datetime | None = None) -> None:
+        """Prune one safe retention pass without ever risking the poll loop.
+
+        Retention follows rollups on its own slow timer, so its coverage gate
+        sees the newest minute and hourly buckets rather than refusing rows
+        simply because maintenance has not rebuilt them yet. Like rollups it
+        owns a second connection in a worker: a long delete transaction must
+        not share transaction state with a poll append or freeze page reads.
+        """
+        moment = now or datetime.now(tz=UTC)
+
+        def _run_on_own_connection() -> None:
+            conn = self._store.maintenance_connection()
+            try:
+                _log_retention_blocks(run_retention(conn, policy, now=moment))
+            finally:
+                conn.close()
+
+        try:
+            policy = policy_from_settings(SettingsStore(self._store))
+            if self._store.is_memory_backed:
+                _log_retention_blocks(run_retention(self._store._conn, policy, now=moment))
+            else:
+                await asyncio.to_thread(_run_on_own_connection)
+        except sqlite3.Error as exc:
+            logger.warning("retention maintenance failed, will retry: %s", exc)
 
     def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int] | None:
         """Return what scoring a day needs, or None when the installation is unconfigured.
@@ -842,11 +883,12 @@ class CollectorService:
     async def _loop(self) -> None:
         """Poll forever, backing off while the inverter is unreachable.
 
-        Rollup maintenance rides along on its own timer rather than getting a
-        task of its own: it shares the store with the poll, and interleaving
-        the two here means they never write at the same moment.
+        Rollup and retention maintenance ride along on their own timers rather
+        than getting tasks of their own: they share the store with the poll,
+        and interleaving them here means they never write at the same moment.
         """
         last_rollup = 0.0
+        last_retention = 0.0
         try:
             while True:
                 started = asyncio.get_running_loop().time()
@@ -857,6 +899,9 @@ class CollectorService:
                     await self.maintain_rollups()
                     await self.maintain_efficiency()
                     await self.backfill_efficiency()
+                if now - last_retention >= RETENTION_INTERVAL:
+                    last_retention = now
+                    await self.maintain_retention()
                 await asyncio.sleep(self._wait_from(started))
         except asyncio.CancelledError:
             raise
