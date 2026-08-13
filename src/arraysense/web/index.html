@@ -167,6 +167,10 @@
   .dtl{margin-top:10px}
   .dtl .rel{display:grid;grid-template-columns:repeat(auto-fit,minmax(268px,1fr));gap:10px}
   .dtl h3{font-size:12.5px;font-weight:600;margin:0 0 11px;letter-spacing:.02em;color:var(--ink2)}
+  /* The heading icon sits on the heading's own line and inherits its ink; only
+     the gap is this rule's to give. It is the icon, never the label, so it
+     stays aria-hidden and the text that names the panel is unchanged. */
+  .dtl h3 .ic{margin-right:6px}
   /* Captions are sentences, not labels. They borrow .lbl for its colour and
      have to undo the rest of it: uppercase with .17em tracking at 9.5px turns
      a diagnosis into shouting nobody reads. */
@@ -318,7 +322,7 @@
   <div class="mode" id="mode" hidden><span class="dot" id="modeDot"></span><b id="modeText"></b><span id="modeBatt"></span><span id="skyReadout" class="muted"></span></div>
   <div class="toprow">
     <div class="p hero">
-      <div class="lbl">Producing now</div>
+      <div class="lbl"><svg class="ic" style="color:var(--pv)" aria-hidden="true"><use href="#ph-sun"></use></svg>Producing now</div>
       <div class="v" id="pv">—<span> kW</span></div>
       <!-- The inverter's own daily counter, not a figure computed from the
            stored power. Integrating would agree on a clean day and quietly
@@ -330,17 +334,17 @@
       <!-- Today beside each flow comes from the inverter's own daily counters
            for the same reason the solar one does, and it is why there is no
            second request: /api/live already carries every column. -->
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--load)"></span>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--load)" aria-hidden="true"><use href="#ph-house"></use></svg>Home</span><b id="load">—</b><span class="sub"><span class="lbl">Today</span> <span id="loadToday">—</span></span></div>
       <!-- The icon sits beside the power figure rather than replacing the
            percentage: the fill is a shape somebody reads at a glance,
            and the number is what they read when the glance is not enough. One
            encodes, the other confirms, and colour is the third and least of
            them. -->
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--batt)"></span>Battery</span>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--batt)" aria-hidden="true"><use href="#ph-battery-charging"></use></svg>Battery</span>
         <div class="battrow"><span class="batticon" id="battIcon"></span><b id="batt">—</b></div>
         <span class="sub" id="battState">—</span>
         <span class="sub" id="battPack"></span></div>
-      <div class="p"><span class="lbl"><span class="sq" style="background:var(--grid)"></span>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
+      <div class="p"><span class="lbl"><svg class="ic" style="color:var(--grid)" aria-hidden="true"><use href="#ph-plug"></use></svg>Grid</span><b id="gridp">—</b><span class="sub"><span class="lbl">Today</span> <span id="gridToday">—</span></span></div>
     </div>
   </div>
 
@@ -935,6 +939,16 @@ function moduleDetail(m) {
 // them is a stored sentence with numbers dropped in, and none of them appears
 // at all when an input is missing — a page whose whole argument is that absent
 // data is not zero cannot afford a derived claim resting on an absent number.
+//
+// Each heading carries an icon, chosen for what the panel is about rather than
+// what it draws. PV Strings takes the solar panel itself — a sun would point at
+// the weather, and this panel is about what the strings did. Backup legs takes
+// the double plug because it is the EPS legs, and Grid & AC the single one.
+// Inverter Temp takes the thermometer, Cable drop the downward trend of voltage
+// lost along the run, and Energy the bolt. BMS takes the circuit board — the
+// battery's own electronics reporting — which is a different thing from the
+// battery, and the summary card already uses ph-battery-charging for that.
+// Status takes the pulse: whether the device is alive and what it is doing.
 // ---------------------------------------------------------------------------
 
 const runtimeStr = (s) => {
@@ -1085,7 +1099,7 @@ function detailStrings(i) {
       <div class="bar${r.p === null ? ' none' : ''}">${fill}<span>${wStr(r.p)}</span></div>
       <span class="sublab">${uStr(r.a, 2, 'A')} · ${uStr(r.v, 0, 'V')}</span></div>`;
   }).join('');
-  return `<div class="p"><h3>PV Strings</h3>${rows}${capOf(stringCaption(s))}</div>`;
+  return `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-solar-panel"></use></svg>PV Strings</h3>${rows}${capOf(stringCaption(s))}</div>`;
 }
 
 // The two legs of a split-phase backup circuit are wired independently and
@@ -1162,7 +1176,7 @@ function detailLegs(i) {
     ${capHasMetric(caps, 'eps_l1_power_w') && capHasMetric(caps, 'eps_l2_power_w')
         && capHasMetric(caps, 'eps_l1_apparent_power_va') && capHasMetric(caps, 'eps_l2_apparent_power_va')
         ? capOf(pfCap) : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Backup legs</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-plugs"></use></svg>Backup legs</h3>${body}</div>`;
 }
 
 // Full scale for the heatsink bars, in Celsius. The conversion for display
@@ -1214,7 +1228,7 @@ function detailHeat(i) {
     ${capHasMetric(caps, 'radiator1_temperature_c') && capHasMetric(caps, 'radiator2_temperature_c')
         ? capOf(spread) : ''}
     `;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Inverter Temp</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-thermometer-simple"></use></svg>Inverter Temp</h3>${body}</div>`;
 }
 
 // The BMS measures at the cells and the inverter at its own terminals, so the
@@ -1235,7 +1249,7 @@ function detailDrop(i) {
     ${capRow(caps, 'battery_voltage_inv_sample_v', 'At the terminals', uStr(inv, 1, 'V'))}
     ${both && d !== null ? capOf('Watch this widen under load — that points at a lug or a busbar') : ''}
     `;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Cable drop</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-trend-down"></use></svg>Cable drop</h3>${body}</div>`;
 }
 
 // State of charge as a percentage hides how much energy that is, and hides
@@ -1343,7 +1357,7 @@ function detailEnergy(i, mods) {
     ${capHasModuleMetric(caps, 'remaining_capacity_ah') ? capOf(cap) : ''}
     ${capHasMetric(caps, 'battery_max_cell_voltage_v') && capHasMetric(caps, 'battery_min_cell_voltage_v') ? capOf(cellCap) : ''}
     ${capHasMetric(caps, 'battery_module_count') ? capOf(countCap) : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Energy</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-lightning"></use></svg>Energy</h3>${body}</div>`;
 }
 
 function detailBms(i) {
@@ -1369,7 +1383,7 @@ function detailBms(i) {
         && numOrNull(i.bms_discharge_current_limit_a) === null ? ''
         : capOf('Limits fall when the pack is cold or near full — that is what stalls a charge')
       }`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>BMS</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-circuitry"></use></svg>BMS</h3>${body}</div>`;
 }
 
 // Grid, AC and status hold no two numbers that mean something together, so
@@ -1392,7 +1406,7 @@ function detailGrid(i) {
         ? capOf('Both of those are grid-direction figures and read zero on this '
           + 'installation: nothing is sold back, and the bank charges from the array '
           + 'rather than from the mains. Neither is the inverter idling.') : ''}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Grid &amp; AC</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-plug"></use></svg>Grid &amp; AC</h3>${body}</div>`;
 }
 
 function detailStatus(i) {
@@ -1410,7 +1424,7 @@ function detailStatus(i) {
         { metric: 'bus_voltage_1_v', label: '1', v: b1 },
         { metric: 'bus_voltage_2_v', label: '2', v: b2 },
       ]), 'DC bus', (v) => uStr(v, 1), 'V', ' / ')}`;
-  return body.trim() === '' ? '' : `<div class="p"><h3>Status</h3>${body}</div>`;
+  return body.trim() === '' ? '' : `<div class="p"><h3><svg class="ic" aria-hidden="true"><use href="#ph-pulse"></use></svg>Status</h3>${body}</div>`;
 }
 
 // Present or absent, from the declaration; the panels themselves stay
