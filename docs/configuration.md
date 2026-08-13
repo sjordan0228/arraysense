@@ -146,12 +146,32 @@ still fills the requested chart width:
 | Minute | 1 minute | 1 year |
 | Hour | 1 hour | Indefinitely |
 
-**No tier is pruned today.** The `keep_days` field is declared in the schema but has
-no readers — nothing deletes old rows from any tier. On the reference installation
-the raw tier spans 34.7 days (declared: 30) and the minute tier spans 369.7 days
-(declared: 365). The database grows about 5.3 MB per day with the measured breakdown
-of 1.6 MB/day inverter raw, 3.5 MB/day module raw, and 0.25 MB/day inverter minute.
-Retention enforcement is tracked at [#135](https://github.com/sjordan0228/arraysense/issues/135).
+`retention.enabled` is off by default. When enabled, `retention.raw_days` keeps raw
+inverter and module data for 30 days, and `retention.minute_days` keeps inverter
+minute data for 365 days; both periods are adjustable in the settings page. Nothing
+is deleted unless an `arraysense-*.db.gz` backup is at least as new as the applicable
+cutoff, and a source bucket stays until every required coarser tier holds it. Raw
+inverter rows therefore require both minute and hourly coverage, raw module rows
+require hourly coverage for the same module, and minute rows require hourly coverage.
+Hourly data is kept indefinitely.
+
+To inspect one guarded pass without changing the database, run:
+
+```bash
+arraysense --config /etc/arraysense/config.toml --prune-dry-run
+```
+
+The report lists each table's effective cutoff, rows that would be removed, oldest
+row, and any reason the pass stopped. After checking that report, run the same pass
+for real with `arraysense --config /etc/arraysense/config.toml --prune`. Both commands
+apply the backup and coverage gates; `--prune` deletes only the bounded batches it
+reports.
+
+SQLite reuses pages freed by retention, so the database stops growing at its retained
+size but does not shrink. It deliberately does not run `VACUUM`: that operation needs
+about twice the database size in free space and can hold the write lock for minutes on
+a Raspberry Pi. A failed or stale backup stops retention safely and leaves the database
+growing until the backup is repaired.
 
 ## Secrets
 

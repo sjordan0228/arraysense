@@ -8,11 +8,16 @@ released on the way out.
 
 from __future__ import annotations
 
+import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
-from arraysense.__main__ import build_app, build_parser, main
+from arraysense import __main__ as main_module
+from arraysense.__main__ import build_app, build_parser, main, run_prune
 from arraysense.config import Config
+from arraysense.store.retention import RetentionReport
+from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
 
@@ -30,6 +35,41 @@ def test_parser_accepts_overrides() -> None:
     assert args.config == "/tmp/c.toml"
     assert args.host == "127.0.0.1"
     assert args.port == 9000
+
+
+def test_prune_dry_run_bypasses_only_the_enabled_gate(tmp_path: Path, monkeypatch: Any) -> None:
+    """Previewing retention must work before its destructive schedule is armed."""
+    policies: list[tuple[bool, bool]] = []
+
+    def fake_run(
+        conn: sqlite3.Connection, policy: Any, *, now: Any, dry_run: bool = False
+    ) -> RetentionReport:
+        policies.append((policy.enabled, dry_run))
+        return RetentionReport(dry_run, True, None, ())
+
+    def fake_build(config: Config) -> tuple[Any, SqliteStore, Any]:
+        return None, SqliteStore(str(tmp_path / f"{len(policies)}.db"), device=TEST_DEVICE), None
+
+    monkeypatch.setattr(main_module, "build_app", fake_build)
+    monkeypatch.setattr(main_module, "run_retention", fake_run)
+
+    assert run_prune(_config(tmp_path), dry_run=True) == 0
+    assert run_prune(_config(tmp_path), dry_run=False) == 0
+    assert policies == [(True, True), (False, False)]
+
+
+def test_prune_failure_allows_for_already_committed_batches(
+    tmp_path: Path, monkeypatch: Any, caplog: Any
+) -> None:
+    """The CLI must not claim an interrupted multi-batch pass changed nothing."""
+
+    def fail(config: Config, *, dry_run: bool) -> int:
+        raise sqlite3.OperationalError("disk full")
+
+    monkeypatch.setattr(main_module, "run_prune", fail)
+    with caplog.at_level(logging.ERROR, logger="arraysense.__main__"):
+        assert main_module.main(["--config", str(_toml(tmp_path)), "--prune"]) == 1
+    assert "database may have been partially pruned" in caplog.text
 
 
 def test_a_missing_config_serves_setup_mode(tmp_path: Path, monkeypatch: Any) -> None:
