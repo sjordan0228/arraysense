@@ -7,6 +7,86 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 0.10.0 — 13 August 2026
+
+The dashboard gets a look of its own, and a way to change it. Behind that, the
+faults building it turned up — including two that had been showing wrong numbers
+and one that had been drawing a chart with no line in it.
+
+### Added
+
+- **Glass, and the choice not to have it.** The pages are frosted panels over a
+  wash that follows the system: warm while the array is producing, cooling to
+  indigo on battery and after dark. The old flat look remains as Classic, chosen
+  from a Theme area on the Settings page. The choice is remembered per browser,
+  like light and dark beside it — one household can want the wall tablet glassy
+  and the laptop plain, and a setting stored on the service could not do that.
+
+- **The current state, on every page.** A small strip in the header carries
+  solar, house, battery and grid wherever you are, rather than only on the
+  dashboard. When the collector stops it mutes and says how old the figures are;
+  a three-day-old reading labelled "live" is the failure this project exists to
+  prevent, and it was caught in review before it shipped.
+
+- **Both energy diagrams flow.** The ribbons move, hovering one isolates it and
+  dims the rest with its share of the total, and losses are separated by hatch
+  rather than a sixth colour — a distinction that does not depend on telling two
+  hues apart.
+
+- **A rate schedule you can read at a glance.** Settings draws every hour of
+  every month coloured by the band that covers it, so a tariff can be checked by
+  looking rather than by reading twelve rows of syntax. It is drawn from the
+  band windows the service computes for the charts; the tariff itself is still
+  parsed in exactly one place, on the service.
+
+- **Charts say what they are showing.** Each band on the Graphs page carries its
+  current reading and its peak, and hovering any band moves the crosshair on all
+  of them at the same instant — which is the reason the page is small multiples
+  rather than one chart. On a signed band the peak is the largest excursion
+  either way, so a hard discharge is not reported as the smallest charge.
+
+- **Icons**, from Phosphor, vendored with their licence beside the fonts and the
+  chart library. Every label stays: an icon here is reinforcement and never the
+  name of anything.
+
+- Typography: Space Grotesk and JetBrains Mono, self-hosted, with the readings
+  in the mono face and tabular figures so columns line up.
+
+### Fixed
+
+- **The live view was reading the whole battery table to answer one question.**
+  `latest_modules` ran a correlated subquery that scanned 142,712 rows to find
+  four packs. It now drives from the serial list, one index seek each:
+  **454 ms to 9 ms** on the reference installation, and flat as the history
+  grows rather than getting slower every day.
+
+- **The theme control was unreachable on five of the six pages.** It was built
+  at load, appended inside the status pill, and destroyed the moment that pill
+  wrote its next line. It existed for about a second and then vanished.
+
+- **Two writers were breaking each other's charts.** The inverter is polled every
+  eleven seconds and the sky every fifteen minutes, and both write into the same
+  tier. Every sky reading punched a hole in every inverter series — four an hour
+  — and, the other way round, the weather bands' readings sat so far apart among
+  the inverter's that no two were ever adjacent, so the Weather section drew
+  nothing at all. It looked like a section with no data. It had data the whole
+  time.
+
+- **`peak` named the wrong extreme on a signed band.** A day the bank only ever
+  discharged reported the *smallest* discharge as its peak.
+
+- **A range with no data kept the last range's figures** above a chart that said
+  nothing was recorded.
+
+- The Graphs page scrolled sideways on a phone.
+
+### Known
+
+- There is still no authentication. Anything on the network can read the
+  dashboard and write its settings, so run it on a network you trust.
+
+- Declared tier retention is not enforced, so the database grows without bound.
+
 ## 0.9.0 — 12 August 2026
 
 The setup wizard learns what an installation is, a first-visit tour explains the
