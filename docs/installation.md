@@ -24,6 +24,19 @@ the per-module fields stay empty. The inverter exposes four battery slots and
 rotates modules through them, so a module is identified by serial number, never by
 position.
 
+Another inverter family is intended rather than ruled out, and adding one is a
+directory under `drivers/` plus a line of registration. What gates it is evidence:
+nothing ships as supported until its registers are confirmed against real hardware,
+because a register that means one thing on a hybrid can mean something else
+elsewhere, and a wrong reading is worse than a missing one. If yours is not listed,
+[open a hardware
+request](https://github.com/sjordan0228/arraysense/issues/new?template=hardware-request.yml)
+— and say whether you could test against your own unit, which is the thing that
+actually unblocks a family.
+
+Want to look around before buying into any of this? Set `driver = "fake"` and the
+whole application runs against a simulated inverter, no hardware attached.
+
 ### Connection
 
 | Connection | Notes |
@@ -100,6 +113,8 @@ The installer prints two addresses — `http://<hostname>.local:<port>` and
 a browser. With no config file present, the service is running in setup mode, and
 the page is a first-run wizard rather than a dashboard.
 
+![The first-run wizard: manufacturer, model, connection, battery and inverter serial](images/setup-wizard.jpg)
+
 The wizard asks which manufacturer and model you own, which connection (dongle or
 RS485) and its details, whether the batteries are in closed loop, and the
 inverter's ten-character serial. A **Detect** button probes the connection and
@@ -107,6 +122,13 @@ reads back the serial the inverter answers with — confirming the dongle one yo
 typed, or discovering it on the serial bus. Read the serial off the inverter
 itself rather than out of another tool's logs: other tools have been observed
 reporting a different value, and a mismatch makes every read fail.
+
+Below the connection fields it asks where the installation is, by postcode or place
+name, so the weather service knows which sky to watch. That one is optional — skip
+it and the collector still starts, but the forecast and the performance model stay
+blank until a location is entered.
+
+![The location step, asking for a postcode or place name](images/setup-wizard-location.jpg)
 
 On apply, the wizard writes `/etc/arraysense/config.toml` (mode 0600, because it
 identifies your hardware) and restarts the service into the dashboard. The page

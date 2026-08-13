@@ -1,0 +1,81 @@
+name: Hardware support request
+description: Ask for an inverter or battery family this build cannot read yet
+title: "Support <manufacturer> <model>"
+labels: ["hardware-request", "drivers"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. Support for a new family is mostly a question of
+        evidence: the register map has to be confirmed against a real unit,
+        because a register that means one thing on a hybrid can mean something
+        else on an off-grid model, and a wrong reading is worse than a missing
+        one.
+
+        The more of this you can fill in, the further it gets. None of it is
+        required — an entry with only the model is still worth opening.
+  - type: input
+    id: model
+    attributes:
+      label: Manufacturer and model
+      placeholder: e.g. EG4 6000XP, LuxPower SNA5000, Sol-Ark 15K
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: How is it connected, or how could it be?
+      options:
+        - WiFi dongle
+        - Wired RS485 / Modbus
+        - Ethernet dongle
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version, if you know it
+  - type: input
+    id: device_type_code
+    attributes:
+      label: Device type code, if you know it
+      description: >
+        Some LuxPower-family units report one. It is the single most useful
+        thing here, because the PV string count and register layout follow
+        from it.
+  - type: dropdown
+    id: battery
+    attributes:
+      label: Battery setup
+      options:
+        - Closed loop — the battery talks to the inverter
+        - Open loop / voltage only
+        - No battery
+        - Not sure
+  - type: textarea
+    id: interest
+    attributes:
+      label: What do you most want to read from it?
+      placeholder: >
+        Per-module battery detail, energy counters, string-level production…
+  - type: dropdown
+    id: testing
+    attributes:
+      label: Could you test against your own unit?
+      description: >
+        This is the thing that actually unblocks a family. Nothing is shipped
+        as supported on guesswork alone.
+      options:
+        - "Yes — I can run builds and report back"
+        - "Yes — I can capture register dumps"
+        - "No, but I can share documentation"
+        - "No"
+  - type: checkboxes
+    id: acknowledge
+    attributes:
+      label: Before you post
+      options:
+        - label: >
+            I understand a family stays unsupported until someone can confirm
+            its registers against real hardware, and that this may take a while.
