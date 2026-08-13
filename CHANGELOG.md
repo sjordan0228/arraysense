@@ -7,6 +7,28 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.1 — 13 August 2026
+
+Says which dongle, because "WiFi dongle" was not specific enough to buy from.
+
+### Fixed
+
+- **The front page now carries the install command.** There is a one-line
+  installer — a stdlib-only script piped into root that prints what it will do
+  before doing it, checks the host and refuses with a reason rather than failing
+  halfway — and the README did not mention it at all. Somebody arriving to try
+  this got a link to a documentation page instead of a command to run.
+
+- **The front page now states that exactly one dongle is supported**, and which.
+  It is the LuxPower/EG4 **WiFi** dongle speaking the proprietary protocol on TCP
+  port 8000. **Ethernet dongles have never exposed that port and do not work at
+  any firmware version**, and some newer WiFi firmware removes it with no way to
+  re-enable it — so a dongle that worked can stop after an update. All of this was
+  already in the troubleshooting notes and none of it was on the page somebody
+  reads before buying hardware. Both the README and the installation guide now
+  carry it as a table, with wired RS485 marked as the recommended path rather than
+  merely an alternative.
+
 ## 1.0.0 — 13 August 2026
 
 The first release meant for somebody else's inverter.
