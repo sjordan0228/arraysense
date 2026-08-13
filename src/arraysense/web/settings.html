@@ -158,20 +158,14 @@
   .look .help{font-size:11px;color:var(--ink3);line-height:1.55;margin:6px 0 0}
 
   /* --- Tabs --------------------------------------------------------------- */
-  .tabs{display:flex;gap:4px;margin-bottom:14px;flex-wrap:wrap}
-  .tabs button{background:var(--tint);border:1px solid var(--panel-b);
-    color:var(--ink3);border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;
-    line-height:1.45;cursor:pointer}
-  .tabs button:hover{color:var(--ink2)}
-  /* The active tab is amber on purpose, and it is not the same "selected" as
-     the nav pill above it. The pill says which page this is and stays grey;
-     the tab says which section of this page is open. The tab is deliberately
-     the louder of the two so the two levels read as different questions. */
-  .tabs button[aria-pressed="true"]{background:var(--pv);border-color:transparent;
-    color:#1a1204;font-weight:600}
-  .tabs button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* The .tabs look lives in common.js now, shared with the Graphs page so the
+     two tabbed pages cannot drift apart; what stays here is what is particular
+     to settings: a group hidden by its tab, and the empty-tab note. */
   /* A group whose tab is not the active one, hidden rather than removed so the
-     controls keep their values and the dirty check still sees them. */
+     controls keep their values and the dirty check still sees them. The panel
+     rule `.p[hidden]` in common.js already covers these — `.grp` elements are
+     `.p` too — but it is named here as the settings page's own statement of the
+     same rule. */
   .grp[hidden]{display:none}
   /* The empty-tab note, rendered when a tab with no settings is deep-linked. */
   .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:8px 0}

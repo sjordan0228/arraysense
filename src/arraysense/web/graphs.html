@@ -45,7 +45,24 @@
   .bandread .cur{font-size:15px;font-weight:600}
   .bandread .peak{font-size:11px;color:var(--ink2)}
   .empty{color:var(--ink3);font-size:11.5px;padding:14px 0 14px 48px}
+  /* Said when the selected tab has nothing to show. Every other tab hides its
+     sections and leaves the bands to say "nothing recorded" themselves, but a
+     tab whose whole section is withheld draws no bands at all — so without
+     this the page is a toolbar over blank space, and a deep link to it looks
+     broken rather than empty. Settings answers the same case the same way. */
+  .tab-empty{font-size:12px;color:var(--ink3);line-height:1.6;padding:14px 2px}
   .why{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 2px 0;max-width:78ch}
+  /* The tab bar and the weather pin share one row. The pin is not a tab, so it
+     takes the tinted pressed state rather than the amber an active tab gets —
+     two controls pressed the same way would read as the same kind of thing. */
+  .tabrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .tabrow .tabs{margin-bottom:0}
+  .pin{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
+    border-radius:9px;padding:7px 15px;font:inherit;font-size:12.5px;line-height:1.45;
+    cursor:pointer;margin-left:auto}
+  .pin:hover{color:var(--ink2)}
+  .pin[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  .pin:focus-visible{outline:2px solid var(--load);outline-offset:2px}
 </style>
 <!-- The default look, and then whatever this browser has chosen instead. The
      <link> is written here rather than created by the script below it because
@@ -82,6 +99,19 @@
     <span class="note" id="chartNote" hidden></span>
     <button id="zoomReset" hidden>Reset zoom</button>
     <span class="zoomhint">drag across any band to zoom them all</span>
+  </div>
+
+  <!-- One tab per section, plus All for the page exactly as it always was. The
+       buttons are drawn by drawTabs() from the same table the routing and the
+       tests read, so the page cannot show a tab its own logic does not know
+       about. The weather pin sits beside the bar rather than in it: it is not a
+       view of the page but a preference about how a view behaves, so it takes
+       the quieter pressed state and not the amber of an active tab. -->
+  <div class="tabrow">
+    <div class="tabs" id="tabs" role="tablist" aria-label="Graph sections"></div>
+    <p class="tab-empty" id="tabEmpty" hidden></p>
+    <button type="button" class="pin" id="pinWeather" aria-pressed="false"
+      title="Keep the weather bands on screen under every tab">Keep weather visible</button>
   </div>
 
   <section class="p">
@@ -452,6 +482,167 @@ const SECTIONS = [
   { key: 'weather', host: 'weatherBands' },
 ];
 
+// ---------------------------------------------------------------------------
+// Tabs, and the weather pin.
+//
+// The page grew six ways to look at it — all the bands, or one section at a
+// time — and a way to keep the weather bands visible under whichever tab is
+// open, because a solar dip is only readable against the sky: a dip is a cloud
+// or a fault, and the two look identical without irradiance beside them. Both
+// are per-browser choices, held in localStorage the way the theme and the look
+// are, and the hash names the tab so `/graphs#battery` is a link somebody can
+// send, exactly as `/settings#rate-bands` is.
+//
+// The rules below are pure so node can hold them to the band table
+// (tests/test_graphs_tabs_js.py): every section the band table names has a
+// tab, every tab names a section, and the default is All — today's page,
+// exactly. The DOM around them — drawTabs, selectTab, the pin's button — sits
+// after this slice and is the part a browser is needed to see.
+// >>> graph-tabs
+const GRAPH_TABS = [
+  { key: 'all', title: 'All' },
+  { key: 'solar', title: 'Solar' },
+  { key: 'battery', title: 'Battery' },
+  { key: 'packs', title: 'Packs' },
+  { key: 'ac', title: 'AC' },
+  { key: 'weather', title: 'Weather' },
+];
+const DEFAULT_GRAPH_TAB = 'all';
+// Which tab this browser was on, and whether the weather bands are pinned. `as.`
+// is the prefix the other per-browser choices already use — the settings page's
+// tab, the dashboard's view, the temperature unit — so these are the same
+// mechanism, not a second one.
+const GRAPH_TAB_KEY = 'as.graphsTab';
+const GRAPH_PIN_KEY = 'as.graphsPinWeather';
+
+// The tab the reader should land on. The URL fragment wins when it names a tab;
+// otherwise the remembered choice, if it names a tab; otherwise All.
+function wantedGraphTab(hash, stored) {
+  const keys = GRAPH_TABS.map((t) => t.key);
+  if (hash && keys.includes(hash)) return hash;
+  if (stored && keys.includes(stored)) return stored;
+  return DEFAULT_GRAPH_TAB;
+}
+
+// Whether a section is on screen. The All tab shows everything; a section tab
+// shows its own section; and a pinned weather section stays visible under every
+// tab. The pin and the Weather tab both resolve to the one weather section, so
+// pinning can never draw it twice — the section is one element, shown once. A
+// weather section with nothing recorded stays hidden whatever the pin says,
+// because two permanently empty charts read as a fault (see load()).
+function graphSectionVisible(section, tab, pin, weatherHasData) {
+  if (section === 'weather' && !weatherHasData) return false;
+  if (section === 'weather' && pin) return true;
+  return tab === 'all' || tab === section;
+}
+
+// The pin, held as a single character so a stored "0" and a stored "1" cannot
+// be mistaken for anything else, and a key that was never written reads back as
+// unpinned.
+function graphPinOf(raw) { return raw === '1'; }
+function graphPinTo(pinned) { return pinned ? '1' : '0'; }
+// <<< graph-tabs
+
+// The state the pure rules above decide from. `activeTab` starts as All, set
+// before the first paint; `weatherPinned` is read from localStorage at boot so
+// a pin survives a reload; `weatherHasData` starts true and is corrected by the
+// first fetch, so a fresh install does not flash two empty weather charts.
+let activeTab = DEFAULT_GRAPH_TAB;
+let weatherPinned = false;
+let weatherHasData = true;
+
+const sectionVisible = (key) => graphSectionVisible(key, activeTab, weatherPinned, weatherHasData);
+
+function wantedTab() {
+  let held = null;
+  try { held = localStorage.getItem(GRAPH_TAB_KEY); } catch (e) { /* private browsing */ }
+  return wantedGraphTab(location.hash.replace('#', ''), held);
+}
+
+function drawTabs() {
+  const bar = $('tabs');
+  if (!bar) return;
+  bar.innerHTML = GRAPH_TABS.map((t) =>
+    `<button type="button" role="tab" data-tab="${esc(t.key)}">${esc(t.title)}</button>`).join('');
+  bar.querySelectorAll('button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      if (btn.getAttribute('aria-pressed') !== 'true') crossfade(() => selectTab(btn.dataset.tab));
+    });
+  });
+}
+
+// Show and hide the sections, matching settings.html's selectTab: each section
+// stays in the DOM — charts keep their data and their zoom — only visibility
+// changes.
+function updateSections() {
+  let shown = 0;
+  for (const s of SECTIONS) {
+    const el = $(s.host).parentElement;
+    if (!el) continue;
+    el.hidden = !sectionVisible(s.key);
+    if (!el.hidden) shown += 1;
+  }
+  // A tab that withholds its only section shows nothing at all — the weather
+  // section is hidden outright when the window holds no sky readings, so
+  // /graphs#weather on an install whose poller has never run is a toolbar over
+  // an empty page. The bands cannot say "nothing recorded in this range" here,
+  // because they are never drawn to say it.
+  const note = $('tabEmpty');
+  if (note) {
+    note.hidden = shown > 0;
+    if (shown === 0) {
+      note.textContent = activeTab === 'weather'
+        ? 'No sky readings in this window. The weather poller runs every fifteen '
+          + 'minutes and needs a location set in Settings; a wider range may also reach some.'
+        : 'Nothing to show on this tab for the range selected.';
+    }
+  }
+}
+
+function selectTab(id) {
+  activeTab = id;
+  const bar = $('tabs');
+  if (bar) {
+    bar.querySelectorAll('button').forEach((btn) => {
+      btn.setAttribute('aria-pressed', btn.dataset.tab === id ? 'true' : 'false');
+    });
+  }
+  updateSections();
+  try { localStorage.setItem(GRAPH_TAB_KEY, id); } catch (e) { /* private browsing */ }
+  if (location.hash !== '#' + id) history.replaceState(null, '', '#' + id);
+  // A section that just became visible for the first time holds deferred bands;
+  // redraw() is what paints them. Sections already drawn keep their charts.
+  redraw();
+}
+
+// The pin's button: pressed state and the word that says what will happen next.
+function pinState() {
+  const btn = $('pinWeather');
+  if (!btn) return;
+  btn.setAttribute('aria-pressed', String(weatherPinned));
+  btn.textContent = weatherPinned ? 'Weather pinned' : 'Keep weather visible';
+  btn.title = weatherPinned
+    ? 'The weather bands stay on screen under every tab. Click to unpin.'
+    : 'Keep the weather bands on screen under every tab.';
+}
+
+function togglePin() {
+  weatherPinned = !weatherPinned;
+  try { localStorage.setItem(GRAPH_PIN_KEY, graphPinTo(weatherPinned)); } catch (e) { /* private browsing */ }
+  pinState();
+  updateSections();
+  redraw();
+}
+
+function wirePin() {
+  const btn = $('pinWeather');
+  if (btn) btn.addEventListener('click', togglePin);
+  let held = null;
+  try { held = localStorage.getItem(GRAPH_PIN_KEY); } catch (e) { /* private browsing */ }
+  weatherPinned = graphPinOf(held);
+  pinState();
+}
+
 // The inverter metrics one band reads: its own, or the operands a computed
 // band names in `needs`. Both the fetch list and the capability filter below
 // are built from this, so a band cannot be drawn without its inputs being
@@ -608,6 +799,16 @@ const linesOf = (b) => b.lines || [{ label: b.label, width: 1.4 }];
 function paintBand(b, xs, cols, sync) {
   const k = kindOf(b);
   const lines = linesOf(b);
+  // A band whose section is off screen and was never built stays deferred: a
+  // uPlot constructed inside a hidden container measures zero wide and lays out
+  // as an empty grid — the blank-chart state that took three attempts to
+  // diagnose in issue #159 and PR #164, and that no test can see, because the
+  // canvas exists, it is sized, it simply has nothing on it. Built charts are
+  // the opposite: they keep their data and their zoom and are updated in place
+  // even while hidden, so switching back is instant. The first time the section
+  // is shown, selectTab's redraw() paints the deferred bands from the last
+  // fetched data.
+  if (!sectionVisible(b.sec) && !CHARTS[b.id]) return;
   if (!anyReading(...cols)) {
     chartMessage(b.id, 'nothing recorded in this range');
     // The previous window's "latest · peak" must not survive above a chart
@@ -713,6 +914,24 @@ function valuesFor(b, f) {
   const raw = b.values ? b.values(f) : f.of(b.metric);
   const conv = kindOf(b).conv;
   return conv ? raw.map(conv) : raw;
+}
+
+// The last answers from each of the page's three endpoints, held so a section
+// shown for the first time can be painted from data already fetched. Without
+// them, switching to a deferred tab would have to wait for the next refresh to
+// have anything to draw.
+let lastInv = null;
+let lastSite = null;
+let lastPacks = null;
+
+// Paint every section that has data, deferring any band whose section is hidden
+// and was never built (see paintBand). Called by load() on every refresh and by
+// selectTab on every switch, so a tab that first becomes visible gets its charts
+// then, and an already-drawn section is simply refreshed in place.
+function redraw() {
+  if (lastInv) drawInverter(lastInv);
+  if (lastSite) drawWeather(lastSite);
+  if (lastPacks) drawPacks(lastPacks);
 }
 
 function drawInverter(body) {
@@ -942,25 +1161,37 @@ async function load() {
   note(problems.join(' · '));
   resolution(inv);
   packResolution(packs);
-  drawInverter(inv);
-  drawWeather(site);
-  drawPacks(packs);
-  // The data-in-window rule for site metrics: hide the weather section when the
-  // fetched window carries no non-null value for either site metric. An install
-  // that has never recorded weather must not show two permanently empty charts
-  // — an empty chart reads as a fault — and an install where the weather poller
-  // stopped a month ago degrades right when the owner scrolls to a window
-  // before it stopped. Only on a successful fetch: a failed poll must not tear
+  // Held for a section that has never been shown yet: when its tab is first
+  // selected, selectTab's redraw() paints it from these rather than waiting for
+  // the next refresh.
+  lastInv = inv;
+  lastSite = site;
+  lastPacks = packs;
+  // The data-in-window rule for site metrics: a weather section with nothing in
+  // the fetched window stays hidden, whichever tab is open. An install that has
+  // never recorded weather must not show two permanently empty charts — an empty
+  // chart reads as a fault — and an install where the weather poller stopped a
+  // month ago degrades right when the owner scrolls to a window before it
+  // stopped. Only a successful fetch decides this: a failed poll must not tear
   // the section down over a problem that usually lasts one request. The site
   // response carries only weather rows (and gap rows), so this is a question
-  // about whether the window holds any.
+  // about whether the window holds any. It must land before redraw(), which asks
+  // graphSectionVisible whether the weather section may draw at all.
   if (site) {
-    const hasWeather = (site.points || []).some(
+    weatherHasData = (site.points || []).some(
       (p) => numOrNull(p.outside_temperature_c) !== null
           || numOrNull(p.cloud_cover_pct) !== null,
     );
-    $('weatherBands').parentElement.hidden = !hasWeather;
   }
+  // Visibility settles before anything paints. paintBand defers a chart whose
+  // section is hidden, and uPlot measures its container at construction — so a
+  // section this fetch has just revealed (weather data appearing in a window
+  // that had none) must be unhidden first, or its charts are built into a box
+  // with no width and left relying on the resize observer to rescue them.
+  // selectTab and togglePin already order it this way; this was the third path
+  // and the only one still doing it backwards.
+  updateSections();
+  redraw();
   rangeChanged = false;
   refreshZoomState();
 }
@@ -1004,15 +1235,26 @@ async function boot() {
   drawNav('graphs');
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
+  wirePin();
   // Both answers shape the first request — the cadence decides the width and
   // the capabilities decide the band list — and neither needs the other.
   const [secs] = await Promise.all([pollInterval(), loadCaps()]);
   cadence = secs;
   buildSections();
+  drawTabs();
+  // The active tab is settled before the first load, so the first paint is
+  // already the tab the reader asked for — deep-linked, remembered, or All.
+  selectTab(wantedTab());
   showRanges();
   await load();
   setInterval(load, REFRESH_MS);
 }
+
+// Back and forward, or a link from another page: resolve the hash and switch
+// without a reload, exactly as settings.html and the dashboard do.
+window.addEventListener('hashchange', () => {
+  crossfade(() => selectTab(wantedTab()));
+});
 
 boot();
 </script>
