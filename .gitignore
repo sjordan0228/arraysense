@@ -39,3 +39,7 @@ build/
 
 # OS
 .DS_Store
+
+# agent reports for this branch, not source
+terra-133.md
+sol-133.md

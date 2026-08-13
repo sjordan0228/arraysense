@@ -3748,6 +3748,45 @@ def test_efficiency_does_not_divide_two_strings_output_by_three_strings_kwp(
     assert summary["partial"] is True
 
 
+def test_efficiency_reports_a_shared_mppt_as_one_named_group(tmp_path: Path) -> None:
+    """The page gets members and one measured total, never an invented split."""
+    when = datetime(2026, 8, 10, 13, tzinfo=UTC)
+
+    def build(store: SqliteStore) -> None:
+        store.append(
+            Sample(
+                timestamp=when,
+                readings={
+                    "pv1_power_w": 3000.0,
+                    "pv1_voltage_v": 310.0,
+                    "pv1_current_a": 9.7,
+                    "ghi_wm2": 600.0,
+                    "dni_wm2": 500.0,
+                    "dhi_wm2": 100.0,
+                    "wind_speed_ms": 2.0,
+                    "outside_temperature_c": 30.0,
+                    "battery_soc_pct": 60.0,
+                    "bms_charge_current_limit_a": 400.0,
+                },
+            )
+        )
+
+    strings = "East | 1 | 10 | 400 | 25 | 90\nWest | 1 | 8 | 410 | 25 | 270"
+    with _efficiency_client(tmp_path, build, strings=strings) as c:
+        body = c.get(
+            "/api/efficiency",
+            params={"period": "day", "start": "2026-08-10", "tz": "America/Chicago"},
+        ).json()
+
+    assert body["summary"]["actual_kwh"] == 3.0
+    assert len(body["strings"]) == 1
+    group = body["strings"][0]
+    assert group["name"] == "[MPPT 1] East + West"
+    assert group["members"] == ["East", "West"]
+    assert group["mppt"] == 1
+    assert group["actual_kwh"] == 3.0
+
+
 def test_efficiency_week_says_how_many_of_its_days_it_scored(tmp_path: Path) -> None:
     """A week totalled over four days must not be presented as a week.
 

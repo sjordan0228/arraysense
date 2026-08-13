@@ -924,9 +924,11 @@ class SqliteStore:
     def write_efficiency_day(self, rows: Sequence[EfficiencyRow]) -> None:
         """Store one day's expected and actual production, overwriting what exists.
 
-        Keyed on (day, string_name), so re-computing a day after a config change
-        replaces the stale rows rather than duplicating them. One row per string
-        plus a total row whose ``string_name`` is the empty string.
+        Re-computing deletes each supplied day before inserting its new rows.
+        A changed array can turn two old string rows into one MPPT group, which
+        a primary-key upsert alone cannot replace because their names differ.
+        The delete and insert share one transaction, so a reader sees either
+        the old complete day or the new one, never a mixture.
         """
         data = [
             (
@@ -943,7 +945,9 @@ class SqliteStore:
             )
             for r in rows
         ]
+        days = {(int(row.day.timestamp()),) for row in rows}
         with self._conn:
+            self._conn.executemany("DELETE FROM efficiency_day WHERE day = ?", days)
             self._conn.executemany(
                 "INSERT OR REPLACE INTO efficiency_day "
                 "(day, string_name, expected_kwh, actual_kwh, curtailed_kwh, "

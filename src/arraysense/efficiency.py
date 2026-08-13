@@ -58,12 +58,13 @@ _MIN_COVERAGE = 0.6
 
 @dataclass(frozen=True)
 class EfficiencyRow:
-    """One day's expected and actual production for one string or the total.
+    """One day's expected and actual production for one MPPT group or the total.
 
-    The total row has ``string_name`` of ``""`` and sums every string's figures.
-    ``partial`` is true when fewer than 60% of daylight hours could be modelled,
-    and a caller drawing a performance ratio from a partial day must label it
-    rather than presenting the figure as measured.
+    A singleton group keeps its original string name; a shared MPPT has one
+    composite name. The total row has ``string_name`` of ``""`` and sums every
+    group. ``partial`` is true when fewer than 60% of daylight hours could be
+    modelled, and a caller drawing a performance ratio from a partial day must
+    label it rather than presenting the figure as measured.
     """
 
     day: datetime
@@ -195,11 +196,56 @@ def _hourly_rows(
     return by_hour
 
 
+@dataclass(frozen=True)
+class MpptGroup:
+    """Strings the inverter can measure only as one MPPT-level reading.
+
+    A singleton deliberately keeps its string name. That is the compatibility
+    boundary for existing installations: its stored row, API response and page
+    output remain the same because it is still the same named scoring unit.
+    """
+
+    mppt: int
+    label: str
+    members: tuple[StringSpec, ...]
+
+
+def mppt_groups(strings: Sequence[StringSpec]) -> tuple[MpptGroup, ...]:
+    """Collect strings sharing an MPPT without inventing an unmeasured split.
+
+    The inverter reports one power, voltage and current reading per MPPT, so
+    more than one configured string on it has to be one scored unit. Members
+    are name-sorted for a durable composite row label, while group order follows
+    the configuration's first occurrence so singleton rows retain their legacy
+    output order.
+    """
+    by_mppt: dict[int, list[StringSpec]] = {}
+    for string in strings:
+        by_mppt.setdefault(string.mppt, []).append(string)
+    string_names = {string.name for string in strings}
+    labels: set[str] = set()
+    groups: list[MpptGroup] = []
+    for mppt, declared in by_mppt.items():
+        members = tuple(sorted(declared, key=lambda string: string.name))
+        if len(members) == 1:
+            label = members[0].name
+        else:
+            base = f"[MPPT {mppt}] " + " + ".join(string.name for string in members)
+            label = base
+            suffix = 2
+            while label in string_names or label in labels:
+                label = f"{base} ({suffix})"
+                suffix += 1
+        labels.add(label)
+        groups.append(MpptGroup(mppt=mppt, label=label, members=members))
+    return tuple(groups)
+
+
 def _fit_baselines(
     rows_by_hour: dict[int, dict[str, object]],
-    strings: Sequence[StringSpec],
-) -> dict[str, StringBaseline | None]:
-    """Fit each string's ordinary operating point from the rows in hand.
+    groups: Sequence[MpptGroup],
+) -> dict[int, StringBaseline | None]:
+    """Fit each MPPT group's ordinary operating point from the rows in hand.
 
     Split out of ``compute_hours`` so the endpoint that tells an owner their
     system is calibrated can ask what was actually fitted instead of inferring
@@ -213,15 +259,15 @@ def _fit_baselines(
     Fitting it twice would be worse than not reporting it, so this stays the
     only place the fit happens and both callers walk through here.
     """
-    baselines: dict[str, StringBaseline | None] = {}
-    for s in strings:
+    baselines: dict[int, StringBaseline | None] = {}
+    for group in groups:
         pairs: list[tuple[float, float]] = []
         for candidate in rows_by_hour.values():
-            volts = candidate.get(f"pv{s.mppt}_voltage_v")
-            amps = candidate.get(f"pv{s.mppt}_current_a")
+            volts = candidate.get(f"pv{group.mppt}_voltage_v")
+            amps = candidate.get(f"pv{group.mppt}_current_a")
             if isinstance(volts, float) and isinstance(amps, float):
                 pairs.append((volts, amps))
-        baselines[s.name] = baseline_for(s.name, pairs)
+        baselines[group.mppt] = baseline_for(group.label, pairs)
     return baselines
 
 
@@ -231,12 +277,12 @@ def fitted_baselines(
     start: datetime,
     end: datetime,
     strings: Sequence[StringSpec],
-) -> dict[str, StringBaseline | None]:
+) -> dict[int, StringBaseline | None]:
     """What the curtailment rule was calibrated against over this range.
 
     The same rows and the same fit ``compute_hours`` runs on, so a page saying
     the array is calibrated is reading the calibration rather than guessing from
-    the presence of a summary row. A string with fewer than three producing
+    the presence of a summary row. A group with fewer than three producing
     hours in the range comes back None, which is the honest "nothing was fitted"
     the endpoint had no way to express.
     """
@@ -244,17 +290,19 @@ def fitted_baselines(
         raise ValueError("start and end must be timezone-aware")
     if not strings:
         return {}
-    mppt_indices = sorted({s.mppt for s in strings})
+    groups = mppt_groups(strings)
+    mppt_indices = [group.mppt for group in groups]
     span = _wall_clock_hours(start, end)
     rows_by_hour = _hourly_rows(store, start, end, mppt_indices, start.tzinfo, span)
-    return _fit_baselines(rows_by_hour, strings)
+    return _fit_baselines(rows_by_hour, groups)
 
 
 @dataclass(frozen=True)
 class StringHour:
-    """One string's share of one hour."""
+    """One MPPT group's measured and modelled energy for one hour."""
 
-    name: str
+    mppt: int
+    label: str
     expected_kwh: float
     actual_kwh: float
     curtailed_kwh: float
@@ -325,15 +373,16 @@ def compute_hours(
         return []
 
     tz = start.tzinfo
-    mppt_indices = sorted({s.mppt for s in strings})
+    groups = mppt_groups(strings)
+    mppt_indices = [group.mppt for group in groups]
     span = _wall_clock_hours(start, end)
     rows_by_hour = _hourly_rows(store, start, end, mppt_indices, tz, span)
     if not rows_by_hour:
         return []
 
-    # Each string against its own operating point, the bank against its own
+    # Each MPPT against its own operating point, the bank against its own
     # widest charge limit. See curtailment.py for why neither may be a constant.
-    baselines = _fit_baselines(rows_by_hour, strings)
+    baselines = _fit_baselines(rows_by_hour, groups)
     seen_limits: list[float | None] = []
     for candidate in rows_by_hour.values():
         limit_reading = candidate.get("bms_charge_current_limit_a")
@@ -383,28 +432,38 @@ def compute_hours(
         )
 
         share: list[StringHour] = []
-        for s in strings:
-            act_w = row.get(f"pv{s.mppt}_power_w")
+        for group in groups:
+            act_w = row.get(f"pv{group.mppt}_power_w")
             if not isinstance(act_w, float):
                 continue
-            string_poa = poa_irradiance(
-                ghi, dni, dhi, elevation, sun_azimuth, s.tilt, s.azimuth, day_of_year
-            )
-            cell_c = cell_temperature(string_poa, air_c, wind_val, s.mounting, s.noct)
-            exp_kwh = expected_watts(s, string_poa, cell_c, when.astimezone(UTC)) / 1000.0
+            exp_kwh = 0.0
+            for string in group.members:
+                string_poa = poa_irradiance(
+                    ghi,
+                    dni,
+                    dhi,
+                    elevation,
+                    sun_azimuth,
+                    string.tilt,
+                    string.azimuth,
+                    day_of_year,
+                )
+                cell_c = cell_temperature(string_poa, air_c, wind_val, string.mounting, string.noct)
+                exp_kwh += expected_watts(string, string_poa, cell_c, when.astimezone(UTC)) / 1000.0
             act_kwh = act_w / 1000.0
-            volts = row.get(f"pv{s.mppt}_voltage_v")
+            volts = row.get(f"pv{group.mppt}_voltage_v")
             refused = curtailed_kwh_for_hour(
                 exp_kwh,
                 act_kwh,
                 gate_open=gate_open,
                 signature_seen=signature_matches(
-                    volts if isinstance(volts, float) else None, baselines.get(s.name)
+                    volts if isinstance(volts, float) else None, baselines.get(group.mppt)
                 ),
             )
             share.append(
                 StringHour(
-                    name=s.name,
+                    mppt=group.mppt,
+                    label=group.label,
                     expected_kwh=exp_kwh,
                     actual_kwh=act_kwh,
                     curtailed_kwh=refused,
@@ -425,7 +484,7 @@ def compute_day(
     strings: Sequence[StringSpec],
     config_version: int,
 ) -> list[EfficiencyRow]:
-    """Summarise one day: a row per string, plus a total row named "".
+    """Summarise one day: a row per MPPT group, plus a total row named "".
 
     Aggregation only. Every figure it reports comes from ``compute_hours``,
     which is the one place the model runs -- the day's totals and the day's
@@ -458,41 +517,46 @@ def compute_day(
     if not hours:
         return []
 
-    expected: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
-    actual: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
-    curtailed: dict[str, float] = dict.fromkeys([s.name for s in strings] + [""], 0.0)
-    modelled: dict[str, int] = dict.fromkeys([s.name for s in strings] + [""], 0)
-    # Weighted by each hour's share of the day's energy; modelled[""] stays an
-    # honest count of hours, because that is what the row reports.
+    groups = mppt_groups(strings)
+    expected: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    actual: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    curtailed: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    modelled: dict[int, int] = dict.fromkeys((group.mppt for group in groups), 0)
+    # Weighted by each hour's share of the day's energy; total_modelled stays
+    # an honest count of hours, because that is what the total row reports.
     modelled_weight = 0.0
+    total_expected = 0.0
+    total_actual = 0.0
+    total_curtailed = 0.0
+    total_modelled = 0
 
     for hour in hours:
         modelled_weight += daylight.get(hour.offset, 0.0)
-        modelled[""] += 1
-        expected[""] += hour.expected_kwh
-        actual[""] += hour.actual_kwh
-        curtailed[""] += hour.curtailed_kwh
+        total_modelled += 1
+        total_expected += hour.expected_kwh
+        total_actual += hour.actual_kwh
+        total_curtailed += hour.curtailed_kwh
         for share in hour.strings:
-            expected[share.name] += share.expected_kwh
-            actual[share.name] += share.actual_kwh
-            curtailed[share.name] += share.curtailed_kwh
-            modelled[share.name] += 1
+            expected[share.mppt] += share.expected_kwh
+            actual[share.mppt] += share.actual_kwh
+            curtailed[share.mppt] += share.curtailed_kwh
+            modelled[share.mppt] += 1
 
     coverage = modelled_weight / total_daylight if total_daylight > 0.0 else 0.0
     partial = coverage < _MIN_COVERAGE
 
     rows: list[EfficiencyRow] = []
-    for s in strings:
+    for group in groups:
         # A string the inverter never reported has no row, for the same reason
         # a day nobody watched has none. Zero expected against zero actual is a
         # claim that this string was meant to make nothing and made nothing,
         # and the page renders it as a specific yield of 0.0 kWh/kWp — an
         # unmeasured third of the array presented as a dead one.
-        if modelled[s.name] == 0:
+        if modelled[group.mppt] == 0:
             continue
-        exp = expected[s.name]
-        act = actual[s.name]
-        refused = curtailed[s.name]
+        exp = expected[group.mppt]
+        act = actual[group.mppt]
+        refused = curtailed[group.mppt]
         # Curtailed energy leaves the comparison on both sides: it was never
         # lost, so it must not count against the ratio, and the shortfall that
         # remains claims no cause of its own.
@@ -501,12 +565,12 @@ def compute_day(
         rows.append(
             EfficiencyRow(
                 day=day_start,
-                string_name=s.name,
+                string_name=group.label,
                 expected_kwh=exp,
                 actual_kwh=act,
-                curtailed_kwh=curtailed[s.name],
+                curtailed_kwh=curtailed[group.mppt],
                 unexplained_kwh=unexplained,
-                modelled_hours=modelled.get(s.name, 0),
+                modelled_hours=modelled.get(group.mppt, 0),
                 partial=partial,
                 pr=pr,
                 config_version=config_version,
@@ -517,13 +581,10 @@ def compute_day(
     # the collector down all day — has no expectation to compare against, and
     # saying "expected nothing, produced nothing, and it was partial" would
     # dress that silence up as a measurement.
-    if modelled[""] == 0:
+    if total_modelled == 0:
         return []
 
     # Total row
-    total_expected = expected[""]
-    total_actual = actual[""]
-    total_curtailed = curtailed[""]
     unexplained_total = max(0.0, total_expected - total_actual - total_curtailed)
     total_pr = (
         total_actual / (total_expected - total_curtailed)
@@ -538,7 +599,7 @@ def compute_day(
             actual_kwh=total_actual,
             curtailed_kwh=total_curtailed,
             unexplained_kwh=unexplained_total,
-            modelled_hours=modelled[""],
+            modelled_hours=total_modelled,
             partial=partial,
             pr=total_pr,
             config_version=config_version,

@@ -61,6 +61,7 @@ from arraysense.efficiency import (
     compute_day,
     compute_hours,
     fitted_baselines,
+    mppt_groups,
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
@@ -2050,7 +2051,7 @@ _NO_BASELINE: dict[str, Any] = {"window_start": None, "window_end": None, "sampl
 
 
 def _baseline_info(
-    baselines: Mapping[str, StringBaseline | None],
+    baselines: Mapping[int, StringBaseline | None],
     range_start: datetime,
     range_end: datetime,
 ) -> dict[str, Any]:
@@ -2102,7 +2103,9 @@ def efficiency(
     by the efficiency engine and the results are aggregated: the summary is
     the total across all days, the waterfall reconciles expected to actual
     through unexplained and curtailed, and the per-string breakdown lets an
-    underperformer be localised.
+    underperformer be localised wherever the inverter exposes an independent
+    MPPT reading. Strings sharing one MPPT are one group because the hardware
+    cannot distinguish them.
 
     ``period=day`` also returns an hourly breakdown computed live from the
     stored irradiance and inverter readings rather than from any stored
@@ -2202,6 +2205,9 @@ def efficiency(
     for r in daily_rows:
         by_string.setdefault(r.string_name, []).append(r)
 
+    groups = mppt_groups(strings)
+    groups_by_name = {group.label: group for group in groups}
+
     # The array's yield is its output over the nameplate that produced it, and a
     # string the inverter never reported produced no part of the numerator — so
     # it must be no part of the denominator either. Dividing two strings' output
@@ -2210,7 +2216,12 @@ def efficiency(
     # read, against 14.04 kWp of which only 9.36 was measured.
     scored_names = {r.string_name for r in daily_rows if r.string_name}
     described_names = {s.name for s in strings}
-    total_kwp = sum(_string_kwp(s) for s in strings if s.name in scored_names)
+    total_kwp = sum(
+        _string_kwp(member)
+        for group in groups
+        if group.label in scored_names
+        for member in group.members
+    )
 
     # How much of the period the total was actually totalled over. A day the
     # engine could not model returns no rows at all, so it simply vanishes from
@@ -2228,8 +2239,8 @@ def efficiency(
     # the days West was absent.  The total is only complete when every described
     # string was scored on every expected day.
     string_days: dict[str, int] = {}
-    for s in strings:
-        string_days[s.name] = len({r.day for r in by_string.get(s.name, [])})
+    for group in groups:
+        string_days[group.label] = len({r.day for r in by_string.get(group.label, [])})
     any_string_incomplete = any(d < days_expected for d in string_days.values())
 
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
@@ -2248,7 +2259,11 @@ def efficiency(
         denom = expected - curtailed
         pr: float | None = actual / denom if denom > 0.0 else None
         # Per-string kWp for per-string yield; total for total.
-        kwp = total_kwp if name == "" else sum(_string_kwp(s) for s in strings if s.name == name)
+        kwp = (
+            total_kwp
+            if name == ""
+            else sum(_string_kwp(member) for member in groups_by_name[name].members)
+        )
         sy: float | None = actual / kwp if kwp > 0.0 else None
         # The total is incomplete when any string is incomplete.  A per-string
         # row is incomplete when its own days fall short of what the period owes,
@@ -2281,16 +2296,24 @@ def efficiency(
 
     summary = {
         **_summarise("", by_string.get("", [])),
-        "strings_scored": len(scored_names),
+        "strings_scored": sum(
+            len(groups_by_name[name].members) for name in scored_names if name in groups_by_name
+        ),
         "strings_described": len(described_names),
     }
 
-    # Per-string summaries
+    # Per-MPPT summaries. A singleton group preserves the existing per-string
+    # response shape; a shared MPPT carries its members so the page can explain
+    # why the inverter cannot offer separate rows.
     string_summaries: list[dict[str, Any]] = []
-    for s in strings:
-        rows = by_string.get(s.name, [])
+    for group in groups:
+        rows = by_string.get(group.label, [])
         if rows:
-            string_summaries.append({"name": s.name, **_summarise(s.name, rows)})
+            summary_row = {"name": group.label, **_summarise(group.label, rows)}
+            if len(group.members) > 1:
+                summary_row["members"] = [member.name for member in group.members]
+                summary_row["mppt"] = group.mppt
+            string_summaries.append(summary_row)
 
     # Waterfall
     expected = summary["expected_kwh"]
