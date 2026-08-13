@@ -2051,7 +2051,7 @@ _NO_BASELINE: dict[str, Any] = {"window_start": None, "window_end": None, "sampl
 
 
 def _baseline_info(
-    baselines: Mapping[str, StringBaseline | None],
+    baselines: Mapping[int, StringBaseline | None],
     range_start: datetime,
     range_end: datetime,
 ) -> dict[str, Any]:
@@ -2206,7 +2206,7 @@ def efficiency(
         by_string.setdefault(r.string_name, []).append(r)
 
     groups = mppt_groups(strings)
-    groups_by_name = {group.name: group for group in groups}
+    groups_by_name = {group.label: group for group in groups}
 
     # The array's yield is its output over the nameplate that produced it, and a
     # string the inverter never reported produced no part of the numerator — so
@@ -2219,7 +2219,7 @@ def efficiency(
     total_kwp = sum(
         _string_kwp(member)
         for group in groups
-        if group.name in scored_names
+        if group.label in scored_names
         for member in group.members
     )
 
@@ -2240,7 +2240,7 @@ def efficiency(
     # string was scored on every expected day.
     string_days: dict[str, int] = {}
     for group in groups:
-        string_days[group.name] = len({r.day for r in by_string.get(group.name, [])})
+        string_days[group.label] = len({r.day for r in by_string.get(group.label, [])})
     any_string_incomplete = any(d < days_expected for d in string_days.values())
 
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
@@ -2307,9 +2307,9 @@ def efficiency(
     # why the inverter cannot offer separate rows.
     string_summaries: list[dict[str, Any]] = []
     for group in groups:
-        rows = by_string.get(group.name, [])
+        rows = by_string.get(group.label, [])
         if rows:
-            summary_row = {"name": group.name, **_summarise(group.name, rows)}
+            summary_row = {"name": group.label, **_summarise(group.label, rows)}
             if len(group.members) > 1:
                 summary_row["members"] = [member.name for member in group.members]
                 summary_row["mppt"] = group.mppt

@@ -629,6 +629,7 @@ class TestSharedMpptGroups:
         *,
         pv1_w: float | None,
         pv2_w: float | None = None,
+        pv3_w: float | None = None,
         throttled: bool = False,
     ) -> None:
         """Stage enough sunlit hours for an MPPT group to be scored."""
@@ -652,6 +653,10 @@ class TestSharedMpptGroups:
                 values["pv2_power_w"] = pv2_w
                 values["pv2_voltage_v"] = 310.0
                 values["pv2_current_a"] = pv2_w / 310.0
+            if pv3_w is not None:
+                values["pv3_power_w"] = pv3_w
+                values["pv3_voltage_v"] = 310.0
+                values["pv3_current_a"] = pv3_w / 310.0
             columns = ["timestamp", "device", *values, "sample_count"]
             encoded = [
                 int(_utc(h).timestamp()),
@@ -741,6 +746,25 @@ class TestSharedMpptGroups:
         assert next(row for row in rows if row.string_name == "South").actual_kwh == pytest.approx(
             20.0
         )
+
+    def test_a_string_named_like_a_group_does_not_merge_two_mppts(self, tmp_path: Path) -> None:
+        """MPPT identity cannot be the label an owner chose for another string."""
+        collision = "[MPPT 1] East + West"
+        strings = self._shared_text + f"\n{collision} | 3 | 9 | 400 | 30 | 180"
+        store = _store(str(tmp_path / "colliding-group-name.db"))
+        self._stage(store, pv1_w=3000.0, pv3_w=1600.0)
+
+        rows = self._rows(store, strings)
+        groups = [row for row in rows if row.string_name]
+        store.write_efficiency_day(rows)
+        stored = store.read_efficiency_days(_summer_day(0), _summer_day(0) + timedelta(days=1))
+
+        assert len(groups) == 2
+        assert len({row.string_name for row in groups}) == 2
+        assert collision in {row.string_name for row in groups}
+        assert f"{collision} (2)" in {row.string_name for row in groups}
+        assert sorted(row.actual_kwh for row in groups) == pytest.approx([12.8, 24.0])
+        assert len(stored) == 3
 
     def test_a_group_recompute_replaces_its_old_string_rows(self, tmp_path: Path) -> None:
         """A version-two group must not leave version-one strings beside it."""

@@ -206,7 +206,7 @@ class MpptGroup:
     """
 
     mppt: int
-    name: str
+    label: str
     members: tuple[StringSpec, ...]
 
 
@@ -215,29 +215,36 @@ def mppt_groups(strings: Sequence[StringSpec]) -> tuple[MpptGroup, ...]:
 
     The inverter reports one power, voltage and current reading per MPPT, so
     more than one configured string on it has to be one scored unit. Members
-    are name-sorted for a durable composite row name, while group order follows
+    are name-sorted for a durable composite row label, while group order follows
     the configuration's first occurrence so singleton rows retain their legacy
     output order.
     """
     by_mppt: dict[int, list[StringSpec]] = {}
     for string in strings:
         by_mppt.setdefault(string.mppt, []).append(string)
+    string_names = {string.name for string in strings}
+    labels: set[str] = set()
     groups: list[MpptGroup] = []
     for mppt, declared in by_mppt.items():
         members = tuple(sorted(declared, key=lambda string: string.name))
-        name = (
-            members[0].name
-            if len(members) == 1
-            else f"[MPPT {mppt}] " + " + ".join(string.name for string in members)
-        )
-        groups.append(MpptGroup(mppt=mppt, name=name, members=members))
+        if len(members) == 1:
+            label = members[0].name
+        else:
+            base = f"[MPPT {mppt}] " + " + ".join(string.name for string in members)
+            label = base
+            suffix = 2
+            while label in string_names or label in labels:
+                label = f"{base} ({suffix})"
+                suffix += 1
+        labels.add(label)
+        groups.append(MpptGroup(mppt=mppt, label=label, members=members))
     return tuple(groups)
 
 
 def _fit_baselines(
     rows_by_hour: dict[int, dict[str, object]],
     groups: Sequence[MpptGroup],
-) -> dict[str, StringBaseline | None]:
+) -> dict[int, StringBaseline | None]:
     """Fit each MPPT group's ordinary operating point from the rows in hand.
 
     Split out of ``compute_hours`` so the endpoint that tells an owner their
@@ -252,7 +259,7 @@ def _fit_baselines(
     Fitting it twice would be worse than not reporting it, so this stays the
     only place the fit happens and both callers walk through here.
     """
-    baselines: dict[str, StringBaseline | None] = {}
+    baselines: dict[int, StringBaseline | None] = {}
     for group in groups:
         pairs: list[tuple[float, float]] = []
         for candidate in rows_by_hour.values():
@@ -260,7 +267,7 @@ def _fit_baselines(
             amps = candidate.get(f"pv{group.mppt}_current_a")
             if isinstance(volts, float) and isinstance(amps, float):
                 pairs.append((volts, amps))
-        baselines[group.name] = baseline_for(group.name, pairs)
+        baselines[group.mppt] = baseline_for(group.label, pairs)
     return baselines
 
 
@@ -270,7 +277,7 @@ def fitted_baselines(
     start: datetime,
     end: datetime,
     strings: Sequence[StringSpec],
-) -> dict[str, StringBaseline | None]:
+) -> dict[int, StringBaseline | None]:
     """What the curtailment rule was calibrated against over this range.
 
     The same rows and the same fit ``compute_hours`` runs on, so a page saying
@@ -294,7 +301,8 @@ def fitted_baselines(
 class StringHour:
     """One MPPT group's measured and modelled energy for one hour."""
 
-    name: str
+    mppt: int
+    label: str
     expected_kwh: float
     actual_kwh: float
     curtailed_kwh: float
@@ -449,12 +457,13 @@ def compute_hours(
                 act_kwh,
                 gate_open=gate_open,
                 signature_seen=signature_matches(
-                    volts if isinstance(volts, float) else None, baselines.get(group.name)
+                    volts if isinstance(volts, float) else None, baselines.get(group.mppt)
                 ),
             )
             share.append(
                 StringHour(
-                    name=group.name,
+                    mppt=group.mppt,
+                    label=group.label,
                     expected_kwh=exp_kwh,
                     actual_kwh=act_kwh,
                     curtailed_kwh=refused,
@@ -509,25 +518,29 @@ def compute_day(
         return []
 
     groups = mppt_groups(strings)
-    expected: dict[str, float] = dict.fromkeys([group.name for group in groups] + [""], 0.0)
-    actual: dict[str, float] = dict.fromkeys([group.name for group in groups] + [""], 0.0)
-    curtailed: dict[str, float] = dict.fromkeys([group.name for group in groups] + [""], 0.0)
-    modelled: dict[str, int] = dict.fromkeys([group.name for group in groups] + [""], 0)
-    # Weighted by each hour's share of the day's energy; modelled[""] stays an
-    # honest count of hours, because that is what the row reports.
+    expected: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    actual: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    curtailed: dict[int, float] = dict.fromkeys((group.mppt for group in groups), 0.0)
+    modelled: dict[int, int] = dict.fromkeys((group.mppt for group in groups), 0)
+    # Weighted by each hour's share of the day's energy; total_modelled stays
+    # an honest count of hours, because that is what the total row reports.
     modelled_weight = 0.0
+    total_expected = 0.0
+    total_actual = 0.0
+    total_curtailed = 0.0
+    total_modelled = 0
 
     for hour in hours:
         modelled_weight += daylight.get(hour.offset, 0.0)
-        modelled[""] += 1
-        expected[""] += hour.expected_kwh
-        actual[""] += hour.actual_kwh
-        curtailed[""] += hour.curtailed_kwh
+        total_modelled += 1
+        total_expected += hour.expected_kwh
+        total_actual += hour.actual_kwh
+        total_curtailed += hour.curtailed_kwh
         for share in hour.strings:
-            expected[share.name] += share.expected_kwh
-            actual[share.name] += share.actual_kwh
-            curtailed[share.name] += share.curtailed_kwh
-            modelled[share.name] += 1
+            expected[share.mppt] += share.expected_kwh
+            actual[share.mppt] += share.actual_kwh
+            curtailed[share.mppt] += share.curtailed_kwh
+            modelled[share.mppt] += 1
 
     coverage = modelled_weight / total_daylight if total_daylight > 0.0 else 0.0
     partial = coverage < _MIN_COVERAGE
@@ -539,11 +552,11 @@ def compute_day(
         # claim that this string was meant to make nothing and made nothing,
         # and the page renders it as a specific yield of 0.0 kWh/kWp — an
         # unmeasured third of the array presented as a dead one.
-        if modelled[group.name] == 0:
+        if modelled[group.mppt] == 0:
             continue
-        exp = expected[group.name]
-        act = actual[group.name]
-        refused = curtailed[group.name]
+        exp = expected[group.mppt]
+        act = actual[group.mppt]
+        refused = curtailed[group.mppt]
         # Curtailed energy leaves the comparison on both sides: it was never
         # lost, so it must not count against the ratio, and the shortfall that
         # remains claims no cause of its own.
@@ -552,12 +565,12 @@ def compute_day(
         rows.append(
             EfficiencyRow(
                 day=day_start,
-                string_name=group.name,
+                string_name=group.label,
                 expected_kwh=exp,
                 actual_kwh=act,
-                curtailed_kwh=curtailed[group.name],
+                curtailed_kwh=curtailed[group.mppt],
                 unexplained_kwh=unexplained,
-                modelled_hours=modelled.get(group.name, 0),
+                modelled_hours=modelled.get(group.mppt, 0),
                 partial=partial,
                 pr=pr,
                 config_version=config_version,
@@ -568,13 +581,10 @@ def compute_day(
     # the collector down all day — has no expectation to compare against, and
     # saying "expected nothing, produced nothing, and it was partial" would
     # dress that silence up as a measurement.
-    if modelled[""] == 0:
+    if total_modelled == 0:
         return []
 
     # Total row
-    total_expected = expected[""]
-    total_actual = actual[""]
-    total_curtailed = curtailed[""]
     unexplained_total = max(0.0, total_expected - total_actual - total_curtailed)
     total_pr = (
         total_actual / (total_expected - total_curtailed)
@@ -589,7 +599,7 @@ def compute_day(
             actual_kwh=total_actual,
             curtailed_kwh=total_curtailed,
             unexplained_kwh=unexplained_total,
-            modelled_hours=modelled[""],
+            modelled_hours=total_modelled,
             partial=partial,
             pr=total_pr,
             config_version=config_version,

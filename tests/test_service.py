@@ -717,7 +717,7 @@ class TestEfficiencyMaintenance:
         assert rows == []
 
     async def test_an_algorithm_change_reopens_stored_efficiency_days(self, tmp_path: Path) -> None:
-        """The MPPT grouping change raises the scorer's minimum version to two."""
+        """The first scorer revision advances a low configuration version once."""
         from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
 
         svc, store = self._configured(tmp_path)
@@ -727,6 +727,60 @@ class TestEfficiencyMaintenance:
         await svc.maintain_efficiency()
 
         assert settings.get(CONFIG_VERSION_KEY) == 2
+        store.close()
+
+    async def test_the_first_scorer_revision_handles_config_version_zero(
+        self, tmp_path: Path
+    ) -> None:
+        """A fresh installation starts its version sequence without a special case."""
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        svc, store = self._configured(tmp_path)
+        settings = SettingsStore(store)
+        settings.set(CONFIG_VERSION_KEY, 0)
+
+        await svc.maintain_efficiency()
+
+        assert settings.get(CONFIG_VERSION_KEY) == 1
+        store.close()
+
+    async def test_a_scorer_revision_advances_a_high_config_version_once(
+        self, tmp_path: Path
+    ) -> None:
+        """A code migration cannot be skipped because settings already advanced its counter."""
+        from datetime import UTC, datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from arraysense.efficiency import EfficiencyRow
+        from arraysense.settings import CONFIG_VERSION_KEY, SettingsStore
+
+        svc, store = self._configured(tmp_path)
+        settings = SettingsStore(store)
+        day = datetime(2026, 8, 10, tzinfo=ZoneInfo("America/Chicago"))
+        self._stage(store, range(8, 16))
+        store.write_efficiency_day(
+            [EfficiencyRow(day, "East", 1.0, 1.0, 0.0, 0.0, 1, False, 1.0, 13)]
+        )
+        settings.set(CONFIG_VERSION_KEY, 13)
+
+        now = datetime(2026, 8, 11, 12, tzinfo=UTC)
+        await svc.maintain_efficiency(now=now)
+        rescored = store.read_efficiency_days(day, day + timedelta(days=1))
+
+        assert settings.get(CONFIG_VERSION_KEY) == 14
+        assert rescored and all(row.config_version == 14 for row in rescored)
+        assert any(row.actual_kwh != 1.0 for row in rescored)
+
+        await svc.maintain_efficiency(now=now)
+        assert settings.get(CONFIG_VERSION_KEY) == 14
+
+        settings.set("panels.strings", "East | 1 | 10 | 410 | 25 | 90")
+        await svc.maintain_efficiency(now=now)
+        assert settings.get(CONFIG_VERSION_KEY) == 15
+        assert all(
+            row.config_version == 15
+            for row in store.read_efficiency_days(day, day + timedelta(days=1))
+        )
         store.close()
 
 

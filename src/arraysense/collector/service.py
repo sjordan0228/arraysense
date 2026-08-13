@@ -471,12 +471,10 @@ class CollectorService:
 
         # A code change that alters how scores are computed makes every stored
         # efficiency day stale — the same reason a settings edit bumps the
-        # version.  Bumping here invalidates all stored days so they are
-        # recomputed with the current logic.  The check against ``minimum`` is
-        # cheap (a single-row read) and the method is a no-op after the first
-        # call, so it is safe to leave in the periodic path rather than wiring a
-        # one-shot trigger.
-        if settings.ensure_efficiency_version(2):
+        # version. The scorer revision is deliberately separate from that
+        # mutable configuration counter: an owner can raise the latter far past
+        # any code revision, but must still receive this one invalidation.
+        if settings.ensure_efficiency_scorer_revision(1):
             # The version just advanced — re-read it so the rows we are about to
             # write carry the new version rather than the one they would match
             # and never recompute.
