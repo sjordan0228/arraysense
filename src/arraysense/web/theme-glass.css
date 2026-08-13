@@ -585,9 +585,9 @@ table td,
 /* The four summary cards each admit which series they are about: a bloom of
    their own hue bleeding up from the lower-left edge, under the glass. This is
    the hero's original solar wash, now shared by the three flow cards — keyed by
-   the swatch already in their markup (:has over the .sq's inline style) rather
-   than by position, so the cards can be reordered without the accent lying
-   about which is which. The strength is the --bloom token above — 15% in dark,
+   the series icon already in their markup (:has over the .ic's inline colour,
+   the same attribute the old swatch carried) rather than by position, so the
+   cards can be reordered without the accent lying about which is which. The strength is the --bloom token above — 15% in dark,
    28% in light, and see that token for why the two differ. The tint identifies
    the pane from across the room while staying a soft radial patch that reads as
    light through frosted glass rather than a stripe. */
@@ -596,17 +596,17 @@ table td,
     radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--pv) var(--bloom), transparent), transparent 55%),
     linear-gradient(160deg, var(--glass-top), var(--glass-bot));
 }
-.flow .p:has(.sq[style*="--load"]) {
+.flow .p:has(.ic[style*="--load"]) {
   background:
     radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--load) var(--bloom), transparent), transparent 55%),
     linear-gradient(160deg, var(--glass-top), var(--glass-bot));
 }
-.flow .p:has(.sq[style*="--batt"]) {
+.flow .p:has(.ic[style*="--batt"]) {
   background:
     radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--batt) var(--bloom), transparent), transparent 55%),
     linear-gradient(160deg, var(--glass-top), var(--glass-bot));
 }
-.flow .p:has(.sq[style*="--grid"]) {
+.flow .p:has(.ic[style*="--grid"]) {
   background:
     radial-gradient(120% 100% at 12% 108%, color-mix(in oklab, var(--grid) var(--bloom), transparent), transparent 55%),
     linear-gradient(160deg, var(--glass-top), var(--glass-bot));

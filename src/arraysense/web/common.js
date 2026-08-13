@@ -396,8 +396,20 @@ const BASE_CSS = `
   /* An icon from the Phosphor sprite. Sized to the surrounding text and painted
      in the same ink, so it follows both themes and both looks without a colour
      of its own — the symbol's paths carry fill="currentColor", so the one thing
-     this rule must do is give the svg a size and a line to sit on. */
-  .ic{width:1em;height:1em;display:inline-block;vertical-align:-.125em;fill:currentColor}
+     this rule must do is give the svg a size and a line to sit on. The three
+     placements below only add a gap and, where the label is set in tiny caps,
+     a floor: a house or a plug at 1em of a 9.5px label is below the size at
+     which it reads, so the card icons get a fixed size that still fits the
+     label's own line box and reflows nothing. */
+  /* Sized a little above the text they sit beside rather than matched to it. At
+     1em an icon reads as punctuation; the point of it is to be found before the
+     word is, which takes slightly more presence than the word has. The card
+     labels are 9.5px uppercase, so theirs is set in pixels — an em of that is
+     smaller than the mark needs to be legible at all. */
+  .ic{width:1.15em;height:1.15em;display:inline-block;vertical-align:-.2em;fill:currentColor}
+  .nav a .ic{margin-right:6px}
+  .lbl .ic{width:15px;height:15px;margin-right:6px;vertical-align:-.24em}
+  .stalemark .ic{width:18px;height:18px;margin-right:0}
   details{margin-top:10px}
   summary{cursor:pointer;font-size:11px;color:var(--ink3)}
   /* --- The setup wizard / connection picker --------------------------------
@@ -988,14 +1000,22 @@ const zoneWords = (zone) => String(zone || '').replace(/_/g, ' ');
 // ---------------------------------------------------------------------------
 
 const NAV = [
-  { key:'now',     label:'Now',         href:'/#now' },
-  { key:'flow',    label:'Energy flow', href:'/#flow' },
-  { key:'inverter', label:'Inverter',  href:'/#inverter' },
-  { key:'graphs',  label:'Graphs',      href:'/graphs' },
-  { key:'history', label:'History',     href:'/history' },
-  { key:'costs',   label:'Costs',       href:'/costs' },
-  { key:'efficiency', label:'Efficiency', href:'/efficiency' },
-  { key:'settings', label:'Settings',   href:'/settings' },
+  // One icon per entry, each chosen for what the view is rather than what it
+  // shows: the chart line draws Graphs, the backwards clock draws History, the
+  // dollar draws Costs, the gauge draws Efficiency and the gear draws Settings.
+  // Now takes the bolt because its headline is "producing now", and Energy flow
+  // takes the circling arrows because the Sankey moves energy in a loop.
+  // Inverter is left text-only: no symbol in the sprite names the box in the
+  // middle, and a plug (connection), a gear (Settings) or a bolt (Now) would
+  // each say a specific wrong thing.
+  { key:'now',     label:'Now',         href:'/#now',        icon:'ph-lightning' },
+  { key:'flow',    label:'Energy flow', href:'/#flow',       icon:'ph-arrows-clockwise' },
+  { key:'inverter', label:'Inverter',   href:'/#inverter' },
+  { key:'graphs',  label:'Graphs',      href:'/graphs',      icon:'ph-chart-line' },
+  { key:'history', label:'History',     href:'/history',     icon:'ph-clock-counter-clockwise' },
+  { key:'costs',   label:'Costs',       href:'/costs',       icon:'ph-currency-dollar' },
+  { key:'efficiency', label:'Efficiency', href:'/efficiency', icon:'ph-gauge' },
+  { key:'settings', label:'Settings',   href:'/settings',    icon:'ph-gear' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1115,11 @@ function drawNav(current) {
   const el = $('nav');
   if (!el) return;
   el.innerHTML = NAV.map((n) =>
-    `<a href="${n.href}"${n.key === current ? ' aria-current="page"' : ''}>${esc(n.label)}</a>`
+    `<a href="${n.href}"${n.key === current ? ' aria-current="page"' : ''}>` +
+    // The icon is decoration beside a label that already names the page, so a
+    // reader hears the entry once. The one entry with no icon stays text-only.
+    (n.icon ? `<svg class="ic" aria-hidden="true"><use href="#${n.icon}"/></svg>` : '') +
+    `${esc(n.label)}</a>`
   ).join('');
 }
 
@@ -1166,11 +1190,21 @@ function elapsedWords(ms) {
 const clockWords = (t, age) => age !== null && age < 18 * 3600000
   ? new Date(t).toLocaleTimeString() : new Date(t).toLocaleString();
 
-// One mark per tone, borrowed from the calibration ladder on the dashboard: a
-// dot advises, a triangle alerts, and a pause bar says the silence was asked
-// for. Three shapes for three tones, so the reader who cannot tell the amber
-// rule from the red one still has the distinction.
-const STALE_MARKS = { note: '⏸', warn: '●', bad: '⚠' };
+// One mark per tone. The pause bar belongs to the one tone that says nothing is
+// wrong — the dongle was handed over on purpose — and keeps a mark of its own:
+// a warning triangle there would train the reader to wave away the real ones.
+// The two fault tones share the warning glyph from the sprite, differing on the
+// colour, the border rule and the headline that already name the condition, so
+// the amber rule and the red one no longer need a shape of their own to keep
+// apart. Drawn as a vector rather than a text glyph so it inherits the tone's
+// colour from the same CSS that painted the old mark.
+// Three tones, three shapes. The tones differ in colour too, but colour is not
+// what tells them apart: a circle for something that wants attention, a
+// triangle for something that has stopped. The glyphs this replaced were
+// already shape-distinct and giving warn and bad the same triangle would have
+// left the severity resting on hue alone, which is the one thing this project
+// does not do.
+const STALE_MARKS = { note: '⏸', warn: 'ph-info', bad: 'ph-warning' };
 
 // How far behind the screen is, in a sentence. The endpoint reports the age of
 // the newest *reading*, so a stretch of recorded gaps leaves no age to quote
@@ -1360,17 +1394,32 @@ function staleElement() {
   return stalePart;
 }
 
+// The mark is either the pause glyph or a sprite id. The pause is plain text;
+// a sprite id becomes a <use>, safe to write as markup because the id is one of
+// the two constants above and never payload. Only rewritten when it changes, so
+// the mark does not churn every thirty-second poll.
+const setMark = (el, mark) => {
+  if (el.dataset.mark === mark) return;
+  el.dataset.mark = mark;
+  if (mark.startsWith('ph-')) {
+    el.innerHTML = `<svg class="ic" aria-hidden="true"><use href="#${mark}"/></svg>`;
+  } else {
+    el.textContent = mark;
+  }
+};
+
 function showStale(state) {
   const parts = staleElement();
   if (!parts) return;
   if (!state) { parts.box.hidden = true; return; }
   // Written as text and never as markup. The reason comes from somewhere down
   // in the transport or the storage stack and has no business being parsed as
-  // HTML, and text also means there is no esc() call here to forget. Only on a
-  // change, so an unchanged line is not re-announced to a screen reader.
+  // HTML, and text also means there is no esc() call here to forget. The one
+  // exception is the mark above, whose content is a constant. Only on a change,
+  // so an unchanged line is not re-announced to a screen reader.
   const set = (el, text) => { if (el.textContent !== text) el.textContent = text; };
   parts.box.className = `p stale tone-${state.tone}`;
-  set(parts.mark, state.mark);
+  setMark(parts.mark, state.mark);
   set(parts.head, state.headline);
   set(parts.detail, state.detail);
   set(parts.why, state.why || '');
