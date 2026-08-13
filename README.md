@@ -32,8 +32,30 @@ than a missing one.
 | **EG4 6000XP** | ⚠️ Partial, and not recommended yet. An off-grid family: several registers this driver reads mean something different there, and the PV string count is unconfirmed. Readings may be *wrong* rather than missing — see [#122](https://github.com/sjordan0228/arraysense/issues/122). |
 
 EG4 is the US rebrand of LuxPower, so LuxPower units speaking the same protocol
-should work. Both a **WiFi dongle** and **wired RS485/Modbus** are supported; the
-reference installation runs RS485, which is the durable path.
+should work.
+
+### How it connects — read this before buying a dongle
+
+Two transports, and the dongle one is narrower than "WiFi dongle" suggests.
+
+| Connection | Supported | Notes |
+| --- | --- | --- |
+| **Wired RS485 / Modbus** | ✅ **Recommended** | A USB-to-RS485 adapter on the inverter's 485A/485B terminals. What the reference installation runs. No firmware can take it away, and nothing competes for it. |
+| **LuxPower/EG4 WiFi dongle, TCP port 8000** | ✅ The only dongle supported | The proprietary LuxPower protocol, authenticated with the dongle's serial. |
+| **The same WiFi dongle on newer firmware** | ❌ | Some firmware has **no port 8000 at all**, and there is **no way to re-enable it**. A dongle that worked can stop after an update. |
+| **Ethernet dongles** | ❌ | They never exposed port 8000. Not usable, at any firmware version. |
+| Any other vendor's dongle | ❌ | Different protocol entirely. |
+
+Two more things about the WiFi dongle specifically:
+
+- It accepts **exactly one TCP client**. Anything else already polling it — the EG4
+  app, Solar Assistant, a Home Assistant integration — will fight with this one and
+  both will lose readings. Run only one.
+- Firmware updates go through the vendor's app, which needs that same single slot,
+  so the service has a yield mode to hand it back temporarily.
+
+This is precisely why the transport is pluggable and why **RS485 is the path this
+project treats as durable**. If you are choosing today, choose RS485.
 
 Want to try it without an inverter? A simulated driver ships in the box — set
 `driver = "fake"` and everything below runs against generated data.
@@ -120,24 +142,45 @@ where packs genuinely disagree on *voltage* is reported separately and more loud
 because parallel packs are forced to the same voltage and a spread there means a
 cable, a lug or a busbar rather than arithmetic.
 
-## Getting started
+## Install
 
-Setup is a form in the browser — pick the manufacturer, the model and how it is
-wired, and it starts collecting. Everything is changeable afterwards on the settings
-page.
+One line, on a Linux host with systemd — a Raspberry Pi is the usual target:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sjordan0228/arraysense/main/install.py | sudo python3 -
+```
+
+That is the whole install. The script is written to be read before it is trusted:
+it is **standard library only** and parses on the Python 3.8 a distribution ships,
+it **fetches exactly two things** — [uv](https://docs.astral.sh/uv/)'s installer and
+this repository — and it **prints everything it intends to do before doing any of
+it**. It asks its questions on the terminal rather than stdin, so piping into `sudo`
+cannot swallow your answers, and it is safe to re-run over a partial install.
+
+It checks the host first and refuses with a reason rather than failing halfway:
+architecture, systemd, and at least 2 GB free. Then it installs uv, has it fetch
+Python 3.12, clones to `/opt/arraysense`, creates the service account, and installs
+the systemd service plus the daily backup timer.
+
+For an unattended install:
+
+```bash
+sudo python3 install.py --yes --port 8090
+```
+
+`--repo URL` installs from a fork and `--ref NAME` pins a branch, tag or commit.
+
+### Then set it up in the browser
+
+The installer prints the address. Open it and you get a first-run wizard rather than
+a dashboard — pick the manufacturer, the model and how it is wired, and it starts
+collecting. Everything is changeable afterwards on the settings page.
 
 ![The first-run setup wizard](docs/images/setup-wizard.jpg)
 
 Full instructions are in [docs/installation.md](docs/installation.md), including the
-Raspberry Pi path in [docs/raspberry-pi.md](docs/raspberry-pi.md).
-
-Two constraints worth knowing before you plan a deployment:
-
-- The WiFi dongle accepts **exactly one TCP client**. Anything else already polling it
-  — a vendor app, another monitoring tool — will fight with this one. Run only one.
-- **Port 8000 is being removed** in newer dongle firmware and does not exist on
-  Ethernet dongles. That is why the transport is pluggable, and why RS485 is the
-  path this project treats as durable.
+Raspberry Pi path in [docs/raspberry-pi.md](docs/raspberry-pi.md) — which covers the
+RS485 wiring, the USB adapter, and the two systemd settings a serial install needs.
 
 ### How much disk
 

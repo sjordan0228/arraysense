@@ -39,10 +39,16 @@ whole application runs against a simulated inverter, no hardware attached.
 
 ### Connection
 
-| Connection | Notes |
-| --- | --- |
-| WiFi dongle, TCP port 8000 | The wizard asks for the dongle's address and serial |
-| Wired RS485 | A USB-to-RS485 adapter to the 485A/485B terminals; the wizard asks for the device path |
+Only one kind of dongle works, and it is worth being precise about which before you
+buy anything.
+
+| Connection | Supported | Notes |
+| --- | --- | --- |
+| Wired RS485 | ✅ **Recommended** | A USB-to-RS485 adapter to the 485A/485B terminals; the wizard asks for the device path. Nothing competes for it and no firmware update can remove it. |
+| LuxPower/EG4 **WiFi** dongle on TCP port 8000 | ✅ The only dongle supported | The proprietary LuxPower protocol, authenticated with the dongle serial. The wizard asks for the dongle's address and serial. |
+| That same WiFi dongle on newer firmware | ❌ | Some firmware exposes no port 8000, and it cannot be re-enabled. A working dongle can stop after an update. |
+| **Ethernet** dongles | ❌ | They never exposed port 8000 at any firmware version. |
+| Another vendor's dongle | ❌ | A different protocol; this driver cannot speak it. |
 
 The dongle accepts **exactly one TCP client**. A second client is closed
 immediately, and two clients repeatedly evicting each other produce CRC errors and
