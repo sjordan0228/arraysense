@@ -268,6 +268,17 @@
   --tint-3: light-dark(oklch(30% 0.02 265 / 0.15), oklch(95% 0.02 265 / 0.18));
   --tip: light-dark(oklch(100% 0 0 / 0.94), oklch(16% 0.03 268 / 0.88));
   --tip-shadow: 0 18px 44px -18px light-dark(oklch(45% 0.05 265 / 0.35), oklch(4% 0.03 268 / 0.90));
+
+  /* The semantic layer's names, as this look means them. Everything not named
+     here — --surface-elevated, --text, --text-muted, --accent — keeps the base
+     sheet's alias and follows the token it points at (--tip, --ink, --ink2,
+     --pv), which this file already overrides where it differs. Only the two a
+     glass pane genuinely changes are restated: the ground is a pane of smoked
+     quartz rather than one flat fill, and the hairline is the lit edge ring
+     rather than the base sheet's border. Neither is read back by JS, so both
+     may resolve through light-dark(). */
+  --surface: linear-gradient(160deg, var(--glass-top), var(--glass-bot));
+  --border: var(--edge);
 }
 
 /* The light counterpart of --grid-line, kept out of light-dark() for the reason

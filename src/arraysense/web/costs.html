@@ -68,8 +68,20 @@
     box-shadow:inset 0 0 0 1px var(--tint-2)}
   .tw{overflow-x:auto}
   .hours{font-size:9.5px;color:var(--ink3);letter-spacing:.03em;margin-top:2px}
-  .bandbar{height:4px;border-radius:2px;background:var(--tint);margin-top:5px;overflow:hidden}
-  .bandbar i{display:block;height:100%;width:0;border-radius:2px;background:var(--grid)}
+  /* The inline cost bar. Every fill starts at the same zero on the same
+     full-width track, so the rows compare at a glance. The fill is the grid
+     accent — this is what the owner paid the grid — and the track is the
+     neutral the page gives an empty length. */
+  .bandbar{height:5px;border-radius:3px;background:var(--tint-2);margin-top:6px;overflow:hidden}
+  .bandbar i{display:block;height:100%;width:0;border-radius:0 3px 3px 0;background:var(--grid)}
+  /* The table's figures line up only if the digits do not change width as the
+     values move, so they are set in tabular figures. The face is deliberately
+     the page's own rather than a mono stack: --font-mono exists only under
+     Glass, so naming it here sent Classic's figures to the system mono — a
+     face change that was never asked for — and tabular figures alone already
+     deliver the alignment. The band name keeps the page face too; it is a
+     word, not a number. */
+  #bandTable td:nth-child(n+2){font-variant-numeric:tabular-nums}
   td.part{position:relative}
   td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
   /* A marked segment of a split bar. Two things the table's dot cannot do here.

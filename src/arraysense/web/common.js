@@ -156,6 +156,23 @@ const BASE_CSS = `
        everything else is read against. */
     --page:linear-gradient(168deg,#101a33 0%,#1b2547 34%,#3d2f56 62%,#7d4a3e 85%,#c07b3e 100%);
     --glow:radial-gradient(circle,rgba(255,198,120,.34),transparent 66%);
+    /* The semantic layer: names for what a rule is *for*, not how it renders.
+       Classic is the reference — each name aliases the token that already
+       carries that meaning here, so new work can say --surface or --text
+       instead of reaching for --panel or --ink, and a look restates only the
+       meanings it genuinely changes (Glass turns --surface into a pane and
+       --border into its edge ring) without a page having to know which look
+       it is under. Each resolves through a var() to the token above, so these
+       are aliases rather than values: they follow both themes by construction
+       and change no pixel until something uses them.
+       --glow is deliberately absent: the ambient glow above is already part of
+       this layer, and a second definition would be a second copy that drifts. */
+    --surface:var(--panel);
+    --surface-elevated:var(--tip);
+    --border:var(--panel-b);
+    --text:var(--ink);
+    --text-muted:var(--ink2);
+    --accent:var(--pv);
   }
   ${LIGHT_TOKEN_BLOCK}
   * { box-sizing:border-box; }
@@ -210,6 +227,12 @@ const BASE_CSS = `
   .nsfig u{text-decoration:none;font-size:9px;letter-spacing:.14em;
     text-transform:uppercase;color:var(--ink3)}
   .nsfig b{font-weight:500;font-size:12px}
+  /* A measured zero recedes while staying a number. Idle flows — no sun at
+     night, no grid traffic — read as background rather than as news; a dash,
+     which says a value was not measured, is a different thing and keeps full
+     ink so it is never mistaken for a zero. common.js marks the figures it
+     renders; a page that renders its own can carry the same class. */
+  .nsfig b.is-zero{opacity:.5}
   /* The theme button. Sized and shaped like the settings gear beside it, because
      they are the same kind of thing: a control that belongs to this browser
      rather than a reading from the inverter. */
@@ -219,6 +242,15 @@ const BASE_CSS = `
   .themebtn:hover{background:var(--tint-2);color:var(--ink)}
   .themebtn:focus-visible{outline:2px solid var(--load);outline-offset:2px}
   .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:0}
+  /* The connection pill's dot, while the collector is live. A slow breathe so
+     the page reads as alive rather than frozen. It reinforces a state the
+     dot's own colour and the pill's words already carry, so dropping it for
+     reduced motion loses nothing — and common.js writes the data-conn-live
+     state from /api/status, so a pulse can never survive a dead collector.
+     Written on the root rather than on the pill so a look sheet reacts to the
+     state without the pill needing a class a page might overwrite. */
+  :root[data-conn-live] .conn .dot{animation:conn-breathe 2.8s ease-in-out infinite}
+  @keyframes conn-breathe{0%,100%{opacity:1}50%{opacity:.45}}
   .sq{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
   .p{background:var(--panel);border:1px solid var(--panel-b);border-radius:13px;padding:14px 16px;
      backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
@@ -344,6 +376,9 @@ const BASE_CSS = `
   @media(prefers-reduced-motion:reduce){
     .sank .rflow{display:none}
     .sank .rib{transition:none}
+    /* The dot's colour and the pill's words still say "live"; only the breathe
+       goes. */
+    :root[data-conn-live] .conn .dot{animation:none}
   }
   .kv{display:flex;justify-content:space-between;font-size:10.5px;color:var(--ink2);margin-top:3px}
   .kv u{text-decoration:none;color:var(--ink3)}
@@ -358,6 +393,11 @@ const BASE_CSS = `
     border-radius:8px;padding:4px 10px;font-size:13px;cursor:pointer;font-family:inherit;line-height:1.4}
   .iconbtn:hover{background:var(--tint-2);color:var(--ink)}
   .iconbtn.wide{font-size:11px;flex:1}
+  /* An icon from the Phosphor sprite. Sized to the surrounding text and painted
+     in the same ink, so it follows both themes and both looks without a colour
+     of its own — the symbol's paths carry fill="currentColor", so the one thing
+     this rule must do is give the svg a size and a line to sit on. */
+  .ic{width:1em;height:1em;display:inline-block;vertical-align:-.125em;fill:currentColor}
   details{margin-top:10px}
   summary{cursor:pointer;font-size:11px;color:var(--ink3)}
   /* --- The setup wizard / connection picker --------------------------------
@@ -398,6 +438,14 @@ const BASE_CSS = `
   @media(max-width:520px){.setup .adv .fields{grid-template-columns:1fr}}
   .wizard{max-width:620px;margin:0 auto}
   .wizard .welcome{font-size:13px;color:var(--ink2);line-height:1.6;margin:2px 0 18px;max-width:70ch}
+  /* A crossfade when navigating between the pages. This is the View Transitions
+     API doing its default thing — the old page and the new one blend briefly —
+     and it is a progressive enhancement: a browser without it, or one whose
+     reader asked for less motion, navigates exactly as it always did. The fade
+     sits over the new page's own loading, never in front of it. */
+  @media (prefers-reduced-motion: no-preference) {
+    @view-transition { navigation: auto; }
+  }
 `;
 document.head.appendChild(
   Object.assign(document.createElement('style'), { textContent: BASE_CSS }));
@@ -413,6 +461,74 @@ const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
 // A reading is a number or it is absent. Anything else — null, undefined, a
 // string, a NaN — is unknown, and unknown must never fall through to zero.
 const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
+
+// ---------------------------------------------------------------------------
+// The Phosphor icon sprite, and the one animation this file owns.
+//
+// Icons are drawn with <use href="#ph-gear">, which has to resolve against this
+// document and not across one: currentColor inheritance over an external SVG
+// reference is inconsistent between engines, so the sprite is fetched once and
+// injected, hidden, into every page. The fetch is allowed to fail quietly — an
+// icon is decoration, and one that does not arrive must read as nothing at all,
+// never as a broken layout or a thrown error.
+// ---------------------------------------------------------------------------
+
+const ICON_SPRITE_URL = '/vendor/phosphor.svg';
+let iconSpriteLoading = null;
+
+function mountIconSprite() {
+  if (iconSpriteLoading) return iconSpriteLoading;
+  iconSpriteLoading = fetch(ICON_SPRITE_URL)
+    .then((response) => {
+      if (!response.ok) throw new Error(`sprite ${response.status}`);
+      return response.text();
+    })
+    .then((markup) => {
+      const doc = new DOMParser().parseFromString(markup, 'image/svg+xml');
+      const sprite = doc.documentElement;
+      // A parse failure lands a <parsererror> root here; treating it as the
+      // failure it is keeps a corrupt vendored file from becoming markup on
+      // the page.
+      if (!sprite || sprite.nodeName.toLowerCase() !== 'svg') throw new Error('sprite did not parse');
+      const place = () => {
+        const host = document.body;
+        if (host) host.insertBefore(sprite, host.firstChild);
+      };
+      // A fetch can beat the parser to <body>; the sprite belongs anywhere in
+      // the document, so it waits for the body rather than landing in <head>.
+      if (document.body) place();
+      else document.addEventListener('DOMContentLoaded', place, { once: true });
+    })
+    .catch(() => {
+      // An icon that does not arrive is nothing visible.
+    });
+  return iconSpriteLoading;
+}
+
+mountIconSprite();
+
+// A crossfade over an in-page switch — the dashboard's hash views and the
+// settings page's tabs. Where the browser cannot do one, or has been asked for
+// less motion, `update` runs exactly as it always has; where it can, the new
+// view is painted behind the old and the two blend briefly. The callback must
+// return nothing and not a promise: data still loads on its own schedule, and
+// the fade is decoration painted over it, never a gate in front of it.
+function crossfade(update) {
+  const reduced = typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (typeof document.startViewTransition === 'function' && !reduced) {
+    try {
+      document.startViewTransition(update);
+      return;
+    } catch (err) {
+      // A transition is already in flight — a second view switch landed mid-
+      // fade, or the document cannot transition right now. The switch must
+      // still happen, so it falls back to the plain update rather than
+      // silently swallowing the click.
+    }
+  }
+  update();
+}
 
 // ---------------------------------------------------------------------------
 // The setup wizard's decisions. One renderer serves both the first-run wizard
@@ -1293,6 +1409,7 @@ async function checkStale() {
       paintStale(document.getElementById('nowstrip'), null);
       showStale(null);
       staleMisses = 0;
+      paintConn(false);
       return;
     }
     if (response.ok) {
@@ -1318,6 +1435,13 @@ async function checkStale() {
   } else {
     staleMisses = 0;
   }
+  // The pulse follows the same verdict, on the same clock. A status that could
+  // not be reached after the tolerated misses confirms nothing and takes the
+  // pulse away; a single dropped poll (the tolerated miss) holds it, exactly as
+  // it holds the banner.
+  paintConn(Boolean(status && status.running && status.connected
+    && !status.yielding
+    && status.staleness && !status.staleness.stale));
   // An unreachable status is not a verdict of fresh: a strip already marked
   // stale by the last reachable reply must not be un-marked by an outage that
   // only stopped the service from answering.
@@ -1477,6 +1601,20 @@ function paintStale(strip, stale) {
   else strip.removeAttribute('title');
 }
 
+// The connection pill's live state, written from the same /api/status verdict
+// the banner draws. The dot breathes only while the collector is genuinely
+// live — running, connected, not handed over, and not stale — so a pulse can
+// never survive a dead collector, and no page has to remember to ask for it.
+// Written on the root rather than on the pill for the same reason the light
+// state is: the state is the page's to know, and a look sheet (or a page)
+// reacts to it without the pill needing a class a page might overwrite. With
+// the attribute absent the dot is exactly as it was before any of this.
+function paintConn(live) {
+  const root = document.documentElement;
+  if (live) root.setAttribute('data-conn-live', '');
+  else root.removeAttribute('data-conn-live');
+}
+
 function mountLiveStrip() {
   const header = document.querySelector('header');
   if (!header || header.querySelector('.nowstrip')) return null;
@@ -1525,6 +1663,11 @@ function applyLive(payload) {
       cell.textContent = value === null
         ? DASH
         : (spec.signed && value >= 0 ? '+' : '') + kw(value);
+      // A measured zero is a reading and stays, but recedes; an absent value
+      // is the dash and is never marked, so the two cannot be confused.
+      // Guarded so a cell that carries no classList — an unusual DOM, or a
+      // test double — no-ops rather than throwing; a real <b> always has one.
+      if (cell.classList) cell.classList.toggle('is-zero', value === 0);
     }
   }
   // The attribute is set for every look, not only for Glass. Classic declares
@@ -1651,7 +1794,22 @@ function drawRanges(el, current, onPick) {
 // crosshair at the same instant on the others. Zoom rides the same channel:
 // a drag-select on one window zooms them all and a double-click resets them
 // together, which is the only way the comparison stays honest.
+//
+// Every chart is in the group by default; chartBase merges CHART_SYNC into
+// the cursor of every chart it builds. uPlot syncs through the x-scale value
+// (posToVal on the sending chart, valToPos on the rest), so a crosshair lands
+// at the same instant wherever that instant exists in the other chart's range
+// — the sync never depends on the charts being the same size or covering the
+// same span. A chart that genuinely must not participate passes `sync: false`
+// to chartBase; the forecast chart on the dashboard is the one deliberate
+// opt-out, because its range is a fixed calendar day while its neighbours
+// follow the selected window.
 const SYNC_KEY = 'arraysense';
+
+// The one sync declaration. The x scale is the shared range every band on the
+// Graphs page is drawn over; the y scale is deliberately not in the list, so a
+// band's own value never rides another band's axis.
+const CHART_SYNC = { key: SYNC_KEY, setSeries: false, scales: ['x', null] };
 
 // uPlot paints on a canvas and a canvas has no idea what var(--pv) means, so
 // the palette has to be resolved to real colours. It is read back out of the
@@ -1987,7 +2145,63 @@ function fade(name, alpha) {
 // expected to read belongs. The gutters below grew with it: a taller label needs
 // more height under the plot, and a wider one needs more room beside it, or the
 // text clips instead of shrinking.
-const AXIS_FONT = '12px system-ui,-apple-system,"Segoe UI",sans-serif';
+//
+// The labels are painted onto the canvas, which takes its font from a string
+// rather than from the stylesheet, so the vendored face has to be named here
+// and cannot be read from a token. Figures belong in the mono face — a mono
+// face is tabular by construction, which is the same property the figures in
+// the cards get from font-variant-numeric — and the stack leads with JetBrains
+// Mono and falls back to the system mono every other figure in Classic uses,
+// so an installation on Classic, which ships no @font-face for the vendored
+// face, reads the axes in the same face as its cards rather than in the UI
+// face the axes used to show.
+const AXIS_FONT = '12px "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace';
+
+// The vendored face has to be loaded before the canvas paints, or the browser
+// silently resolves the string to the fallback and the labels stay in the
+// system face. So the load is asked for here, at module time, and any chart
+// drawn before the face is ready is repainted when it is. On Classic the face
+// is not declared at all; the load settles empty, the fallback stack is what
+// redraws with, and the axes and the cards agree in Classic, which is all the
+// rule asks.
+if (typeof document !== 'undefined' && document.fonts && document.fonts.load) {
+  document.fonts.load(AXIS_FONT).catch(() => {});
+}
+
+// Whether the face the axis wants is usable right now. A face still loading —
+// or unknown, which for a canvas is the same thing as not loaded — answers
+// false, which is what makes the repaint below happen. A page where every
+// font is already in place answers true and no chart redraws for this.
+function axisFontReady() {
+  if (typeof document === 'undefined' || !document.fonts || !document.fonts.check) return true;
+  try {
+    return document.fonts.check(AXIS_FONT);
+  } catch (err) {
+    return true;
+  }
+}
+
+// Redraw every chart whose axis may have painted in the fallback face. Called
+// from the first chart that draws before the face is ready; charts drawn
+// later find the face loaded and skip straight past. One redraw is enough —
+// after the face is in the set every subsequent draw resolves it — hence the
+// waiting guard, which also keeps a slow font from queueing one redraw per
+// chart.
+let axisFontWaiting = false;
+function ensureAxisFont() {
+  if (axisFontReady() || axisFontWaiting) return;
+  if (typeof document === 'undefined' || !document.fonts || !document.fonts.load) return;
+  axisFontWaiting = true;
+  document.fonts.load(AXIS_FONT)
+    .then(() => {
+      for (const id of Object.keys(CHARTS)) {
+        const held = CHARTS[id];
+        if (held && held.u) held.u.redraw();
+      }
+    })
+    .catch(() => {})
+    .finally(() => { axisFontWaiting = false; });
+}
 
 // A gap is a break, never bridged. A null reading, or a row the collector
 // wrote with an error because the poll failed, enters the series as null and
@@ -2102,8 +2316,9 @@ const zeroRule = () => ({
 // opacity only — no new hue. The maintainer is colour blind and every hue has to
 // be measured against every other, so a band with its own colour would be one
 // nobody checked; a tariff also has as many bands as it likes, which two colours
-// could never say. Luminance carries it instead, and luminance is the one
-// distinction that survives every form of colour vision deficiency.
+// could never say. Luminance carries it instead, and it survives the three
+// deficiencies the validator actually simulates — protanopia, deuteranopia and
+// tritanopia — which is not every form of colour vision deficiency.
 //
 // On a dark panel the wash is white, so more opacity reads *brighter*. The more
 // expensive the band, the more it stands out, which puts the eye on the costly
@@ -2426,21 +2641,37 @@ function batteryRange(u, min, max) {
   return [-mag * 1.08, mag * 1.08];
 }
 
-const chartBase = (extra) => Object.assign({
-  padding: [12, 14, 0, 0],
-  // The panel header already names the series; uPlot's own legend would say it
-  // again in a second style.
-  legend: { show: false },
-  cursor: {
-    // uPlot's own zoom, left switched on: drag a window on the time axis,
-    // double-click anywhere to go back to the whole range.
-    drag: { x: true, y: false, setScale: true },
-    // One vertical crosshair and no horizontal one. These charts are read
-    // against time, not against whatever value the pointer is level with.
-    y: false,
-    sync: { key: SYNC_KEY, setSeries: false, scales: ['x', null] },
-  },
-}, extra);
+const chartBase = (extra) => {
+  const out = Object.assign({
+    padding: [12, 14, 0, 0],
+    // The panel header already names the series; uPlot's own legend would say it
+    // again in a second style.
+    legend: { show: false },
+    cursor: {
+      // uPlot's own zoom, left switched on: drag a window on the time axis,
+      // double-click anywhere to go back to the whole range.
+      drag: { x: true, y: false, setScale: true },
+      // One vertical crosshair and no horizontal one. These charts are read
+      // against time, not against whatever value the pointer is level with.
+      y: false,
+    },
+  }, extra);
+  // Crosshair sync is the default: every chart joins the page's group, so a
+  // cursor on any one of them puts the crosshair at the same instant on the
+  // rest and a drag-select zooms them together. A chart that must not
+  // participate passes `sync: false` — the forecast chart on the dashboard is
+  // the one deliberate opt-out, because it is pinned to a fixed calendar day
+  // while its neighbours follow the selected window. `sync` is chartBase's own
+  // option and must not ride into uPlot's opts, so it is merged into the cursor
+  // and removed.
+  if (out.sync === false || out.sync === null) {
+    delete out.cursor.sync;
+  } else {
+    out.cursor = Object.assign({}, out.cursor, { sync: out.sync || CHART_SYNC });
+  }
+  delete out.sync;
+  return out;
+};
 
 // Live instances by chart id, so a refresh updates the data in place instead
 // of tearing the canvas down and losing the zoom with it.
@@ -2546,6 +2777,10 @@ function paint(id, spec, data) {
     if (keep) held.u.redraw();
   }
   fit(wrap, held.u, spec.height);
+  // If the vendored axis face was still loading, this chart just painted its
+  // labels in the fallback; ensureAxisFont repaints every chart once the face
+  // arrives. Harmless when the face is already in place.
+  ensureAxisFont();
 }
 
 // A fetch that cannot hang forever. A dongle behind a dead proxy can accept a
@@ -3632,7 +3867,7 @@ function showOffer() {
   box.setAttribute('role', 'region');
   box.setAttribute('aria-label', 'Tour offer');
   box.innerHTML = `
-    <div class="calmark" aria-hidden="true">?</div>
+    <div class="calmark" aria-hidden="true"><svg class="ic"><use href="#ph-question"></use></svg></div>
     <div class="calbody">
       <h2>Take a quick tour</h2>
       <p>A short walkthrough of the pages — what each card is for and where the numbers come
