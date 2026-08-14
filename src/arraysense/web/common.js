@@ -3159,6 +3159,39 @@ function mountSetup(host, payload, opts) {
         state.inverter_serial = body.serial;
         const input = host.querySelector('[data-k="inverter_serial"]');
         if (input) input.value = body.serial;
+      }
+      if (body.model) {
+        // Select it in the model dropdown, the same driver family already chosen.
+        // The match can miss — Detect is often clicked before the right
+        // manufacturer is — and the status must say only what actually happened.
+        const modelSelect = host.querySelector('[data-role="model"]');
+        const match = [...modelSelect.options].find((o) => o.value.endsWith('::' + body.model));
+        if (match) {
+          modelSelect.value = match.value;
+          const [driver, name] = match.value.split('::');
+          state.driver = driver; state.model = name;
+          render();
+          status(`The inverter answered as a ${body.model}, serial ${body.serial}.`, 'ok');
+        } else {
+          status(`The inverter answered as a ${body.model}, serial ${body.serial}, but ` +
+            `that model isn't listed under the manufacturer currently selected above.`, 'warn');
+        }
+      } else if (body.serial && body.model_read_failed) {
+        // The serial answered on the same connection the model read failed on,
+        // which is what a flaky link looks like — but it is also what a
+        // retried-out dongle misroute or a device that simply never serves
+        // these registers looks like. Naming the transport is a useful hint,
+        // not a diagnosis: the wording must not assert the fault is the link.
+        const hint = state.transport === 'modbus_serial'
+          ? 'if this keeps happening, check the RS485 connection.'
+          : 'if this keeps happening, check the WiFi dongle connection.';
+        status(`The inverter answered with serial ${body.serial}, but reading its ` +
+          `model failed — ${hint}`, 'warn');
+      } else if (body.serial && body.family_recognized) {
+        status(`The inverter answered with serial ${body.serial}. Its family was ` +
+          `recognized but the exact model could not be confirmed — look for it in the ` +
+          `list below, or enter it by hand if it isn't there.`, 'warn');
+      } else if (body.serial) {
         status(`The inverter answered with serial ${body.serial}.`, 'ok');
       } else {
         status('The probe returned no serial.', 'warn');

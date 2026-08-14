@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
@@ -432,7 +433,7 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
         return {"query": q.strip(), "candidates": results}
 
     @app.post("/api/setup/detect")
-    async def setup_detect(body: dict[str, object]) -> dict[str, str]:
+    async def setup_detect(body: dict[str, object]) -> dict[str, Any]:
         # A plain dict rather than DetectRequest: a nested endpoint annotated
         # with the imported class is an unresolved forward reference under this
         # module's postponed annotations, which FastAPI turns into a 422 for a

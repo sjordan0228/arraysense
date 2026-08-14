@@ -54,6 +54,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pylxpweb import InverterModelInfo
 from pylxpweb.transports.exceptions import TransportError, TransportResponseMismatchError
 from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
 from pylxpweb.transports.modbus_serial import ModbusSerialTransport
@@ -522,6 +523,41 @@ def find_model_by_name(name: str) -> ModelSpec:
         if model.name == name:
             return model
     raise ValueError(f"no model {name!r} in this family")
+
+
+def identify_model(device_type_code: int, hold_model_reg0: int, hold_model_reg1: int) -> str | None:
+    """Return the exact model name register 19 and HOLD_MODEL together identify.
+
+    The mapping is pylxpweb's own claim, read from the top-level export rather
+    than transcribed: ``InverterModelInfo.get_power_rating_kw``'s docstring
+    matches PV series code 2092 to ratings 2 -> 12 kW and 6 -> 18 kW, and
+    FlexBOSS code 10284 to 8 -> 21 kW and 9 -> 18 kW — the same pair of
+    device-type codes the MODELS table above already cites for its PV-string
+    counts, and no further. Returns None for anything else, because a family
+    this project has not cited a model-level mapping for (off-grid, LXP) must
+    not come back from Detect as a confident match. A guess dressed as a
+    detection is worse than the wizard asking the owner to pick one.
+    """
+    rating_kw = InverterModelInfo.from_registers(
+        hold_model_reg0, hold_model_reg1
+    ).get_power_rating_kw(device_type_code)
+    if device_type_code == 2092:  # PV series: the 18kPV and the 12kPV
+        return {18: "18kPV", 12: "12kPV"}.get(rating_kw)
+    if device_type_code == 10284:  # FlexBOSS: the FlexBOSS21 and the FlexBOSS18
+        return {21: "FlexBOSS21", 18: "FlexBOSS18"}.get(rating_kw)
+    return None
+
+
+# The device-type codes this project's own registry has cited a meaning for,
+# used only to tell a recognized family whose exact model identify_model could
+# not pin down from nothing recognized at all. 2092 PV series (18kPV, 12kPV),
+# 10284 FlexBOSS (FlexBOSS21, FlexBOSS18), 54 SNA off-grid (12000XP, 6000XP)
+# and 38 the 6000XP variant — stated as literals here, beside the function
+# that already cites the first two, rather than the library's private table.
+# No LXP code is cited anywhere in this driver, so none is listed. A family
+# added to MODELS without a matching code here silently stops being detected
+# as recognized — there is no test that catches that drift, so add both.
+RECOGNIZED_DEVICE_TYPE_CODES = frozenset({2092, 10284, 54, 38})
 
 
 def _reading(source: object, attribute: str) -> float | None:

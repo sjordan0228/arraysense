@@ -7,6 +7,22 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.3 — 14 August 2026
+
+The wizard's Detect button now says which inverter answered, not just its serial.
+
+### Added
+
+- **Detect reads the model, not only the serial.** The 18kPV, 12kPV,
+  FlexBOSS21 and FlexBOSS18 are read off the same connection Detect already
+  opens and told apart exactly; an off-grid or other recognized family says so
+  without guessing which one; and a register read that fails after the serial
+  already answered names the transport, rather than leaving the page silent
+  about which connection to check. If the model detected isn't one the
+  currently selected manufacturer offers — Detect is often clicked before the
+  right one is chosen — the page says what answered without claiming the form
+  now reflects it.
+
 ## 1.0.2 — 13 August 2026
 
 A performance ratio that was roughly double for one wiring arrangement.

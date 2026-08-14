@@ -29,7 +29,7 @@ import logging
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
@@ -2449,18 +2449,50 @@ class DetectRequest(BaseModel):
         return value
 
 
-async def _probe_serial(body: DetectRequest) -> str:
+@dataclass
+class ProbeResult:
+    """What a probe read off the wire: the serial, and the model when readable.
+
+    The model fields are optional because the register read is best-effort —
+    the serial is what the wizard cannot proceed without. ``model_read_failed``
+    separates a register read that raised (a connection symptom, the thing a
+    "check your connection" message is for) from a read that returned a code
+    this project does not recognize (a real answer, just not one in the map).
+    The frontend never has to guess which happened: the two are different
+    fields.
+    """
+
+    serial: str
+    model: str | None = None
+    family_recognized: bool = False
+    model_read_failed: bool = False
+
+
+async def _probe_serial(body: DetectRequest) -> ProbeResult:
     """Open the candidate transport read-only and ask who is there.
 
     Split from the route so tests can stand in for the hardware: the route's
     job is borrowing, error mapping and never writing; this function's job is
     the wire. The library imports live inside so the module keeps no
     top-level dependency on the transport stack.
+
+    The model registers are read on the same connection as the serial, before
+    it is released. A second connection would cost a second open and release
+    on a wire that admits one client, and on the serial transport a second
+    open can fail while the first worked. The model read is best-effort and
+    its failure never costs the serial: a register read raising beside a
+    serial read that just succeeded is exactly what a flaky RS485 link looks
+    like, and it is reported as its own field rather than failing the probe.
     """
     from pylxpweb.transports.dongle import DongleTransport
     from pylxpweb.transports.exceptions import TransportError
     from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
     from pylxpweb.transports.modbus_serial import ModbusSerialTransport
+
+    from arraysense.drivers.eg4_luxpower.source import (
+        RECOGNIZED_DEVICE_TYPE_CODES,
+        identify_model,
+    )
 
     transport: ModbusSerialTransport | DongleTransport
     if body.transport == "modbus_serial":
@@ -2488,11 +2520,34 @@ async def _probe_serial(body: DetectRequest) -> str:
         # unhandled 500 on the unauthenticated setup surface.
         raise ConnectionError(str(exc)) from exc
     try:
-        return str(await transport.read_serial_number())
+        serial = str(await transport.read_serial_number())
     except (TransportError, OSError) as exc:
         raise ConnectionError(str(exc)) from exc
+
+    model: str | None = None
+    family_recognized = False
+    model_read_failed = False
+    try:
+        regs = await transport.read_parameters(0, 20)
+        device_type_code = regs.get(19)
+        if device_type_code is not None:
+            model = identify_model(device_type_code, regs.get(0, 0), regs.get(1, 0))
+            family_recognized = device_type_code in RECOGNIZED_DEVICE_TYPE_CODES
+    except (TransportError, OSError) as exc:
+        # The serial already answered on this same connection; a register read
+        # failing beside it is a connection symptom and must not fail the whole
+        # probe. It is signalled so the page can name the transport, and logged
+        # because an unattended service loses a flaky-link hint if nothing says.
+        model_read_failed = True
+        logger.warning("serial %s read but the model registers did not answer: %s", serial, exc)
     finally:
         await transport.disconnect()
+    return ProbeResult(
+        serial=serial,
+        model=model,
+        family_recognized=family_recognized,
+        model_read_failed=model_read_failed,
+    )
 
 
 # One detect at a time across the process. Two concurrent probes would both
@@ -2501,8 +2556,8 @@ async def _probe_serial(body: DetectRequest) -> str:
 _DETECT_LOCK = asyncio.Lock()
 
 
-async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, str]:
-    """Read the inverter's serial off a candidate connection. Writes nothing.
+async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, Any]:
+    """Read the inverter's serial and model off a candidate connection. Writes nothing.
 
     Shared by the running-service route and first-run setup so the two cannot
     validate differently. A running collector holds the single client slot —
@@ -2512,6 +2567,14 @@ async def run_detect(body: DetectRequest, service: CollectorService | None) -> d
     it, and starts it again on the way out whatever happened. In setup mode
     there is no collector, so nothing is borrowed. The mismatch decision
     belongs to the page: this returns what answered.
+
+    The model fields only appear when they mean something. ``model`` when an
+    exact model was identified, ``family_recognized`` when the family was
+    recognized but no exact model could be asserted, ``model_read_failed``
+    when the model register read raised on an otherwise-working connection.
+    A probe that answered a serial and nothing else returns exactly
+    ``{"serial": ...}``, the same shape it always did — which is also why a
+    stand-in probe that returns a bare serial string still works here.
     """
     if body.transport not in ("dongle", "modbus_serial"):
         raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
@@ -2531,13 +2594,26 @@ async def run_detect(body: DetectRequest, service: CollectorService | None) -> d
             await service.stop()
             borrowed = True
         try:
-            serial = await _probe_serial(body)
+            result = await _probe_serial(body)
         except (ConnectionError, OSError, TimeoutError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         finally:
             if borrowed and service is not None:
                 await service.start()
-    return {"serial": serial}
+    if isinstance(result, str):
+        # A bare serial string is what the tests' stand-in probe returns; the
+        # real probe returns a ProbeResult. The bare string means "no model
+        # answer at all", which is also the honest reading of a model read that
+        # could not be determined.
+        result = ProbeResult(serial=result)
+    payload: dict[str, Any] = {"serial": result.serial}
+    if result.model is not None:
+        payload["model"] = result.model
+    if result.family_recognized:
+        payload["family_recognized"] = True
+    if result.model_read_failed:
+        payload["model_read_failed"] = True
+    return payload
 
 
 def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
@@ -2564,8 +2640,8 @@ def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
 
 
 @router.post("/setup/detect")
-async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
-    """Read the inverter's serial off a candidate connection. Writes nothing."""
+async def setup_detect(request: Request, body: DetectRequest) -> dict[str, Any]:
+    """Read the inverter's serial and model off a candidate connection. Writes nothing."""
     file_config = getattr(request.app.state, "file_config", None) or request.app.state.config
     settings = SettingsStore(request.app.state.store)
     body = _fill_masked_detect(body, effective(file_config, settings))
