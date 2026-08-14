@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
+from arraysense.auth import AUTH_PASSWORD_KEY
 from arraysense.panels import EXAMPLE_STRINGS, parse_strings
 from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, Tier
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
@@ -218,8 +219,8 @@ class SettingSpec:
 
     ``secret`` marks a value the API masks rather than echoes. The dongle and
     inverter serials are not passwords, but they identify specific hardware and
-    the settings page has no authentication in front of it, so they go out with
-    their middle replaced — enough for the owner to recognise which serial is
+    reads stay open even when a password is set, so they go out with their
+    middle replaced — enough for the owner to recognise which serial is
     configured, not enough for a stranger on the network to learn it.
 
     ``label`` and ``help`` live here rather than in the page because the page is
@@ -1226,7 +1227,7 @@ class SettingsStore:
         rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
         out: dict[str, object] = {}
         for key, raw in rows:
-            if key in (CONFIG_VERSION_KEY, _EFFICIENCY_SCORER_REVISION_KEY):
+            if key in (CONFIG_VERSION_KEY, _EFFICIENCY_SCORER_REVISION_KEY, AUTH_PASSWORD_KEY):
                 continue
             try:
                 out[key] = lookup_setting(key).decode(raw)
@@ -1287,11 +1288,13 @@ class SettingsStore:
         value being readable by someone who did not already know it.
 
         **This is form safety, not confidentiality, and the difference matters.**
-        The same unauthenticated endpoint accepts writes, so a client on the
-        network can point ``connection.dongle_host`` at a listener it controls
-        and read both serials off the wire at the next poll — the protocol
-        carries them in clear ASCII. Masking stops a serial being read off the
-        page; only authentication stops it being taken. Nothing here should be
+        With no password set, the same unauthenticated endpoint accepts writes,
+        so a client on the network can point ``connection.dongle_host`` at a
+        listener it controls and read both serials off the wire at the next
+        poll — the protocol carries them in clear ASCII. Masking stops a serial
+        being read off the page; only authentication stops it being taken, and
+        since #34 that is a password the owner can now actually set, which
+        closes this particular route. Nothing here should be
         described to an owner as protecting the value.
         """
         out: dict[str, object] = {}

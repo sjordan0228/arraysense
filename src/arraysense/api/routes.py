@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -34,11 +35,20 @@ from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
+from arraysense.auth import (
+    MIN_PASSWORD_LENGTH,
+    Sessions,
+    clear_password,
+    password_hash,
+    password_is_set,
+    set_password,
+    verify_password,
+)
 from arraysense.calibration import (
     CORROBORATING_ABSORB,
     PACK_RESET_LAG,
@@ -133,6 +143,32 @@ def _read_store(request: Request) -> Iterator[SqliteStore]:
 
 
 _ReadStore = Annotated[SqliteStore, Depends(_read_store)]
+
+# The cookie the session token rides in. Named here because both the login
+# route that sets it and the guard that reads it have to agree, and a literal
+# typed in two places drifts the way every other repeated literal here does.
+_SESSION_COOKIE = "arraysense_session"
+
+
+async def _require_write(request: Request) -> None:
+    """Allow an unauthenticated write only while no password is set.
+
+    This is the optional half and the whole point of #34: with no hash stored
+    the request passes through exactly as it did before authentication
+    existed. With one stored, the session cookie is checked against the
+    in-memory sessions, and an absent, unknown or expired session is a 401.
+    What this protects against is casual and accidental writes from anything
+    on the LAN; the traffic is plain HTTP and observable, and the auth
+    endpoints' docstrings say so rather than claiming more.
+    """
+    settings = SettingsStore(request.app.state.store)
+    if not password_is_set(settings):
+        return
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token is not None and request.app.state.sessions.valid(token):
+        return
+    raise HTTPException(status_code=401, detail="authentication required")
+
 
 _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 
@@ -931,7 +967,7 @@ def _reject_unwritable_backup_dir(request: Request, wanted: dict[str, Any]) -> N
         raise ValueError(f"{BACKUP_DIRECTORY_KEY}: {exc}") from exc
 
 
-@router.put("/settings")
+@router.put("/settings", dependencies=[Depends(_require_write)])
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
 
@@ -983,6 +1019,146 @@ def _is_mask(key: str, value: object) -> bool:
     except KeyError:
         return False
     return spec.secret and isinstance(value, str) and "\N{BULLET}" in value
+
+
+@router.get("/auth")
+def auth_status(request: Request) -> dict[str, Any]:
+    """Whether authentication is on, and whether this client holds a session.
+
+    A read and deliberately open: the login form has to know whether to render
+    at all, and this reveals only that a password is set — not the password,
+    and not any other setting. That fact is not secret; every write endpoint
+    already answers it, by answering 401 or not.
+    """
+    settings = SettingsStore(request.app.state.store)
+    token = request.cookies.get(_SESSION_COOKIE)
+    authenticated = token is not None and request.app.state.sessions.valid(token)
+    return {"required": password_is_set(settings), "authenticated": authenticated}
+
+
+class LoginRequest(BaseModel):
+    """The password being presented for a session."""
+
+    password: str
+
+
+@router.post("/auth/login")
+def login(request: Request, response: Response, body: LoginRequest) -> dict[str, Any]:
+    """Start a session in exchange for the password.
+
+    The cookie is HttpOnly so the page's own script cannot read it,
+    SameSite=Strict so a request from another origin cannot ride it — the
+    write API is CSRF-able today, and this closes that as a side effect — and
+    Path=/ so it reaches every protected endpoint. Max-Age matches the session
+    lifetime. Deliberately not Secure: this is plain HTTP on a LAN, and a
+    Secure cookie would simply never be sent, so setting it would leave the
+    owner unable to log in and nothing on the page to say why.
+    """
+    key = request.client.host if request.client else "unknown"
+    now = time.time()
+    if request.app.state.throttle.blocked(key, now):
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed attempts; try again shortly",
+        )
+    settings = SettingsStore(request.app.state.store)
+    stored = password_hash(settings)
+    if stored is None:
+        # Nothing to guess yet, so nothing is counted. Counting here let a
+        # stranger spend the owner's five attempts before the owner had set a
+        # password at all, and the block is keyed on the address, so the
+        # owner's own first login met a 429 somebody else earned — renewable
+        # indefinitely, and waiting never cleared it. Measured before the fix:
+        # five junk attempts with no password set, then the correct password
+        # on a freshly set one answered 429.
+        raise HTTPException(status_code=401, detail="incorrect password")
+    if not verify_password(body.password, stored):
+        request.app.state.throttle.record_failure(key, now)
+        raise HTTPException(status_code=401, detail="incorrect password")
+    request.app.state.throttle.record_success(key)
+    token = request.app.state.sessions.issue()
+    response.set_cookie(
+        _SESSION_COOKIE,
+        token,
+        max_age=int(Sessions.SESSION_LIFETIME.total_seconds()),
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return {"ok": True}
+
+
+@router.post("/auth/logout")
+def logout(request: Request, response: Response) -> dict[str, Any]:
+    """End this session and clear its cookie.
+
+    Always 200, even when nothing was logged in: logout is idempotent, and the
+    login form must be able to call it without first asking whether a session
+    exists. The cookie is deleted rather than merely expired, so the browser
+    forgets it instead of re-sending a token the server no longer recognises.
+    """
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token is not None:
+        request.app.state.sessions.revoke(token)
+    response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return {"ok": True}
+
+
+class PasswordRequest(BaseModel):
+    """A new password, and the current one when one is already set."""
+
+    new_password: str
+    current_password: str | None = None
+
+
+@router.post("/auth/password")
+def change_password(request: Request, response: Response, body: PasswordRequest) -> dict[str, Any]:
+    """Set, change or clear the password.
+
+    Setting the first password needs no credential — there is none yet, and
+    this endpoint is no more exposed than every other write it is protecting.
+    Changing or clearing an existing password requires the current one,
+    verified, whatever the session state: a session proves the browser once
+    logged in, not that the person at it knows the password. An empty
+    ``new_password`` clears the password — the owner's way of switching
+    authentication off — and revokes every session.
+
+    This shares the login throttle rather than keeping its own, because it
+    verifies the same secret: guarding only the login endpoint would leave the
+    backstop with a second door standing open, and the guessing rate through
+    it was measured at unlimited against login's five-a-minute. Failures count
+    only once a password is set — before that there is no secret to guess, and
+    counting would let a stranger fill the throttle the owner is going to need.
+    A consequence worth naming: five wrong guesses here also block login from
+    that address for a minute, which is right, since it is one secret.
+    """
+    settings = SettingsStore(request.app.state.store)
+    stored = password_hash(settings)
+    if stored is not None:
+        key = request.client.host if request.client else "unknown"
+        now = time.time()
+        if request.app.state.throttle.blocked(key, now):
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed attempts; try again shortly",
+            )
+        current = body.current_password
+        if not current or not verify_password(current, stored):
+            request.app.state.throttle.record_failure(key, now)
+            raise HTTPException(status_code=401, detail="current password is required")
+        request.app.state.throttle.record_success(key)
+    if body.new_password:
+        if len(body.new_password) < MIN_PASSWORD_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
+            )
+        set_password(settings, body.new_password)
+    else:
+        clear_password(settings)
+        request.app.state.sessions.revoke_all()
+        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return {"ok": True}
 
 
 @router.get("/costs")
@@ -1856,7 +2032,7 @@ class BackfillRequest(BaseModel):
     end: str
 
 
-@router.post("/efficiency/backfill")
+@router.post("/efficiency/backfill", dependencies=[Depends(_require_write)])
 def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict[str, Any]:
     """Fetch past hourly conditions into the store, a day at a time.
 
@@ -2639,7 +2815,7 @@ def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
     return body.model_copy(update=updates) if updates else body
 
 
-@router.post("/setup/detect")
+@router.post("/setup/detect", dependencies=[Depends(_require_write)])
 async def setup_detect(request: Request, body: DetectRequest) -> dict[str, Any]:
     """Read the inverter's serial and model off a candidate connection. Writes nothing."""
     file_config = getattr(request.app.state, "file_config", None) or request.app.state.config
@@ -2710,7 +2886,7 @@ def _schedule_restart() -> None:
     loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
 
 
-@router.post("/setup/apply")
+@router.post("/setup/apply", dependencies=[Depends(_require_write)])
 async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     """Validate the merged result, write the overlay, restart the collector.
 
@@ -2748,7 +2924,7 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     return {"applied": sorted(provided), "restarting": True}
 
 
-@router.post("/yield")
+@router.post("/yield", dependencies=[Depends(_require_write)])
 async def yield_dongle(request: Request, body: YieldRequest) -> dict[str, Any]:
     """Release the dongle so the vendor's app can push a firmware update.
 
@@ -2760,7 +2936,7 @@ async def yield_dongle(request: Request, body: YieldRequest) -> dict[str, Any]:
     return {"yielding": True, "seconds": body.seconds, "until": until.isoformat()}
 
 
-@router.post("/resume")
+@router.post("/resume", dependencies=[Depends(_require_write)])
 async def resume(request: Request) -> dict[str, Any]:
     """Take the dongle back before the yield timer runs out."""
     await request.app.state.service.resume()

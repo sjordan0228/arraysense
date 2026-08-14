@@ -13,9 +13,9 @@
 <script src="/common.js"></script>
 <style>
   .grp{margin-bottom:12px}
-  /* The Theme area takes the same introduction as a settings group without
-     being one — see the comment on #lookSec in the body. */
-  .grp .intro,#lookSec .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
+  /* The Theme and Access areas take the same introduction as a settings group
+     without being one — see the comment on #lookSec in the body. */
+  .grp .intro,#lookSec .intro,#accessSec .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;
     margin:0 0 14px}
   .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
   @media(max-width:760px){.fields{grid-template-columns:1fr}}
@@ -306,6 +306,17 @@
           same value behind it — changing either moves the other.</p>
       </fieldset>
     </div>
+  </section>
+
+  <!-- Not a setting, and deliberately not one: the password lives in the
+       settings table under a key the registry does not know, so the settings
+       API can neither read it nor write it. This section talks to the auth
+       endpoints instead, and renders what /api/auth says rather than assuming
+       the state it was in when the page loaded. It sits on the General tab the
+       way the Theme area does, outside the form. -->
+  <section class="p" id="accessSec" hidden>
+    <div class="chead"><h2>Access</h2></div>
+    <div id="accessHost"></div>
   </section>
 
   <!-- Not a setting: what the process running behind this page actually is.
@@ -773,6 +784,11 @@ function selectTab(id) {
   // appears with it.
   const lookSec = $('lookSec');
   if (lookSec) lookSec.hidden = id !== LOOK_TAB_ID;
+  // The Access section is the same shape of thing as the Theme area: not a
+  // setting, so it is outside the form the loop above walks, and it appears
+  // with the tab it belongs to.
+  const accessSec = $('accessSec');
+  if (accessSec) accessSec.hidden = id !== LOOK_TAB_ID;
   // The rate-schedule heatmap is the same shape of thing as the Theme area: not
   // a setting, so it is outside the form the loop above walks, and it appears
   // with the tab it belongs to.
@@ -2195,11 +2211,19 @@ async function save() {
   say('Saving…', '');
   let response;
   try {
-    response = await fetch('/api/settings', {
+    // 20 s rather than the helper's 8 s default, chosen rather than inherited.
+    // A save is a local SQLite write and answers in milliseconds, but it also
+    // runs the backup-directory writability check, which touches a filesystem
+    // that may not be local. Before authentication this call had no timeout at
+    // all, so the only behaviour a short one could add on an installation with
+    // no password is a save that reports "could not reach the service" while
+    // the service was merely slow — describing a timeout as unreachability,
+    // about a write that may well have landed.
+    response = await writeWithAuth('/api/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(changes),
-    });
+    }, 20000);
   } catch (e) {
     say(`Could not reach the service: ${e.message}. Nothing was saved.`, 'bad');
     dirtyCheck();
@@ -2260,7 +2284,7 @@ function applyDisplay(values) {
 async function applyConnection(body, ui) {
   ui.status('Saving and restarting the collector…', 'busy');
   try {
-    const r = await fetchTimeout('/api/setup/apply', {
+    const r = await writeWithAuth('/api/setup/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }, 20000);
@@ -2278,6 +2302,160 @@ async function applyConnection(body, ui) {
     () => location.reload(),
     () => { ui.status('Saved, but the collector did not report ready. Reload to check its state.', 'warn'); ui.reenable(); },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Access: the password lives outside the settings registry, so this section is
+// written by hand and rendered from /api/auth rather than from describe(). The
+// auth endpoints carry their own credential, so none of this goes through
+// writeWithAuth — a 401 here means "wrong current password", not "log in
+// first" — and the service's own wording is shown rather than a guess.
+// ---------------------------------------------------------------------------
+
+async function mountAccess() {
+  const host = $('accessHost');
+  if (!host) return;
+  let auth = null;
+  try {
+    const r = await fetch('/api/auth');
+    auth = r.ok ? await r.json() : null;
+  } catch (e) {
+    auth = null;
+  }
+  if (!auth) {
+    host.innerHTML = '<p class="intro">The service did not answer when asked about '
+      + 'authentication. Reload the page to try again.</p>';
+    return;
+  }
+  host.innerHTML = auth.required
+    ? accessSetMarkup(auth.authenticated)
+    : accessUnsetMarkup();
+  wireAccess(auth);
+}
+
+function accessUnsetMarkup() {
+  return `
+    <p class="intro">Nothing protects writes right now: any device on this
+      network can change the settings and the connection. Setting a password
+      makes the write endpoints ask for it, while the dashboard keeps reading
+      without one. This is plain HTTP on a home network — the password stops
+      other devices changing things by accident or mischief, not anyone who can
+      watch the traffic.</p>
+    <div class="fields">
+      <div class="f">
+        <label class="lbl" for="accessNew">New password</label>
+        <input id="accessNew" type="password" autocomplete="new-password">
+      </div>
+      <div class="f">
+        <label class="lbl" for="accessConfirm">Confirm password</label>
+        <input id="accessConfirm" type="password" autocomplete="new-password">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="iconbtn" id="accessSet">Set password</button>
+      <span class="said" id="accessSaid"></span>
+    </div>
+    <p class="masknote">Forgot it? Run <code>arraysense --clear-password</code> on the
+      machine — it removes the password and lets every write through again.</p>`;
+}
+
+function accessSetMarkup(authenticated) {
+  const logout = authenticated
+    ? '<button type="button" class="iconbtn" id="accessLogout">Log out</button>'
+    : '';
+  return `
+    <p class="intro">Writes are protected: the write endpoints ask for a
+      session cookie, while the dashboard keeps reading without one. This is
+      plain HTTP on a home network — the password stops other devices changing
+      things by accident or mischief, not anyone who can watch the traffic. A
+      restart ends every session, which is no loss for a wall display that only
+      reads.</p>
+    <div class="fields">
+      <div class="f">
+        <label class="lbl" for="accessCurrent">Current password</label>
+        <input id="accessCurrent" type="password" autocomplete="current-password">
+      </div>
+      <div class="f">
+        <label class="lbl" for="accessNew">New password</label>
+        <input id="accessNew" type="password" autocomplete="new-password">
+      </div>
+      <div class="f">
+        <label class="lbl" for="accessConfirm">Confirm new password</label>
+        <input id="accessConfirm" type="password" autocomplete="new-password">
+      </div>
+    </div>
+    <div class="actions">
+      <button type="button" class="iconbtn" id="accessChange">Change password</button>
+      <button type="button" class="iconbtn" id="accessOff">Turn off authentication</button>
+      ${logout}
+      <span class="said" id="accessSaid"></span>
+    </div>
+    <p class="masknote">Forgot it? Run <code>arraysense --clear-password</code> on the
+      machine — it removes the password and lets every write through again.</p>`;
+}
+
+function wireAccess(auth) {
+  const said = (text, kind) => {
+    const el = $('accessSaid');
+    if (el) { el.textContent = text || ''; el.className = 'said' + (kind ? ' ' + kind : ''); }
+  };
+  const set = $('accessSet');
+  if (set) set.addEventListener('click', async () => {
+    if ($('accessNew').value !== $('accessConfirm').value) {
+      said('The two passwords do not match.', 'bad');
+      return;
+    }
+    await postAuth({ new_password: $('accessNew').value },
+      'Password set. Writes are now protected.', said);
+  });
+  const change = $('accessChange');
+  if (change) change.addEventListener('click', async () => {
+    if ($('accessNew').value !== $('accessConfirm').value) {
+      said('The two new passwords do not match.', 'bad');
+      return;
+    }
+    await postAuth({ new_password: $('accessNew').value, current_password: $('accessCurrent').value },
+      'Password changed.', said);
+  });
+  const off = $('accessOff');
+  if (off) off.addEventListener('click', async () => {
+    await postAuth({ new_password: '', current_password: $('accessCurrent').value },
+      'Authentication is off — writes are open again.', said);
+  });
+  const logout = $('accessLogout');
+  if (logout) logout.addEventListener('click', async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      await mountAccess();
+      said('Logged out.', 'ok');
+    } catch (e) {
+      said(`Could not reach the service: ${e.message}`, 'bad');
+    }
+  });
+}
+
+async function postAuth(body, okMessage, said) {
+  // A slow answer must not be double-sent, so the section's buttons stay
+  // disabled until the reply lands.
+  const buttons = Array.from(document.querySelectorAll('#accessSec .iconbtn'));
+  buttons.forEach((b) => { b.disabled = true; });
+  try {
+    const r = await fetch('/api/auth/password', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const reply = await r.json().catch(() => ({}));
+    if (r.ok) {
+      await mountAccess();
+      said(okMessage, 'ok');
+      return;
+    }
+    said(problemText(reply.detail) || `the service answered ${r.status}`, 'bad');
+  } catch (e) {
+    said(`Could not reach the service: ${e.message}`, 'bad');
+  } finally {
+    buttons.forEach((b) => { b.disabled = false; });
+  }
 }
 
 async function load() {
@@ -2317,6 +2495,7 @@ async function load() {
   applyDisplay(saved);
   stamp();
   mountHeatmap();
+  mountAccess();
 }
 
 function stamp() {

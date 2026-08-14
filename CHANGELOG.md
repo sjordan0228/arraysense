@@ -7,6 +7,47 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.0 — 14 August 2026
+
+A password, if you want one. Nothing changes for anybody who does not.
+
+### Added
+
+- **Optional authentication, off until you set a password.** Until now every
+  device that could reach the port could rewrite every setting — the tariff
+  that decides what you are told your electricity costs, the address the
+  collector polls, whether it polls at all. Setting a password on the Settings
+  page under General closes that. **A fresh install and an existing one behave
+  exactly as before**: there is no default password, nothing to migrate, and
+  nothing to switch off if you do not want it.
+
+  It protects **writes only**, which is what keeps a wall-mounted dashboard
+  working — the pages only read, so a display never logs in and can never be
+  logged out. When a write needs a session you are asked for the password once
+  and the write goes through; it is not a login screen in front of the site.
+
+- **`arraysense --clear-password`**, for when it is forgotten. It runs on the
+  machine, which is a stronger credential than the password it clears, and it
+  says whether a password was actually there rather than exiting silently.
+
+### Notes
+
+- **What this is worth, stated plainly, because it is not everything.** The
+  pages are plain HTTP on a home network, so the password and the session
+  cross it in the clear. It protects against other devices on the network
+  changing things — by accident or by mischief — and not against anyone in a
+  position to watch the traffic. The Settings page says the same thing in the
+  same words, and the documentation does not claim more.
+
+- Sessions are held in memory, so restarting the service ends them. That is
+  deliberate: the database is copied by the backup feature, and a session kept
+  on disk would ride into every archive as a live credential. The only thing
+  authentication writes down is the password's scrypt hash.
+
+- The password is stored where the settings API can neither read it nor write
+  it, and five guesses a minute is all any caller gets — at the login and at
+  the password-change endpoint alike, since both check the same secret.
+
 ## 1.0.3 — 14 August 2026
 
 The wizard's Detect button now says which inverter answered, not just its serial.

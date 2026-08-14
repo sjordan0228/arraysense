@@ -476,6 +476,32 @@ const BASE_CSS = `
   @media (prefers-reduced-motion: no-preference) {
     @view-transition { navigation: auto; }
   }
+  /* The one login prompt on the site. A native <dialog> puts it in the top
+     layer with focus trapping and Escape for free; the styling is the existing
+     panel and ink tokens rather than a colour of its own, and the backdrop is
+     a neutral dim — held off pure black because the shared stylesheet's
+     surface rule forbids a hardcoded near-black background that would not
+     invert with the theme, and a mid-gray dim reads the same way over both. */
+  .authdlg{background:var(--panel);color:var(--ink);border:1px solid var(--panel-b);
+    border-radius:14px;padding:20px 22px;max-width:340px;width:calc(100vw - 40px);
+    box-shadow:0 18px 50px rgba(0,0,0,.4);backdrop-filter:blur(14px);
+    -webkit-backdrop-filter:blur(14px)}
+  .authdlg::backdrop{background:rgba(64,64,64,.5)}
+  .authdlg h2{font-size:15px;margin:0 0 6px}
+  .authdlg .authp{font-size:12px;color:var(--ink2);line-height:1.6;margin:0 0 14px}
+  .authdlg form{display:flex;flex-direction:column;gap:8px}
+  .authdlg label{font-size:11px;color:var(--ink3)}
+  .authdlg input[type=password]{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;
+    font-variant-numeric:tabular-nums}
+  .authdlg input[type=password]:focus{outline:2px solid var(--pv);outline-offset:1px;
+    border-color:transparent}
+  .authdlg .authmsg{font-size:12px;color:var(--bad);line-height:1.55;min-height:1em}
+  .authdlg .authacts{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}
+  .authdlg .primary{background:var(--pv);border:1px solid transparent;color:#1a1204;font-weight:600;
+    font-size:13px;padding:6px 16px;border-radius:8px;cursor:pointer;font-family:inherit}
+  .authdlg .primary:hover{background:#e08c33}
+  .authdlg .primary:disabled{opacity:.45;cursor:default}
 `;
 document.head.appendChild(
   Object.assign(document.createElement('style'), { textContent: BASE_CSS }));
@@ -2913,6 +2939,142 @@ function problemText(detail) {
   return 'the value was refused';
 }
 
+// A write that may ask for a login. With no password set the protected write
+// endpoints answer exactly as they always have, so this is a pass-through and
+// a fresh install never sees the dialog — the login prompt appears only in
+// response to a real 401, which is the rule this phase exists to keep.
+async function writeWithAuth(url, options, ms) {
+  const response = await fetchTimeout(url, options, ms);
+  if (!authShouldRetry(response.status, false)) return response;
+  const loggedIn = await openLoginDialog();
+  if (!loggedIn) return response;
+  // One retry, never two: a repeat 401 here is a genuine failure — the session
+  // did not take, or was revoked between the login and the retry — and the
+  // caller's own error handling is the right response to it.
+  return fetchTimeout(url, options, ms);
+}
+
+// >>> write-auth-logic
+// Whether a 401 deserves the login dialog and one retry. The second half is
+// what stops the loop: a repeat 401 after a successful login is a genuine
+// failure, and answering it with another dialog would retry forever. The
+// dialog's DOM is not exercised here — that is the browser's job — only this
+// decision is, because it is the part a wrong edit would break silently.
+function authShouldRetry(status, alreadyRetried) {
+  return status === 401 && !alreadyRetried;
+}
+// <<< write-auth-logic
+
+// The one login prompt on the site, built lazily because it is only ever
+// needed after a real 401. A native <dialog> with showModal() gives focus
+// trapping and Escape for free, and the password field takes focus when it
+// opens. The markup is static — nothing from the server or the page is
+// interpolated into it — and the messages below go through textContent, so a
+// service reply can never become markup inside the dialog.
+let authDialog = null;
+function authDialogEl() {
+  if (authDialog) return authDialog;
+  const dlg = document.createElement('dialog');
+  dlg.className = 'authdlg';
+  dlg.innerHTML = `
+    <form id="authForm">
+      <h2 id="authTitle">Authentication required</h2>
+      <p class="authp">This write needs a session. Enter the password this
+        installation was set up with.</p>
+      <label for="authPassword">Password</label>
+      <input id="authPassword" name="password" type="password"
+        autocomplete="current-password">
+      <div class="authmsg" id="authMsg" role="status"></div>
+      <div class="authacts">
+        <button type="button" class="iconbtn" id="authCancel">Cancel</button>
+        <button type="submit" class="iconbtn primary" id="authSubmit">Log in</button>
+      </div>
+    </form>`;
+  const form = dlg.querySelector('form');
+  // Settle on every dismissal path rather than on the close event alone.
+  // Cancel resolves the waiting caller directly, Escape through the cancel
+  // event, and the close event stays as the catch-all for any other way the
+  // dialog is dismissed. settleAuth is idempotent, so whichever arrives first
+  // wins and the rest are no-ops.
+  //
+  // Why not trust close by itself: the promise it settles is what a Save
+  // button is waiting on, and a promise that neither resolves nor rejects
+  // leaves that button disabled with nothing on screen to say why — a failure
+  // no gate can see, since it is the absence of an event rather than an error.
+  // One event is a single point of failure for a UI that cannot recover from
+  // it without a reload. (This was not reproduced in a real browser: the
+  // automation harness used here cannot deliver clicks or Escape to a modal
+  // dialog in the top layer and never fires close even on a bare dialog, so
+  // it could not settle the question either way. Chrome does fire close, so
+  // the original single listener was most likely fine; this is belt and
+  // braces, not a fix for a diagnosed defect.)
+  dlg.querySelector('#authCancel').addEventListener('click', () => settleAuth(false));
+  dlg.addEventListener('cancel', () => settleAuth(false));
+  dlg.addEventListener('close', () => settleAuth(false));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = dlg.querySelector('#authPassword');
+    const msg = dlg.querySelector('#authMsg');
+    const submit = dlg.querySelector('#authSubmit');
+    if (!input.value) { msg.textContent = 'Enter the password.'; input.focus(); return; }
+    submit.disabled = true;
+    try {
+      const r = await fetchTimeout('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: input.value }),
+      }, 8000);
+      if (r.ok) { settleAuth(true); return; }
+      let detail = null;
+      try { const body = await r.json(); detail = body.detail; } catch (err) { /* not JSON */ }
+      if (r.status === 429) {
+        // The owner has already been told the password is wrong; the second
+        // message is the one that explains the wait.
+        msg.textContent = 'Too many failed attempts — wait a minute before trying again.';
+      } else {
+        msg.textContent = problemText(detail) || `Login failed (${r.status}).`;
+      }
+      input.value = '';
+      input.focus();
+    } catch (err) {
+      msg.textContent = 'The service could not be reached.';
+      input.focus();
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  document.body.appendChild(dlg);
+  authDialog = dlg;
+  return dlg;
+}
+
+// Open the dialog and resolve with whether the login succeeded. Concurrent
+// callers share one dialog: a second write that hits a 401 while it is open
+// waits on the same outcome and retries alongside the first.
+let authSettle = null;
+let authOutcome = null;
+function openLoginDialog() {
+  const dlg = authDialogEl();
+  if (dlg.open && authOutcome) return authOutcome;
+  authOutcome = new Promise((resolve) => { authSettle = resolve; });
+  const msg = dlg.querySelector('#authMsg');
+  if (msg) msg.textContent = '';
+  const input = dlg.querySelector('#authPassword');
+  if (input) input.value = '';
+  dlg.showModal();
+  if (input) input.focus();
+  return authOutcome;
+}
+
+// Resolve any caller waiting on the dialog. Idempotent: the close event that
+// follows a success finds authSettle already cleared and does nothing.
+function settleAuth(ok) {
+  const resolve = authSettle;
+  authSettle = null;
+  authOutcome = null;
+  if (authDialog && authDialog.open) authDialog.close();
+  if (resolve) resolve(ok);
+}
+
 // Watch the collector come back after a save-and-restart, for both shells. The
 // service SIGTERMs itself and systemd restarts it, so /api/status goes away and
 // then answers again — and in first-run setup mode it did not exist to begin
@@ -3149,7 +3311,7 @@ function mountSetup(host, payload, opts) {
     btn.disabled = true;
     status('Reading the inverter’s serial…', 'busy');
     try {
-      const r = await fetchTimeout('/api/setup/detect', {
+      const r = await writeWithAuth('/api/setup/detect', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildSetupBody(state)),
       }, 20000);

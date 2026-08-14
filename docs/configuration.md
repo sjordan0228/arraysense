@@ -135,6 +135,35 @@ EG4/LuxPower inverters.
 Modbus unit ID for the serial connection. Defaults to `1`. Must be between 1 and
 247, because 0 is the broadcast address and never answers a read.
 
+## Authentication
+
+Authentication is optional and off until a password is set. It is not a
+configuration-file setting and it is not in the settings registry: the password
+is stored in the database under its own key, and the Access section on the
+Settings page's General tab is where it is set, changed and cleared. There is no
+default password and no way for an upgrade to lock an installation out — with no
+hash stored, the service behaves exactly as it did before.
+
+When a password is set, the write endpoints — settings, setup, yield and resume,
+and the efficiency backfill — ask for a session cookie, while every read stays
+open. The dashboard only reads, so it never logs in and a wall display needs
+nothing on its screen. The password and the session cookie cross the network in
+plain HTTP, so the protection is against other devices on the LAN changing
+things by accident or mischief, not against anyone who can watch the traffic.
+
+Sessions live in the service's memory only, so a restart ends every session.
+That is accepted: the dashboard holds none, and nothing about a session is
+written to disk where a backup could carry it.
+
+Forgetting the password is not a lockout. On the machine itself, run:
+
+```bash
+arraysense --clear-password
+```
+
+It removes the stored hash and lets every write through again, and it reports
+which of the two it did — cleared, or already off.
+
 ## Data retention
 
 Three resolution tiers are kept, and queries are served from the coarsest one that

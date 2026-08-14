@@ -32,6 +32,7 @@ from fastapi import FastAPI
 
 from arraysense import __version__, drivers
 from arraysense.api.app import create_app
+from arraysense.auth import clear_password, password_is_set
 from arraysense.collector.service import CollectorService
 from arraysense.collector.weather import WeatherPoller
 from arraysense.config import DEFAULT_PATH, Config, effective, load
@@ -74,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--prune",
         action="store_true",
         help="run one retention pass by hand, then exit",
+    )
+    parser.add_argument(
+        "--clear-password",
+        action="store_true",
+        help="remove the stored password so every write is allowed again, then exit",
     )
     parser.add_argument("--version", action="version", version=f"arraysense {__version__}")
     return parser
@@ -357,6 +363,28 @@ def run_prune(config: Config, *, dry_run: bool) -> int:
     return 0
 
 
+def run_clear_password(config: Config) -> int:
+    """Remove the stored password hash and report what happened.
+
+    Sessions live in memory, so a process that is not running holds none —
+    clearing the hash is all that is needed, and a running service's sessions
+    end on its next restart, which the plan accepts. Works whether or not a
+    password is set and says which, because a command that silently did
+    nothing is how a forgotten password stays forgotten.
+    """
+    _app, store, _service = build_app(config)
+    try:
+        settings = SettingsStore(store)
+        if password_is_set(settings):
+            clear_password(settings)
+            print("authentication password cleared; writes are allowed again")
+        else:
+            print("no password was set; authentication was already off")
+    finally:
+        store.close()
+    return 0
+
+
 def _schedule_setup_restart() -> None:
     """Exit cleanly in a moment, after the apply response has gone out.
 
@@ -587,6 +615,13 @@ def main(argv: list[str] | None = None) -> int:
             return run_prune(config, dry_run=args.prune_dry_run)
         except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
             logger.error("retention prune failed; database may have been partially pruned: %s", exc)
+            return 1
+
+    if args.clear_password:
+        try:
+            return run_clear_password(config)
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            logger.error("could not clear the password: %s", exc)
             return 1
 
     if needs_device_migration(config.database_path):
