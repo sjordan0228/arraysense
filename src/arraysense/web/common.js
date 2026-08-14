@@ -3195,11 +3195,18 @@ function mountSetup(host, payload, opts) {
     const out = [];
     for (const fam of (mk && mk.families) || []) {
       for (const m of fam.models || []) {
+        // Every field the option list renders from has to be copied across
+        // here. This rebuilds each model rather than passing the payload's own
+        // object through, so a field added to the payload and read by the
+        // renderer is silently empty until it is named on this line — which is
+        // how the family tag reached the browser, passed its own test, and
+        // still drew a bare name in the dropdown.
         out.push({
           driver: fam.driver,
           name: m.name,
           caveat: m.caveat || '',
           unreadable: m.unreadable || [],
+          family: m.family || '',
         });
       }
     }
