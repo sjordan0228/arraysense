@@ -2822,6 +2822,110 @@ def test_detect_hands_back_an_already_yielded_collector(client: Any, monkeypatch
     assert status["running"] is True
 
 
+class _FakeProbeTransport:
+    """A serial transport stand-in that answers the probe's two reads.
+
+    read_parameters returns whatever register map it was built with, or raises
+    the library's TransportReadError when ``raise_read`` is set — the RS485
+    symptom ``model_read_failed`` exists to report. The real factory is
+    monkeypatched away, so the probe never touches a serial port.
+    """
+
+    def __init__(self, regs: dict[int, int] | None = None, raise_read: bool = False) -> None:
+        self._regs = regs if regs is not None else {19: 2092, 0: 0x86C0, 1: 0x9}
+        self._raise_read = raise_read
+
+    async def connect(self) -> None: ...
+    async def disconnect(self) -> None: ...
+
+    async def read_serial_number(self) -> str:
+        return "3352000000"
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        if self._raise_read:
+            from pylxpweb.transports.exceptions import TransportReadError
+
+            raise TransportReadError("could not read holding registers at 0")
+        return dict(self._regs)
+
+
+def _patch_serial_factory(monkeypatch: Any, transport: _FakeProbeTransport) -> None:
+    # _probe_serial imports the factory inside the function, so patching the
+    # factory module's attribute is what the probe resolves at call time.
+    from pylxpweb.transports import factory as factory_module
+
+    monkeypatch.setattr(factory_module, "create_serial_transport", lambda **kwargs: transport)
+
+
+def test_detect_returns_the_model_an_18kpv_answers(client: Any, monkeypatch: Any) -> None:
+    # The serial and the model registers come back together on one connection,
+    # and the response names the exact model so the wizard can select it.
+    _patch_serial_factory(monkeypatch, _FakeProbeTransport())
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["serial"] == "3352000000"
+    assert body["model"] == "18kPV"
+    assert body["family_recognized"] is True
+    assert "model_read_failed" not in body
+
+
+def test_detect_recognizes_an_off_grid_family_without_guessing_the_model(
+    client: Any, monkeypatch: Any
+) -> None:
+    # Code 54 is the off-grid family, which this project's registry only
+    # carries a caveat for. Detection says the family was recognized and stops
+    # there — a guessed model would be the caveat dressed as a citation.
+    _patch_serial_factory(monkeypatch, _FakeProbeTransport(regs={19: 54, 0: 0, 1: 0}))
+    body = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    ).json()
+    assert body["serial"] == "3352000000"
+    assert "model" not in body
+    assert body["family_recognized"] is True
+    assert "model_read_failed" not in body
+
+
+def test_detect_reports_an_unrecognized_family_as_a_plain_serial(
+    client: Any, monkeypatch: Any
+) -> None:
+    # A code nothing in this project has cited is a real answer, not a
+    # connection symptom: no model, no family_recognized, exactly the response
+    # shape the serial-only probe has always returned.
+    _patch_serial_factory(monkeypatch, _FakeProbeTransport(regs={19: 9999, 0: 0, 1: 0}))
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"serial": "3352000000"}
+
+
+def test_detect_reports_a_model_read_that_raised_as_a_connection_symptom(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The serial answered on the same connection the holding-register read
+    # failed on: a register read raising beside a serial read that worked is
+    # exactly what a flaky RS485 link looks like. It is reported as its own
+    # field — not as a failed probe, and not as "nothing recognized" — so the
+    # page can tell the owner to check the connection rather than the list.
+    _patch_serial_factory(monkeypatch, _FakeProbeTransport(raise_read=True))
+    r = client.post(
+        "/api/setup/detect",
+        json={"transport": "modbus_serial", "serial_device": "/dev/rs485"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["serial"] == "3352000000"
+    assert body["model_read_failed"] is True
+    assert "model" not in body
+    assert "family_recognized" not in body
+
+
 def test_clearing_an_overlay_field_is_validated_against_the_file_not_the_overlay(
     tmp_path: Path, monkeypatch: Any
 ) -> None:

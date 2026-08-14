@@ -709,3 +709,47 @@ def test_a_state_of_health_of_zero_is_absence_not_a_dead_bank() -> None:
     # Everything a real degrading bank reports still arrives.
     assert _measured_soh(SimpleNamespace(soh=97.0), "soh") == 97.0
     assert _measured_soh(SimpleNamespace(soh=1.0), "soh") == 1.0
+
+
+# --- identify_model: Detect decodes to the precision the registry trusts -------
+#
+# Register 19 names the family and registers 0-1 (HOLD_MODEL) carry the power
+# rating; together they decode to an exact model name. The mapping is
+# pylxpweb's own claim, cited in identify_model's docstring, and this project
+# only asserts a model where its own MODELS table already carries a citation.
+# That boundary is what keeps an off-grid or LXP family — which MODELS only
+# carries a caveat for — from coming back from Detect as a confident match.
+
+
+def test_identify_model_decodes_the_pv_series_to_an_exact_model() -> None:
+    # Registers from pylxpweb's own InverterModelInfo docstring for the 18kPV
+    # (raw HOLD_MODEL 0x986C0) and the 12kPV's other cited rating. Both come
+    # back as the names the MODELS table carries.
+    assert eg4_source.identify_model(2092, 0x86C0, 0x9) == "18kPV"
+    assert eg4_source.identify_model(2092, 0x40, 0x0) == "12kPV"
+
+
+def test_identify_model_decodes_flexboss_to_an_exact_model() -> None:
+    # FlexBOSS ratings sit eight higher than the PV series': bit 8 of reg1
+    # adds the offset, which is why 0x0/0x100 is 21 kW and 0x20/0x100 is 18 kW.
+    assert eg4_source.identify_model(10284, 0x0, 0x100) == "FlexBOSS21"
+    assert eg4_source.identify_model(10284, 0x20, 0x100) == "FlexBOSS18"
+
+
+def test_identify_model_refuses_an_off_grid_family() -> None:
+    # 54 is the SNA off-grid family and 38 its 6000XP variant. MODELS carries
+    # them only as a caveat, and a caveat must not be handed back as a
+    # detection — the wizard asks the owner to pick instead.
+    assert eg4_source.identify_model(54, 0x86C0, 0x9) is None
+    assert eg4_source.identify_model(38, 0x86C0, 0x9) is None
+
+
+def test_identify_model_refuses_a_code_this_project_has_not_cited() -> None:
+    assert eg4_source.identify_model(9999, 0x86C0, 0x9) is None
+
+
+def test_identify_model_refuses_a_rating_its_own_family_does_not_carry() -> None:
+    # 2092 is the PV family, but rating 4 is not one of its two cited ratings.
+    # The family is recognized; the exact model is not — and that distinction
+    # is the caller's, carried as family_recognized rather than folded here.
+    assert eg4_source.identify_model(2092, 0x80, 0x0) is None
