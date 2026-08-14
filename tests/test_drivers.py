@@ -15,8 +15,10 @@ counts its own energy, and the whole energy model reads those counters.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import fields, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,8 +38,10 @@ from arraysense.drivers.base import (
     find_model,
     resolve_model,
 )
+from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource
 from arraysense.metrics import _MODULE_SLOTS, column_names
 from arraysense.models import BatteryModuleSample
+from arraysense.store.sqlite_store import SqliteStore
 
 
 def _config(driver: str = "eg4_luxpower") -> Config:
@@ -411,6 +415,98 @@ def test_the_12000xp_resolves_to_two_strings_and_excludes_the_generator_block() 
     # generator_input is a fact about the hardware, not about our ability to
     # read it: the 12000XP has a GEN terminal, exactly like the 6000XP.
     assert resolved.generator_input is True
+
+
+def test_offgrid_models_exclude_the_export_counters() -> None:
+    entry = drivers.get("eg4_luxpower")
+    export = {"grid_export_energy_today_kwh", "grid_export_energy_total_kwh"}
+    for name in ("6000XP", "12000XP"):
+        resolved = resolve_model(entry.capabilities, find_model(entry, name))
+        assert not (export & resolved.metrics), name
+
+
+def test_hybrids_keep_the_export_counters() -> None:
+    entry = drivers.get("eg4_luxpower")
+    export = {"grid_export_energy_today_kwh", "grid_export_energy_total_kwh"}
+    for name in ("18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18"):
+        resolved = resolve_model(entry.capabilities, find_model(entry, name))
+        assert export <= resolved.metrics, name
+
+
+def test_offgrid_models_keep_grid_import_and_grid_power() -> None:
+    """Export goes, import stays — the easy mistake is to sweep up the grid family.
+
+    An off-grid machine can charge from the grid, so the import counters are a
+    real measurement on the same machines whose export counters are not. And
+    grid_power_w is signed, so on this family it simply never goes negative — a
+    real reading that stays on one side of zero, not a constant.
+    """
+    entry = drivers.get("eg4_luxpower")
+    import_metrics = {"grid_import_energy_today_kwh", "grid_import_energy_total_kwh"}
+    for name in ("6000XP", "12000XP"):
+        resolved = resolve_model(entry.capabilities, find_model(entry, name))
+        assert import_metrics <= resolved.metrics, name
+        assert "grid_power_w" in resolved.metrics, name
+
+
+class _OffgridTransport:
+    """A transport whose energy read carries export counters for the filter to drop."""
+
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+    async def read_runtime(self) -> object:
+        return SimpleNamespace(pv1_power=2253.0, output_power=2357.0)
+
+    async def read_battery(self) -> object:
+        return None
+
+    async def read_energy(self) -> object:
+        return SimpleNamespace(
+            grid_export_today=1.0,
+            grid_export_total=42.0,
+            grid_import_today=2.0,
+            grid_import_total=88.0,
+        )
+
+
+async def test_a_6000xp_store_has_no_export_columns_and_its_sample_appends(
+    tmp_path: Path,
+) -> None:
+    """The store opens for the narrowed metric set, and the driver matches it.
+
+    Export is unreadable on the 6000XP, so the resolved metric set the store is
+    opened for has no export column, and the configured driver drops the export
+    readings from every sample. The two halves guard each other: a column
+    created where the driver declared nothing, or a reading emitted where the
+    store declared nothing, would raise KeyError on append and stop the poll
+    loop.
+    """
+    entry = drivers.get("eg4_luxpower")
+    resolved = resolve_model(entry.capabilities, find_model(entry, "6000XP"))
+    path = tmp_path / "offgrid.db"
+    store = SqliteStore(str(path), device="CE12345678", metrics=resolved.metrics)
+    conn = sqlite3.connect(path)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(inverter_raw)")}
+    conn.close()
+    assert "grid_export_energy_today_kwh" not in cols
+    assert "grid_export_energy_total_kwh" not in cols
+    assert "grid_import_energy_today_kwh" in cols
+
+    source = Eg4LuxPowerSource(
+        Config(
+            dongle_host="192.0.2.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path=":memory:",
+            model="6000XP",
+        ),
+        transport=_OffgridTransport(),
+    )
+    sample = await source.read()
+    store.append(sample)
+    store.close()
 
 
 def test_an_unreadable_metric_naming_an_unknown_registry_metric_is_refused() -> None:
