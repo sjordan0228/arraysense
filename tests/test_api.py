@@ -14,7 +14,7 @@ import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -2208,6 +2208,84 @@ def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> 
     assert device["transport"] is None
     assert device["metrics"] is None
     assert device["battery_module_metrics"] is None
+
+
+def test_status_surfaces_the_model_check_the_source_found(tmp_path: Path) -> None:
+    # The dashboard polls /api/status already, so the connect-time model
+    # warning rides that existing poll rather than needing a second request.
+    # A family mismatch never reaches here — it raises at connect and stops the
+    # collector — so this only carries the exact-model warning.
+    class _Mismatched:
+        device = TEST_DEVICE
+        misroutes = None
+        model_check: ClassVar[dict[str, str]] = {
+            "verdict": "model_mismatch",
+            "message": "configured as 12kPV; the inverter reports 18kPV — "
+            "both are hybrid, so the registers mean the same things, but the "
+            "string count and the conversion figures differ. Check the model "
+            "setting.",
+        }
+
+        async def connect(self) -> None: ...
+        async def disconnect(self) -> None: ...
+        async def read(self) -> Sample:
+            return Sample(timestamp=datetime.now(tz=UTC), readings={})
+
+    store = SqliteStore(str(tmp_path / "mm.db"), device=TEST_DEVICE)
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "mm.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=_Mismatched(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        body = c.get("/api/status").json()
+    store.close()
+    assert body["model_check"]["verdict"] == "model_mismatch"
+    assert "18kPV" in body["model_check"]["message"]
+
+
+def test_capabilities_reports_the_detected_model_beside_the_configured_one(
+    tmp_path: Path,
+) -> None:
+    # Detection reports and never reconfigures: the configured model stays the
+    # one the store was opened for, and the wire's answer is a second fact
+    # carried beside it. The plain ``model`` field keeps its meaning so the CLI
+    # and every existing reader are unchanged.
+    from types import SimpleNamespace
+
+    class _Detecting:
+        device = TEST_DEVICE
+        identity = SimpleNamespace(driver="eg4_luxpower", serial=TEST_DEVICE, model="12kPV")
+        model_detection = SimpleNamespace(checked=True, detected="18kPV", family="hybrid")
+
+        async def connect(self) -> None: ...
+        async def disconnect(self) -> None: ...
+        async def read(self) -> Sample:
+            return Sample(timestamp=datetime.now(tz=UTC), readings={})
+
+    store = SqliteStore(str(tmp_path / "det.db"), device=TEST_DEVICE)
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "det.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=_Detecting(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    with TestClient(app) as c:
+        device = c.get("/api/capabilities").json()["devices"][0]
+    store.close()
+    assert device["model"] == "12kPV"
+    assert device["model_detection"] == {
+        "checked": True,
+        "detected": "18kPV",
+        "family": "hybrid",
+    }
 
 
 # --- which tariff band a moment fell in (#46) -----------------------------------

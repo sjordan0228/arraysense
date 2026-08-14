@@ -24,7 +24,7 @@ from pylxpweb.transports.exceptions import (
 )
 
 from arraysense.config import Config
-from arraysense.drivers.base import DeviceIdentityError
+from arraysense.drivers.base import DeviceIdentityError, ModelMismatchError
 from arraysense.drivers.eg4_luxpower.source import (
     _MISROUTED,
     CAPABILITIES,
@@ -520,3 +520,207 @@ async def test_a_dongle_installation_asks_no_identity_question() -> None:
         )
     await source.connect()
     await source.read()
+
+
+# --- connect-time model check (issue #128) ----------------------------------
+
+
+class _ModelAnswering:
+    """A transport that answers the model registers and otherwise reads fine.
+
+    ``regs`` is what ``read_parameters`` returns, defaulting to the reference
+    18kPV's answer (device type code 2092, HOLD_MODEL rating 6). ``reg_reads``
+    counts how often the model was asked, so a test can pin that the question
+    is asked once per connection and never inside the poll loop.
+    """
+
+    def __init__(self, regs: dict[int, int] | None = None) -> None:
+        self._regs = regs if regs is not None else {19: 2092, 0: 0x86C0, 1: 0x9}
+        self.reg_reads = 0
+
+    async def connect(self) -> None: ...
+
+    async def disconnect(self) -> None: ...
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        self.reg_reads += 1
+        return dict(self._regs)
+
+    async def read_runtime(self) -> object:
+        return _runtime()
+
+    async def read_battery(self) -> object:
+        return None
+
+    async def read_energy(self) -> object:
+        return None
+
+
+def _model_source(transport: object, model: str) -> Eg4LuxPowerSource:
+    """A source with a configured model and an injected transport.
+
+    The injected transport takes the dongle path, where ``_confirm_identity``
+    asks nothing, so the model check is the only question connect asks of the
+    wire.
+    """
+    return Eg4LuxPowerSource(
+        Config(
+            dongle_host="127.0.0.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path=":memory:",
+            model=model,
+        ),
+        transport=transport,  # type: ignore[arg-type]
+    )
+
+
+async def test_a_family_mismatch_stops_the_collector_like_a_wrong_serial() -> None:
+    # Off-grid versus hybrid is where register meanings diverge — the
+    # 12000XP's register 123 is a seconds counter, not generator watts — so
+    # collecting anyway writes wrong numbers into a history that cannot be
+    # un-written. This must escape the poll loop, exactly as a wrong serial
+    # does, and name the risk rather than the discrepancy.
+    source = _model_source(_ModelAnswering({19: 54, 0: 0, 1: 0}), model="12kPV")
+    with pytest.raises(ModelMismatchError, match="off-grid") as excinfo:
+        await source.connect()
+    assert "wrong, not missing" in str(excinfo.value)
+    assert not issubclass(ModelMismatchError, ConnectionError), (
+        "a family mismatch never comes right on its own, so it must not be "
+        "recorded as a gap and retried forever"
+    )
+
+
+async def test_a_hybrid_on_the_wire_refuses_an_off_grid_configuration() -> None:
+    # The reverse direction, and the one the 12kPV/12000XP name trap makes
+    # easy to fall into: an off-grid model configured where a hybrid answers.
+    source = _model_source(_ModelAnswering(), model="6000XP")
+    with pytest.raises(ModelMismatchError, match="hybrid"):
+        await source.connect()
+
+
+async def test_an_exact_model_mismatch_warns_and_keeps_collecting() -> None:
+    # An 18kPV configured as a 12kPV reads the same registers with the same
+    # meanings; only the string count and the conversion figures differ. That
+    # is worth saying loudly and is not worth stopping collection for.
+    source = _model_source(_ModelAnswering(), model="12kPV")
+    await source.connect()
+    assert source.model_check is not None
+    assert source.model_check["verdict"] == "model_mismatch"
+    assert "18kPV" in source.model_check["message"]
+    # A sample still lands — the warning is a label, not a stop.
+    sample = await source.read()
+    assert sample.readings["pv1_power_w"] == 2253.0
+
+
+async def test_an_unrecognized_device_type_code_says_nothing() -> None:
+    # A code nothing in this project has cited is a real answer, just not one
+    # it can pin. Absent is absent: it must not read as agreement, and it must
+    # not invent a disagreement either.
+    source = _model_source(_ModelAnswering({19: 9999, 0: 0, 1: 0}), model="12kPV")
+    await source.connect()
+    assert source.model_check is None
+
+
+async def test_a_reply_missing_the_device_type_register_says_nothing() -> None:
+    # A short answer that decodes but carries no register 19 is not a
+    # disagreement — it is an answer that did not arrive. The check stands down
+    # rather than inventing a verdict from what little came back, which is the
+    # difference between "not established" and "agrees".
+    source = _model_source(_ModelAnswering({0: 0x86C0, 1: 0x9}), model="12kPV")
+    await source.connect()
+    assert source.model_check is None
+    assert source.model_detection.detected is None
+
+
+async def test_a_reply_carrying_only_the_device_type_cannot_invent_a_model() -> None:
+    # Register 19 present, HOLD_MODEL absent. The rating decodes to zero, which
+    # maps to no model at all, so a truncated reply cannot fabricate an
+    # exact-model warning against the configured one.
+    source = _model_source(_ModelAnswering({19: 2092}), model="12kPV")
+    await source.connect()
+    assert source.model_detection.detected is None
+    assert source.model_check is None
+
+
+async def test_a_failed_register_read_is_a_gap_not_a_refusal() -> None:
+    """A wire fault must never become a refusal to collect.
+
+    The dongle on this hardware crosses replies often enough that the status
+    endpoint counts them. If a failed model read could refuse, a transient
+    fault would stop collection on a correctly configured machine — far worse
+    than the misconfiguration the check exists to catch. It has to surface as
+    a connection error, which the collector already records as a gap and
+    retries with backoff, leaving the check un-run rather than decided.
+    """
+    from pylxpweb.transports.exceptions import TransportError
+
+    class _RefusingRegisters(_ModelAnswering):
+        async def read_parameters(self, start: int, count: int) -> dict[int, int]:
+            self.reg_reads += 1
+            raise TransportError("crossed reply")
+
+    transport = _RefusingRegisters()
+    source = _model_source(transport, model="12kPV")
+    with pytest.raises(ConnectionError):
+        await source.connect()
+    assert source.model_check is None
+    assert source.model_detection.checked is False, "an un-run check must stay un-run"
+
+
+async def test_an_off_grid_family_with_no_pinnable_model_says_nothing() -> None:
+    # Both off-grid models sit behind code 54, so the family is known and the
+    # exact model is genuinely undeterminable. The family matches the
+    # configuration, so there is no disagreement to report.
+    source = _model_source(_ModelAnswering({19: 54, 0: 0, 1: 0}), model="6000XP")
+    await source.connect()
+    assert source.model_check is None
+    assert source.model_detection.checked is True
+    assert source.model_detection.family == "off-grid"
+    assert source.model_detection.detected is None
+
+
+@pytest.mark.parametrize(
+    ("model", "regs"),
+    [
+        ("18kPV", {19: 2092, 0: 0x86C0, 1: 0x9}),
+        ("12kPV", {19: 2092, 0: 0x40, 1: 0x0}),
+        ("FlexBOSS21", {19: 10284, 0: 0x0, 1: 0x100}),
+        ("FlexBOSS18", {19: 10284, 0: 0x20, 1: 0x100}),
+        ("6000XP", {19: 54, 0: 0, 1: 0}),
+        ("12000XP", {19: 54, 0: 0, 1: 0}),
+    ],
+    ids=["18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18", "6000XP", "12000XP"],
+)
+async def test_a_correctly_configured_installation_says_nothing(
+    model: str, regs: dict[int, int]
+) -> None:
+    # Every model this family offers, matched by a wire answer that really is
+    # that model, produces neither a warning nor a refusal.
+    source = _model_source(_ModelAnswering(regs), model=model)
+    await source.connect()
+    assert source.model_check is None
+
+
+async def test_no_configured_model_reads_no_registers_and_says_nothing() -> None:
+    # The reference installation. With nothing configured there is nothing to
+    # disagree with — no read, no warning, no refusal — so the source behaves
+    # exactly as it did before detection existed.
+    transport = _ModelAnswering()
+    source = _model_source(transport, model="")
+    await source.connect()
+    await source.read()
+    assert source.model_check is None
+    assert transport.reg_reads == 0
+
+
+async def test_the_model_registers_are_read_once_per_connection_not_per_poll() -> None:
+    # What the inverter is does not change between polls, and the dongle has
+    # one TCP slot, so the question is asked on the first connect and held for
+    # the life of the process — the same way the serial identity is held.
+    transport = _ModelAnswering()
+    source = _model_source(transport, model="18kPV")
+    for _ in range(5):
+        await source.connect()
+        await source.read()
+    assert transport.reg_reads == 1

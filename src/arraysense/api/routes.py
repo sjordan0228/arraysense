@@ -611,6 +611,14 @@ async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
         # measurement meaning none happened, and claiming it from something that
         # never looked is the same error as rendering a missing reading as 0.
         "misroutes": getattr(service.source, "misroutes", None),
+        # What a connect-time model read found, when it found a disagreement
+        # worth saying. A family mismatch never reaches here — it raises at
+        # connect and stops the collector, like a wrong serial does — so the
+        # only shape this carries is the exact-model warning, and None is what
+        # an unconfigured, a correctly configured, and an unreadable
+        # installation all get. The dashboard polls this endpoint already; it
+        # needs no second request to say so.
+        "model_check": getattr(service.source, "model_check", None),
         # The verdict the stale banner prints. Reached here because it is a
         # judgement, and one made in the browser is one that can disagree with
         # the watchdog about whether the collector is running.
@@ -723,13 +731,27 @@ async def capabilities(request: Request) -> dict[str, Any]:
     source = request.app.state.service.source
     identity = getattr(source, "identity", None)
     declared = getattr(source, "capabilities", None)
+    detection = getattr(source, "model_detection", None)
     serial = identity.serial if identity is not None else getattr(source, "device", None)
     devices: list[dict[str, Any]] = []
     if serial is not None:
         entry: dict[str, Any] = {
             "device": serial,
             "driver": identity.driver if identity is not None else None,
+            # ``model`` is what the installation is configured as. Detection
+            # reports, never reconfigures, so the wire's answer is a second
+            # fact carried beside it — absent entirely (None) for a source that
+            # has no detection to report, not absent data about the device.
             "model": identity.model if identity is not None else None,
+            "model_detection": (
+                {
+                    "checked": detection.checked,
+                    "detected": detection.detected,
+                    "family": detection.family,
+                }
+                if detection is not None
+                else None
+            ),
             "pv_strings": None,
             "energy": None,
             "backup_output": None,

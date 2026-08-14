@@ -7,6 +7,56 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.7 — 14 August 2026
+
+The service notices when the inverter answering is not the one configured.
+
+### Added
+
+- **A wrong model is caught on connection rather than never.** The model was
+  something you told the service and it believed. It now reads the inverter's
+  own answer once when it connects, and compares. Two models a keystroke apart
+  — the 12kPV is a hybrid, the 12000XP is off-grid — are treated oppositely, so
+  choosing the wrong one meant a register storing a seconds counter as
+  generator watts, silently, forever.
+
+  **A machine of the wrong *family* stops collection**, the way a wrong serial
+  already does: off-grid and hybrid disagree about what their registers mean,
+  so the readings would be wrong rather than missing, and there is no honest
+  way to keep writing them. **A different model within the same family warns
+  and keeps collecting** — those read the same registers the same way, and only
+  the string count and the manufacturer's figures differ.
+
+  The warning appears on the dashboard and in `arraysense status`, and names
+  the risk rather than the discrepancy.
+
+- **`/api/capabilities` says where the model came from.** `configured` beside
+  `detected`, so a page or a script can tell what you declared from what the
+  wire reported.
+
+### Fixed
+
+- **The example configuration described detection that never existed.** It said
+  a blank model meant the driver would identify the machine itself. Nothing ever
+  did that — and on an off-grid inverter a blank model means it is read as a
+  hybrid, which stores exactly the readings the right model would withhold. The
+  comment now says so.
+
+### Notes
+
+- **Nothing changes for an installation with no model set.** No extra reads, no
+  warning, nothing on the page. With nothing configured there is nothing to
+  disagree with.
+
+- Detection reports; it never reconfigures. What the store writes is still
+  decided by what you configured, not by what the wire said.
+
+- The register is read once per connection, never per poll — the dongle has one
+  client slot and what the inverter *is* does not change between readings. A
+  read that fails is recorded as a gap and retried, never treated as a
+  disagreement: a crossed reply on the wire must not stop a correctly
+  configured machine from collecting.
+
 ## 1.0.6 — 14 August 2026
 
 An off-grid machine stops reporting an export figure it can never earn.

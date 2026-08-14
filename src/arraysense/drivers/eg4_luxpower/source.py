@@ -49,9 +49,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from typing import Protocol
+from typing import Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pylxpweb import InverterModelInfo
@@ -66,6 +66,7 @@ from arraysense.drivers.base import (
     DeviceIdentity,
     DeviceIdentityError,
     EnergyReporting,
+    ModelMismatchError,
     ModelSpec,
     SampleBuildError,
     UnreadableMetric,
@@ -697,6 +698,64 @@ def identify_model(device_type_code: int, hold_model_reg0: int, hold_model_reg1:
 # as recognized — there is no test that catches that drift, so add both.
 RECOGNIZED_DEVICE_TYPE_CODES = frozenset({2092, 10284, 54, 38})
 
+# What each recognized device type code implies about which kind of machine
+# answered. Stated beside RECOGNIZED_DEVICE_TYPE_CODES rather than derived from
+# it: a code can be recognized — present in that set — without this table
+# saying what family it is, and that gap is exactly the "cannot pin" case a
+# connect-time check must read as nothing rather than as agreement. The two
+# families are where register *meanings* diverge, which is why the check cares
+# about the family at all; see issue #122.
+_FAMILY_BY_CODE: dict[int, str] = {
+    54: "off-grid",  # SNA off-grid: the 12000XP and the 6000XP
+    38: "off-grid",  # the 6000XP variant
+    2092: "hybrid",  # PV series: the 18kPV and the 12kPV
+    10284: "hybrid",  # FlexBOSS: the FlexBOSS21 and the FlexBOSS18
+}
+
+
+def _family_for_code(device_type_code: int) -> str | None:
+    """The family a device type code implies, or None when nothing is cited.
+
+    None is the answer for a code this project has never named — a real answer
+    from the inverter, just not one that identifies anything here. It must read
+    as "not established", never as agreement, which is what the caller treats
+    it as.
+    """
+    return _FAMILY_BY_CODE.get(device_type_code)
+
+
+def _article(noun: str) -> str:
+    """The indefinite article a family name takes — "a hybrid", "an off-grid".
+
+    The two families this check distinguishes start with a consonant and a
+    vowel respectively, so first letter is enough; a longer list would earn a
+    real pronunciation check.
+    """
+    return "an" if noun[:1].lower() in "aeiou" else "a"
+
+
+@dataclass(frozen=True)
+class ModelDetection:
+    """What a connect-time register read found, for a page or the CLI to print.
+
+    ``detected`` is the exact model the inverter reported, ``family`` the family
+    its device type code implies — either None when the read happened but the
+    wire said nothing this project can pin. ``checked`` separates "asked, and it
+    said nothing" from "never asked": the first must not read as agreement with
+    the configuration, and the second is what an installation with no model
+    configured shows.
+
+    ``warning`` is the risk sentence for an exact-model mismatch inside one
+    family — the only outcome that both detects a disagreement and keeps
+    collecting. A family mismatch raises at connect instead of storing one, and
+    a read that pinned nothing stores none.
+    """
+
+    checked: bool = False
+    detected: str | None = None
+    family: str | None = None
+    warning: str | None = None
+
 
 def _reading(source: object, attribute: str) -> float | None:
     """Read one numeric attribute from a library object, or None if it is absent.
@@ -1271,6 +1330,21 @@ class _Transport(Protocol):
         ...
 
 
+class _RegisterReader(Protocol):
+    """A transport that can also read holding registers, for the model check.
+
+    Narrower than ``_Transport`` and deliberately not part of it: the poll loop
+    never reads a raw register, and adding the method to the shared protocol
+    would demand it of every stand-in transport a test injects — fakes would
+    all have to grow a method they never exercise. Only the model check casts
+    down to this, at the one call site that needs it.
+    """
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        """Read a block of holding registers, keyed by register number."""
+        ...
+
+
 class Eg4LuxPowerSource:
     """An InverterSource backed by one of pylxpweb's local transports.
 
@@ -1355,6 +1429,11 @@ class Eg4LuxPowerSource:
                 g.metric for g in find_model_by_name(self._config.model).unreadable
             )
 
+        # What the wire said the inverter is, established once at connect when a
+        # model is configured. Nothing configured means nothing is ever read or
+        # stored — that is the reference installation. See ``_check_model``.
+        self._model_detection = ModelDetection()
+
     @property
     def device(self) -> str:
         """The configured inverter serial, which is what stored rows are filed under.
@@ -1406,6 +1485,30 @@ class Eg4LuxPowerSource:
             declared = resolve_model(declared, find_model_by_name(self._config.model))
         return replace(declared, transport=self._config.transport)
 
+    @property
+    def model_detection(self) -> ModelDetection:
+        """What the wire said the inverter is, or that nothing has been asked yet.
+
+        ``checked`` is False for an installation with no model configured and
+        for a source that has not connected. That must not read as the wire
+        agreeing with the configuration, which is exactly why the flag exists.
+        """
+        return self._model_detection
+
+    @property
+    def model_check(self) -> dict[str, str] | None:
+        """The disagreement a page should print, or None when there is nothing to say.
+
+        Only the warning case survives here. A family mismatch raises at connect
+        and stops the collector, and a read that pinned nothing is not agreement
+        — but it is also not a disagreement, so there is nothing to print. None
+        is therefore what an unconfigured installation, a correctly configured
+        one, and an unreadable one all deserve.
+        """
+        if self._model_detection.warning is None:
+            return None
+        return {"verdict": "model_mismatch", "message": self._model_detection.warning}
+
     async def connect(self) -> None:
         """Claim the inverter's single client slot, if it is not already held.
 
@@ -1447,6 +1550,68 @@ class Eg4LuxPowerSource:
                     endpoint = f"{self._config.dongle_host}:{self._config.dongle_port}"
                 raise ConnectionError(f"cannot reach inverter at {endpoint}: {exc}") from exc
         await self._confirm_identity()
+        await self._check_model()
+
+    async def _check_model(self) -> None:
+        """Establish what the inverter on the wire is, once per connection.
+
+        Reads holding registers 0-19 — the same read the wizard's Detect makes —
+        and compares the family and exact model against what the installation
+        configured. A family mismatch raises ModelMismatchError: off-grid versus
+        hybrid is where register *meanings* diverge, and collecting anyway
+        writes wrong numbers into a history that cannot be un-written. An
+        exact-model mismatch inside one family warns and keeps collecting,
+        because the registers mean the same things and only the string count and
+        the conversion figures differ. Anything the read cannot pin says nothing
+        at all.
+
+        Nothing configured means nothing to check. That is the reference
+        installation, and with no declared model there is nothing to disagree
+        with — so no read is made and no result is stored.
+
+        The read is made here, on the connection ``connect`` just established,
+        and held for the life of the process. What the inverter *is* does not
+        change between polls, and the dongle has one TCP slot, so asking again
+        on every poll would spend the connection on a question already
+        answered.
+        """
+        if not self._config.model:
+            return
+        if self._model_detection.checked:
+            return
+        reader = cast(_RegisterReader, self._transport)
+        try:
+            regs = await self._retrying(lambda: reader.read_parameters(0, 20))
+        except (TransportError, OSError) as exc:
+            raise ConnectionError(f"could not read the model registers: {exc}") from exc
+        device_type_code = regs.get(19)
+        if device_type_code is None:
+            self._model_detection = ModelDetection(checked=True)
+            return
+        detected = identify_model(device_type_code, regs.get(0, 0), regs.get(1, 0))
+        family = _family_for_code(device_type_code)
+        configured = self._config.model
+        configured_family = find_model_by_name(configured).family
+        if family is not None and family != configured_family:
+            raise ModelMismatchError(
+                f"the inverter reports {_article(family)} {family} machine, but "
+                f"{configured} is configured as {_article(configured_family)} "
+                f"{configured_family} one — readings will be wrong, not "
+                "missing. Refusing to collect."
+            )
+        if detected is not None and detected != configured:
+            warning = (
+                f"configured as {configured}; the inverter reports {detected} — "
+                f"both are {family}, so the registers mean the same things, but "
+                "the string count and the conversion figures differ. Check the "
+                "model setting."
+            )
+            logger.warning("%s", warning)
+            self._model_detection = ModelDetection(
+                checked=True, detected=detected, family=family, warning=warning
+            )
+        else:
+            self._model_detection = ModelDetection(checked=True, detected=detected, family=family)
 
     async def _confirm_identity(self) -> None:
         """Check the inverter on a serial bus is the one the settings name.
