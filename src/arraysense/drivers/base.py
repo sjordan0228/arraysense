@@ -518,6 +518,16 @@ class ModelSpec:
     # of them hold. Offering such a model silently is the failure this field
     # exists to prevent; offering it labelled is a decision the owner can make.
     caveat: str = ""
+    # Which family of machine this is, in the owner's words rather than the
+    # library's — "hybrid", "off-grid". Declared rather than inferred, because
+    # the page uses it to tell two models apart whose names differ by a
+    # keystroke and whose treatment does not: the 12kPV is a hybrid and the
+    # 12000XP is off-grid. Deriving it from something merely correlated — that
+    # a model happens to declare an unreadable metric, say — would relabel a
+    # machine the moment that correlation broke, which is the same class of
+    # mistake as reading a register that holds something else. Empty where a
+    # family has only one kind and the distinction would be noise.
+    family: str = ""
 
     def __post_init__(self) -> None:
         """Refuse a delta that cites nothing.
@@ -533,7 +543,13 @@ class ModelSpec:
         # ``unreadable`` is excluded like ``conversion``: each entry carries its
         # own citation, enforced by UnreadableMetric.__post_init__, so a model
         # that declares gaps need not repeat every source in its own citation.
-        _non_delta = frozenset({"name", "citation", "caveat", "conversion", "unreadable"})
+        #
+        # ``family`` is excluded because it is not a delta at all: it changes
+        # no capability, ``resolve_model`` never reads it, and it exists so a
+        # page can tell an owner which kind of machine they are choosing. It
+        # also defaults to "" rather than None, so without this it would count
+        # as a delta on every model and demand a citation from all of them.
+        _non_delta = frozenset({"name", "citation", "caveat", "conversion", "unreadable", "family"})
         delta_fields = [
             f.name
             for f in __import__("dataclasses").fields(self.__class__)

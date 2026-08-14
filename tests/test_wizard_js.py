@@ -96,6 +96,29 @@ def test_models_for_a_driver() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_list_says_plainly_what_the_12kpv_and_12000xp_are() -> None:
+    # A keystroke apart and opposite families: the 12kPV is a hybrid and the
+    # 12000XP is off-grid. The option label has to say which is which, because
+    # someone scanning the dropdown for their machine decides there and then.
+    # The label comes from the model's own declared family, never inferred from
+    # something merely correlated with it — a hybrid that one day declares an
+    # unreadable metric must not start calling itself off-grid.
+    out = _run(
+        "console.log(setupModelLabel({name:'12kPV', family:'hybrid'}, true) + '|' + "
+        "setupModelLabel({name:'12000XP', family:'off-grid'}, true));"
+    )
+    assert out == "12kPV — hybrid|12000XP — off-grid"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_family_with_one_kind_gets_no_tags() -> None:
+    # The simulated driver has no off-grid machine to contrast with, so tagging
+    # its one model "hybrid" would assert a family it does not belong to.
+    out = _run("console.log(setupModelLabel({name:'Simulated', unreadable:[]}, false));")
+    assert out == "Simulated"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_maker_of_a_driver() -> None:
     out = _run(PAYLOAD + 'console.log(setupMakerOf(P,"fake"));')
     assert out == "Simulated"

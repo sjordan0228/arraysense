@@ -358,17 +358,19 @@ def test_resolve_model_subtracts_the_declared_unreadable_metrics() -> None:
 
 
 def test_every_existing_model_resolves_to_the_same_metric_set() -> None:
-    """The regression bar: only the 6000XP may change what a model resolves to.
+    """The regression bar: only the off-grid models may change what a model resolves to.
 
     The hybrids are the machines people actually run. If any of them resolves
     to a different metric set, string count or generator flag tomorrow, this
-    fails and somebody has to say which model and why. The 6000XP is the one
-    model this work deliberately changes, so it is asserted to differ rather
-    than being dropped from the loop without a word.
+    fails and somebody has to say which model and why. The off-grid machines —
+    6000XP and 12000XP — are the models this work deliberately changes, so each
+    is asserted to differ rather than being dropped from the loop without a
+    word.
     """
     entry = drivers.get("eg4_luxpower")
+    offgrid = {"6000XP", "12000XP"}
     for model in entry.models:
-        if model.name == "6000XP":
+        if model.name in offgrid:
             continue
         resolved = resolve_model(entry.capabilities, model)
         assert resolved.metrics == entry.capabilities.metrics, (
@@ -376,8 +378,9 @@ def test_every_existing_model_resolves_to_the_same_metric_set() -> None:
         )
         assert resolved.pv_strings == entry.capabilities.pv_strings
         assert resolved.generator_input == entry.capabilities.generator_input
-    six = resolve_model(entry.capabilities, find_model(entry, "6000XP"))
-    assert six.metrics != entry.capabilities.metrics
+    for name in ("6000XP", "12000XP"):
+        resolved = resolve_model(entry.capabilities, find_model(entry, name))
+        assert resolved.metrics != entry.capabilities.metrics
 
 
 def test_the_6000xp_resolves_to_two_strings_and_the_hybrids_stay_at_three() -> None:
@@ -396,6 +399,18 @@ def test_the_6000xp_excludes_the_generator_block_but_the_18kpv_keeps_it() -> Non
     assert not (generator & offgrid)
     hybrid = resolve_model(entry.capabilities, find_model(entry, "18kPV")).metrics
     assert generator <= hybrid
+
+
+def test_the_12000xp_resolves_to_two_strings_and_excludes_the_generator_block() -> None:
+    entry = drivers.get("eg4_luxpower")
+    resolved = resolve_model(entry.capabilities, find_model(entry, "12000XP"))
+    assert resolved.pv_strings == 2
+    generator = {"generator_power_w", "generator_voltage_v", "generator_frequency_hz"}
+    assert not (generator & resolved.metrics)
+    assert not any(name.startswith("pv3_") for name in resolved.metrics)
+    # generator_input is a fact about the hardware, not about our ability to
+    # read it: the 12000XP has a GEN terminal, exactly like the 6000XP.
+    assert resolved.generator_input is True
 
 
 def test_an_unreadable_metric_naming_an_unknown_registry_metric_is_refused() -> None:
