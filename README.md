@@ -12,9 +12,13 @@ subscription, and your data never leaves the house.
 > polling over RS485 every eleven seconds. Every screenshot on this page is that
 > installation, live, with hardware serials replaced by the documented placeholders.
 >
-> There is no authentication yet
-> ([#34](https://github.com/sjordan0228/arraysense/issues/34)), so keep it on your own
-> network rather than exposing it to the internet.
+> Authentication is optional and off until you set a password on the Settings
+> page ([#34](https://github.com/sjordan0228/arraysense/issues/34)). When it is
+> on it protects the write endpoints while the dashboard keeps reading without
+> one, so a wall display never needs a login. It travels as plain HTTP on a home
+> network, so it stops other devices changing things by accident or mischief,
+> not anyone who can watch the traffic — keep it on your own network rather
+> than exposing it to the internet.
 
 ## Supported hardware
 

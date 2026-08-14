@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse
 
 from arraysense import __version__
 from arraysense.api.routes import router
+from arraysense.auth import LoginThrottle, Sessions
 from arraysense.collector.service import CollectorService
 from arraysense.config import Config
 from arraysense.store.sqlite_store import SqliteStore
@@ -199,6 +200,11 @@ def create_app(
     # the validation model the wrong base, so this is set here, always, and
     # build_app passes the real file config through it.
     app.state.file_config = file_config if file_config is not None else config
+    # Per-process authentication state. Sessions and the login throttle must not be
+    # module globals: the test suite stands up more than one app in a process and
+    # they would share sessions, so a login to one would unlock the others.
+    app.state.sessions = Sessions()
+    app.state.throttle = LoginThrottle()
     app.include_router(router)
     install_text_guard(app)
 

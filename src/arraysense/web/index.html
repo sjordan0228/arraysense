@@ -516,12 +516,12 @@ function wireSettings() {
     scheduleLive();
   };
   $('yieldBtn').onclick = async () => {
-    await fetch('/api/yield', {method:'POST', headers:{'Content-Type':'application/json'},
+    await writeWithAuth('/api/yield', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({seconds: 300})});
     loadLive();
   };
   $('resumeBtn').onclick = async () => {
-    await fetch('/api/resume', {method:'POST'});
+    await writeWithAuth('/api/resume', {method:'POST'});
     loadLive();
   };
 }
@@ -2183,7 +2183,7 @@ function showWizard(payload) {
 async function applyAndWatch(body, ui) {
   ui.status('Writing the configuration and restarting the collector…', 'busy');
   try {
-    const r = await fetchTimeout('/api/setup/apply', {
+    const r = await writeWithAuth('/api/setup/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     }, 20000);
