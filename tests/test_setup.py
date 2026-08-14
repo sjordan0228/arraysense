@@ -42,7 +42,7 @@ def test_the_payload_carries_the_tree_requirements_and_choices() -> None:
     payload = describe_setup(_config(model="18kPV"))
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     names = [model["name"] for model in eg4["models"]]
-    assert names == ["18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18", "6000XP"]
+    assert names == ["18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18", "6000XP", "12000XP"]
     assert payload["transports"]["modbus_serial"] == ["serial_device"]
     assert payload["transports"]["dongle"] == ["dongle_host", "dongle_serial"]
     assert payload["current"]["model"] == "18kPV"
@@ -83,6 +83,19 @@ def test_describe_setup_carries_the_unreadable_gap_list() -> None:
     for name in ("18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18"):
         model = next(m for m in eg4["models"] if m["name"] == name)
         assert model["unreadable"] == [], f"{name} must declare no gaps"
+
+
+def test_describe_setup_offers_the_12000xp_with_citation_and_gaps() -> None:
+    payload = describe_setup(_config())
+    eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
+    model = next(m for m in eg4["models"] if m["name"] == "12000XP")
+    assert model["citation"]
+    assert "12000XP spec sheet" in model["citation"]
+    assert model["cited_fields"] == ["pv_strings"]
+    assert model["pv_strings"] == 2
+    names = [g["metric"] for g in model["unreadable"]]
+    assert names == ["generator_power_w", "generator_voltage_v", "generator_frequency_hz"]
+    assert all(g["reason"] and g["citation"] for g in model["unreadable"])
 
 
 def test_a_model_whose_readings_are_unproven_says_so() -> None:

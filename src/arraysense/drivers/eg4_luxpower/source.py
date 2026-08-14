@@ -465,12 +465,13 @@ CAPABILITIES = Capabilities(
 # alone. It is offered, because refusing it outright would break an
 # installation that already chose it, and labelled, because a machine whose
 # generator power is a seconds counter must not be presented as supported. The
-# 6000XP's string count is now confirmed from the spec sheet; the generator
-# block is declared unreadable in _OFFGRID_UNREADABLE below. See issue #122.
+# 6000XP's and 12000XP's string counts are now confirmed from their spec
+# sheets; the generator block is declared unreadable in _OFFGRID_UNREADABLE
+# below. See issue #122.
 
 # The generator block an off-grid machine cannot read, and why. Declared once
-# and referenced from the 6000XP's ModelSpec (and, later, the 12000XP's) so the
-# gap list cannot drift from the models that declare it.
+# and referenced from the 6000XP's and 12000XP's ModelSpecs so the gap list
+# cannot drift from the models that declare it.
 #
 # Register 123 is proven a seconds counter on off-grid, not generator power:
 # firmware disassembly shows the SNA comms handler answering it from a RAM word
@@ -519,6 +520,7 @@ _OFFGRID_UNREADABLE: tuple[UnreadableMetric, ...] = (
 MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         name="18kPV",
+        family="hybrid",
         pv_strings=3,
         citation="measured on the reference installation",
         conversion=ConversionSpec(
@@ -535,6 +537,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="12kPV",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -543,6 +546,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="FlexBOSS21",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -551,6 +555,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="FlexBOSS18",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -559,6 +564,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="6000XP",
+        family="off-grid",
         pv_strings=2,
         # generator_input stays the family's True: this machine has a GEN
         # terminal and EG4's spec sheet documents it. What it does not have is a
@@ -575,6 +581,31 @@ MODELS: tuple[ModelSpec, ...] = (
             "Off-grid family: the generator block is not offered (register 123 "
             "is a seconds counter). Your house load total is read locally; only "
             "the smart-load itemisation is cloud-only. See issue #122."
+        ),
+    ),
+    ModelSpec(
+        name="12000XP",
+        family="off-grid",
+        pv_strings=2,
+        # generator_input stays the family's True, exactly as on the 6000XP:
+        # this machine has a GEN terminal too, and being unable to read it is a
+        # different fact from not having one.
+        unreadable=_OFFGRID_UNREADABLE,
+        citation=(
+            "EG4 12000XP spec sheet: NUMBER OF MPPTS 2, INPUTS PER MPPT 2/2 — "
+            "four physical terminals but two MPPT trackers, and readings come "
+            "per tracker, so two strings paralleled into one input share one "
+            "measurement; "
+            "https://eg4electronics.com/wp-content/uploads/2024/10/"
+            "EG4-12000XP-Spec-Sheet.pdf"
+        ),
+        caveat=(
+            "Off-grid family, not a hybrid like the 12kPV: two MPPT trackers "
+            "behind the four PV inputs, and the generator block is not offered "
+            "— register 123 is a seconds counter, and the firmware disassembly "
+            "that proved it was located on this very model. Your house load "
+            "total is read locally; only the smart-load split is cloud-only. "
+            "See issue #122."
         ),
     ),
 )

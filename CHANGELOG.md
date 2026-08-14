@@ -7,6 +7,39 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.6 — 14 August 2026
+
+The 12000XP is offered, and the list says which machine is which.
+
+### Added
+
+- **The EG4 12000XP can be chosen.** Until now an owner of one had no correct
+  model to pick at all. It gets the same treatment as the 6000XP — the
+  generator readings that would not mean what they say are not offered — and
+  the evidence behind that is stronger for this machine than for its smaller
+  sibling, because the firmware work that proved it was done on this one.
+
+- **It declares two PV strings, and that is not a typo.** The 12000XP has two
+  MPPT trackers with two paralleled input terminals each: four places to land a
+  string, two measurements. A reading comes from a tracker, not a terminal, so
+  an owner running four strings sees two figures. Since 1.0.2 the efficiency
+  scorer groups strings that share a tracker, so a four-string install scores
+  correctly rather than at roughly double.
+
+- **The model list says what each machine is.** The 12kPV is a hybrid and the
+  12000XP is off-grid — a keystroke apart, opposite families, opposite
+  treatment. The list now labels them rather than leaving an owner to know.
+  Each model declares its own family, so the label is a fact about the machine
+  and not a guess made from something that happens to correlate with it.
+
+### Notes
+
+- Nothing changes for the five models already offered.
+
+- The first-run wizard cannot detect which off-grid machine you have: both
+  report the same device type code, so Detect says nothing rather than guess,
+  and you pick from the list.
+
 ## 1.0.5 — 14 August 2026
 
 The 6000XP stops reporting a seconds counter as generator power.

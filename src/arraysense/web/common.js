@@ -643,6 +643,18 @@ function setupModelGapNote(model) {
   };
 }
 
+// The option label for one model in the setup list. A family that contains
+// both kinds says plainly which kind each model is, so the 12kPV (hybrid) and
+// the 12000XP (off-grid) — a keystroke apart, opposite families — cannot be
+// confused by an owner who has not read the manual. The off-grid machines are
+// the ones with an unreadable list; in a mixed family everything else is a
+// hybrid. A family with only one kind, the simulated driver say, needs no
+// tags at all.
+function setupModelLabel(model, familyHasOffgrid) {
+  if (!model.family) return model.name;
+  return familyHasOffgrid ? `${model.name} — ${model.family}` : model.name;
+}
+
 // The apply body: only the connection keys, only the ones with a real value.
 // The transport-specific fields ride only when their transport needs them, so a
 // dongle install never sends a serial_device the server would ignore and a
@@ -3246,13 +3258,19 @@ function mountSetup(host, payload, opts) {
 
     const makerSel = makerNames.map((n) =>
       `<option value="${esc(n)}"${n === state.manufacturer ? ' selected' : ''}>${esc(n)}</option>`).join('');
-    // A model with a caveat says so in the option itself, not only once it is
-    // chosen. Someone scanning the list for their machine decides there and
-    // then, and a warning that appears afterwards has already lost the argument.
+    // The option itself says what kind of machine each model is, not only once
+    // it is chosen: the 12kPV and the 12000XP are a keystroke apart and
+    // opposite families, and someone scanning the list for their machine
+    // decides there and then. A model with a caveat still carries it in the
+    // note below once chosen; the list labels the family, not the warning.
+    // Tag the models only where the list actually holds more than one kind.
+    // A family of hybrids alone does not need every entry saying so.
+    const kinds = new Set(models.map((m) => m.family).filter(Boolean));
+    const familyHasOffgrid = kinds.size > 1;
     const modelSel = models.map((m) => {
       const v = `${m.driver}::${m.name}`;
       const on = m.name === state.model && m.driver === state.driver;
-      const label = m.caveat ? `${m.name} — unverified` : m.name;
+      const label = setupModelLabel(m, familyHasOffgrid);
       return `<option value="${esc(v)}"${on ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
     const chosenModel = models.find((m) => m.name === state.model && m.driver === state.driver);
