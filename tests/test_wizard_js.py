@@ -111,6 +111,24 @@ def test_the_list_says_plainly_what_the_12kpv_and_12000xp_are() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_option_list_carries_every_field_the_label_reads() -> None:
+    """The renderer rebuilds each model, so a field it reads must be copied over.
+
+    ``modelOptionsFor`` constructs a fresh object per model rather than passing
+    the payload's own through. A field added to the payload and read by the
+    renderer is therefore silently empty until it is named there — which is
+    exactly what happened to the family tag: it reached the browser, its own
+    test passed, and the dropdown still drew a bare name. A string check is
+    crude, but it catches the one failure the pure-function test cannot see.
+    """
+    source = COMMON.read_text(encoding="utf-8")
+    start = source.index("const modelOptionsFor")
+    body = source[start : source.index("};", start)]
+    for field_name in ("name:", "caveat:", "unreadable:", "family:"):
+        assert field_name in body, f"modelOptionsFor drops {field_name!r}"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_family_with_one_kind_gets_no_tags() -> None:
     # The simulated driver has no off-grid machine to contrast with, so tagging
     # its one model "hybrid" would assert a family it does not belong to.
