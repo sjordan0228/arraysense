@@ -626,6 +626,23 @@ function setupBatterySourcesFor(payload, driver) {
   return Array.isArray(map[driver]) ? map[driver] : ['none'];
 }
 
+// The three honest things a page can say about a model with gaps, as the
+// design that added them names them: what is read locally and correct (the
+// bulk, not enumerated), what cannot be read locally with whether the vendor
+// cloud carries it, and what is not offered at all. Structured rather than
+// HTML so a test can pin the decision without the DOM; the two shells render
+// it themselves, and the cloud list is named, not promised — a phase 2 path
+// that does not exist yet must not be advertised.
+function setupModelGapNote(model) {
+  const gaps = (model && model.unreadable) || [];
+  if (!gaps.length) return null;
+  return {
+    local: true,
+    cloud: gaps.filter((g) => g.cloud_available),
+    gone: gaps.filter((g) => !g.cloud_available),
+  };
+}
+
 // The apply body: only the connection keys, only the ones with a real value.
 // The transport-specific fields ride only when their transport needs them, so a
 // dongle install never sends a serial_device the server would ignore and a
@@ -3166,7 +3183,12 @@ function mountSetup(host, payload, opts) {
     const out = [];
     for (const fam of (mk && mk.families) || []) {
       for (const m of fam.models || []) {
-        out.push({ driver: fam.driver, name: m.name, caveat: m.caveat || '' });
+        out.push({
+          driver: fam.driver,
+          name: m.name,
+          caveat: m.caveat || '',
+          unreadable: m.unreadable || [],
+        });
       }
     }
     return out;
@@ -3236,6 +3258,26 @@ function mountSetup(host, payload, opts) {
     const chosenModel = models.find((m) => m.name === state.model && m.driver === state.driver);
     const modelNote = chosenModel && chosenModel.caveat
       ? `<div class="hint warn-note">${esc(chosenModel.caveat)}</div>` : '';
+    // A model that cannot read some of its family's registers must say which,
+    // in the three honest categories the setup design names — not one vague
+    // warning. Rendered from the server's declaration via setupModelGapNote,
+    // never from a list kept here, which would drift the first time this
+    // registry changes.
+    const gaps = setupModelGapNote(chosenModel);
+    // "Everything else is correct" is a claim nobody has established, so it is
+    // not made. What can honestly be said is narrower and still useful: these
+    // named readings are not offered, and the rest is read the same way it is
+    // read on every other model in this family.
+    const gapsHTML = gaps ? `<div class="hint warn-note"><strong>What this model does not report</strong>
+      <div>Everything not listed here is read locally, the same as on the rest of
+        this family.</div>`
+      + (gaps.cloud.length ? `<div><strong>Not available locally — the vendor cloud carries it:</strong><ul>
+          ${gaps.cloud.map((g) => `<li>${esc(g.reason)}</li>`).join('')}
+        </ul></div>` : '')
+      + (gaps.gone.length ? `<div><strong>Not offered — the reading would not mean what it says:</strong><ul>
+          ${gaps.gone.map((g) => `<li>${esc(g.reason)}</li>`).join('')}
+        </ul></div>` : '')
+      + `</div>` : '';
     const transSel = [['dongle', 'WiFi dongle'], ['modbus_serial', 'RS485 serial']].map(([v, lbl]) =>
       `<option value="${v}"${v === state.transport ? ' selected' : ''}>${lbl}</option>`).join('');
     const battLabel = {
@@ -3255,6 +3297,7 @@ function mountSetup(host, payload, opts) {
       <div class="row"><label for="su_model">Model</label>
         <select id="su_model" data-role="model">${modelSel}</select></div>
       ${modelNote}
+      ${gapsHTML}
       <div class="row"><label for="su_transport">Connection</label>
         <select id="su_transport" data-role="transport">${transSel}</select></div>
       <div data-role="fields">${connectionFields()}</div>

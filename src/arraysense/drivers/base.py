@@ -261,6 +261,16 @@ class Capabilities:
                     f"string(s) {', '.join(str(m) for m in missing)}"
                 )
 
+        # There is deliberately no check tying ``generator_input`` to the
+        # presence of a generator metric. The flag answers "does this machine
+        # have a generator input", which is a fact about the hardware; whether
+        # this project can read that input is a separate question with a
+        # separate answer. The 6000XP is exactly the case that separates them —
+        # it has a GEN terminal, documented on EG4's own spec sheet, and none of
+        # the registers behind it can be trusted (issue #122). Forbidding that
+        # combination would force a model to deny hardware it demonstrably has
+        # in order to admit a reading it cannot take.
+
 
 @dataclass(frozen=True)
 class DeviceIdentity:
@@ -423,6 +433,52 @@ class ConversionSpec:
 
 
 @dataclass(frozen=True)
+class UnreadableMetric:
+    """One metric a model cannot read, even though the family maps the register.
+
+    ``ModelSpec`` can already adjust how many strings or battery slots a model
+    has. It has no way to say *this register does not mean what the family says
+    it means on this model* — which is how an off-grid machine silently
+    inherited the hybrid family's whole metric set, including a "generator
+    power" column that is actually a seconds counter. That is the gap this
+    closes.
+
+    The metric name is validated against the registry at construction, exactly
+    as ``Capabilities`` already refuses an unknown name: a typo here would
+    declare a gap nothing produces, and a gap the driver never acts on is a
+    wrong reading back on the chart.
+
+    ``cloud_available`` says whether the vendor's cloud carries a correct figure
+    for this metric, so a page can tell "gone from the cloud too" from "waiting
+    on the cloud path". Nothing in this phase reads it; phase 2 will.
+    """
+
+    metric: str
+    reason: str
+    citation: str
+    cloud_available: bool = False
+
+    def __post_init__(self) -> None:
+        """Refuse a gap that names no registry metric, or gives no reason.
+
+        All three of these fail at import, where a driver's declaration is
+        built: a typo here is a gap the driver never acts on, and a gap with no
+        reason or citation is a claim a future reader cannot check.
+        """
+        if self.metric not in column_names():
+            raise ValueError(f"no such metric in the registry: {self.metric!r}")
+        if not self.reason.strip():
+            raise ValueError(
+                f"unreadable metric {self.metric!r} needs a reason written for a person"
+            )
+        if not self.citation.strip():
+            raise ValueError(
+                f"unreadable metric {self.metric!r} needs a citation; "
+                "naming a register unreadable asserts a fact about the hardware"
+            )
+
+
+@dataclass(frozen=True)
 class ModelSpec:
     """One model within a driver family, and how it differs from the family.
 
@@ -437,6 +493,16 @@ class ModelSpec:
     name: str
     pv_strings: int | None = None
     battery_module_slots: int | None = None
+    # Whether this model has a generator input at all. None inherits the family
+    # declaration. Setting False asserts the machine has none — an off-grid
+    # model whose generator registers are not what the family says — and is a
+    # hardware fact requiring a citation like any other.
+    generator_input: bool | None = None
+    # The metrics this model cannot read even though the family maps their
+    # registers. Each entry carries its own reason and citation; see
+    # UnreadableMetric. A model that declares none reads everything the family
+    # does, which is every existing model today.
+    unreadable: tuple[UnreadableMetric, ...] = ()
     # Manufacturer's conversion figures, where the model's spec sheet carries
     # them. None for models whose sheets have not been fetched and read — the
     # same rule their pv_strings already follow. These are facts with a
@@ -464,7 +530,10 @@ class ModelSpec:
         ``ConversionSpec.__post_init__``, and that citation is the spec sheet
         rather than the model's own measurement citation.
         """
-        _non_delta = frozenset({"name", "citation", "caveat", "conversion"})
+        # ``unreadable`` is excluded like ``conversion``: each entry carries its
+        # own citation, enforced by UnreadableMetric.__post_init__, so a model
+        # that declares gaps need not repeat every source in its own citation.
+        _non_delta = frozenset({"name", "citation", "caveat", "conversion", "unreadable"})
         delta_fields = [
             f.name
             for f in __import__("dataclasses").fields(self.__class__)
@@ -501,6 +570,14 @@ def resolve_model(family: Capabilities, model: ModelSpec) -> Capabilities:
         resolved = replace(resolved, battery_module_slots=model.battery_module_slots)
     if model.conversion is not None:
         resolved = replace(resolved, conversion=model.conversion)
+    # generator_input before the unreadable subtraction, so the intermediate
+    # value is never a declaration that claims a generator input it no longer
+    # produces — Capabilities refuses exactly that.
+    if model.generator_input is not None:
+        resolved = replace(resolved, generator_input=model.generator_input)
+    if model.unreadable:
+        names = frozenset(g.metric for g in model.unreadable)
+        resolved = replace(resolved, metrics=resolved.metrics - names)
     return resolved
 
 

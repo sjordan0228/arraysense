@@ -12,6 +12,7 @@ loud if the extraction markers move, so the slice cannot drift out from under it
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -57,6 +58,35 @@ const P = {
   current: {}
 };
 """
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_model_gap_note_splits_into_the_three_honest_categories() -> None:
+    out = _run(
+        PAYLOAD
+        + """
+        const m = {name:'6000XP', unreadable:[
+          {metric:'generator_power_w', reason:'a seconds counter', cloud_available:false},
+          {metric:'generator_voltage_v', reason:'never verified', cloud_available:true}
+        ]};
+        console.log(JSON.stringify(setupModelGapNote(m)));
+        """
+    )
+    note = json.loads(out)
+    assert note["local"] is True
+    assert [g["metric"] for g in note["gone"]] == ["generator_power_w"]
+    assert [g["metric"] for g in note["cloud"]] == ["generator_voltage_v"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_model_with_no_gaps_has_no_note() -> None:
+    # JSON.stringify so the bare JS null is logged as the string "null";
+    # node colours the null keyword itself and the assertion would see escape
+    # codes rather than the value.
+    out = _run(
+        PAYLOAD + "console.log(JSON.stringify(setupModelGapNote({name:'18kPV', unreadable:[]})));"
+    )
+    assert out == "null"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

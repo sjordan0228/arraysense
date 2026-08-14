@@ -31,6 +31,7 @@ from arraysense.drivers.base import (
     InverterDriver,
     InverterSource,
     ModelSpec,
+    UnreadableMetric,
     expand_module_metrics,
     find_model,
     resolve_model,
@@ -320,6 +321,113 @@ def test_resolve_model_applies_deltas_and_inherits_the_rest() -> None:
     assert resolved.relays_battery is True  # inherited untouched
 
 
+def test_resolve_model_subtracts_the_declared_unreadable_metrics() -> None:
+    family = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset(
+            {
+                "pv1_power_w",
+                "pv2_power_w",
+                "pv3_power_w",
+                "generator_power_w",
+                "generator_voltage_v",
+            }
+        ),
+        generator_input=True,
+    )
+    model = ModelSpec(
+        name="offgrid-test",
+        pv_strings=3,
+        generator_input=False,
+        unreadable=(
+            UnreadableMetric(
+                metric="generator_power_w", reason="a seconds counter", citation="issue #544"
+            ),
+            UnreadableMetric(
+                metric="generator_voltage_v", reason="never verified", citation="issue #544"
+            ),
+        ),
+        citation="test",
+    )
+    resolved = resolve_model(family, model)
+    assert "generator_power_w" not in resolved.metrics
+    assert "generator_voltage_v" not in resolved.metrics
+    assert "pv1_power_w" in resolved.metrics
+    assert resolved.generator_input is False
+
+
+def test_every_existing_model_resolves_to_the_same_metric_set() -> None:
+    """The regression bar: only the 6000XP may change what a model resolves to.
+
+    The hybrids are the machines people actually run. If any of them resolves
+    to a different metric set, string count or generator flag tomorrow, this
+    fails and somebody has to say which model and why. The 6000XP is the one
+    model this work deliberately changes, so it is asserted to differ rather
+    than being dropped from the loop without a word.
+    """
+    entry = drivers.get("eg4_luxpower")
+    for model in entry.models:
+        if model.name == "6000XP":
+            continue
+        resolved = resolve_model(entry.capabilities, model)
+        assert resolved.metrics == entry.capabilities.metrics, (
+            f"{entry.name} {model.name} changes the family metric set"
+        )
+        assert resolved.pv_strings == entry.capabilities.pv_strings
+        assert resolved.generator_input == entry.capabilities.generator_input
+    six = resolve_model(entry.capabilities, find_model(entry, "6000XP"))
+    assert six.metrics != entry.capabilities.metrics
+
+
+def test_the_6000xp_resolves_to_two_strings_and_the_hybrids_stay_at_three() -> None:
+    entry = drivers.get("eg4_luxpower")
+    for name in ("18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18"):
+        resolved = resolve_model(entry.capabilities, find_model(entry, name))
+        assert resolved.pv_strings == 3, name
+    resolved = resolve_model(entry.capabilities, find_model(entry, "6000XP"))
+    assert resolved.pv_strings == 2
+
+
+def test_the_6000xp_excludes_the_generator_block_but_the_18kpv_keeps_it() -> None:
+    entry = drivers.get("eg4_luxpower")
+    generator = {"generator_power_w", "generator_voltage_v", "generator_frequency_hz"}
+    offgrid = resolve_model(entry.capabilities, find_model(entry, "6000XP")).metrics
+    assert not (generator & offgrid)
+    hybrid = resolve_model(entry.capabilities, find_model(entry, "18kPV")).metrics
+    assert generator <= hybrid
+
+
+def test_an_unreadable_metric_naming_an_unknown_registry_metric_is_refused() -> None:
+    with pytest.raises(ValueError, match="no such metric"):
+        UnreadableMetric(metric="generator_megawatts_w", reason="r", citation="c")
+
+
+def test_an_unreadable_metric_needs_a_reason_and_a_citation() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        UnreadableMetric(metric="generator_power_w", reason="  ", citation="c")
+    with pytest.raises(ValueError, match="citation"):
+        UnreadableMetric(metric="generator_power_w", reason="a seconds counter", citation="  ")
+
+
+def test_a_generator_input_may_have_no_readable_generator_metric() -> None:
+    """Having a generator port and being able to read it are separate facts.
+
+    The 6000XP has a GEN terminal on EG4's own spec sheet and no register
+    behind it worth storing (issue #122). A rule tying the flag to the metrics
+    would force that model to deny its own hardware in order to admit the
+    reading it cannot take.
+    """
+    caps = Capabilities(
+        pv_strings=3,
+        energy=EnergyReporting.COUNTED,
+        metrics=frozenset({"pv1_power_w", "pv2_power_w", "pv3_power_w"}),
+        generator_input=True,
+    )
+    assert caps.generator_input is True
+    assert not any(name.startswith("generator_") for name in caps.metrics)
+
+
 # --- Task 3: EG4 and fake families declare themselves -----------------------
 
 
@@ -339,11 +447,21 @@ def test_the_18kpv_cites_its_measured_string_count() -> None:
 
 
 def test_uncited_models_inherit_the_family_defaults() -> None:
-    entry = drivers.get("eg4_luxpower")
-    for name in ("6000XP", "12kPV"):
-        model = find_model(entry, name)
-        resolved = resolve_model(entry.capabilities, model)
-        assert resolved.pv_strings == entry.capabilities.pv_strings
+    """A model that declares no deltas inherits the family's whole declaration.
+
+    This used to run over the real 6000XP and 12kPV, which were the last models
+    without a cited string count. The 6000XP now cites its own two strings from
+    the EG4 spec sheet (NUMBER OF MPPTS 2, INPUTS PER MPPT 1), so a test whose
+    subject is "whichever real model happens to lack a citation" has no subject
+    left. The mechanism is what needs guarding, so it is pinned on a synthetic
+    model instead — a real model gaining a citation must not break it again.
+    """
+    family = drivers.get("eg4_luxpower").capabilities
+    model = ModelSpec(name="uncited-model")
+    resolved = resolve_model(family, model)
+    assert resolved.pv_strings == family.pv_strings
+    assert resolved.metrics == family.metrics
+    assert resolved.generator_input == family.generator_input
 
 
 # --- what the reference driver declares -------------------------------------

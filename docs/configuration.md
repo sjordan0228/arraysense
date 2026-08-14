@@ -58,13 +58,54 @@ and get abandoned.
 ### `driver`
 
 Which family of inverter to read. Defaults to `eg4_luxpower`, which covers the EG4
-and LuxPower hybrids reached over the WiFi dongle — the 18kPV, the 12kPV and the
-FlexBOSS models. The off-grid 6000XP is offered too, with a caveat: several
-registers mean something different there, so its readings may be wrong rather than
-missing. There is no reason to set this today; it exists so that a second family
-can be added as a directory rather than as an edit to the collector.
+and LuxPower inverters reached over the WiFi dongle — the 18kPV, the 12kPV, the
+FlexBOSS models and the off-grid 6000XP. There is no reason to set this today; it
+exists so that a second family can be added as a directory rather than as an edit
+to the collector.
 
 An unrecognised name stops the service at startup with the list of names that work.
+
+### Model support
+
+The EG4/LuxPower family covers the hybrids — 18kPV, 12kPV, FlexBOSS21 and
+FlexBOSS18 — and the off-grid 6000XP. The hybrids are read in full: all three PV
+strings, the backup panel, the battery bank and every kWh counter. An off-grid
+machine differs in three ways, all declared by the driver and shown on the setup
+page when you choose it:
+
+- **Two PV strings, not three.** The 6000XP has 2 MPPTs with 1 input each (EG4
+  spec sheet). The third-string columns are never created.
+- **No generator block.** Register 123, which the register map calls "generator
+  power", is a seconds counter on off-grid — proven by firmware disassembly, not
+  inferred — and registers 124–126 are ARM status words, not energy. The
+  generator power, voltage and frequency readings are therefore not offered at
+  all rather than risk storing a wrong value. This is more conservative than
+  upstream `pylxpweb`, which removed only the power and energy sensors; it is a
+  judgement rather than a finding, and a reading will be added back if one is
+  ever confirmed.
+- **The smart-load split is cloud-only.** The GEN terminal can be repurposed as a
+  smart load, but the itemised `smartLoadPower`/`epsLoadPower` figures have no
+  local Modbus register. Your house load *total* is read locally; only the split
+  is not.
+
+**Set `model` if you own one of these.** All of the above follows from the
+configured model, so an off-grid installation that leaves `model` unset is read
+as though it were a hybrid — which puts the seconds counter back on the chart as
+generator watts. The first-run wizard always sets it, so this only affects a
+`config.toml` written by hand. The wizard cannot detect which off-grid model you
+have either: device type code 54 covers the 6000XP and the 12000XP alike, so
+Detect deliberately reports nothing rather than guess, and you pick from the
+list.
+
+Sources: [`joyfulhouse/eg4_web_monitor` issue #544](https://github.com/joyfulhouse/eg4_web_monitor/issues/544)
+(the register 123 disassembly), [issue #222](https://github.com/joyfulhouse/eg4_web_monitor/issues/222)
+(the smart-load split), and the
+[EG4 6000XP spec sheet](https://eg4electronics.com/wp-content/uploads/2024/04/EG4-6000XP-Inverter-Spec-Sheet.pdf).
+
+The WiFi dongle's TCP port 8000 works on these models. Modbus TCP on port 502 is
+closed on them, so do not spend an evening trying to reach the inverter directly
+over Modbus TCP; use the dongle, or a USB-to-RS485 adapter with
+`transport = "modbus_serial"`.
 
 ### `model`
 
