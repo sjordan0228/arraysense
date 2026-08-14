@@ -7,7 +7,7 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 1.1.0 — 14 August 2026
+## 1.0.4 — 14 August 2026
 
 A password, if you want one. Nothing changes for anybody who does not.
 
