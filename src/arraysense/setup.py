@@ -77,8 +77,22 @@ def describe_setup(config: Config, dev_root: Path | str = "/dev") -> dict[str, A
                 "citation": model.citation,
                 "cited_fields": cited,
                 "caveat": model.caveat,
+                "family": model.family,
                 "pv_strings": resolved.pv_strings,
                 "battery_module_slots": resolved.battery_module_slots,
+                # The metrics this model cannot read, each with a reason written
+                # for a person. Rendered by the setup component, never
+                # hard-coded there — a list the page kept itself would drift the
+                # first time this registry changes.
+                "unreadable": [
+                    {
+                        "metric": gap.metric,
+                        "reason": gap.reason,
+                        "citation": gap.citation,
+                        "cloud_available": gap.cloud_available,
+                    }
+                    for gap in model.unreadable
+                ],
             }
             if model.conversion is not None:
                 entry_dict["conversion"] = {

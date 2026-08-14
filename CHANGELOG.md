@@ -7,6 +7,143 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.5 — 14 August 2026
+
+EG4's off-grid inverters are supported honestly: the 6000XP stops reporting a
+seconds counter as generator power, and the 12000XP can be chosen at all.
+
+### Fixed
+
+- **An off-grid 6000XP no longer stores readings that are not what they claim
+  to be.** The off-grid machines share a register map with the hybrids, but
+  several addresses hold something else entirely — register 123, which the
+  hybrids use for generator power, is a seconds counter on off-grid firmware.
+  It was being stored and charted as watts. The generator power, voltage and
+  frequency readings are no longer offered on that family at all, because a
+  missing reading is honest and a wrong one is not.
+
+- **The 6000XP declares two PV strings, not three.** It has two MPPTs with one
+  input each, from EG4's own spec sheet. It had been inheriting the family's
+  three, which is a fallback the upstream library itself marks as a guess.
+
+### Added
+
+- **The EG4 12000XP can be chosen.** Until now an owner of one had no correct
+  model to pick at all. It gets the same treatment as the 6000XP, and the
+  evidence behind that is stronger for this machine than for its smaller
+  sibling, because the firmware work that proved it was done on this one.
+
+- **It declares two PV strings, and that is not a typo.** The 12000XP has two
+  MPPT trackers with two paralleled input terminals each: four places to land a
+  string, two measurements. A reading comes from a tracker, not a terminal, so
+  an owner running four strings sees two figures. Since 1.0.2 the efficiency
+  scorer groups strings that share a tracker, so a four-string install scores
+  correctly rather than at roughly double.
+
+- **A model can now say what it cannot read, and the setup page says so.**
+  Choosing either off-grid machine shows what is not reported and why —
+  separating a reading that would be wrong from one that is only available
+  through the vendor cloud. Nothing is hidden behind a single vague warning.
+
+- **The model list says what each machine is.** The 12kPV is a hybrid and the
+  12000XP is off-grid — a keystroke apart, opposite families, opposite
+  treatment. The list now labels them rather than leaving an owner to know.
+  Each model declares its own family, so the label is a fact about the machine
+  and not a guess made from something that happens to correlate with it.
+
+### Notes
+
+- **Nothing changes for the machines already supported.** Every hybrid —
+  18kPV, 12kPV, FlexBOSS21, FlexBOSS18 — reports exactly what it did before,
+  string counts and generator readings included.
+
+- **Set `model` in your configuration if you own an off-grid machine.** All of
+  this follows from the configured model; one left unset is still read as a
+  hybrid. The first-run wizard always sets it.
+
+- The first-run wizard cannot detect which off-grid machine you have: both
+  report the same device type code, so Detect says nothing rather than guess,
+  and you pick from the list.
+
+- Readings already recorded on an existing off-grid database are left alone.
+  They stop being drawn, but a bogus generator figure stored before this
+  release is still in the history.
+
+- A model changed through the settings page now reopens the database for that
+  model. Before, moving an installation between an off-grid and a hybrid model
+  that way left the collector writing readings the database had no column for,
+  which stopped collection until it was changed back.
+
+## 1.0.4 — 14 August 2026
+
+A password, if you want one. Nothing changes for anybody who does not.
+
+### Added
+
+- **Optional authentication, off until you set a password.** Until now every
+  device that could reach the port could rewrite every setting — the tariff
+  that decides what you are told your electricity costs, the address the
+  collector polls, whether it polls at all. Setting a password on the Settings
+  page under General closes that. **A fresh install and an existing one behave
+  exactly as before**: there is no default password, nothing to migrate, and
+  nothing to switch off if you do not want it.
+
+  It protects **writes only**, which is what keeps a wall-mounted dashboard
+  working — the pages only read, so a display never logs in and can never be
+  logged out. When a write needs a session you are asked for the password once
+  and the write goes through; it is not a login screen in front of the site.
+
+- **`arraysense --clear-password`**, for when it is forgotten. It runs on the
+  machine, which is a stronger credential than the password it clears, and it
+  says whether a password was actually there rather than exiting silently.
+
+### Notes
+
+- **What this is worth, stated plainly, because it is not everything.** The
+  pages are plain HTTP on a home network, so the password and the session
+  cross it in the clear. It protects against other devices on the network
+  changing things — by accident or by mischief — and not against anyone in a
+  position to watch the traffic. The Settings page says the same thing in the
+  same words, and the documentation does not claim more.
+
+- Sessions are held in memory, so restarting the service ends them. That is
+  deliberate: the database is copied by the backup feature, and a session kept
+  on disk would ride into every archive as a live credential. The only thing
+  authentication writes down is the password's scrypt hash.
+
+- The password is stored where the settings API can neither read it nor write
+  it, and five guesses a minute is all any caller gets — at the login and at
+  the password-change endpoint alike, since both check the same secret.
+
+## 1.0.3 — 14 August 2026
+
+The wizard's Detect button now says which inverter answered, not just its serial.
+
+### Added
+
+- **Detect reads the model, not only the serial.** The 18kPV, 12kPV,
+  FlexBOSS21 and FlexBOSS18 are read off the same connection Detect already
+  opens and told apart exactly; an off-grid or other recognized family says so
+  without guessing which one; and a register read that fails after the serial
+  already answered names the transport, rather than leaving the page silent
+  about which connection to check. If the model detected isn't one the
+  currently selected manufacturer offers — Detect is often clicked before the
+  right one is chosen — the page says what answered without claiming the form
+  now reflects it.
+
+## 1.0.2 — 13 August 2026
+
+A performance ratio that was roughly double for one wiring arrangement.
+
+### Fixed
+
+- **Performance ratios for two strings sharing one MPPT are corrected.** The
+  inverter reports one MPPT total, but the old scorer counted that reading once
+  for each configured string, so affected past ratios were roughly double. The
+  corrected scorer groups those strings under their one measured input and
+  queues historical days for recomputation; installations with one string per
+  MPPT keep the same rows and figures.
+
 ## 1.0.1 — 13 August 2026
 
 Says which dongle, because "WiFi dongle" was not specific enough to buy from.

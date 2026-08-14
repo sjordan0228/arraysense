@@ -306,6 +306,21 @@ together, and the copy dies with the original. It is a defence against the
 database's disk failing, not against the machine failing, and it should not be
 described as more than that.
 
+## I forgot the access password
+
+The Access section on the Settings page can set, change and clear the password,
+but a forgotten one is exactly the case where the page cannot help — it asks
+for the current password before changing or clearing anything. The recovery is
+on the machine itself:
+
+```bash
+arraysense --clear-password
+```
+
+It removes the stored password and lets every write through again, and it says
+which it did — cleared, or already off. It needs shell access to the box, which
+is a stronger credential than the web password it clears.
+
 ## Finding your dongle serial
 
 It appears on the dongle's label, in your router's DHCP client list, and as the name

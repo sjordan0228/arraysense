@@ -843,3 +843,213 @@ def test_the_wizard_writes_the_config_unreadable_to_others(tmp_path: Path) -> No
     assert config.exists()
     mode = stat.S_IMODE(os.stat(config).st_mode)
     assert mode == 0o600, f"config landed {oct(mode)}, must be 0o600 — it holds the serials"
+
+
+def test_a_model_changed_through_settings_reopens_the_store(tmp_path: Path) -> None:
+    """The overlay can move an installation between models, and the store must follow.
+
+    A model narrows the writable set now that it can declare metrics it cannot
+    read, so the columns depend on the model exactly as they depend on the
+    driver. A file naming a 6000XP opens a store with no generator columns; the
+    settings page then moving that installation to an 18kPV leaves the collector
+    producing generator readings the store will not take. ``append`` raises
+    KeyError, which is not a ``sqlite3.Error`` and so is not among the
+    collector's STORE_ERRORS — the poll task dies on the first poll, the
+    watchdog stops the process, and systemd restarts it into the same state.
+    The reopen condition covered the serial and the driver and not the model,
+    which is how a crash loop hid behind a settings change.
+    """
+    from dataclasses import replace
+    from datetime import UTC, datetime
+
+    from arraysense.config import effective
+    from arraysense.models import Sample
+    from arraysense.settings import SettingsStore
+
+    config = replace(_config(tmp_path), model="6000XP")
+    _app, store, _service = build_app(config)
+    assert "generator_power_w" not in store._present.get("inverter_raw", frozenset())
+    SettingsStore(store).set("connection.model", "18kPV")
+    store.close()
+
+    _app2, store2, _service2 = build_app(config)
+    try:
+        assert effective(config, SettingsStore(store2)).model == "18kPV"
+        # The reading an 18kPV produces and a 6000XP's store would refuse.
+        store2.append(
+            Sample(
+                timestamp=datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+                readings={"generator_power_w": 1234.0},
+            ),
+        )
+    finally:
+        store2.close()
+
+
+def test_a_store_opened_for_a_6000xp_has_no_generator_columns(tmp_path: Path) -> None:
+    """The store is opened for the resolved model, not just the driver.
+
+    A 6000XP declares the generator block unreadable, so its store must carry no
+    generator columns — a column nothing can ever fill is exactly the mistake
+    the narrowed declaration exists to prevent, and a sample carrying one would
+    raise KeyError on append.
+    """
+    from dataclasses import replace
+
+    from arraysense.__main__ import build_app
+
+    config = replace(_config(tmp_path), model="6000XP")
+    _app, store, _service = build_app(config)
+    try:
+        columns = store._present.get("inverter_raw", frozenset())
+        assert "generator_power_w" not in columns
+        assert "generator_voltage_v" not in columns
+        assert "generator_frequency_hz" not in columns
+        assert "pv1_power_w" in columns
+        assert "pv2_power_w" in columns
+    finally:
+        store.close()
+
+
+def test_a_store_opened_for_a_12000xp_has_no_generator_columns_and_no_pv3(
+    tmp_path: Path,
+) -> None:
+    """The store follows the resolved model, so a 12000XP has no columns it cannot fill.
+
+    The 12000XP declares the generator block unreadable and two PV strings, so
+    its store must carry no generator columns and no third-string columns — a
+    column nothing can ever fill is exactly the mistake the narrowed
+    declaration exists to prevent.
+    """
+    from dataclasses import replace
+
+    from arraysense.__main__ import build_app
+
+    config = replace(_config(tmp_path), model="12000XP")
+    _app, store, _service = build_app(config)
+    try:
+        columns = store._present.get("inverter_raw", frozenset())
+        assert "generator_power_w" not in columns
+        assert "generator_voltage_v" not in columns
+        assert "generator_frequency_hz" not in columns
+        assert "pv3_power_w" not in columns
+        assert "pv1_power_w" in columns
+        assert "pv2_power_w" in columns
+    finally:
+        store.close()
+
+
+async def test_a_6000xp_sample_carries_no_generator_readings_and_appends(
+    tmp_path: Path,
+) -> None:
+    """Both halves of the narrowing, so the collector survives its first poll.
+
+    The store must not declare the removed metrics AND the driver must not
+    produce them — a sample carrying an undeclared metric raises KeyError on
+    append, which is not a store error the collector treats as a gap. Drive a
+    6000XP-configured source whose transport insists on reporting the generator
+    block, and confirm the sample drops it and the append succeeds.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from arraysense.__main__ import _declared_metrics
+    from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource
+    from arraysense.store.sqlite_store import SqliteStore
+
+    class _Transport:
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def read_runtime(self) -> object:
+            return SimpleNamespace(
+                pv1_power=1000.0,
+                pv1_voltage=372.0,
+                pv1_current=2.7,
+                output_power=2000.0,
+                generator_power=42.0,
+                generator_voltage=230.0,
+                generator_frequency=50.0,
+            )
+
+        async def read_battery(self) -> object:
+            return None
+
+        async def read_energy(self) -> object:
+            return None
+
+    config = replace(_config(tmp_path), model="6000XP")
+    Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(
+        config.database_path,
+        device=config.inverter_serial,
+        metrics=_declared_metrics(config),
+    )
+    try:
+        source = Eg4LuxPowerSource(config, transport=_Transport())
+        sample = await source.read()
+        assert not any(name.startswith("generator_") for name in sample.readings)
+        store.append(sample)  # must not raise KeyError
+    finally:
+        store.close()
+
+
+async def test_a_12000xp_sample_carries_no_generator_readings_and_appends(
+    tmp_path: Path,
+) -> None:
+    """Both halves of the narrowing, so a 12000XP collector survives its first poll.
+
+    The store must not declare the removed metrics AND the driver must not
+    produce them — a sample carrying an undeclared metric raises KeyError on
+    append, which is not a store error the collector treats as a gap. Drive a
+    12000XP-configured source whose transport insists on reporting the generator
+    block, and confirm the sample drops it and the append succeeds.
+    """
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from arraysense.__main__ import _declared_metrics
+    from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource
+    from arraysense.store.sqlite_store import SqliteStore
+
+    class _Transport:
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def read_runtime(self) -> object:
+            return SimpleNamespace(
+                pv1_power=1000.0,
+                pv1_voltage=372.0,
+                pv1_current=2.7,
+                output_power=2000.0,
+                generator_power=42.0,
+                generator_voltage=230.0,
+                generator_frequency=50.0,
+            )
+
+        async def read_battery(self) -> object:
+            return None
+
+        async def read_energy(self) -> object:
+            return None
+
+    config = replace(_config(tmp_path), model="12000XP")
+    Path(config.database_path).parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteStore(
+        config.database_path,
+        device=config.inverter_serial,
+        metrics=_declared_metrics(config),
+    )
+    try:
+        source = Eg4LuxPowerSource(config, transport=_Transport())
+        sample = await source.read()
+        assert not any(name.startswith("generator_") for name in sample.readings)
+        store.append(sample)  # must not raise KeyError
+    finally:
+        store.close()

@@ -58,13 +58,67 @@ and get abandoned.
 ### `driver`
 
 Which family of inverter to read. Defaults to `eg4_luxpower`, which covers the EG4
-and LuxPower hybrids reached over the WiFi dongle — the 18kPV, the 12kPV and the
-FlexBOSS models. The off-grid 6000XP is offered too, with a caveat: several
-registers mean something different there, so its readings may be wrong rather than
-missing. There is no reason to set this today; it exists so that a second family
-can be added as a directory rather than as an edit to the collector.
+and LuxPower inverters reached over the WiFi dongle — the 18kPV, the 12kPV, the
+FlexBOSS models and the off-grid 6000XP and 12000XP. There is no reason to set this today; it
+exists so that a second family can be added as a directory rather than as an edit
+to the collector.
 
 An unrecognised name stops the service at startup with the list of names that work.
+
+### Model support
+
+The EG4/LuxPower family covers the hybrids — 18kPV, 12kPV, FlexBOSS21 and
+FlexBOSS18 — and the off-grid 6000XP and 12000XP. The hybrids are read in full: all three PV
+strings, the backup panel, the battery bank and every kWh counter. An off-grid
+machine differs in three ways, all declared by the driver and shown on the setup
+page when you choose it:
+
+- **Two PV strings, not three.** Both off-grid machines have two MPPT trackers:
+  the 6000XP with one input each, the 12000XP with two each (its sheet says
+  `NUMBER OF MPPTS 2`, `INPUTS PER MPPT 2/2`). Readings come per tracker, not per
+  terminal, so on the 12000XP two strings paralleled into one input share one
+  measurement — an owner who wires four strings sees two readings, and that is
+  the expected shape, not a missing pair (the efficiency model groups them;
+  issue #133). The third-string columns are never created.
+- **No generator block.** Register 123, which the register map calls "generator
+  power", is a seconds counter on off-grid — proven by firmware disassembly, not
+  inferred — and registers 124–126 are ARM status words, not energy. The
+  generator power, voltage and frequency readings are therefore not offered at
+  all rather than risk storing a wrong value. This is more conservative than
+  upstream `pylxpweb`, which removed only the power and energy sensors; it is a
+  judgement rather than a finding, and a reading will be added back if one is
+  ever confirmed.
+- **The smart-load split is cloud-only.** The GEN terminal can be repurposed as a
+  smart load, but the itemised `smartLoadPower`/`epsLoadPower` figures have no
+  local Modbus register. Your house load *total* is read locally; only the split
+  is not.
+
+**A word on names:** the **12kPV is a hybrid** and the **12000XP is off-grid** — a
+keystroke apart, opposite families, and the setup page's model list now labels
+each one. Pick the off-grid model only for a 6000XP or 12000XP; picking the
+12kPV for a 12000XP declares three strings on a two-tracker machine, and picking
+the 12000XP for a 12kPV drops a string it actually has.
+
+**Set `model` if you own one of these.** All of the above follows from the
+configured model, so an off-grid installation that leaves `model` unset is read
+as though it were a hybrid — which puts the seconds counter back on the chart as
+generator watts. The first-run wizard always sets it, so this only affects a
+`config.toml` written by hand. The wizard cannot detect which off-grid model you
+have either: device type code 54 covers the 6000XP and the 12000XP alike, so
+Detect deliberately reports nothing rather than guess, and you pick from the
+list.
+
+Sources: [`joyfulhouse/eg4_web_monitor` issue #544](https://github.com/joyfulhouse/eg4_web_monitor/issues/544)
+(the register 123 disassembly), [issue #222](https://github.com/joyfulhouse/eg4_web_monitor/issues/222)
+(the smart-load split), and the
+[EG4 6000XP spec sheet](https://eg4electronics.com/wp-content/uploads/2024/04/EG4-6000XP-Inverter-Spec-Sheet.pdf)
+and the
+[EG4 12000XP spec sheet](https://eg4electronics.com/wp-content/uploads/2024/10/EG4-12000XP-Spec-Sheet.pdf).
+
+The WiFi dongle's TCP port 8000 works on these models. Modbus TCP on port 502 is
+closed on them, so do not spend an evening trying to reach the inverter directly
+over Modbus TCP; use the dongle, or a USB-to-RS485 adapter with
+`transport = "modbus_serial"`.
 
 ### `model`
 
@@ -134,6 +188,35 @@ EG4/LuxPower inverters.
 
 Modbus unit ID for the serial connection. Defaults to `1`. Must be between 1 and
 247, because 0 is the broadcast address and never answers a read.
+
+## Authentication
+
+Authentication is optional and off until a password is set. It is not a
+configuration-file setting and it is not in the settings registry: the password
+is stored in the database under its own key, and the Access section on the
+Settings page's General tab is where it is set, changed and cleared. There is no
+default password and no way for an upgrade to lock an installation out — with no
+hash stored, the service behaves exactly as it did before.
+
+When a password is set, the write endpoints — settings, setup, yield and resume,
+and the efficiency backfill — ask for a session cookie, while every read stays
+open. The dashboard only reads, so it never logs in and a wall display needs
+nothing on its screen. The password and the session cookie cross the network in
+plain HTTP, so the protection is against other devices on the LAN changing
+things by accident or mischief, not against anyone who can watch the traffic.
+
+Sessions live in the service's memory only, so a restart ends every session.
+That is accepted: the dashboard holds none, and nothing about a session is
+written to disk where a backup could carry it.
+
+Forgetting the password is not a lockout. On the machine itself, run:
+
+```bash
+arraysense --clear-password
+```
+
+It removes the stored hash and lets every write through again, and it reports
+which of the two it did — cleared, or already off.
 
 ## Data retention
 

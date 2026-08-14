@@ -5,8 +5,11 @@ the inverter. The collector owns the one connection the dongle allows, so the AP
 reads only from the database — which means you can query it as hard as you like
 without affecting collection.
 
-The service listens on port 8080 by default. There is no authentication: run it on a
-network you trust, or put a reverse proxy in front of it.
+The service listens on port 8080 by default. Authentication is optional and off
+until a password is set; when it is on it protects the write endpoints only, and
+the password travels as plain HTTP, so it stops other devices on the network
+changing things by accident or mischief rather than anyone who can watch the
+traffic. Run it on a network you trust, or put a reverse proxy in front of it.
 
 Interactive documentation generated from the code is at `/docs`.
 
@@ -319,8 +322,9 @@ a `400` rather than a silently created setting nothing reads.
 settings apply on the next page refresh; the connection and poll settings are read
 when the collector starts.
 
-**Identifying values come back masked**, as `BA••••••60`. There is no authentication
-in front of this endpoint, so it answers anything that can reach the port. The
+**Identifying values come back masked**, as `BA••••••60`. This is a read endpoint,
+and reads stay open even when a password is set — a wall display never logs in — so
+it answers anything that can reach the port. The
 serials are not passwords — the dongle broadcasts its own as a WiFi network name —
 but handing the full set to any device on the network is not a decision worth making
 by accident. Masking rather than blanking keeps the page usable: you can confirm
@@ -335,6 +339,69 @@ form without editing that field does not write bullets over the real serial.
 `database_path` and the bind address remain command-line arguments. The service
 cannot read settings out of a database before it knows where the database is, and
 nothing sensitive is in that pair.
+
+## Authentication
+
+Optional, and off until a password is set. With none set, every write endpoint
+behaves exactly as it does without this section. With one, the six write
+endpoints — `PUT /api/settings`, `POST /api/setup/apply`, `POST /api/setup/detect`,
+`POST /api/yield`, `POST /api/resume` and `POST /api/efficiency/backfill` — answer
+`401` with `{"detail": "authentication required"}` unless the request carries a
+session cookie. Reads are never protected, so the dashboard keeps working without
+a login.
+
+The password and the session cookie cross the network in plain HTTP, so the
+protection is against other devices on the same network changing settings or
+stopping collection by accident or mischief, not against anyone who can watch the
+traffic. Sessions live in the service's memory, so a restart ends every session —
+no loss for a display that only reads — and nothing about a session is written to
+disk.
+
+### `GET /api/auth`
+
+Whether authentication is on, and whether this client holds a session. Open, so
+a page can decide what to render.
+
+```json
+{ "required": false, "authenticated": false }
+```
+
+### `POST /api/auth/login`
+
+Start a session in exchange for the password.
+
+```bash
+curl -X POST localhost:8080/api/auth/login -H 'Content-Type: application/json' -d '{"password": "…"}'
+```
+
+On success the reply sets an `HttpOnly`, `SameSite=Strict` session cookie and
+returns `{"ok": true}`. A wrong password is `401`; after five wrong attempts
+from one address, further attempts — including one with the right password —
+are refused with `429` for a minute. The count is not a rolling window: it
+accumulates until it reaches five, whenever those failures happened. Nothing is
+counted before a password has been set, so a stranger cannot spend the
+attempts the owner is going to need.
+
+### `POST /api/auth/logout`
+
+End this session and clear its cookie. Always `200`, even when nothing was
+logged in.
+
+### `POST /api/auth/password`
+
+Set, change or clear the password.
+
+```bash
+curl -X POST localhost:8080/api/auth/password -H 'Content-Type: application/json' -d '{"new_password": "…"}'
+```
+
+Setting the first password needs no credential — there is none yet. Changing or
+clearing an existing password requires the current one, verified, whatever the
+session state. An empty `new_password` clears the password, which turns
+authentication off and revokes every session. A new password shorter than 8
+characters is a `400`. A wrong `current_password` is a `401`, and this endpoint
+shares the login throttle, so five wrong guesses here also block login from that
+address for a minute.
 
 ## `POST /api/yield` and `POST /api/resume`
 

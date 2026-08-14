@@ -4,8 +4,9 @@
 > reference database on 11 August 2026: 668 days of hourly history, and 34.5 days
 > of continuous raw collection carrying 272,789 inverter readings — 99.76 % of
 > that window covered. One inverter model has been measured; three more are
-> supported on upstream evidence. There is no authentication yet, so run it on a
-> network you trust and do not expose it to the internet.
+> supported on upstream evidence. Authentication is optional and off until a
+> password is set; when it is on it protects writes only, so run it on a network
+> you trust and do not expose it to the internet.
 
 ## What you need
 
@@ -141,10 +142,14 @@ identifies your hardware) and restarts the service into the dashboard. The page
 then opens the live dashboard once the collector is up. `arraysense status` shows
 the same thing from the terminal.
 
-The service has no authentication yet. It binds every interface so the dashboard is
-reachable from other machines on the LAN, and anything on that network can also
-write its settings — so keep it on a network you trust and do not expose it to the
-internet. A reverse proxy in front of it is the answer if you need it further away.
+The service binds every interface so the dashboard is reachable from other machines
+on the LAN. Authentication is optional and off until a password is set: with none
+set, anything on that network can also write its settings, and with one, the write
+endpoints ask for it while the dashboard keeps reading without a login. The password
+travels as plain HTTP, so it stops other devices on the network changing things by
+accident or mischief, not anyone who can watch the traffic. Keep it on a network you
+trust and do not expose it to the internet; a reverse proxy in front of it is the
+answer if you need it further away.
 
 ## Managing it
 

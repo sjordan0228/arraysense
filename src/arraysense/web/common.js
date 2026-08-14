@@ -476,6 +476,32 @@ const BASE_CSS = `
   @media (prefers-reduced-motion: no-preference) {
     @view-transition { navigation: auto; }
   }
+  /* The one login prompt on the site. A native <dialog> puts it in the top
+     layer with focus trapping and Escape for free; the styling is the existing
+     panel and ink tokens rather than a colour of its own, and the backdrop is
+     a neutral dim — held off pure black because the shared stylesheet's
+     surface rule forbids a hardcoded near-black background that would not
+     invert with the theme, and a mid-gray dim reads the same way over both. */
+  .authdlg{background:var(--panel);color:var(--ink);border:1px solid var(--panel-b);
+    border-radius:14px;padding:20px 22px;max-width:340px;width:calc(100vw - 40px);
+    box-shadow:0 18px 50px rgba(0,0,0,.4);backdrop-filter:blur(14px);
+    -webkit-backdrop-filter:blur(14px)}
+  .authdlg::backdrop{background:rgba(64,64,64,.5)}
+  .authdlg h2{font-size:15px;margin:0 0 6px}
+  .authdlg .authp{font-size:12px;color:var(--ink2);line-height:1.6;margin:0 0 14px}
+  .authdlg form{display:flex;flex-direction:column;gap:8px}
+  .authdlg label{font-size:11px;color:var(--ink3)}
+  .authdlg input[type=password]{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink);border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;
+    font-variant-numeric:tabular-nums}
+  .authdlg input[type=password]:focus{outline:2px solid var(--pv);outline-offset:1px;
+    border-color:transparent}
+  .authdlg .authmsg{font-size:12px;color:var(--bad);line-height:1.55;min-height:1em}
+  .authdlg .authacts{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}
+  .authdlg .primary{background:var(--pv);border:1px solid transparent;color:#1a1204;font-weight:600;
+    font-size:13px;padding:6px 16px;border-radius:8px;cursor:pointer;font-family:inherit}
+  .authdlg .primary:hover{background:#e08c33}
+  .authdlg .primary:disabled{opacity:.45;cursor:default}
 `;
 document.head.appendChild(
   Object.assign(document.createElement('style'), { textContent: BASE_CSS }));
@@ -598,6 +624,35 @@ function setupFieldsFor(payload, transport) {
 function setupBatterySourcesFor(payload, driver) {
   const map = (payload && payload.battery_sources) || {};
   return Array.isArray(map[driver]) ? map[driver] : ['none'];
+}
+
+// The three honest things a page can say about a model with gaps, as the
+// design that added them names them: what is read locally and correct (the
+// bulk, not enumerated), what cannot be read locally with whether the vendor
+// cloud carries it, and what is not offered at all. Structured rather than
+// HTML so a test can pin the decision without the DOM; the two shells render
+// it themselves, and the cloud list is named, not promised — a phase 2 path
+// that does not exist yet must not be advertised.
+function setupModelGapNote(model) {
+  const gaps = (model && model.unreadable) || [];
+  if (!gaps.length) return null;
+  return {
+    local: true,
+    cloud: gaps.filter((g) => g.cloud_available),
+    gone: gaps.filter((g) => !g.cloud_available),
+  };
+}
+
+// The option label for one model in the setup list. A family that contains
+// both kinds says plainly which kind each model is, so the 12kPV (hybrid) and
+// the 12000XP (off-grid) — a keystroke apart, opposite families — cannot be
+// confused by an owner who has not read the manual. The off-grid machines are
+// the ones with an unreadable list; in a mixed family everything else is a
+// hybrid. A family with only one kind, the simulated driver say, needs no
+// tags at all.
+function setupModelLabel(model, familyHasOffgrid) {
+  if (!model.family) return model.name;
+  return familyHasOffgrid ? `${model.name} — ${model.family}` : model.name;
 }
 
 // The apply body: only the connection keys, only the ones with a real value.
@@ -2913,6 +2968,142 @@ function problemText(detail) {
   return 'the value was refused';
 }
 
+// A write that may ask for a login. With no password set the protected write
+// endpoints answer exactly as they always have, so this is a pass-through and
+// a fresh install never sees the dialog — the login prompt appears only in
+// response to a real 401, which is the rule this phase exists to keep.
+async function writeWithAuth(url, options, ms) {
+  const response = await fetchTimeout(url, options, ms);
+  if (!authShouldRetry(response.status, false)) return response;
+  const loggedIn = await openLoginDialog();
+  if (!loggedIn) return response;
+  // One retry, never two: a repeat 401 here is a genuine failure — the session
+  // did not take, or was revoked between the login and the retry — and the
+  // caller's own error handling is the right response to it.
+  return fetchTimeout(url, options, ms);
+}
+
+// >>> write-auth-logic
+// Whether a 401 deserves the login dialog and one retry. The second half is
+// what stops the loop: a repeat 401 after a successful login is a genuine
+// failure, and answering it with another dialog would retry forever. The
+// dialog's DOM is not exercised here — that is the browser's job — only this
+// decision is, because it is the part a wrong edit would break silently.
+function authShouldRetry(status, alreadyRetried) {
+  return status === 401 && !alreadyRetried;
+}
+// <<< write-auth-logic
+
+// The one login prompt on the site, built lazily because it is only ever
+// needed after a real 401. A native <dialog> with showModal() gives focus
+// trapping and Escape for free, and the password field takes focus when it
+// opens. The markup is static — nothing from the server or the page is
+// interpolated into it — and the messages below go through textContent, so a
+// service reply can never become markup inside the dialog.
+let authDialog = null;
+function authDialogEl() {
+  if (authDialog) return authDialog;
+  const dlg = document.createElement('dialog');
+  dlg.className = 'authdlg';
+  dlg.innerHTML = `
+    <form id="authForm">
+      <h2 id="authTitle">Authentication required</h2>
+      <p class="authp">This write needs a session. Enter the password this
+        installation was set up with.</p>
+      <label for="authPassword">Password</label>
+      <input id="authPassword" name="password" type="password"
+        autocomplete="current-password">
+      <div class="authmsg" id="authMsg" role="status"></div>
+      <div class="authacts">
+        <button type="button" class="iconbtn" id="authCancel">Cancel</button>
+        <button type="submit" class="iconbtn primary" id="authSubmit">Log in</button>
+      </div>
+    </form>`;
+  const form = dlg.querySelector('form');
+  // Settle on every dismissal path rather than on the close event alone.
+  // Cancel resolves the waiting caller directly, Escape through the cancel
+  // event, and the close event stays as the catch-all for any other way the
+  // dialog is dismissed. settleAuth is idempotent, so whichever arrives first
+  // wins and the rest are no-ops.
+  //
+  // Why not trust close by itself: the promise it settles is what a Save
+  // button is waiting on, and a promise that neither resolves nor rejects
+  // leaves that button disabled with nothing on screen to say why — a failure
+  // no gate can see, since it is the absence of an event rather than an error.
+  // One event is a single point of failure for a UI that cannot recover from
+  // it without a reload. (This was not reproduced in a real browser: the
+  // automation harness used here cannot deliver clicks or Escape to a modal
+  // dialog in the top layer and never fires close even on a bare dialog, so
+  // it could not settle the question either way. Chrome does fire close, so
+  // the original single listener was most likely fine; this is belt and
+  // braces, not a fix for a diagnosed defect.)
+  dlg.querySelector('#authCancel').addEventListener('click', () => settleAuth(false));
+  dlg.addEventListener('cancel', () => settleAuth(false));
+  dlg.addEventListener('close', () => settleAuth(false));
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const input = dlg.querySelector('#authPassword');
+    const msg = dlg.querySelector('#authMsg');
+    const submit = dlg.querySelector('#authSubmit');
+    if (!input.value) { msg.textContent = 'Enter the password.'; input.focus(); return; }
+    submit.disabled = true;
+    try {
+      const r = await fetchTimeout('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: input.value }),
+      }, 8000);
+      if (r.ok) { settleAuth(true); return; }
+      let detail = null;
+      try { const body = await r.json(); detail = body.detail; } catch (err) { /* not JSON */ }
+      if (r.status === 429) {
+        // The owner has already been told the password is wrong; the second
+        // message is the one that explains the wait.
+        msg.textContent = 'Too many failed attempts — wait a minute before trying again.';
+      } else {
+        msg.textContent = problemText(detail) || `Login failed (${r.status}).`;
+      }
+      input.value = '';
+      input.focus();
+    } catch (err) {
+      msg.textContent = 'The service could not be reached.';
+      input.focus();
+    } finally {
+      submit.disabled = false;
+    }
+  });
+  document.body.appendChild(dlg);
+  authDialog = dlg;
+  return dlg;
+}
+
+// Open the dialog and resolve with whether the login succeeded. Concurrent
+// callers share one dialog: a second write that hits a 401 while it is open
+// waits on the same outcome and retries alongside the first.
+let authSettle = null;
+let authOutcome = null;
+function openLoginDialog() {
+  const dlg = authDialogEl();
+  if (dlg.open && authOutcome) return authOutcome;
+  authOutcome = new Promise((resolve) => { authSettle = resolve; });
+  const msg = dlg.querySelector('#authMsg');
+  if (msg) msg.textContent = '';
+  const input = dlg.querySelector('#authPassword');
+  if (input) input.value = '';
+  dlg.showModal();
+  if (input) input.focus();
+  return authOutcome;
+}
+
+// Resolve any caller waiting on the dialog. Idempotent: the close event that
+// follows a success finds authSettle already cleared and does nothing.
+function settleAuth(ok) {
+  const resolve = authSettle;
+  authSettle = null;
+  authOutcome = null;
+  if (authDialog && authDialog.open) authDialog.close();
+  if (resolve) resolve(ok);
+}
+
 // Watch the collector come back after a save-and-restart, for both shells. The
 // service SIGTERMs itself and systemd restarts it, so /api/status goes away and
 // then answers again — and in first-run setup mode it did not exist to begin
@@ -3004,7 +3195,19 @@ function mountSetup(host, payload, opts) {
     const out = [];
     for (const fam of (mk && mk.families) || []) {
       for (const m of fam.models || []) {
-        out.push({ driver: fam.driver, name: m.name, caveat: m.caveat || '' });
+        // Every field the option list renders from has to be copied across
+        // here. This rebuilds each model rather than passing the payload's own
+        // object through, so a field added to the payload and read by the
+        // renderer is silently empty until it is named on this line — which is
+        // how the family tag reached the browser, passed its own test, and
+        // still drew a bare name in the dropdown.
+        out.push({
+          driver: fam.driver,
+          name: m.name,
+          caveat: m.caveat || '',
+          unreadable: m.unreadable || [],
+          family: m.family || '',
+        });
       }
     }
     return out;
@@ -3062,18 +3265,44 @@ function mountSetup(host, payload, opts) {
 
     const makerSel = makerNames.map((n) =>
       `<option value="${esc(n)}"${n === state.manufacturer ? ' selected' : ''}>${esc(n)}</option>`).join('');
-    // A model with a caveat says so in the option itself, not only once it is
-    // chosen. Someone scanning the list for their machine decides there and
-    // then, and a warning that appears afterwards has already lost the argument.
+    // The option itself says what kind of machine each model is, not only once
+    // it is chosen: the 12kPV and the 12000XP are a keystroke apart and
+    // opposite families, and someone scanning the list for their machine
+    // decides there and then. A model with a caveat still carries it in the
+    // note below once chosen; the list labels the family, not the warning.
+    // Tag the models only where the list actually holds more than one kind.
+    // A family of hybrids alone does not need every entry saying so.
+    const kinds = new Set(models.map((m) => m.family).filter(Boolean));
+    const familyHasOffgrid = kinds.size > 1;
     const modelSel = models.map((m) => {
       const v = `${m.driver}::${m.name}`;
       const on = m.name === state.model && m.driver === state.driver;
-      const label = m.caveat ? `${m.name} — unverified` : m.name;
+      const label = setupModelLabel(m, familyHasOffgrid);
       return `<option value="${esc(v)}"${on ? ' selected' : ''}>${esc(label)}</option>`;
     }).join('');
     const chosenModel = models.find((m) => m.name === state.model && m.driver === state.driver);
     const modelNote = chosenModel && chosenModel.caveat
       ? `<div class="hint warn-note">${esc(chosenModel.caveat)}</div>` : '';
+    // A model that cannot read some of its family's registers must say which,
+    // in the three honest categories the setup design names — not one vague
+    // warning. Rendered from the server's declaration via setupModelGapNote,
+    // never from a list kept here, which would drift the first time this
+    // registry changes.
+    const gaps = setupModelGapNote(chosenModel);
+    // "Everything else is correct" is a claim nobody has established, so it is
+    // not made. What can honestly be said is narrower and still useful: these
+    // named readings are not offered, and the rest is read the same way it is
+    // read on every other model in this family.
+    const gapsHTML = gaps ? `<div class="hint warn-note"><strong>What this model does not report</strong>
+      <div>Everything not listed here is read locally, the same as on the rest of
+        this family.</div>`
+      + (gaps.cloud.length ? `<div><strong>Not available locally — the vendor cloud carries it:</strong><ul>
+          ${gaps.cloud.map((g) => `<li>${esc(g.reason)}</li>`).join('')}
+        </ul></div>` : '')
+      + (gaps.gone.length ? `<div><strong>Not offered — the reading would not mean what it says:</strong><ul>
+          ${gaps.gone.map((g) => `<li>${esc(g.reason)}</li>`).join('')}
+        </ul></div>` : '')
+      + `</div>` : '';
     const transSel = [['dongle', 'WiFi dongle'], ['modbus_serial', 'RS485 serial']].map(([v, lbl]) =>
       `<option value="${v}"${v === state.transport ? ' selected' : ''}>${lbl}</option>`).join('');
     const battLabel = {
@@ -3093,6 +3322,7 @@ function mountSetup(host, payload, opts) {
       <div class="row"><label for="su_model">Model</label>
         <select id="su_model" data-role="model">${modelSel}</select></div>
       ${modelNote}
+      ${gapsHTML}
       <div class="row"><label for="su_transport">Connection</label>
         <select id="su_transport" data-role="transport">${transSel}</select></div>
       <div data-role="fields">${connectionFields()}</div>
@@ -3149,7 +3379,7 @@ function mountSetup(host, payload, opts) {
     btn.disabled = true;
     status('Reading the inverter’s serial…', 'busy');
     try {
-      const r = await fetchTimeout('/api/setup/detect', {
+      const r = await writeWithAuth('/api/setup/detect', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildSetupBody(state)),
       }, 20000);
@@ -3159,6 +3389,39 @@ function mountSetup(host, payload, opts) {
         state.inverter_serial = body.serial;
         const input = host.querySelector('[data-k="inverter_serial"]');
         if (input) input.value = body.serial;
+      }
+      if (body.model) {
+        // Select it in the model dropdown, the same driver family already chosen.
+        // The match can miss — Detect is often clicked before the right
+        // manufacturer is — and the status must say only what actually happened.
+        const modelSelect = host.querySelector('[data-role="model"]');
+        const match = [...modelSelect.options].find((o) => o.value.endsWith('::' + body.model));
+        if (match) {
+          modelSelect.value = match.value;
+          const [driver, name] = match.value.split('::');
+          state.driver = driver; state.model = name;
+          render();
+          status(`The inverter answered as a ${body.model}, serial ${body.serial}.`, 'ok');
+        } else {
+          status(`The inverter answered as a ${body.model}, serial ${body.serial}, but ` +
+            `that model isn't listed under the manufacturer currently selected above.`, 'warn');
+        }
+      } else if (body.serial && body.model_read_failed) {
+        // The serial answered on the same connection the model read failed on,
+        // which is what a flaky link looks like — but it is also what a
+        // retried-out dongle misroute or a device that simply never serves
+        // these registers looks like. Naming the transport is a useful hint,
+        // not a diagnosis: the wording must not assert the fault is the link.
+        const hint = state.transport === 'modbus_serial'
+          ? 'if this keeps happening, check the RS485 connection.'
+          : 'if this keeps happening, check the WiFi dongle connection.';
+        status(`The inverter answered with serial ${body.serial}, but reading its ` +
+          `model failed — ${hint}`, 'warn');
+      } else if (body.serial && body.family_recognized) {
+        status(`The inverter answered with serial ${body.serial}. Its family was ` +
+          `recognized but the exact model could not be confirmed — look for it in the ` +
+          `list below, or enter it by hand if it isn't there.`, 'warn');
+      } else if (body.serial) {
         status(`The inverter answered with serial ${body.serial}.`, 'ok');
       } else {
         status('The probe returned no serial.', 'warn');

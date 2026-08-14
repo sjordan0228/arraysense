@@ -12,6 +12,7 @@ loud if the extraction markers move, so the slice cannot drift out from under it
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -60,9 +61,79 @@ const P = {
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_model_gap_note_splits_into_the_three_honest_categories() -> None:
+    out = _run(
+        PAYLOAD
+        + """
+        const m = {name:'6000XP', unreadable:[
+          {metric:'generator_power_w', reason:'a seconds counter', cloud_available:false},
+          {metric:'generator_voltage_v', reason:'never verified', cloud_available:true}
+        ]};
+        console.log(JSON.stringify(setupModelGapNote(m)));
+        """
+    )
+    note = json.loads(out)
+    assert note["local"] is True
+    assert [g["metric"] for g in note["gone"]] == ["generator_power_w"]
+    assert [g["metric"] for g in note["cloud"]] == ["generator_voltage_v"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_model_with_no_gaps_has_no_note() -> None:
+    # JSON.stringify so the bare JS null is logged as the string "null";
+    # node colours the null keyword itself and the assertion would see escape
+    # codes rather than the value.
+    out = _run(
+        PAYLOAD + "console.log(JSON.stringify(setupModelGapNote({name:'18kPV', unreadable:[]})));"
+    )
+    assert out == "null"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_models_for_a_driver() -> None:
     out = _run(PAYLOAD + 'console.log(setupModelsFor(P,"eg4_luxpower").map(m=>m.name).join(","));')
     assert out == "18kPV,6000XP"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_list_says_plainly_what_the_12kpv_and_12000xp_are() -> None:
+    # A keystroke apart and opposite families: the 12kPV is a hybrid and the
+    # 12000XP is off-grid. The option label has to say which is which, because
+    # someone scanning the dropdown for their machine decides there and then.
+    # The label comes from the model's own declared family, never inferred from
+    # something merely correlated with it — a hybrid that one day declares an
+    # unreadable metric must not start calling itself off-grid.
+    out = _run(
+        "console.log(setupModelLabel({name:'12kPV', family:'hybrid'}, true) + '|' + "
+        "setupModelLabel({name:'12000XP', family:'off-grid'}, true));"
+    )
+    assert out == "12kPV — hybrid|12000XP — off-grid"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_option_list_carries_every_field_the_label_reads() -> None:
+    """The renderer rebuilds each model, so a field it reads must be copied over.
+
+    ``modelOptionsFor`` constructs a fresh object per model rather than passing
+    the payload's own through. A field added to the payload and read by the
+    renderer is therefore silently empty until it is named there — which is
+    exactly what happened to the family tag: it reached the browser, its own
+    test passed, and the dropdown still drew a bare name. A string check is
+    crude, but it catches the one failure the pure-function test cannot see.
+    """
+    source = COMMON.read_text(encoding="utf-8")
+    start = source.index("const modelOptionsFor")
+    body = source[start : source.index("};", start)]
+    for field_name in ("name:", "caveat:", "unreadable:", "family:"):
+        assert field_name in body, f"modelOptionsFor drops {field_name!r}"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_family_with_one_kind_gets_no_tags() -> None:
+    # The simulated driver has no off-grid machine to contrast with, so tagging
+    # its one model "hybrid" would assert a family it does not belong to.
+    out = _run("console.log(setupModelLabel({name:'Simulated', unreadable:[]}, false));")
+    assert out == "Simulated"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

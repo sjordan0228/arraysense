@@ -27,18 +27,28 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Annotated, Any, cast
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
+from arraysense.auth import (
+    MIN_PASSWORD_LENGTH,
+    Sessions,
+    clear_password,
+    password_hash,
+    password_is_set,
+    set_password,
+    verify_password,
+)
 from arraysense.calibration import (
     CORROBORATING_ABSORB,
     PACK_RESET_LAG,
@@ -61,6 +71,7 @@ from arraysense.efficiency import (
     compute_day,
     compute_hours,
     fitted_baselines,
+    mppt_groups,
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
@@ -132,6 +143,32 @@ def _read_store(request: Request) -> Iterator[SqliteStore]:
 
 
 _ReadStore = Annotated[SqliteStore, Depends(_read_store)]
+
+# The cookie the session token rides in. Named here because both the login
+# route that sets it and the guard that reads it have to agree, and a literal
+# typed in two places drifts the way every other repeated literal here does.
+_SESSION_COOKIE = "arraysense_session"
+
+
+async def _require_write(request: Request) -> None:
+    """Allow an unauthenticated write only while no password is set.
+
+    This is the optional half and the whole point of #34: with no hash stored
+    the request passes through exactly as it did before authentication
+    existed. With one stored, the session cookie is checked against the
+    in-memory sessions, and an absent, unknown or expired session is a 401.
+    What this protects against is casual and accidental writes from anything
+    on the LAN; the traffic is plain HTTP and observable, and the auth
+    endpoints' docstrings say so rather than claiming more.
+    """
+    settings = SettingsStore(request.app.state.store)
+    if not password_is_set(settings):
+        return
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token is not None and request.app.state.sessions.valid(token):
+        return
+    raise HTTPException(status_code=401, detail="authentication required")
+
 
 _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
 
@@ -930,7 +967,7 @@ def _reject_unwritable_backup_dir(request: Request, wanted: dict[str, Any]) -> N
         raise ValueError(f"{BACKUP_DIRECTORY_KEY}: {exc}") from exc
 
 
-@router.put("/settings")
+@router.put("/settings", dependencies=[Depends(_require_write)])
 async def write_settings(request: Request, values: dict[str, Any]) -> dict[str, Any]:
     """Apply a settings change, validating every value before writing any of them.
 
@@ -982,6 +1019,146 @@ def _is_mask(key: str, value: object) -> bool:
     except KeyError:
         return False
     return spec.secret and isinstance(value, str) and "\N{BULLET}" in value
+
+
+@router.get("/auth")
+def auth_status(request: Request) -> dict[str, Any]:
+    """Whether authentication is on, and whether this client holds a session.
+
+    A read and deliberately open: the login form has to know whether to render
+    at all, and this reveals only that a password is set — not the password,
+    and not any other setting. That fact is not secret; every write endpoint
+    already answers it, by answering 401 or not.
+    """
+    settings = SettingsStore(request.app.state.store)
+    token = request.cookies.get(_SESSION_COOKIE)
+    authenticated = token is not None and request.app.state.sessions.valid(token)
+    return {"required": password_is_set(settings), "authenticated": authenticated}
+
+
+class LoginRequest(BaseModel):
+    """The password being presented for a session."""
+
+    password: str
+
+
+@router.post("/auth/login")
+def login(request: Request, response: Response, body: LoginRequest) -> dict[str, Any]:
+    """Start a session in exchange for the password.
+
+    The cookie is HttpOnly so the page's own script cannot read it,
+    SameSite=Strict so a request from another origin cannot ride it — the
+    write API is CSRF-able today, and this closes that as a side effect — and
+    Path=/ so it reaches every protected endpoint. Max-Age matches the session
+    lifetime. Deliberately not Secure: this is plain HTTP on a LAN, and a
+    Secure cookie would simply never be sent, so setting it would leave the
+    owner unable to log in and nothing on the page to say why.
+    """
+    key = request.client.host if request.client else "unknown"
+    now = time.time()
+    if request.app.state.throttle.blocked(key, now):
+        raise HTTPException(
+            status_code=429,
+            detail="too many failed attempts; try again shortly",
+        )
+    settings = SettingsStore(request.app.state.store)
+    stored = password_hash(settings)
+    if stored is None:
+        # Nothing to guess yet, so nothing is counted. Counting here let a
+        # stranger spend the owner's five attempts before the owner had set a
+        # password at all, and the block is keyed on the address, so the
+        # owner's own first login met a 429 somebody else earned — renewable
+        # indefinitely, and waiting never cleared it. Measured before the fix:
+        # five junk attempts with no password set, then the correct password
+        # on a freshly set one answered 429.
+        raise HTTPException(status_code=401, detail="incorrect password")
+    if not verify_password(body.password, stored):
+        request.app.state.throttle.record_failure(key, now)
+        raise HTTPException(status_code=401, detail="incorrect password")
+    request.app.state.throttle.record_success(key)
+    token = request.app.state.sessions.issue()
+    response.set_cookie(
+        _SESSION_COOKIE,
+        token,
+        max_age=int(Sessions.SESSION_LIFETIME.total_seconds()),
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return {"ok": True}
+
+
+@router.post("/auth/logout")
+def logout(request: Request, response: Response) -> dict[str, Any]:
+    """End this session and clear its cookie.
+
+    Always 200, even when nothing was logged in: logout is idempotent, and the
+    login form must be able to call it without first asking whether a session
+    exists. The cookie is deleted rather than merely expired, so the browser
+    forgets it instead of re-sending a token the server no longer recognises.
+    """
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token is not None:
+        request.app.state.sessions.revoke(token)
+    response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return {"ok": True}
+
+
+class PasswordRequest(BaseModel):
+    """A new password, and the current one when one is already set."""
+
+    new_password: str
+    current_password: str | None = None
+
+
+@router.post("/auth/password")
+def change_password(request: Request, response: Response, body: PasswordRequest) -> dict[str, Any]:
+    """Set, change or clear the password.
+
+    Setting the first password needs no credential — there is none yet, and
+    this endpoint is no more exposed than every other write it is protecting.
+    Changing or clearing an existing password requires the current one,
+    verified, whatever the session state: a session proves the browser once
+    logged in, not that the person at it knows the password. An empty
+    ``new_password`` clears the password — the owner's way of switching
+    authentication off — and revokes every session.
+
+    This shares the login throttle rather than keeping its own, because it
+    verifies the same secret: guarding only the login endpoint would leave the
+    backstop with a second door standing open, and the guessing rate through
+    it was measured at unlimited against login's five-a-minute. Failures count
+    only once a password is set — before that there is no secret to guess, and
+    counting would let a stranger fill the throttle the owner is going to need.
+    A consequence worth naming: five wrong guesses here also block login from
+    that address for a minute, which is right, since it is one secret.
+    """
+    settings = SettingsStore(request.app.state.store)
+    stored = password_hash(settings)
+    if stored is not None:
+        key = request.client.host if request.client else "unknown"
+        now = time.time()
+        if request.app.state.throttle.blocked(key, now):
+            raise HTTPException(
+                status_code=429,
+                detail="too many failed attempts; try again shortly",
+            )
+        current = body.current_password
+        if not current or not verify_password(current, stored):
+            request.app.state.throttle.record_failure(key, now)
+            raise HTTPException(status_code=401, detail="current password is required")
+        request.app.state.throttle.record_success(key)
+    if body.new_password:
+        if len(body.new_password) < MIN_PASSWORD_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
+            )
+        set_password(settings, body.new_password)
+    else:
+        clear_password(settings)
+        request.app.state.sessions.revoke_all()
+        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    return {"ok": True}
 
 
 @router.get("/costs")
@@ -1855,7 +2032,7 @@ class BackfillRequest(BaseModel):
     end: str
 
 
-@router.post("/efficiency/backfill")
+@router.post("/efficiency/backfill", dependencies=[Depends(_require_write)])
 def backfill(request: Request, store: _ReadStore, body: BackfillRequest) -> dict[str, Any]:
     """Fetch past hourly conditions into the store, a day at a time.
 
@@ -2050,7 +2227,7 @@ _NO_BASELINE: dict[str, Any] = {"window_start": None, "window_end": None, "sampl
 
 
 def _baseline_info(
-    baselines: Mapping[str, StringBaseline | None],
+    baselines: Mapping[int, StringBaseline | None],
     range_start: datetime,
     range_end: datetime,
 ) -> dict[str, Any]:
@@ -2102,7 +2279,9 @@ def efficiency(
     by the efficiency engine and the results are aggregated: the summary is
     the total across all days, the waterfall reconciles expected to actual
     through unexplained and curtailed, and the per-string breakdown lets an
-    underperformer be localised.
+    underperformer be localised wherever the inverter exposes an independent
+    MPPT reading. Strings sharing one MPPT are one group because the hardware
+    cannot distinguish them.
 
     ``period=day`` also returns an hourly breakdown computed live from the
     stored irradiance and inverter readings rather than from any stored
@@ -2202,6 +2381,9 @@ def efficiency(
     for r in daily_rows:
         by_string.setdefault(r.string_name, []).append(r)
 
+    groups = mppt_groups(strings)
+    groups_by_name = {group.label: group for group in groups}
+
     # The array's yield is its output over the nameplate that produced it, and a
     # string the inverter never reported produced no part of the numerator — so
     # it must be no part of the denominator either. Dividing two strings' output
@@ -2210,7 +2392,12 @@ def efficiency(
     # read, against 14.04 kWp of which only 9.36 was measured.
     scored_names = {r.string_name for r in daily_rows if r.string_name}
     described_names = {s.name for s in strings}
-    total_kwp = sum(_string_kwp(s) for s in strings if s.name in scored_names)
+    total_kwp = sum(
+        _string_kwp(member)
+        for group in groups
+        if group.label in scored_names
+        for member in group.members
+    )
 
     # How much of the period the total was actually totalled over. A day the
     # engine could not model returns no rows at all, so it simply vanishes from
@@ -2228,8 +2415,8 @@ def efficiency(
     # the days West was absent.  The total is only complete when every described
     # string was scored on every expected day.
     string_days: dict[str, int] = {}
-    for s in strings:
-        string_days[s.name] = len({r.day for r in by_string.get(s.name, [])})
+    for group in groups:
+        string_days[group.label] = len({r.day for r in by_string.get(group.label, [])})
     any_string_incomplete = any(d < days_expected for d in string_days.values())
 
     def _summarise(name: str, rows: list[EfficiencyRow]) -> dict[str, Any]:
@@ -2248,7 +2435,11 @@ def efficiency(
         denom = expected - curtailed
         pr: float | None = actual / denom if denom > 0.0 else None
         # Per-string kWp for per-string yield; total for total.
-        kwp = total_kwp if name == "" else sum(_string_kwp(s) for s in strings if s.name == name)
+        kwp = (
+            total_kwp
+            if name == ""
+            else sum(_string_kwp(member) for member in groups_by_name[name].members)
+        )
         sy: float | None = actual / kwp if kwp > 0.0 else None
         # The total is incomplete when any string is incomplete.  A per-string
         # row is incomplete when its own days fall short of what the period owes,
@@ -2281,16 +2472,24 @@ def efficiency(
 
     summary = {
         **_summarise("", by_string.get("", [])),
-        "strings_scored": len(scored_names),
+        "strings_scored": sum(
+            len(groups_by_name[name].members) for name in scored_names if name in groups_by_name
+        ),
         "strings_described": len(described_names),
     }
 
-    # Per-string summaries
+    # Per-MPPT summaries. A singleton group preserves the existing per-string
+    # response shape; a shared MPPT carries its members so the page can explain
+    # why the inverter cannot offer separate rows.
     string_summaries: list[dict[str, Any]] = []
-    for s in strings:
-        rows = by_string.get(s.name, [])
+    for group in groups:
+        rows = by_string.get(group.label, [])
         if rows:
-            string_summaries.append({"name": s.name, **_summarise(s.name, rows)})
+            summary_row = {"name": group.label, **_summarise(group.label, rows)}
+            if len(group.members) > 1:
+                summary_row["members"] = [member.name for member in group.members]
+                summary_row["mppt"] = group.mppt
+            string_summaries.append(summary_row)
 
     # Waterfall
     expected = summary["expected_kwh"]
@@ -2426,18 +2625,50 @@ class DetectRequest(BaseModel):
         return value
 
 
-async def _probe_serial(body: DetectRequest) -> str:
+@dataclass
+class ProbeResult:
+    """What a probe read off the wire: the serial, and the model when readable.
+
+    The model fields are optional because the register read is best-effort —
+    the serial is what the wizard cannot proceed without. ``model_read_failed``
+    separates a register read that raised (a connection symptom, the thing a
+    "check your connection" message is for) from a read that returned a code
+    this project does not recognize (a real answer, just not one in the map).
+    The frontend never has to guess which happened: the two are different
+    fields.
+    """
+
+    serial: str
+    model: str | None = None
+    family_recognized: bool = False
+    model_read_failed: bool = False
+
+
+async def _probe_serial(body: DetectRequest) -> ProbeResult:
     """Open the candidate transport read-only and ask who is there.
 
     Split from the route so tests can stand in for the hardware: the route's
     job is borrowing, error mapping and never writing; this function's job is
     the wire. The library imports live inside so the module keeps no
     top-level dependency on the transport stack.
+
+    The model registers are read on the same connection as the serial, before
+    it is released. A second connection would cost a second open and release
+    on a wire that admits one client, and on the serial transport a second
+    open can fail while the first worked. The model read is best-effort and
+    its failure never costs the serial: a register read raising beside a
+    serial read that just succeeded is exactly what a flaky RS485 link looks
+    like, and it is reported as its own field rather than failing the probe.
     """
     from pylxpweb.transports.dongle import DongleTransport
     from pylxpweb.transports.exceptions import TransportError
     from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
     from pylxpweb.transports.modbus_serial import ModbusSerialTransport
+
+    from arraysense.drivers.eg4_luxpower.source import (
+        RECOGNIZED_DEVICE_TYPE_CODES,
+        identify_model,
+    )
 
     transport: ModbusSerialTransport | DongleTransport
     if body.transport == "modbus_serial":
@@ -2465,11 +2696,34 @@ async def _probe_serial(body: DetectRequest) -> str:
         # unhandled 500 on the unauthenticated setup surface.
         raise ConnectionError(str(exc)) from exc
     try:
-        return str(await transport.read_serial_number())
+        serial = str(await transport.read_serial_number())
     except (TransportError, OSError) as exc:
         raise ConnectionError(str(exc)) from exc
+
+    model: str | None = None
+    family_recognized = False
+    model_read_failed = False
+    try:
+        regs = await transport.read_parameters(0, 20)
+        device_type_code = regs.get(19)
+        if device_type_code is not None:
+            model = identify_model(device_type_code, regs.get(0, 0), regs.get(1, 0))
+            family_recognized = device_type_code in RECOGNIZED_DEVICE_TYPE_CODES
+    except (TransportError, OSError) as exc:
+        # The serial already answered on this same connection; a register read
+        # failing beside it is a connection symptom and must not fail the whole
+        # probe. It is signalled so the page can name the transport, and logged
+        # because an unattended service loses a flaky-link hint if nothing says.
+        model_read_failed = True
+        logger.warning("serial %s read but the model registers did not answer: %s", serial, exc)
     finally:
         await transport.disconnect()
+    return ProbeResult(
+        serial=serial,
+        model=model,
+        family_recognized=family_recognized,
+        model_read_failed=model_read_failed,
+    )
 
 
 # One detect at a time across the process. Two concurrent probes would both
@@ -2478,8 +2732,8 @@ async def _probe_serial(body: DetectRequest) -> str:
 _DETECT_LOCK = asyncio.Lock()
 
 
-async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, str]:
-    """Read the inverter's serial off a candidate connection. Writes nothing.
+async def run_detect(body: DetectRequest, service: CollectorService | None) -> dict[str, Any]:
+    """Read the inverter's serial and model off a candidate connection. Writes nothing.
 
     Shared by the running-service route and first-run setup so the two cannot
     validate differently. A running collector holds the single client slot —
@@ -2489,6 +2743,14 @@ async def run_detect(body: DetectRequest, service: CollectorService | None) -> d
     it, and starts it again on the way out whatever happened. In setup mode
     there is no collector, so nothing is borrowed. The mismatch decision
     belongs to the page: this returns what answered.
+
+    The model fields only appear when they mean something. ``model`` when an
+    exact model was identified, ``family_recognized`` when the family was
+    recognized but no exact model could be asserted, ``model_read_failed``
+    when the model register read raised on an otherwise-working connection.
+    A probe that answered a serial and nothing else returns exactly
+    ``{"serial": ...}``, the same shape it always did — which is also why a
+    stand-in probe that returns a bare serial string still works here.
     """
     if body.transport not in ("dongle", "modbus_serial"):
         raise HTTPException(status_code=400, detail=f"unknown transport {body.transport!r}")
@@ -2508,13 +2770,26 @@ async def run_detect(body: DetectRequest, service: CollectorService | None) -> d
             await service.stop()
             borrowed = True
         try:
-            serial = await _probe_serial(body)
+            result = await _probe_serial(body)
         except (ConnectionError, OSError, TimeoutError) as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         finally:
             if borrowed and service is not None:
                 await service.start()
-    return {"serial": serial}
+    if isinstance(result, str):
+        # A bare serial string is what the tests' stand-in probe returns; the
+        # real probe returns a ProbeResult. The bare string means "no model
+        # answer at all", which is also the honest reading of a model read that
+        # could not be determined.
+        result = ProbeResult(serial=result)
+    payload: dict[str, Any] = {"serial": result.serial}
+    if result.model is not None:
+        payload["model"] = result.model
+    if result.family_recognized:
+        payload["family_recognized"] = True
+    if result.model_read_failed:
+        payload["model_read_failed"] = True
+    return payload
 
 
 def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
@@ -2540,9 +2815,9 @@ def _fill_masked_detect(body: DetectRequest, config: Config) -> DetectRequest:
     return body.model_copy(update=updates) if updates else body
 
 
-@router.post("/setup/detect")
-async def setup_detect(request: Request, body: DetectRequest) -> dict[str, str]:
-    """Read the inverter's serial off a candidate connection. Writes nothing."""
+@router.post("/setup/detect", dependencies=[Depends(_require_write)])
+async def setup_detect(request: Request, body: DetectRequest) -> dict[str, Any]:
+    """Read the inverter's serial and model off a candidate connection. Writes nothing."""
     file_config = getattr(request.app.state, "file_config", None) or request.app.state.config
     settings = SettingsStore(request.app.state.store)
     body = _fill_masked_detect(body, effective(file_config, settings))
@@ -2611,7 +2886,7 @@ def _schedule_restart() -> None:
     loop.call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
 
 
-@router.post("/setup/apply")
+@router.post("/setup/apply", dependencies=[Depends(_require_write)])
 async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     """Validate the merged result, write the overlay, restart the collector.
 
@@ -2649,7 +2924,7 @@ async def setup_apply(request: Request, body: ApplyRequest) -> dict[str, Any]:
     return {"applied": sorted(provided), "restarting": True}
 
 
-@router.post("/yield")
+@router.post("/yield", dependencies=[Depends(_require_write)])
 async def yield_dongle(request: Request, body: YieldRequest) -> dict[str, Any]:
     """Release the dongle so the vendor's app can push a firmware update.
 
@@ -2661,7 +2936,7 @@ async def yield_dongle(request: Request, body: YieldRequest) -> dict[str, Any]:
     return {"yielding": True, "seconds": body.seconds, "until": until.isoformat()}
 
 
-@router.post("/resume")
+@router.post("/resume", dependencies=[Depends(_require_write)])
 async def resume(request: Request) -> dict[str, Any]:
     """Take the dongle back before the yield timer runs out."""
     await request.app.state.service.resume()

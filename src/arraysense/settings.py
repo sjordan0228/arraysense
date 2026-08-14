@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
+from arraysense.auth import AUTH_PASSWORD_KEY
 from arraysense.panels import EXAMPLE_STRINGS, parse_strings
 from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, Tier
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
@@ -51,6 +52,7 @@ Kind = Literal["str", "int", "float", "bool", "choice"]
 # typed by hand in one place and mistyped in another reads as an unset setting
 # rather than as an error.
 CONFIG_VERSION_KEY = "efficiency.config_version"
+_EFFICIENCY_SCORER_REVISION_KEY = "efficiency.scorer_revision"
 PANELS_STRINGS_KEY = "panels.strings"
 SETTING_TIMEZONE = "site.timezone"
 SETTING_LATITUDE = "site.latitude"
@@ -217,8 +219,8 @@ class SettingSpec:
 
     ``secret`` marks a value the API masks rather than echoes. The dongle and
     inverter serials are not passwords, but they identify specific hardware and
-    the settings page has no authentication in front of it, so they go out with
-    their middle replaced — enough for the owner to recognise which serial is
+    reads stay open even when a password is set, so they go out with their
+    middle replaced — enough for the owner to recognise which serial is
     configured, not enough for a stranger on the network to learn it.
 
     ``label`` and ``help`` live here rather than in the page because the page is
@@ -1106,20 +1108,28 @@ class SettingsStore:
         )
         logger.info("array configuration changed; efficiency version now %d", current + 1)
 
-    def ensure_efficiency_version(self, minimum: int) -> bool:
-        """Advance the config version to at least ``minimum`` if it is below it.
+    def ensure_efficiency_scorer_revision(self, revision: int) -> bool:
+        """Apply a scorer migration once, then invalidate every stored score.
 
-        Called when a code change alters how scores are computed — the same
-        reason ``_bump_config_version`` fires on an array-description change, but
-        triggered by a new deployment rather than a settings edit.  Returns True
-        when a bump actually happened so the caller can log it.
-
-        Bumping invalidates every stored efficiency day, which forces a
-        recomputation of history and is not free.  The caller chooses the
-        ``minimum`` by knowing what version the previous code wrote; a minimum of
-        1 is the right call after the first logic change in a fresh installation
-        that has only ever written version 0.
+        The configuration version belongs to owner edits and has no upper bound:
+        using it as a code-migration marker meant an installation that had edited
+        its array often looked newer than the scorer that produced its rows.  A
+        separate persisted revision records the scorer instead, while advancing
+        the configuration version keeps the existing stale-row and backfill
+        machinery responsible for recomputing history.
         """
+        if revision < 1:
+            raise ValueError("efficiency scorer revision must be positive")
+        revision_row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (_EFFICIENCY_SCORER_REVISION_KEY,)
+        ).fetchone()
+        try:
+            applied = int(revision_row[0]) if revision_row and revision_row[0] else 0
+        except ValueError:
+            applied = 0
+        if applied >= revision:
+            return False
+
         row = self._conn.execute(
             "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)
         ).fetchone()
@@ -1127,15 +1137,23 @@ class SettingsStore:
             current = int(row[0]) if row and row[0] else 0
         except ValueError:
             current = 0
-        if current >= minimum:
-            return False
         with self._conn:
             self._conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (CONFIG_VERSION_KEY, str(minimum)),
+                (CONFIG_VERSION_KEY, str(current + 1)),
             )
-        logger.info("efficiency version bumped from %d to %d for a code change", current, minimum)
+            self._conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_EFFICIENCY_SCORER_REVISION_KEY, str(revision)),
+            )
+        logger.info(
+            "efficiency scorer revision %d advanced config version from %d to %d",
+            revision,
+            current,
+            current + 1,
+        )
         return True
 
     def set_many(self, values: dict[str, object]) -> None:
@@ -1209,6 +1227,8 @@ class SettingsStore:
         rows = self._conn.execute("SELECT key, value FROM settings").fetchall()
         out: dict[str, object] = {}
         for key, raw in rows:
+            if key in (CONFIG_VERSION_KEY, _EFFICIENCY_SCORER_REVISION_KEY, AUTH_PASSWORD_KEY):
+                continue
             try:
                 out[key] = lookup_setting(key).decode(raw)
             except (KeyError, ValueError):
@@ -1268,11 +1288,13 @@ class SettingsStore:
         value being readable by someone who did not already know it.
 
         **This is form safety, not confidentiality, and the difference matters.**
-        The same unauthenticated endpoint accepts writes, so a client on the
-        network can point ``connection.dongle_host`` at a listener it controls
-        and read both serials off the wire at the next poll — the protocol
-        carries them in clear ASCII. Masking stops a serial being read off the
-        page; only authentication stops it being taken. Nothing here should be
+        With no password set, the same unauthenticated endpoint accepts writes,
+        so a client on the network can point ``connection.dongle_host`` at a
+        listener it controls and read both serials off the wire at the next
+        poll — the protocol carries them in clear ASCII. Masking stops a serial
+        being read off the page; only authentication stops it being taken, and
+        since #34 that is a password the owner can now actually set, which
+        closes this particular route. Nothing here should be
         described to an owner as protecting the value.
         """
         out: dict[str, object] = {}

@@ -8,7 +8,9 @@ verify the partial/downtime/versioning rules the spec lays out.
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -614,3 +616,223 @@ def test_a_string_that_never_reported_gets_no_row_at_all(tmp_path: Path) -> None
     names = {r.string_name for r in rows}
     assert "West" not in names, "a string nobody read was reported as making nothing"
     assert names == {"East", ""}
+
+
+class TestSharedMpptGroups:
+    """An MPPT meter is one reading even when more than one string shares it."""
+
+    _shared_text = "East | 1 | 10 | 400 | 25 | 90\nWest | 1 | 8 | 410 | 25 | 270"
+
+    @staticmethod
+    def _stage(
+        store: SqliteStore,
+        *,
+        pv1_w: float | None,
+        pv2_w: float | None = None,
+        pv3_w: float | None = None,
+        throttled: bool = False,
+    ) -> None:
+        """Stage enough sunlit hours for an MPPT group to be scored."""
+        from arraysense.metrics import lookup
+
+        for h in range(8, 16):
+            values: dict[str, float] = {
+                "ghi_wm2": 800.0,
+                "dni_wm2": 850.0,
+                "dhi_wm2": 120.0,
+                "wind_speed_ms": 2.0,
+                "outside_temperature_c": 30.0,
+                "battery_soc_pct": 100.0 if throttled and h == 10 else 60.0,
+                "bms_charge_current_limit_a": 40.0 if throttled and h == 10 else 800.0,
+            }
+            if pv1_w is not None:
+                values["pv1_power_w"] = 300.0 if throttled and h == 10 else pv1_w
+                values["pv1_voltage_v"] = 373.0 if throttled and h == 10 else 310.0
+                values["pv1_current_a"] = 1.0 if throttled and h == 10 else pv1_w / 310.0
+            if pv2_w is not None:
+                values["pv2_power_w"] = pv2_w
+                values["pv2_voltage_v"] = 310.0
+                values["pv2_current_a"] = pv2_w / 310.0
+            if pv3_w is not None:
+                values["pv3_power_w"] = pv3_w
+                values["pv3_voltage_v"] = 310.0
+                values["pv3_current_a"] = pv3_w / 310.0
+            columns = ["timestamp", "device", *values, "sample_count"]
+            encoded = [
+                int(_utc(h).timestamp()),
+                TEST_DEVICE,
+                *(round(value * lookup(name).scale) for name, value in values.items()),
+                1,
+            ]
+            store._conn.execute(
+                f"INSERT OR REPLACE INTO inverter_hourly ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                encoded,
+            )
+
+    @staticmethod
+    def _rows(store: SqliteStore, strings: str) -> list[EfficiencyRow]:
+        """Score the fixed summer day against this array description."""
+        SettingsStore(store).set("panels.strings", strings)
+        return compute_day(
+            store,
+            SettingsStore(store),
+            _summer_day(0),
+            _summer_day(0) + timedelta(days=1),
+            parse_strings(strings),
+            1,
+        )
+
+    def test_shared_mppt_counts_its_actual_once_and_not_at_the_legacy_pr(
+        self, tmp_path: Path
+    ) -> None:
+        """One 3 kW MPPT reading is not two 3 kW strings' output."""
+        store = _store(str(tmp_path / "shared-once.db"))
+        self._stage(store, pv1_w=3000.0)
+
+        rows = self._rows(store, self._shared_text)
+        total = next(row for row in rows if row.string_name == "")
+
+        assert [row.string_name for row in rows] == ["[MPPT 1] East + West", ""]
+        assert total.actual_kwh == pytest.approx(24.0)
+        assert total.pr is not None
+        legacy_pr = 2.0 * total.actual_kwh / (total.expected_kwh - total.curtailed_kwh)
+        assert total.pr == pytest.approx(legacy_pr / 2.0)
+        strings = "East | 1 | 10 | 400 | 25 | 90\nWest | 2 | 8 | 410 | 25 | 270"
+        one_per_store = _store(str(tmp_path / "one-per-mppt.db"))
+        self._stage(one_per_store, pv1_w=3000.0, pv2_w=2500.0)
+        one_per_rows = self._rows(one_per_store, strings)
+        one_per_store.write_efficiency_day(one_per_rows)
+        stored = one_per_store.read_efficiency_days(
+            _summer_day(0), _summer_day(0) + timedelta(days=1)
+        )
+        expected_bytes = (
+            '[{"actual_kwh": 24.0, "config_version": 1, "curtailed_kwh": 0.0, '
+            '"day": "2026-08-10 00:00:00-05:00", "expected_kwh": 21.263182740044265, '
+            '"modelled_hours": 8, "partial": false, "pr": 1.1287115524244438, '
+            '"string_name": "East", "unexplained_kwh": 0.0}, '
+            '{"actual_kwh": 20.0, "config_version": 1, "curtailed_kwh": 0.0, '
+            '"day": "2026-08-10 00:00:00-05:00", "expected_kwh": 10.786957522510683, '
+            '"modelled_hours": 8, "partial": false, "pr": 1.854090920286202, '
+            '"string_name": "West", "unexplained_kwh": 0.0}, '
+            '{"actual_kwh": 44.0, "config_version": 1, "curtailed_kwh": 0.0, '
+            '"day": "2026-08-10 00:00:00-05:00", "expected_kwh": 32.050140262554955, '
+            '"modelled_hours": 8, "partial": false, "pr": 1.3728489061062359, '
+            '"string_name": "", "unexplained_kwh": 0.0}]'
+        )
+        assert (
+            json.dumps([asdict(row) for row in one_per_rows], default=str, sort_keys=True)
+            == expected_bytes
+        )
+        assert (
+            json.dumps(
+                [asdict(row) for row in [stored[1], stored[2], stored[0]]],
+                default=str,
+                sort_keys=True,
+            )
+            == expected_bytes
+        )
+
+    def test_a_shared_pair_and_lone_string_keep_the_lone_name(self, tmp_path: Path) -> None:
+        """Grouping one MPPT does not change another MPPT's independently measured row."""
+        strings = self._shared_text + "\nSouth | 2 | 9 | 400 | 30 | 180"
+        store = _store(str(tmp_path / "mixed-groups.db"))
+        self._stage(store, pv1_w=3000.0, pv2_w=2500.0)
+
+        rows = self._rows(store, strings)
+        names = [row.string_name for row in rows]
+
+        assert names == ["[MPPT 1] East + West", "South", ""]
+        assert next(row for row in rows if row.string_name == "South").actual_kwh == pytest.approx(
+            20.0
+        )
+
+    def test_a_string_named_like_a_group_does_not_merge_two_mppts(self, tmp_path: Path) -> None:
+        """MPPT identity cannot be the label an owner chose for another string."""
+        collision = "[MPPT 1] East + West"
+        strings = self._shared_text + f"\n{collision} | 3 | 9 | 400 | 30 | 180"
+        store = _store(str(tmp_path / "colliding-group-name.db"))
+        self._stage(store, pv1_w=3000.0, pv3_w=1600.0)
+
+        rows = self._rows(store, strings)
+        groups = [row for row in rows if row.string_name]
+        store.write_efficiency_day(rows)
+        stored = store.read_efficiency_days(_summer_day(0), _summer_day(0) + timedelta(days=1))
+
+        assert len(groups) == 2
+        assert len({row.string_name for row in groups}) == 2
+        assert collision in {row.string_name for row in groups}
+        assert f"{collision} (2)" in {row.string_name for row in groups}
+        assert sorted(row.actual_kwh for row in groups) == pytest.approx([12.8, 24.0])
+        assert len(stored) == 3
+
+    def test_a_group_recompute_replaces_its_old_string_rows(self, tmp_path: Path) -> None:
+        """A version-two group must not leave version-one strings beside it."""
+        store = _store(str(tmp_path / "replace-shared-rows.db"))
+        self._stage(store, pv1_w=3000.0)
+        day = _summer_day(0)
+        old = [
+            EfficiencyRow(day, name, 10.0, 5.0, 0.0, 5.0, 8, False, 0.5, 1)
+            for name in ("East", "West", "")
+        ]
+        store.write_efficiency_day(old)
+
+        fresh = [replace(row, config_version=2) for row in self._rows(store, self._shared_text)]
+        store.write_efficiency_day(fresh)
+        rows = store.read_efficiency_days(day, day + timedelta(days=1))
+
+        assert [row.string_name for row in rows] == ["", "[MPPT 1] East + West"]
+        assert all(row.config_version == 2 for row in rows)
+
+    def test_group_expected_keeps_each_members_geometry(self, tmp_path: Path) -> None:
+        """Grouping adds separately modelled strings instead of copying one model twice."""
+        separate = "East | 1 | 10 | 400 | 25 | 90\nWest | 2 | 8 | 410 | 25 | 270"
+        shared_store = _store(str(tmp_path / "shared-geometry.db"))
+        separate_store = _store(str(tmp_path / "separate-geometry.db"))
+        self._stage(shared_store, pv1_w=3000.0)
+        self._stage(separate_store, pv1_w=1500.0, pv2_w=1500.0)
+
+        shared = self._rows(shared_store, self._shared_text)
+        separate_rows = self._rows(separate_store, separate)
+
+        shared_group = next(row for row in shared if row.string_name.startswith("[MPPT 1]"))
+        separate_expected = sum(row.expected_kwh for row in separate_rows if row.string_name)
+        assert shared_group.expected_kwh == pytest.approx(separate_expected)
+
+    def test_shared_mppt_curtailment_is_booked_once_at_group_level(self, tmp_path: Path) -> None:
+        """The MPPT's one throttled operating point cannot create two refused-energy rows."""
+        store = _store(str(tmp_path / "shared-curtailment.db"))
+        self._stage(store, pv1_w=2830.0, throttled=True)
+
+        rows = self._rows(store, self._shared_text)
+        group = next(row for row in rows if row.string_name.startswith("[MPPT 1]"))
+        total = next(row for row in rows if row.string_name == "")
+
+        assert group.curtailed_kwh > 0.0
+        assert total.curtailed_kwh == pytest.approx(group.curtailed_kwh)
+        assert total.actual_kwh == pytest.approx(20.11)
+
+    def test_group_names_are_stable_when_configuration_order_changes(self, tmp_path: Path) -> None:
+        """A reordered setting must overwrite the same history row, not fragment it."""
+        reordered = "West | 1 | 8 | 410 | 25 | 270\nEast | 1 | 10 | 400 | 25 | 90"
+        store = _store(str(tmp_path / "stable-group-name.db"))
+        self._stage(store, pv1_w=3000.0)
+
+        forward = self._rows(store, self._shared_text)
+        backward = self._rows(store, reordered)
+
+        assert forward[0].string_name == backward[0].string_name == "[MPPT 1] East + West"
+
+    def test_shared_mppt_without_its_reading_has_no_group_row(self, tmp_path: Path) -> None:
+        """An absent MPPT measurement remains absent rather than becoming zero output."""
+        strings = self._shared_text + "\nSouth | 2 | 9 | 400 | 30 | 180"
+        present_store = _store(str(tmp_path / "shared-present.db"))
+        self._stage(present_store, pv1_w=3000.0, pv2_w=2500.0)
+        present = self._rows(present_store, strings)
+        store = _store(str(tmp_path / "shared-silent.db"))
+        self._stage(store, pv1_w=None, pv2_w=2500.0)
+
+        rows = self._rows(store, strings)
+
+        assert [row.string_name for row in present] == ["[MPPT 1] East + West", "South", ""]
+        assert [row.string_name for row in rows] == ["South", ""]

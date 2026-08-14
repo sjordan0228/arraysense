@@ -54,6 +54,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pylxpweb import InverterModelInfo
 from pylxpweb.transports.exceptions import TransportError, TransportResponseMismatchError
 from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
 from pylxpweb.transports.modbus_serial import ModbusSerialTransport
@@ -67,6 +68,7 @@ from arraysense.drivers.base import (
     EnergyReporting,
     ModelSpec,
     SampleBuildError,
+    UnreadableMetric,
     expand_module_metrics,
     resolve_model,
 )
@@ -459,13 +461,66 @@ CAPABILITIES = Capabilities(
 # decode directly through _reading(), so none of it runs. A wrong meaning would
 # be stored as a reading rather than caught.
 #
-# So an off-grid model carries a caveat rather than a citation. It is offered,
-# because refusing it outright would break an installation that already chose
-# it, and labelled, because a machine whose generator power is a seconds
-# counter must not be presented as supported. See issue #122.
+# So an off-grid model carries a caveat and a gap list rather than a citation
+# alone. It is offered, because refusing it outright would break an
+# installation that already chose it, and labelled, because a machine whose
+# generator power is a seconds counter must not be presented as supported. The
+# 6000XP's and 12000XP's string counts are now confirmed from their spec
+# sheets; the generator block is declared unreadable in _OFFGRID_UNREADABLE
+# below. See issue #122.
+
+# The generator block an off-grid machine cannot read, and why. Declared once
+# and referenced from the 6000XP's and 12000XP's ModelSpecs so the gap list
+# cannot drift from the models that declare it.
+#
+# Register 123 is proven a seconds counter on off-grid, not generator power:
+# firmware disassembly shows the SNA comms handler answering it from a RAM word
+# a timer task increments about once a second, with no path from the
+# power-conversion DSP (joyfulhouse/eg4_web_monitor issue #544). Registers
+# 124-126 are ARM status words, not energy (issue #544; the withdrawn PR in
+# issue #220). Generator voltage and frequency were never examined by the
+# firmware work, and the prior that they alone are genuine DSP measurements, in
+# a block otherwise full of ARM housekeeping, is weak — so they are not offered
+# rather than risk storing a wrong reading. This is more conservative than
+# upstream, which removed only the power and energy sensors, and it is a
+# judgement rather than a finding: adding a reading back once somebody confirms
+# it costs nothing, and storing a wrong one cannot be undone.
+_OFFGRID_UNREADABLE: tuple[UnreadableMetric, ...] = (
+    UnreadableMetric(
+        metric="generator_power_w",
+        reason=(
+            "register 123 is a seconds counter on off-grid, not generator power; "
+            "a reading stored here would be a seconds count charted as watts."
+        ),
+        citation=(
+            "joyfulhouse/eg4_web_monitor issue #544: firmware disassembly shows "
+            "no path from the power-conversion DSP to this register"
+        ),
+    ),
+    UnreadableMetric(
+        metric="generator_voltage_v",
+        reason=(
+            "generator voltage was never examined by the firmware work; in a "
+            "register block otherwise full of ARM housekeeping it is not offered "
+            "rather than risk a wrong reading."
+        ),
+        citation="joyfulhouse/eg4_web_monitor issue #544",
+    ),
+    UnreadableMetric(
+        metric="generator_frequency_hz",
+        reason=(
+            "generator frequency was never examined by the firmware work; in a "
+            "register block otherwise full of ARM housekeeping it is not offered "
+            "rather than risk a wrong reading."
+        ),
+        citation="joyfulhouse/eg4_web_monitor issue #544",
+    ),
+)
+
 MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         name="18kPV",
+        family="hybrid",
         pv_strings=3,
         citation="measured on the reference installation",
         conversion=ConversionSpec(
@@ -482,6 +537,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="12kPV",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -490,6 +546,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="FlexBOSS21",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -498,6 +555,7 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="FlexBOSS18",
+        family="hybrid",
         pv_strings=3,
         citation=(
             "pylxpweb DEVICE_TYPE_CODE_PV_STRING_COUNT: live-confirmed for device type "
@@ -506,10 +564,47 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="6000XP",
+        family="off-grid",
+        pv_strings=2,
+        # generator_input stays the family's True: this machine has a GEN
+        # terminal and EG4's spec sheet documents it. What it does not have is a
+        # register behind that terminal worth storing, which is what the
+        # unreadable list below says. Denying the hardware to describe a
+        # reading would be a second false claim in place of the first.
+        unreadable=_OFFGRID_UNREADABLE,
+        citation=(
+            "EG4 6000XP spec sheet: NUMBER OF MPPTS 2, INPUTS PER MPPT 1; "
+            "https://eg4electronics.com/wp-content/uploads/2024/04/"
+            "EG4-6000XP-Inverter-Spec-Sheet.pdf"
+        ),
         caveat=(
-            "Off-grid family: several registers this driver reads mean something "
-            "different here than on the hybrids, and its PV string count is "
-            "unconfirmed upstream. Readings may be wrong rather than missing. "
+            "Off-grid family: the generator block is not offered (register 123 "
+            "is a seconds counter). Your house load total is read locally; only "
+            "the smart-load itemisation is cloud-only. See issue #122."
+        ),
+    ),
+    ModelSpec(
+        name="12000XP",
+        family="off-grid",
+        pv_strings=2,
+        # generator_input stays the family's True, exactly as on the 6000XP:
+        # this machine has a GEN terminal too, and being unable to read it is a
+        # different fact from not having one.
+        unreadable=_OFFGRID_UNREADABLE,
+        citation=(
+            "EG4 12000XP spec sheet: NUMBER OF MPPTS 2, INPUTS PER MPPT 2/2 — "
+            "four physical terminals but two MPPT trackers, and readings come "
+            "per tracker, so two strings paralleled into one input share one "
+            "measurement; "
+            "https://eg4electronics.com/wp-content/uploads/2024/10/"
+            "EG4-12000XP-Spec-Sheet.pdf"
+        ),
+        caveat=(
+            "Off-grid family, not a hybrid like the 12kPV: two MPPT trackers "
+            "behind the four PV inputs, and the generator block is not offered "
+            "— register 123 is a seconds counter, and the firmware disassembly "
+            "that proved it was located on this very model. Your house load "
+            "total is read locally; only the smart-load split is cloud-only. "
             "See issue #122."
         ),
     ),
@@ -522,6 +617,41 @@ def find_model_by_name(name: str) -> ModelSpec:
         if model.name == name:
             return model
     raise ValueError(f"no model {name!r} in this family")
+
+
+def identify_model(device_type_code: int, hold_model_reg0: int, hold_model_reg1: int) -> str | None:
+    """Return the exact model name register 19 and HOLD_MODEL together identify.
+
+    The mapping is pylxpweb's own claim, read from the top-level export rather
+    than transcribed: ``InverterModelInfo.get_power_rating_kw``'s docstring
+    matches PV series code 2092 to ratings 2 -> 12 kW and 6 -> 18 kW, and
+    FlexBOSS code 10284 to 8 -> 21 kW and 9 -> 18 kW — the same pair of
+    device-type codes the MODELS table above already cites for its PV-string
+    counts, and no further. Returns None for anything else, because a family
+    this project has not cited a model-level mapping for (off-grid, LXP) must
+    not come back from Detect as a confident match. A guess dressed as a
+    detection is worse than the wizard asking the owner to pick one.
+    """
+    rating_kw = InverterModelInfo.from_registers(
+        hold_model_reg0, hold_model_reg1
+    ).get_power_rating_kw(device_type_code)
+    if device_type_code == 2092:  # PV series: the 18kPV and the 12kPV
+        return {18: "18kPV", 12: "12kPV"}.get(rating_kw)
+    if device_type_code == 10284:  # FlexBOSS: the FlexBOSS21 and the FlexBOSS18
+        return {21: "FlexBOSS21", 18: "FlexBOSS18"}.get(rating_kw)
+    return None
+
+
+# The device-type codes this project's own registry has cited a meaning for,
+# used only to tell a recognized family whose exact model identify_model could
+# not pin down from nothing recognized at all. 2092 PV series (18kPV, 12kPV),
+# 10284 FlexBOSS (FlexBOSS21, FlexBOSS18), 54 SNA off-grid (12000XP, 6000XP)
+# and 38 the 6000XP variant — stated as literals here, beside the function
+# that already cites the first two, rather than the library's private table.
+# No LXP code is cited anywhere in this driver, so none is listed. A family
+# added to MODELS without a matching code here silently stops being detected
+# as recognized — there is no test that catches that drift, so add both.
+RECOGNIZED_DEVICE_TYPE_CODES = frozenset({2092, 10284, 54, 38})
 
 
 def _reading(source: object, attribute: str) -> float | None:
@@ -1170,6 +1300,17 @@ class Eg4LuxPowerSource:
         # outside. What rate is normal on this hardware has not been measured.
         self._misroutes = 0
 
+        # The metrics this configured model cannot read, even though the family
+        # maps their registers. Filtered out of every sample: the store is
+        # opened for the same narrowed set, and a sample carrying an undeclared
+        # metric raises KeyError on append, which stops the poll loop — so the
+        # driver must not produce one in the first place.
+        self._unreadable: frozenset[str] = frozenset()
+        if self._config.model:
+            self._unreadable = frozenset(
+                g.metric for g in find_model_by_name(self._config.model).unreadable
+            )
+
     @property
     def device(self) -> str:
         """The configured inverter serial, which is what stored rows are filed under.
@@ -1459,9 +1600,19 @@ class Eg4LuxPowerSource:
             raise ConnectionError(f"reading from inverter failed: {exc}") from exc
         sample = to_sample(runtime, bank)
         energy = await self._read_energy(sample.timestamp)
-        if not energy:
-            return sample
-        return replace(sample, readings={**sample.readings, **energy})
+        if energy:
+            sample = replace(sample, readings={**sample.readings, **energy})
+        # The configured model may declare metrics the family maps but this
+        # machine cannot read. A sample carrying one would raise KeyError on
+        # append — the store is opened for the same narrowed set — so the
+        # driver drops them rather than produce a reading that is not what it
+        # claims to be.
+        if self._unreadable:
+            sample = replace(
+                sample,
+                readings={k: v for k, v in sample.readings.items() if k not in self._unreadable},
+            )
+        return sample
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.

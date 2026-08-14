@@ -5,4 +5,4 @@ store, no collector and no FastAPI, so the CLI, the API's status endpoint and a
 smoke test can all read ``__version__`` without opening a database or a socket.
 """
 
-__version__ = "1.0.1"
+__version__ = "1.0.5"
