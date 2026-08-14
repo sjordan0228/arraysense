@@ -7,6 +7,30 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.6 — 14 August 2026
+
+An off-grid machine stops reporting an export figure it can never earn.
+
+### Fixed
+
+- **The grid-export counters are no longer offered on the 6000XP or the
+  12000XP.** EG4 documents the family as off-grid capable with no grid
+  sellback, so those counters can only ever read zero. Nothing false was being
+  stored — unlike the generator registers, these hold exactly what they claim —
+  but a figure of 0.0 kWh reads as *measured, and it was zero* rather than as a
+  machine that cannot export at all. Absent is the honest answer.
+
+### Notes
+
+- Grid **import** is untouched and still read: these machines charge from the
+  grid even though they cannot sell back to it.
+
+- On an installation that already ran an earlier release with one of these
+  models selected, the export columns exist and hold zeros. They stop being
+  written, but the stored zeros remain — the same as any other reading recorded
+  before the release that stopped taking it. On the dashboard nothing changes
+  either way, because a zero flow and an absent one draw the same: no ribbon.
+
 ## 1.0.5 — 14 August 2026
 
 EG4's off-grid inverters are supported honestly: the 6000XP stops reporting a

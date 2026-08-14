@@ -515,6 +515,47 @@ _OFFGRID_UNREADABLE: tuple[UnreadableMetric, ...] = (
         ),
         citation="joyfulhouse/eg4_web_monitor issue #544",
     ),
+    # The export counters are a different kind of gap from the generator block.
+    # Registers 36 and 56 hold exactly what they claim — Etogrid_day and
+    # Etogrid_all — and upstream flags no off-grid divergence on either, so
+    # nothing false would be stored. What is wrong is that a constant is
+    # presented as a measurement: a 0.0 kWh reads as "measured, and it was zero"
+    # rather than "this machine cannot sell back". That is the same
+    # absent-versus-zero rule the project runs on, at a lower severity than a
+    # reading that means something else. The family is documented off-grid
+    # capable with no grid sellback, so the counters have nothing to count.
+    UnreadableMetric(
+        metric="grid_export_energy_today_kwh",
+        reason=(
+            "this family has no grid sellback, so the daily export counter has "
+            "nothing to count; a stored 0.0 kWh reads as measured-and-zero, not "
+            "as a machine that cannot export."
+        ),
+        citation=(
+            "EG4 6000XP and 12000XP spec sheets document the family as off-grid "
+            "capable with no grid sellback: "
+            "https://eg4electronics.com/wp-content/uploads/2024/04/"
+            "EG4-6000XP-Inverter-Spec-Sheet.pdf, "
+            "https://eg4electronics.com/wp-content/uploads/2024/10/"
+            "EG4-12000XP-Spec-Sheet.pdf"
+        ),
+    ),
+    UnreadableMetric(
+        metric="grid_export_energy_total_kwh",
+        reason=(
+            "this family has no grid sellback, so the lifetime export counter "
+            "has nothing to count; a stored 0.0 kWh reads as measured-and-zero, "
+            "not as a machine that cannot export."
+        ),
+        citation=(
+            "EG4 6000XP and 12000XP spec sheets document the family as off-grid "
+            "capable with no grid sellback: "
+            "https://eg4electronics.com/wp-content/uploads/2024/04/"
+            "EG4-6000XP-Inverter-Spec-Sheet.pdf, "
+            "https://eg4electronics.com/wp-content/uploads/2024/10/"
+            "EG4-12000XP-Spec-Sheet.pdf"
+        ),
+    ),
 )
 
 MODELS: tuple[ModelSpec, ...] = (
@@ -579,8 +620,10 @@ MODELS: tuple[ModelSpec, ...] = (
         ),
         caveat=(
             "Off-grid family: the generator block is not offered (register 123 "
-            "is a seconds counter). Your house load total is read locally; only "
-            "the smart-load itemisation is cloud-only. See issue #122."
+            "is a seconds counter), and neither are the grid-export counters, "
+            "because this family cannot sell back. Your house load total is "
+            "read locally; only the smart-load itemisation is cloud-only. "
+            "See issue #122."
         ),
     ),
     ModelSpec(
@@ -601,11 +644,12 @@ MODELS: tuple[ModelSpec, ...] = (
         ),
         caveat=(
             "Off-grid family, not a hybrid like the 12kPV: two MPPT trackers "
-            "behind the four PV inputs, and the generator block is not offered "
-            "— register 123 is a seconds counter, and the firmware disassembly "
-            "that proved it was located on this very model. Your house load "
-            "total is read locally; only the smart-load split is cloud-only. "
-            "See issue #122."
+            "behind the four PV inputs, and neither the generator block nor the "
+            "grid-export counters are offered — register 123 is a seconds "
+            "counter, the firmware disassembly that proved it was located on "
+            "this very model, and this family cannot sell back. Your house "
+            "load total is read locally; only the smart-load split is "
+            "cloud-only. See issue #122."
         ),
     ),
 )
