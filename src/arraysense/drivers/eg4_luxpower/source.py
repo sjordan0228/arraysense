@@ -68,6 +68,7 @@ from arraysense.drivers.base import (
     EnergyReporting,
     ModelSpec,
     SampleBuildError,
+    UnreadableMetric,
     expand_module_metrics,
     resolve_model,
 )
@@ -460,10 +461,61 @@ CAPABILITIES = Capabilities(
 # decode directly through _reading(), so none of it runs. A wrong meaning would
 # be stored as a reading rather than caught.
 #
-# So an off-grid model carries a caveat rather than a citation. It is offered,
-# because refusing it outright would break an installation that already chose
-# it, and labelled, because a machine whose generator power is a seconds
-# counter must not be presented as supported. See issue #122.
+# So an off-grid model carries a caveat and a gap list rather than a citation
+# alone. It is offered, because refusing it outright would break an
+# installation that already chose it, and labelled, because a machine whose
+# generator power is a seconds counter must not be presented as supported. The
+# 6000XP's string count is now confirmed from the spec sheet; the generator
+# block is declared unreadable in _OFFGRID_UNREADABLE below. See issue #122.
+
+# The generator block an off-grid machine cannot read, and why. Declared once
+# and referenced from the 6000XP's ModelSpec (and, later, the 12000XP's) so the
+# gap list cannot drift from the models that declare it.
+#
+# Register 123 is proven a seconds counter on off-grid, not generator power:
+# firmware disassembly shows the SNA comms handler answering it from a RAM word
+# a timer task increments about once a second, with no path from the
+# power-conversion DSP (joyfulhouse/eg4_web_monitor issue #544). Registers
+# 124-126 are ARM status words, not energy (issue #544; the withdrawn PR in
+# issue #220). Generator voltage and frequency were never examined by the
+# firmware work, and the prior that they alone are genuine DSP measurements, in
+# a block otherwise full of ARM housekeeping, is weak — so they are not offered
+# rather than risk storing a wrong reading. This is more conservative than
+# upstream, which removed only the power and energy sensors, and it is a
+# judgement rather than a finding: adding a reading back once somebody confirms
+# it costs nothing, and storing a wrong one cannot be undone.
+_OFFGRID_UNREADABLE: tuple[UnreadableMetric, ...] = (
+    UnreadableMetric(
+        metric="generator_power_w",
+        reason=(
+            "register 123 is a seconds counter on off-grid, not generator power; "
+            "a reading stored here would be a seconds count charted as watts."
+        ),
+        citation=(
+            "joyfulhouse/eg4_web_monitor issue #544: firmware disassembly shows "
+            "no path from the power-conversion DSP to this register"
+        ),
+    ),
+    UnreadableMetric(
+        metric="generator_voltage_v",
+        reason=(
+            "generator voltage was never examined by the firmware work; in a "
+            "register block otherwise full of ARM housekeeping it is not offered "
+            "rather than risk a wrong reading."
+        ),
+        citation="joyfulhouse/eg4_web_monitor issue #544",
+    ),
+    UnreadableMetric(
+        metric="generator_frequency_hz",
+        reason=(
+            "generator frequency was never examined by the firmware work; in a "
+            "register block otherwise full of ARM housekeeping it is not offered "
+            "rather than risk a wrong reading."
+        ),
+        citation="joyfulhouse/eg4_web_monitor issue #544",
+    ),
+)
+
 MODELS: tuple[ModelSpec, ...] = (
     ModelSpec(
         name="18kPV",
@@ -507,11 +559,22 @@ MODELS: tuple[ModelSpec, ...] = (
     ),
     ModelSpec(
         name="6000XP",
+        pv_strings=2,
+        # generator_input stays the family's True: this machine has a GEN
+        # terminal and EG4's spec sheet documents it. What it does not have is a
+        # register behind that terminal worth storing, which is what the
+        # unreadable list below says. Denying the hardware to describe a
+        # reading would be a second false claim in place of the first.
+        unreadable=_OFFGRID_UNREADABLE,
+        citation=(
+            "EG4 6000XP spec sheet: NUMBER OF MPPTS 2, INPUTS PER MPPT 1; "
+            "https://eg4electronics.com/wp-content/uploads/2024/04/"
+            "EG4-6000XP-Inverter-Spec-Sheet.pdf"
+        ),
         caveat=(
-            "Off-grid family: several registers this driver reads mean something "
-            "different here than on the hybrids, and its PV string count is "
-            "unconfirmed upstream. Readings may be wrong rather than missing. "
-            "See issue #122."
+            "Off-grid family: the generator block is not offered (register 123 "
+            "is a seconds counter). Your house load total is read locally; only "
+            "the smart-load itemisation is cloud-only. See issue #122."
         ),
     ),
 )
@@ -1206,6 +1269,17 @@ class Eg4LuxPowerSource:
         # outside. What rate is normal on this hardware has not been measured.
         self._misroutes = 0
 
+        # The metrics this configured model cannot read, even though the family
+        # maps their registers. Filtered out of every sample: the store is
+        # opened for the same narrowed set, and a sample carrying an undeclared
+        # metric raises KeyError on append, which stops the poll loop — so the
+        # driver must not produce one in the first place.
+        self._unreadable: frozenset[str] = frozenset()
+        if self._config.model:
+            self._unreadable = frozenset(
+                g.metric for g in find_model_by_name(self._config.model).unreadable
+            )
+
     @property
     def device(self) -> str:
         """The configured inverter serial, which is what stored rows are filed under.
@@ -1495,9 +1569,19 @@ class Eg4LuxPowerSource:
             raise ConnectionError(f"reading from inverter failed: {exc}") from exc
         sample = to_sample(runtime, bank)
         energy = await self._read_energy(sample.timestamp)
-        if not energy:
-            return sample
-        return replace(sample, readings={**sample.readings, **energy})
+        if energy:
+            sample = replace(sample, readings={**sample.readings, **energy})
+        # The configured model may declare metrics the family maps but this
+        # machine cannot read. A sample carrying one would raise KeyError on
+        # append — the store is opened for the same narrowed set — so the
+        # driver drops them rather than produce a reading that is not what it
+        # claims to be.
+        if self._unreadable:
+            sample = replace(
+                sample,
+                readings={k: v for k, v in sample.readings.items() if k not in self._unreadable},
+            )
+        return sample
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.

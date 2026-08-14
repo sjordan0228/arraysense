@@ -36,6 +36,7 @@ from arraysense.auth import clear_password, password_is_set
 from arraysense.collector.service import CollectorService
 from arraysense.collector.weather import WeatherPoller
 from arraysense.config import DEFAULT_PATH, Config, effective, load
+from arraysense.drivers.base import find_model, resolve_model
 from arraysense.metrics import SITE_METRICS
 from arraysense.settings import SettingsStore
 from arraysense.store.migrate import migrate_devices, needs_device_migration
@@ -85,6 +86,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _declared_metrics(config: Config) -> frozenset[str]:
+    """The metric set a store for ``config`` must be opened for.
+
+    The driver entry carries the family declaration; an installation that names
+    a model resolves it, so a 6000XP's store declares no generator columns. The
+    store's writable set has to agree with what the collector actually produces
+    — a sample carrying a metric the store was not opened for raises KeyError on
+    append — which is why this resolves the model rather than reading the entry
+    alone. The site metrics ride along because the weather poller writes them
+    into the same store, and a store opened without them refused every sky
+    append with a KeyError that was not a sqlite error and so escaped the
+    poller's store guard entirely.
+    """
+    entry = drivers.get(config.driver)
+    declared = entry.capabilities
+    if config.model:
+        declared = resolve_model(declared, find_model(entry, config.model))
+    return declared.metrics | SITE_METRICS
+
+
 def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     """Open the store, build the collector, and assemble the application.
 
@@ -105,12 +126,16 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # not is left in place, unwritten, which is harmless.
     file_config = config
     opened_driver = config.driver
+    # The model too, not only the driver: a model narrows the writable set now
+    # that it can declare metrics it cannot read, so the store's columns depend
+    # on it exactly as they depend on the driver.
+    opened_model = config.model
     # The store's writable set is what the SITE records, not the driver alone:
     # the driver's declaration plus the weather metrics the poller writes. A
     # store opened for the driver's metrics only refused every weather append
     # with a KeyError — which is not a sqlite error, so it escaped the poller's
     # store guard and the sky was silently never recorded.
-    declared = drivers.get(config.driver).capabilities.metrics | SITE_METRICS
+    declared = _declared_metrics(config)
     store = SqliteStore(
         config.database_path,
         device=config.inverter_serial,
@@ -128,7 +153,7 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # overlay would otherwise write EG4 samples into a fake-declared store and
     # KeyError on the first EG4-only metric, killing the poll loop. The weather
     # metrics ride along for the same reason they did at the first open.
-    declared = drivers.get(config.driver).capabilities.metrics | SITE_METRICS
+    declared = _declared_metrics(config)
 
     # Which leaves an ordering problem now that the store is opened for a
     # device: the serial the settings page may override is the identity the
@@ -136,12 +161,27 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
     # read it. Reopening is the cheap and visible answer. Without it the API
     # would read one serial's rows while the collector wrote another's, and
     # every page would go blank with the collector apparently healthy.
-    if config.inverter_serial != store.device or config.driver != opened_driver:
-        # Reopen whenever the identity or the driver the store was first built
-        # with no longer matches the effective configuration. The serial is the
-        # row identity; the driver decides the column set. Either one wrong
-        # means the collector and the store disagree about what they are
-        # writing, and the reopen is cheap and visible.
+    if (
+        config.inverter_serial != store.device
+        or config.driver != opened_driver
+        or config.model != opened_model
+    ):
+        # Reopen whenever the identity, the driver or the model the store was
+        # first built with no longer matches the effective configuration. The
+        # serial is the row identity; the driver and the model together decide
+        # the column set. Any one of them wrong means the collector and the
+        # store disagree about what they are writing, and the reopen is cheap
+        # and visible.
+        #
+        # The model earns its place here the moment a model can declare a
+        # metric it cannot read. A file naming a 6000XP opens a store with no
+        # generator columns; the settings page then moving that installation to
+        # an 18kPV leaves the collector producing generator readings the store
+        # will not take. ``append`` raises KeyError, which is not a
+        # ``sqlite3.Error`` and so is not in the collector's STORE_ERRORS — the
+        # poll task dies on the first poll, the watchdog stops the process, and
+        # systemd restarts it into exactly the same state. A crash loop with
+        # nothing but a stale chart to show for it.
         logger.info(
             "settings override the connection; reopening the store as %s on the %s driver",
             config.inverter_serial,
@@ -529,7 +569,7 @@ def build_setup_app(config_path: Path | str) -> FastAPI:
             # registry do not check. A path load() accepts but sqlite cannot
             # open would otherwise become the real config and crash-loop every
             # restart with no setup mode left to offer.
-            declared = drivers.get(candidate.driver).capabilities.metrics
+            declared = _declared_metrics(candidate)
             store = SqliteStore(
                 candidate.database_path,
                 device=candidate.inverter_serial,

@@ -7,6 +7,50 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.5 — 14 August 2026
+
+The 6000XP stops reporting a seconds counter as generator power.
+
+### Fixed
+
+- **An off-grid 6000XP no longer stores readings that are not what they claim
+  to be.** The off-grid machines share a register map with the hybrids, but
+  several addresses hold something else entirely — register 123, which the
+  hybrids use for generator power, is a seconds counter on off-grid firmware.
+  It was being stored and charted as watts. The generator power, voltage and
+  frequency readings are no longer offered on that family at all, because a
+  missing reading is honest and a wrong one is not.
+
+- **The 6000XP declares two PV strings, not three.** It has two MPPTs with one
+  input each, from EG4's own spec sheet. It had been inheriting the family's
+  three, which is a fallback the upstream library itself marks as a guess.
+
+### Added
+
+- **A model can now say what it cannot read, and the setup page says so.**
+  Choosing the 6000XP shows what is not reported and why — separating a reading
+  that would be wrong from one that is only available through the vendor cloud.
+  Nothing is hidden behind a single vague warning.
+
+### Notes
+
+- Only the 6000XP changes. Every hybrid — 18kPV, 12kPV, FlexBOSS21, FlexBOSS18
+  — reports exactly what it did before, string counts and generator readings
+  included.
+
+- **Set `model` in your configuration if you own an off-grid machine.** All of
+  this follows from the configured model; one left unset is still read as a
+  hybrid. The first-run wizard always sets it.
+
+- Readings already recorded on an existing 6000XP database are left alone. They
+  stop being drawn, but a bogus generator figure stored before this release is
+  still in the history.
+
+- A model changed through the settings page now reopens the database for that
+  model. Before, moving an installation between an off-grid and a hybrid model
+  that way left the collector writing readings the database had no column for,
+  which stopped collection until it was changed back.
+
 ## 1.0.4 — 14 August 2026
 
 A password, if you want one. Nothing changes for anybody who does not.

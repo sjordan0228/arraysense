@@ -53,13 +53,36 @@ def test_model_deltas_declare_their_citation_status() -> None:
     payload = describe_setup(_config())
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     cited = next(m for m in eg4["models"] if m["name"] == "18kPV")
-    uncited = next(m for m in eg4["models"] if m["name"] == "6000XP")
+    offgrid = next(m for m in eg4["models"] if m["name"] == "6000XP")
     assert cited["citation"]
     assert cited["cited_fields"] == ["pv_strings"]
-    # The off-grid machine asserts nothing about itself: its string count is an
-    # open question upstream, so it inherits rather than claiming.
-    assert uncited["citation"] == ""
-    assert uncited["cited_fields"] == []
+    # The 6000XP's string count used to be an open question upstream and it
+    # inherited the family's 3. The EG4 spec sheet settled it — NUMBER OF
+    # MPPTS 2, INPUTS PER MPPT 1 — so it now cites its own count. The fact
+    # worth guarding is that the citation names the spec sheet, so a future
+    # reader can tell a fact moved rather than a test bent to fit.
+    assert offgrid["citation"]
+    assert "6000XP spec sheet" in offgrid["citation"]
+    assert offgrid["cited_fields"] == ["pv_strings"]
+
+
+def test_describe_setup_carries_the_unreadable_gap_list() -> None:
+    payload = describe_setup(_config())
+    eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
+    six = next(m for m in eg4["models"] if m["name"] == "6000XP")
+    names = [g["metric"] for g in six["unreadable"]]
+    assert names == ["generator_power_w", "generator_voltage_v", "generator_frequency_hz"]
+    assert all(g["reason"] and g["citation"] for g in six["unreadable"])
+    assert all("cloud_available" in g for g in six["unreadable"])
+
+    # Every model the payload offers has the key, so a page reads it
+    # unconditionally rather than branching on whether it happens to be there.
+    assert all("unreadable" in model for model in eg4["models"])
+
+    # The hybrids read everything the family does.
+    for name in ("18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18"):
+        model = next(m for m in eg4["models"] if m["name"] == name)
+        assert model["unreadable"] == [], f"{name} must declare no gaps"
 
 
 def test_a_model_whose_readings_are_unproven_says_so() -> None:
