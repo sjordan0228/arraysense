@@ -254,6 +254,11 @@
   <nav class="nav" id="nav" aria-label="Views"></nav>
 
   <div class="p cal" id="cal" hidden></div>
+  <!-- A second .cal box, for the model warning. Both advisories can be true at
+       once — a bank drifting while the configured model is wrong — and they are
+       independent, so each needs its own box rather than the two sharing one
+       and the second render overwriting the first. Same shape, same tone. -->
+  <div class="p cal" id="modelCal" hidden></div>
 
   <div class="p" id="settings" hidden>
     <!-- Two of these three also exist as installation settings on the service.
@@ -716,6 +721,9 @@ async function loadLive() {
     calibration = cal;
     renderCalibration(cal);
     renderAgreement(cal);
+    // The model warning rides the status poll already made above, so this needs
+    // no second request.
+    renderModelCheck(status);
     // Packs that stopped answering keep their last reading forever in
     // latest_modules, so they are dropped before anything compares them.
     const packs = reporting(live.modules);
@@ -792,6 +800,48 @@ function renderCalibration(cal) {
     <button class="calhide" id="calHide" type="button"
       title="Hide this for ${CAL_SNOOZE_DAYS} days">Dismiss</button>`;
   $('calHide').onclick = () => dismissCal(sev);
+  box.hidden = false;
+}
+
+// >>> model-check
+// The dashboard's model warning, decided from the status payload. A null
+// model_check is the ordinary answer — an unconfigured installation never
+// produces one, and a correctly configured or an unreadable one gets nothing
+// either — so it must render nothing and take no space. The message is the
+// backend's own wording and the page prints it verbatim; a verdict with no
+// message is nothing to show, because composing a sentence here would drift
+// the moment the backend reworded the risk.
+function modelCheckBanner(status) {
+  if (!status || typeof status !== 'object') return null;
+  const check = status.model_check;
+  if (!check || typeof check !== 'object') return null;
+  const message = check.message;
+  if (typeof message !== 'string' || !message) return null;
+  return message;
+}
+
+// The banner's body, drawn through the same .cal shape the calibration
+// advisory uses. esc() comes from common.js; the message is escaped for HTML
+// but never reworded.
+function modelCheckHtml(message) {
+  return `<div class="calmark">●</div>
+    <div class="calbody"><h2>Model mismatch</h2><p>${esc(message)}</p></div>`;
+}
+// <<< model-check
+
+// The model warning drawn through the same .cal box as the calibration banner
+// (same shape, same tone class), because a second banner mechanism beside it
+// would be the drift this project keeps paying for. Unlike calibration, it is
+// deliberately not dismissible: a drifted counter corrects itself at the next
+// full charge, but a wrong model stays wrong until a setting changes, and every
+// reading taken meanwhile is suspect — so there is no dismiss button and no
+// localStorage snooze.
+function renderModelCheck(status) {
+  const box = $('modelCal');
+  const message = modelCheckBanner(status);
+  if (message === null) { box.hidden = true; box.className = 'p cal'; return; }
+  box.className = 'p cal sev-warning';
+  box.innerHTML = modelCheckHtml(message);
   box.hidden = false;
 }
 

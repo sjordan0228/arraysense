@@ -909,6 +909,14 @@ def cmd_status(argv: list[str]) -> int:
             f"staleness={staleness}"
         )
     print(driver_line(_probe(capabilities_url(port), timeout=5.0)))
+    # The connect-time model check, when the service found a disagreement worth
+    # saying. The message names the risk rather than the discrepancy, which is
+    # the wording the issue asks for — nobody fixes a wrong model from a bare
+    # "model mismatch". A family mismatch stops the collector before a row is
+    # written, so the only thing that can reach here is the exact-model warning.
+    mismatch = (body.get("model_check") or {}).get("message")
+    if mismatch:
+        print(f"model:     {mismatch}")
     facts = database_facts(_database_path())
     size = f"{facts['bytes'] / 1_048_576:.1f} MB" if facts["bytes"] is not None else "unknown size"
     if not facts["readable"]:
