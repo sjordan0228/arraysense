@@ -7,42 +7,10 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 1.0.6 — 14 August 2026
-
-The 12000XP is offered, and the list says which machine is which.
-
-### Added
-
-- **The EG4 12000XP can be chosen.** Until now an owner of one had no correct
-  model to pick at all. It gets the same treatment as the 6000XP — the
-  generator readings that would not mean what they say are not offered — and
-  the evidence behind that is stronger for this machine than for its smaller
-  sibling, because the firmware work that proved it was done on this one.
-
-- **It declares two PV strings, and that is not a typo.** The 12000XP has two
-  MPPT trackers with two paralleled input terminals each: four places to land a
-  string, two measurements. A reading comes from a tracker, not a terminal, so
-  an owner running four strings sees two figures. Since 1.0.2 the efficiency
-  scorer groups strings that share a tracker, so a four-string install scores
-  correctly rather than at roughly double.
-
-- **The model list says what each machine is.** The 12kPV is a hybrid and the
-  12000XP is off-grid — a keystroke apart, opposite families, opposite
-  treatment. The list now labels them rather than leaving an owner to know.
-  Each model declares its own family, so the label is a fact about the machine
-  and not a guess made from something that happens to correlate with it.
-
-### Notes
-
-- Nothing changes for the five models already offered.
-
-- The first-run wizard cannot detect which off-grid machine you have: both
-  report the same device type code, so Detect says nothing rather than guess,
-  and you pick from the list.
-
 ## 1.0.5 — 14 August 2026
 
-The 6000XP stops reporting a seconds counter as generator power.
+EG4's off-grid inverters are supported honestly: the 6000XP stops reporting a
+seconds counter as generator power, and the 12000XP can be chosen at all.
 
 ### Fixed
 
@@ -60,24 +28,46 @@ The 6000XP stops reporting a seconds counter as generator power.
 
 ### Added
 
+- **The EG4 12000XP can be chosen.** Until now an owner of one had no correct
+  model to pick at all. It gets the same treatment as the 6000XP, and the
+  evidence behind that is stronger for this machine than for its smaller
+  sibling, because the firmware work that proved it was done on this one.
+
+- **It declares two PV strings, and that is not a typo.** The 12000XP has two
+  MPPT trackers with two paralleled input terminals each: four places to land a
+  string, two measurements. A reading comes from a tracker, not a terminal, so
+  an owner running four strings sees two figures. Since 1.0.2 the efficiency
+  scorer groups strings that share a tracker, so a four-string install scores
+  correctly rather than at roughly double.
+
 - **A model can now say what it cannot read, and the setup page says so.**
-  Choosing the 6000XP shows what is not reported and why — separating a reading
-  that would be wrong from one that is only available through the vendor cloud.
-  Nothing is hidden behind a single vague warning.
+  Choosing either off-grid machine shows what is not reported and why —
+  separating a reading that would be wrong from one that is only available
+  through the vendor cloud. Nothing is hidden behind a single vague warning.
+
+- **The model list says what each machine is.** The 12kPV is a hybrid and the
+  12000XP is off-grid — a keystroke apart, opposite families, opposite
+  treatment. The list now labels them rather than leaving an owner to know.
+  Each model declares its own family, so the label is a fact about the machine
+  and not a guess made from something that happens to correlate with it.
 
 ### Notes
 
-- Only the 6000XP changes. Every hybrid — 18kPV, 12kPV, FlexBOSS21, FlexBOSS18
-  — reports exactly what it did before, string counts and generator readings
-  included.
+- **Nothing changes for the machines already supported.** Every hybrid —
+  18kPV, 12kPV, FlexBOSS21, FlexBOSS18 — reports exactly what it did before,
+  string counts and generator readings included.
 
 - **Set `model` in your configuration if you own an off-grid machine.** All of
   this follows from the configured model; one left unset is still read as a
   hybrid. The first-run wizard always sets it.
 
-- Readings already recorded on an existing 6000XP database are left alone. They
-  stop being drawn, but a bogus generator figure stored before this release is
-  still in the history.
+- The first-run wizard cannot detect which off-grid machine you have: both
+  report the same device type code, so Detect says nothing rather than guess,
+  and you pick from the list.
+
+- Readings already recorded on an existing off-grid database are left alone.
+  They stop being drawn, but a bogus generator figure stored before this
+  release is still in the history.
 
 - A model changed through the settings page now reopens the database for that
   model. Before, moving an installation between an off-grid and a hybrid model
