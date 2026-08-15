@@ -7,6 +7,24 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.9 — 15 August 2026
+
+The Graphs page stops opening with most of its charts blank.
+
+### Fixed
+
+- **The tab you land on draws every band, not just the first.** Opening Graphs
+  in a new session left most of its charts empty — the axes drawn, the value
+  and peak above each one correct, and no trace anywhere — until you switched
+  the range and came back. The charts had their data the whole time and were
+  the right size; what they were missing was a time axis. uPlot works one out
+  on a tick after the chart is built, and on a first page load that tick
+  arrived for the first chart built and for none of the others, which is why
+  exactly one band on the tab looked right. Nothing already on the page would
+  ever prompt the rest, so they stayed blank until something re-handed them
+  their data. They now claim that axis back for themselves. Reported against
+  both Chrome and Safari, and confirmed fixed on the reference installation.
+
 ## 1.0.8 — 14 August 2026
 
 Your email and your serials stop being readable by anything on the network.
