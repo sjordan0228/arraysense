@@ -441,14 +441,24 @@ def test_dropping_a_held_pack_leaves_the_inverter_readings_alone() -> None:
     assert not sample.is_failed
 
 
-def test_a_state_of_health_of_exactly_100_is_not_stored() -> None:
-    # pylxpweb rewrites a reported 0 to 100 on every path that produces SOH.
-    # In 0.9.38: transports/data.py:635-636 on the runtime path, :1292 per
-    # module, :1705-1707 on the bank. Zero is what a silent BMS reports, so a
-    # stored 100 could be a healthy bank or one that answered nothing, and
-    # nothing downstream can tell which.
-    runtime = _runtime(battery_soh=100)
-    assert "battery_soh_pct" not in to_sample(runtime, bank=None).readings
+def test_a_state_of_health_of_exactly_100_is_stored_when_the_bms_answered() -> None:
+    # pylxpweb rewrites a reported 0 to 100 on every path that produces SOH,
+    # which once made this filter refuse the literal 100: a stored 100 could be
+    # a healthy bank or one that answered nothing. The witness gate has already
+    # run by the time the filter sees the block, so a 100 that reaches
+    # _measured_soh is a measurement, not a fabrication — the refusal was
+    # removed after the reference installation showed four dashes for seven days
+    # on a healthy bank. A block with no live witnesses still stores nothing
+    # even with soh=100: that is the zero-fill shape the gate exists to catch.
+    readings = to_sample(_runtime(battery_soh=100), bank=None).readings
+    assert readings["battery_soh_pct"] == 100.0
+    silent = _runtime(
+        battery_soh=100,
+        bms_max_cell_voltage=0.0,
+        bms_min_cell_voltage=0.0,
+        battery_capacity_ah=0.0,
+    )
+    assert "battery_soh_pct" not in to_sample(silent, bank=None).readings
 
 
 def test_a_state_of_health_below_100_is_stored() -> None:
@@ -469,29 +479,59 @@ def _healthy_bank(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**fields)
 
 
-def test_the_banks_state_of_health_is_refused_on_the_same_terms() -> None:
+def test_the_banks_state_of_health_is_stored_when_the_bms_answered() -> None:
     # The bank decodes the same register 5 the runtime path does, through the
-    # same rewrite, so it inherits the same ambiguity.
-    assert "battery_soh_pct" not in to_sample(_runtime(), _healthy_bank(soh=100)).readings
+    # same rewrite, so the refusal used to apply here on the same terms. The
+    # witness gate has already vouched for the block before the filter runs, so
+    # a 100 is a measurement and is stored; a bank with no live witnesses still
+    # stores nothing even with soh=100, which is the zero-fill shape the gate
+    # exists to catch. Changed after the reference installation showed four
+    # dashes for seven days on a healthy bank.
+    readings = to_sample(_runtime(), _healthy_bank(soh=100)).readings
+    assert readings["battery_soh_pct"] == 100.0
+    silent = to_sample(
+        _runtime(),
+        _healthy_bank(
+            soh=100,
+            max_cell_voltage=0.0,
+            min_cell_voltage=0.0,
+            max_capacity=0.0,
+            current_capacity=0.0,
+        ),
+    ).readings
+    assert "battery_soh_pct" not in silent
     kept = to_sample(_runtime(), _healthy_bank(soh=94)).readings
     assert kept["battery_soh_pct"] == 94.0
 
 
-def test_a_modules_state_of_health_is_refused_on_the_same_terms() -> None:
-    def module(soh: int) -> SimpleNamespace:
+def test_a_modules_state_of_health_is_stored_when_the_bms_answered() -> None:
+    # A module's SOH decodes from offset 8 of its own register block, through
+    # the same rewrite, so the refusal used to apply here too. The witness gate
+    # has already run on the module before the filter, so a 100 is a measurement
+    # and is stored; a module with no live witnesses is dropped entirely even
+    # with soh=100, which is the zero-fill shape the gate exists to catch.
+    # Changed after the reference installation showed four dashes for seven days
+    # on a healthy bank.
+    def module(soh: int, answering: bool) -> SimpleNamespace:
         return SimpleNamespace(
             serial_number="Battery_ID_01",
             battery_index=0,
-            soc=64,
+            soc=64 if answering else 0,
             soh=soh,
-            max_cell_voltage=3.364,
-            min_cell_voltage=3.358,
-            max_capacity=280.0,
+            max_cell_voltage=3.364 if answering else 0.0,
+            min_cell_voltage=3.358 if answering else 0.0,
+            max_capacity=280.0 if answering else 0.0,
         )
 
-    (silent,) = to_sample(_runtime(), _healthy_bank(batteries=[module(100)])).battery_modules
-    assert silent.soh_pct is None
-    (worn,) = to_sample(_runtime(), _healthy_bank(batteries=[module(91)])).battery_modules
+    (full,) = to_sample(
+        _runtime(), _healthy_bank(batteries=[module(100, answering=True)])
+    ).battery_modules
+    assert full.soh_pct == 100.0
+    silent = to_sample(_runtime(), _healthy_bank(batteries=[module(100, answering=False)]))
+    assert silent.battery_modules == ()
+    (worn,) = to_sample(
+        _runtime(), _healthy_bank(batteries=[module(91, answering=True)])
+    ).battery_modules
     assert worn.soh_pct == 91.0
 
 
@@ -697,16 +737,23 @@ async def test_a_closed_socket_is_not_retried_at_all() -> None:
 
 
 def test_a_state_of_health_of_zero_is_absence_not_a_dead_bank() -> None:
-    # The filter refused the library's fabricated 100 and let a raw 0 through,
-    # which is the same error wearing the opposite number. Zero is what a BMS
-    # that answered nothing reports, not a bank with no health left — and
-    # storing it would put an alarming figure on a column nobody measured.
+    # The unit contract of _measured_soh, tested in isolation because the
+    # witness gate is not part of this function. The literal 100 used to be
+    # refused here too — a fabricated 100 and a healthy bank are
+    # indistinguishable at this level, where no gate has run — but every caller
+    # now establishes that the BMS answered before calling, so the refusal was
+    # removed after the reference installation showed four dashes for seven days
+    # on a healthy bank. Zero and None remain absence: not every library path
+    # applies the 0-to-100 rewrite, so a raw 0 still arrives, and a bank
+    # reporting 0% state of health is one that said nothing rather than one with
+    # no health left.
     from arraysense.drivers.eg4_luxpower.source import _measured_soh
 
     assert _measured_soh(SimpleNamespace(soh=0.0), "soh") is None
-    assert _measured_soh(SimpleNamespace(soh=100.0), "soh") is None
     assert _measured_soh(SimpleNamespace(soh=None), "soh") is None
-    # Everything a real degrading bank reports still arrives.
+    # Everything a real bank reports passes through, including the literal 100
+    # now that the witness gate upstream excludes the fabrication.
+    assert _measured_soh(SimpleNamespace(soh=100.0), "soh") == 100.0
     assert _measured_soh(SimpleNamespace(soh=97.0), "soh") == 97.0
     assert _measured_soh(SimpleNamespace(soh=1.0), "soh") == 1.0
 
