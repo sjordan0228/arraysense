@@ -3008,7 +3008,7 @@ function authDialogEl() {
   dlg.innerHTML = `
     <form id="authForm">
       <h2 id="authTitle">Authentication required</h2>
-      <p class="authp">This write needs a session. Enter the password this
+      <p class="authp">This needs a session. Enter the password this
         installation was set up with.</p>
       <label for="authPassword">Password</label>
       <input id="authPassword" name="password" type="password"

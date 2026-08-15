@@ -7,6 +7,44 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.8 — 14 August 2026
+
+Your email and your serials stop being readable by anything on the network.
+
+### Fixed
+
+- **The inverter's serial is no longer handed out in the clear.** Anything that
+  could reach the port could read it from `/api/capabilities`, unmasked, with
+  no password anywhere in the picture. It now goes out with its middle
+  replaced, the same way the settings page has always shown it. This applies
+  whether or not you use a password, because it was never something to give
+  away. Nothing on any page read that value, so nothing looks different.
+
+- **With a password set, the settings a stranger could read are withheld
+  rather than merely masked.** Your contact email, the dongle address and both
+  serials are simply absent to a caller with no session — not blanked, not
+  starred, absent. Masking stops a value being read off the page; it does not
+  stop it being read.
+
+### Notes
+
+- **The dashboard is untouched, which is the point.** A wall display polls
+  readings, capabilities and status, and every one of those stays open — it
+  never asks for a password and cannot be logged out. Even the display
+  preferences it reads from the settings still come through; those were never
+  sensitive, so only the four identifying values are withheld.
+
+- The connection editor on the Settings page asks for the password when a
+  password is set. It uses the same prompt every protected change already uses.
+
+- **Nothing changes on an installation with no password**, apart from the
+  masked serial above.
+
+- Still open, and deliberately not decided here: whether the service should
+  listen only on the machine itself by default rather than on the whole
+  network. Changing that would take the dashboard away from every existing
+  installation on upgrade, and it deserves its own release and its own warning.
+
 ## 1.0.7 — 14 August 2026
 
 The service notices when the inverter answering is not the one configured.

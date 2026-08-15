@@ -2485,8 +2485,22 @@ async function load() {
   // payload is in hand, and falls back to loose controls when it is not, so a
   // failure here degrades the group rather than the whole page.
   try {
-    const r = await fetch('/api/setup');
+    // With a password set and no session this is a 401 — the one thing the
+    // page needs a login for before it can render the connection editor. The
+    // same wrapper the writes use prompts for the password and retries once;
+    // a cancelled dialog leaves the page on the public settings only.
+    const r = await writeWithAuth('/api/setup', {}, 6000);
     setupPayload = r.ok ? await r.json() : null;
+    if (setupPayload) {
+      // The settings read above predates any session this just established, so
+      // its identifying values are absent. Re-read now that the session exists
+      // so the contact email and the serials render like any other visit.
+      const full = await fetch('/api/settings');
+      if (full.ok) {
+        const body = await full.json();
+        saved = (body && body.values) || saved;
+      }
+    }
   } catch (e) {
     setupPayload = null;
   }

@@ -234,6 +234,89 @@ def test_reads_are_never_refused(client: Any) -> None:
     assert client.get("/").status_code == 200
 
 
+# --- the read surface (#34) --------------------------------------------------
+
+
+def test_the_display_defaults_survive_without_a_session(client: Any) -> None:
+    """The pin for the whole design: the wall display seed data stays open.
+
+    ``syncDisplayDefaults`` reads ``/api/settings`` to seed the browser
+    temperature unit and refresh interval, and a flat 401 would leave a fresh
+    tablet showing the built-in defaults — degrading exactly the screen this
+    issue forbids degrading. So the endpoint keeps answering and withholds
+    only the identifying values, absent rather than masked.
+    """
+    client.put("/api/settings", json={"site.contact_email": "owner@example.com"})
+    set_password(_settings(client), PASSWORD)
+    values = client.get("/api/settings").json()["values"]
+    assert values["display.temperature_unit"] == "F"
+    assert values["display.refresh_seconds"] == 5
+    assert values["collector.poll_interval"] == 11.0
+    # The four secret-flagged values are withheld; the public settings are not.
+    for withheld in (
+        "site.contact_email",
+        "connection.dongle_host",
+        "connection.dongle_serial",
+        "connection.inverter_serial",
+    ):
+        assert withheld not in values
+
+
+def test_the_read_surface_is_untouched_with_no_password(client: Any) -> None:
+    # The regression bar for the read half: a fresh install sees every read
+    # exactly as it did before authentication existed.
+    assert client.get("/api/settings").status_code == 200
+    assert client.get("/api/setup").status_code == 200
+    assert client.get("/api/status").status_code == 200
+    assert client.get("/api/live").status_code == 200
+    assert client.get("/api/capabilities").status_code == 200
+
+
+def test_settings_answers_normally_with_a_valid_session(client: Any) -> None:
+    from arraysense.settings import _mask
+
+    client.put("/api/settings", json={"site.contact_email": "owner@example.com"})
+    set_password(_settings(client), PASSWORD)
+    assert client.post("/api/auth/login", json={"password": PASSWORD}).status_code == 200
+    values = client.get("/api/settings").json()["values"]
+    assert values["site.contact_email"] == _mask("owner@example.com")
+    assert values["display.temperature_unit"] == "F"
+
+
+def test_setup_is_a_401_with_a_password_and_no_session(client: Any) -> None:
+    # /api/setup carries the connection editor values and the wall display
+    # never requests it, so it takes the 401 that gives the settings page a
+    # reason to prompt. The reads the dashboard actually polls stay open.
+    set_password(_settings(client), PASSWORD)
+    assert client.get("/api/setup").status_code == 401
+    assert client.get("/api/settings").status_code == 200
+    assert client.get("/api/status").status_code == 200
+    assert client.get("/api/live").status_code == 200
+    assert client.get("/api/capabilities").status_code == 200
+    assert client.get("/").status_code == 200
+
+
+def test_setup_answers_normally_with_a_valid_session(client: Any) -> None:
+    set_password(_settings(client), PASSWORD)
+    assert client.post("/api/auth/login", json={"password": PASSWORD}).status_code == 200
+    assert client.get("/api/setup").status_code == 200
+
+
+def test_capabilities_masks_the_serial_for_everyone(client: Any) -> None:
+    # The serial is an installation secret by this project's own rules, and
+    # nothing renders it — the pages consume the transport, the string count
+    # and the metric list, never the serial — so it is masked for a caller
+    # with no password and for one with a session alike. The mask is the
+    # settings module's own, so one format means one thing everywhere.
+    from arraysense.settings import _mask
+
+    device = client.get("/api/capabilities").json()["devices"][0]
+    assert device["device"] == _mask("CE00000000")
+    set_password(_settings(client), PASSWORD)
+    device = client.get("/api/capabilities").json()["devices"][0]
+    assert device["device"] == _mask("CE00000000")
+
+
 # --- the endpoints -----------------------------------------------------------
 
 
