@@ -33,6 +33,7 @@ from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
+from arraysense.settings import _mask
 from arraysense.store.rollup import rebuild_inverter_hourly
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
@@ -2138,7 +2139,7 @@ def test_capabilities_names_what_the_device_produces(client: Any) -> None:
     assert len(body["devices"]) == 1
     device = body["devices"][0]
     assert device["driver"] == "fake"
-    assert device["device"] == "CE00000000"
+    assert device["device"] == _mask("CE00000000")
     assert device["model"] == "simulated"
     assert device["pv_strings"] == 3
     assert device["energy"] == "estimated"
@@ -2199,7 +2200,7 @@ def test_capabilities_reports_identity_without_a_declaration(tmp_path: Path) -> 
     store.close()
     assert len(body["devices"]) == 1
     device = body["devices"][0]
-    assert device["device"] == TEST_DEVICE
+    assert device["device"] == _mask(TEST_DEVICE)
     assert device["driver"] is None
     assert device["model"] is None
     assert device["pv_strings"] is None
