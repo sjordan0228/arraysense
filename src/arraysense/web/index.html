@@ -432,7 +432,10 @@
     <div class="chart" id="socWrap" role="img" aria-label="Battery state of charge over the selected range"></div>
   </section>
 
-  <section class="p">
+  <!-- Hidden whole on a device whose driver declares no per-module battery: the
+       header, the agreement panel and the grid are one card and leave together.
+       drawModules decides, from capHasModules. -->
+  <section class="p" id="modsCard">
     <div class="chead"><h2>Battery modules</h2>
       <span class="legend muted">per module, live
         <button class="iconbtn" id="modMore" aria-pressed="false">Show more</button></span></div>
@@ -893,6 +896,14 @@ function reporting(mods) {
 }
 
 function drawModules(mods) {
+  // No packs to draw and no packs to be missing. The advisory below tells the
+  // owner to check a CAN link, which is the right thing to say to a bank that
+  // has stopped answering and a wild goose chase on a machine that was never
+  // going to answer, so the card goes rather than the grid emptying. Unknown
+  // keeps it: capHasModules answers yes until a driver has said otherwise.
+  const card = $('modsCard');
+  if (card) card.hidden = !capHasModules(caps);
+  if (card && card.hidden) return;
   if (!mods.length) {
     $('mods').innerHTML = '<div class="p muted" style="grid-column:1/-1">No per-module data. '
       + 'The battery block is populated over CAN — check the packs are in closed loop.</div>';

@@ -152,3 +152,40 @@ def test_pin_keeps_weather_visible_under_another_tab() -> None:
     assert results["battery_under_solar"] == "false", "a section tab hides the other sections"
     assert results["all_everything"] == "true", "All is today's page, every section"
     assert results["weather_empty"] == "false", "no weather data hides the section even when pinned"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_packs_section_hides_on_a_device_that_declares_no_packs() -> None:
+    # Per-pack bands are hardware, not readings. A machine whose driver
+    # declares no per-module battery has no packs to draw, and an empty Packs
+    # section reads as a fault. Unknown keeps it, as everywhere else.
+    out = _run(
+        "console.log('declared_none:' + graphSectionVisible('packs', 'all', false, true, false));\n"
+        "console.log('declared_some:' + graphSectionVisible('packs', 'all', false, true, true));\n"
+        "console.log('undeclared:' + graphSectionVisible('packs', 'all', false, true));\n"
+        "console.log('other_section:' + graphSectionVisible('solar', 'all', false, true, false));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["declared_none"] == "false", "no per-module battery means no Packs section"
+    assert results["declared_some"] == "true"
+    assert results["undeclared"] == "true", "unknown must not suppress"
+    assert results["other_section"] == "true", "the gate is the packs section alone"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_packs_tab_leaves_with_its_section() -> None:
+    # A tab that opens a hidden section is a blank page, and a link somebody
+    # sent to /graphs#packs must land somewhere real on a machine without them.
+    out = _run(
+        "console.log('none:' + graphTabsFor(false).map(t => t.key).join(','));\n"
+        "console.log('some:' + graphTabsFor(true).map(t => t.key).join(','));\n"
+        "console.log('hash:' + wantedGraphTab('packs', null, graphTabsFor(false)));\n"
+        "console.log('stored:' + wantedGraphTab('', 'packs', graphTabsFor(false)));\n"
+        "console.log('kept:' + wantedGraphTab('packs', null, graphTabsFor(true)));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert "packs" not in results["none"].split(","), "the tab goes with the section"
+    assert "packs" in results["some"].split(",")
+    assert results["hash"] == "all", "a link to a section this device lacks lands on All"
+    assert results["stored"] == "all", "a remembered tab this device lacks falls back to All"
+    assert results["kept"] == "packs"
