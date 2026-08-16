@@ -44,6 +44,9 @@ PAGES = {
     # the page says "off" for itself, and a 404 that depends on a setting is a
     # link that rots in somebody's bookmarks the day they switch it off.
     "/emporia": "emporia.html",
+    # The charger gets a page rather than a card, because it is a thing an
+    # owner acts on. Its nav entry appears only on an account that has one.
+    "/charger": "charger.html",
 }
 
 # The code every page is built from — the palette, the formatters, the nav and

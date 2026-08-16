@@ -526,3 +526,32 @@ def test_a_rate_the_charger_does_not_take_is_not_audited_as_applied(tmp_path: Pa
     assert change.applied is False
     assert poller.audit.last_applied_rate(900001) is None
     store.close()
+
+
+def test_the_charger_page_is_served(client: TestClient) -> None:
+    response = client.get("/charger")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+
+
+def test_the_charger_page_declares_no_external_resources() -> None:
+    import arraysense
+
+    html = (Path(arraysense.__file__).parent / "web" / "charger.html").read_text()
+    assert "https://" not in html.split("</style>")[0]
+    assert "cdn." not in html
+
+
+def test_the_charger_tab_appears_only_where_there_is_a_charger() -> None:
+    # Most people who switch this module on have no EV charger at all. A tab
+    # leading to a page about hardware they do not own is the empty-card fault
+    # one level up, which is what #12 was about.
+    import re
+
+    import arraysense
+
+    common = (Path(arraysense.__file__).parent / "web" / "common.js").read_text()
+    entry = re.search(r"key: 'charger'.*?\}", common, re.S)
+    assert entry is not None, "the charger nav entry is missing"
+    assert "/api/emporia/charger" in entry.group(0)
+    assert "body.charger" in entry.group(0), "it must gate on a charger existing, not on a setting"

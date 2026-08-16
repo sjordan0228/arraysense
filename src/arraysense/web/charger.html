@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Charger · Solar ArraySense</title>
+<!-- No chart here, so uPlot is not loaded. The shared front end still is. -->
+<script src="/common.js"></script>
+<style>. -->
+<script src="/common.js"></script>
+<style>
+  /* The list is read top-down to answer "what is drawing all that", so the
+     watts column is the one the eye lands on: right-aligned, tabular, and the
+     only bold thing in the row. */
+  .tablewrap{overflow-x:auto}
+  #circuits{min-width:420px;width:100%}
+  #circuits td.w{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+  #circuits td.kind{color:var(--ink3);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+  /* The icon is decoration beside a name that already says what the circuit
+     is, so it is hidden from a screen reader — the same rule the nav follows.
+     A fixed column keeps the names aligned whether a row has one or not. */
+  #circuits td.ic{width:26px;padding-right:0;color:var(--ink3)}
+  #circuits td.ic svg{width:16px;height:16px;display:block}
+  /* The shared stylesheet left-aligns the first cell of a row and right-aligns
+     the rest, which is right for a table whose first column is a label. Here
+     the first column is the icon, so the name lands in the slot meant for
+     numbers and every circuit reads right-aligned against the watts. Naming
+     the column rather than the position puts it back. */
+  #circuits th:nth-child(2),#circuits td:nth-child(2){text-align:left}
+  /* A circuit nobody has heard from is dimmed rather than dropped. It can still
+     be the thing that spiked, and a row that vanishes takes the question with
+     it — but it must not look like a measurement either. */
+  #circuits tr.absent td{color:var(--ink3)}
+  /* The state line. reconnect_required is deliberately not styled as an error:
+     it is a job for the owner, not a fault in the service, and painting it red
+     is what teaches somebody to ignore the red. */
+  .state{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .state .dot{width:9px;height:9px;border-radius:50%;background:var(--ink3);flex:none}
+  .state.ok .dot{background:var(--good)}
+  .state.unreachable .dot{background:var(--warn)}
+  .state.reconnect_required .dot{background:var(--warn)}
+  .state .detail{color:var(--ink3)}
+  /* Borrowed from the wizard's fields and the password dialog's, rather than
+     invented here: two pages that already ask for a credential look one way,
+     and a third look would read as a different application. */
+  form.login{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+  /* display:flex beats the browser's own [hidden] rule, so without this the
+     form is on screen for ever — including under "Connected", where it
+     invites somebody to type a password nothing needs. common.js guards
+     .nowstrip, .view, .p and .stale the same way and for the same reason;
+     this page had to learn it against a real account. */
+  form.login[hidden]{display:none}
+  form.login input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
+    border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;min-width:210px}
+  form.login input:focus{outline:2px solid var(--pv);outline-offset:1px;border-color:transparent}
+  form.login button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:8px;padding:8px 14px;font:inherit;font-size:13px;cursor:pointer}
+  form.login button:hover:not(:disabled){background:var(--tint-3);color:var(--ink)}
+  form.login button:disabled{opacity:.6;cursor:default}
+  .note{color:var(--ink3);max-width:70ch;line-height:1.5}
+  /* Named for a screen reader, invisible to everyone else: the column holds a
+     decorative mark, but a header cell with nothing in it reads as a nameless
+     column rather than as no column at all. */
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .err{color:var(--bad)}
+</style>
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Charger</h1>
+    <div class="hright">
+      <div class="conn" id="conn">loading…</div>
+    </div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <!-- The charger. Hidden entirely on an account without one, which is most of
+       them. The conflict line is the part that earns its place: Emporia ships
+       four of its own controllers for a charger and two were switched on here,
+       so "nothing else is driving this" is a claim that has to be checked
+       rather than assumed. -->
+  <section class="p" id="chargerPanel" hidden>
+    <div class="chead">
+      <h2>EV charger</h2>
+      <span class="legend muted" id="chargerStatus"></span>
+    </div>
+    <div class="state" id="chargerState"><span class="dot"></span>
+      <span id="chargerRate">—</span></div>
+    <p class="note err" id="chargerConflicts" hidden></p>
+    <form class="login" id="rateForm">
+      <label for="amps" class="muted">Set the rate</label>
+      <input type="number" id="amps" min="1" max="80" step="1" style="min-width:90px">
+      <button type="submit" id="rateGo">Apply</button>
+      <button type="button" id="powerGo">Stop charging</button>
+      <span class="err" id="rateErr"></span>
+    </form>
+    <div class="tablewrap">
+      <table id="changes">
+        <thead><tr><th>When</th><th>Change</th><th>Why</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+
+</main>
+
+<script>
+// A page of its own rather than a card on Circuits, because a charger is a
+// thing you act on and circuits are a thing you read. The tab only exists on an
+// account that has one — see MODULE_NAV in common.js.
+//
+// Nothing here decides anything. What the module may do with a charger is
+// decided server-side in control.py: a limit compared in two places is two
+// limits the day one of them moves, and this one has a car on the end of it.
+
+drawNav('charger');
+
+// Nothing here decides anything. What the module may do with a charger is
+// decided server-side in control.py, because a limit compared in two places is
+// two limits the day one of them moves — and this one has a car on the end of
+// it.
+async function loadCharger() {
+  let body = null;
+  try {
+    const r = await fetch('/api/emporia/charger');
+    if (r.ok) body = await r.json();
+  } catch (e) {
+    return;
+  }
+  const panel = $('chargerPanel');
+  if (!body || !body.charger) { panel.hidden = true; return; }
+  const c = body.charger;
+  panel.hidden = false;
+  // Plugged in is its own fact and not a rewording of the status: Emporia says
+  // "Standby" both when nothing is attached and when an attached car is paused,
+  // so the status line alone would tell somebody the cable was out while it was
+  // in their hand. Unknown says unknown rather than picking a side.
+  const plugged = c.plugged_in === true ? 'car plugged in'
+    : c.plugged_in === false ? 'no car' : 'car unknown';
+  $('chargerStatus').textContent = c.connected === false
+    ? `offline ${c.offline_since || ''}`.trim()
+    : `${plugged} · ${c.status || ''} · ${c.message || ''}`;
+  const rate = numOrNull(c.rate_a);
+  $('chargerRate').textContent = rate === null
+    ? DASH
+    : `${rate} A of a possible ${numOrNull(c.max_rate_a) ?? DASH} A` +
+      ` · this service may go ${c.floor_a}–${c.ceiling_a} A · ${c.authority}`;
+  $('chargerState').className = 'state ' + (c.connected === false ? 'unreachable' : 'ok');
+
+  // A warning, never a block. It is the owner's charger and their account; what
+  // they need is the name of the exact setting that will fight this one.
+  const conflicts = c.conflicts || [];
+  const warn = $('chargerConflicts');
+  warn.hidden = conflicts.length === 0;
+  if (conflicts.length) {
+    warn.textContent = `Emporia is also controlling this charger: ${conflicts.join(', ')}. `
+      + 'Two controllers will move the same rate and undo each other. Turn those off in the '
+      + 'Emporia app if you want this service to have it.';
+  }
+  if (rate !== null && !$('amps').value) $('amps').value = rate;
+  // The button says what pressing it will do, not what the charger is doing.
+  // A button labelled with the current state is a coin toss every time.
+  $('powerGo').textContent = c.on === false ? 'Start charging' : 'Stop charging';
+  $('powerGo').dataset.on = c.on === false ? 'true' : 'false';
+
+  $('changes').querySelector('tbody').innerHTML = (body.changes || []).map((ch) => {
+    const when = new Date(ch.timestamp * 1000).toLocaleString();
+    const from = ch.from_a === null ? DASH : ch.from_a + ' A';
+    const to = ch.to_a === null ? 'stop' : ch.to_a + ' A';
+    // A refused decision is shown, not hidden. A log of successes only makes a
+    // module that never acted look exactly like one nobody asked.
+    return `<tr class="${ch.applied ? '' : 'absent'}">`
+      + `<td>${esc(when)}</td><td>${esc(from)} → ${esc(to)}${ch.applied ? '' : ' (not applied)'}</td>`
+      + `<td>${esc(ch.reason)}</td></tr>`;
+  }).join('') || '<tr><td colspan="3" class="muted">Nothing has changed the rate yet.</td></tr>';
+}
+
+$('powerGo').addEventListener('click', async () => {
+  const err = $('rateErr');
+  err.textContent = '';
+  $('powerGo').disabled = true;
+  try {
+    const r = await fetch('/api/emporia/charger/power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({on: $('powerGo').dataset.on === 'true'}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) err.textContent = body.detail || 'That did not work.';
+    // confirmed is the charger agreeing, not Emporia accepting the request.
+    else if (body.confirmed === false) err.textContent = 'Sent, but the charger still reads otherwise.';
+    await loadCharger();
+  } catch (e) {
+    err.textContent = 'Could not reach this service.';
+  }
+  $('powerGo').disabled = false;
+});
+
+$('rateForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const err = $('rateErr');
+  err.textContent = '';
+  $('rateGo').disabled = true;
+  try {
+    const r = await fetch('/api/emporia/charger/rate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({amps: Number($('amps').value)}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) err.textContent = body.detail || 'That did not work.';
+    else if (body.refused) err.textContent = body.refused;
+    await loadCharger();
+  } catch (e) {
+    err.textContent = 'Could not reach this service.';
+  }
+  $('rateGo').disabled = false;
+});
+
+
+async function refresh() {
+  await loadCharger();
+  // Every page fills this pill for itself; left alone it reads "loading…" for
+  // the life of the tab.
+  $('conn').textContent = 'read ' + new Date().toLocaleTimeString();
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

@@ -103,34 +103,6 @@
     </p>
   </section>
 
-  <!-- The charger. Hidden entirely on an account without one, which is most of
-       them. The conflict line is the part that earns its place: Emporia ships
-       four of its own controllers for a charger and two were switched on here,
-       so "nothing else is driving this" is a claim that has to be checked
-       rather than assumed. -->
-  <section class="p" id="chargerPanel" hidden>
-    <div class="chead">
-      <h2>EV charger</h2>
-      <span class="legend muted" id="chargerStatus"></span>
-    </div>
-    <div class="state" id="chargerState"><span class="dot"></span>
-      <span id="chargerRate">—</span></div>
-    <p class="note err" id="chargerConflicts" hidden></p>
-    <form class="login" id="rateForm">
-      <label for="amps" class="muted">Set the rate</label>
-      <input type="number" id="amps" min="1" max="80" step="1" style="min-width:90px">
-      <button type="submit" id="rateGo">Apply</button>
-      <button type="button" id="powerGo">Stop charging</button>
-      <span class="err" id="rateErr"></span>
-    </form>
-    <div class="tablewrap">
-      <table id="changes">
-        <thead><tr><th>When</th><th>Change</th><th>Why</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </section>
-
   <section class="p" id="listPanel">
     <div class="chead">
       <h2>Live draw</h2>
@@ -267,111 +239,8 @@ async function loadCircuits() {
   }).join('');
 }
 
-// Nothing here decides anything. What the module may do with a charger is
-// decided server-side in control.py, because a limit compared in two places is
-// two limits the day one of them moves — and this one has a car on the end of
-// it.
-async function loadCharger() {
-  let body = null;
-  try {
-    const r = await fetch('/api/emporia/charger');
-    if (r.ok) body = await r.json();
-  } catch (e) {
-    return;
-  }
-  const panel = $('chargerPanel');
-  if (!body || !body.charger) { panel.hidden = true; return; }
-  const c = body.charger;
-  panel.hidden = false;
-  // Plugged in is its own fact and not a rewording of the status: Emporia says
-  // "Standby" both when nothing is attached and when an attached car is paused,
-  // so the status line alone would tell somebody the cable was out while it was
-  // in their hand. Unknown says unknown rather than picking a side.
-  const plugged = c.plugged_in === true ? 'car plugged in'
-    : c.plugged_in === false ? 'no car' : 'car unknown';
-  $('chargerStatus').textContent = c.connected === false
-    ? `offline ${c.offline_since || ''}`.trim()
-    : `${plugged} · ${c.status || ''} · ${c.message || ''}`;
-  const rate = numOrNull(c.rate_a);
-  $('chargerRate').textContent = rate === null
-    ? DASH
-    : `${rate} A of a possible ${numOrNull(c.max_rate_a) ?? DASH} A` +
-      ` · this service may go ${c.floor_a}–${c.ceiling_a} A · ${c.authority}`;
-  $('chargerState').className = 'state ' + (c.connected === false ? 'unreachable' : 'ok');
-
-  // A warning, never a block. It is the owner's charger and their account; what
-  // they need is the name of the exact setting that will fight this one.
-  const conflicts = c.conflicts || [];
-  const warn = $('chargerConflicts');
-  warn.hidden = conflicts.length === 0;
-  if (conflicts.length) {
-    warn.textContent = `Emporia is also controlling this charger: ${conflicts.join(', ')}. `
-      + 'Two controllers will move the same rate and undo each other. Turn those off in the '
-      + 'Emporia app if you want this service to have it.';
-  }
-  if (rate !== null && !$('amps').value) $('amps').value = rate;
-  // The button says what pressing it will do, not what the charger is doing.
-  // A button labelled with the current state is a coin toss every time.
-  $('powerGo').textContent = c.on === false ? 'Start charging' : 'Stop charging';
-  $('powerGo').dataset.on = c.on === false ? 'true' : 'false';
-
-  $('changes').querySelector('tbody').innerHTML = (body.changes || []).map((ch) => {
-    const when = new Date(ch.timestamp * 1000).toLocaleString();
-    const from = ch.from_a === null ? DASH : ch.from_a + ' A';
-    const to = ch.to_a === null ? 'stop' : ch.to_a + ' A';
-    // A refused decision is shown, not hidden. A log of successes only makes a
-    // module that never acted look exactly like one nobody asked.
-    return `<tr class="${ch.applied ? '' : 'absent'}">`
-      + `<td>${esc(when)}</td><td>${esc(from)} → ${esc(to)}${ch.applied ? '' : ' (not applied)'}</td>`
-      + `<td>${esc(ch.reason)}</td></tr>`;
-  }).join('') || '<tr><td colspan="3" class="muted">Nothing has changed the rate yet.</td></tr>';
-}
-
-$('powerGo').addEventListener('click', async () => {
-  const err = $('rateErr');
-  err.textContent = '';
-  $('powerGo').disabled = true;
-  try {
-    const r = await fetch('/api/emporia/charger/power', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({on: $('powerGo').dataset.on === 'true'}),
-    });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) err.textContent = body.detail || 'That did not work.';
-    // confirmed is the charger agreeing, not Emporia accepting the request.
-    else if (body.confirmed === false) err.textContent = 'Sent, but the charger still reads otherwise.';
-    await loadCharger();
-  } catch (e) {
-    err.textContent = 'Could not reach this service.';
-  }
-  $('powerGo').disabled = false;
-});
-
-$('rateForm').addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const err = $('rateErr');
-  err.textContent = '';
-  $('rateGo').disabled = true;
-  try {
-    const r = await fetch('/api/emporia/charger/rate', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({amps: Number($('amps').value)}),
-    });
-    const body = await r.json().catch(() => ({}));
-    if (!r.ok) err.textContent = body.detail || 'That did not work.';
-    else if (body.refused) err.textContent = body.refused;
-    await loadCharger();
-  } catch (e) {
-    err.textContent = 'Could not reach this service.';
-  }
-  $('rateGo').disabled = false;
-});
-
 async function refresh() {
   await loadState();
-  if (enabled) await loadCharger();
   if (enabled) await loadCircuits();
   // Every page fills this pill for itself. Left alone it reads "loading…" for
   // the life of the tab, which is a page that looks stuck while it is working.

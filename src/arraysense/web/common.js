@@ -1206,8 +1206,26 @@ function drawWaterfall(host, segments) {
 // after the fact, only once the module says it is switched on, and a build
 // without the endpoint — or a fetch that fails — leaves the nav exactly as it
 // was drawn. Nothing on the page waits for this.
+// Each entry names the endpoint that decides whether it exists, and the
+// question to ask of the answer. Two different questions already: the module
+// being switched on, and a charger actually being present on the account —
+// most people who enable this have no EV charger at all, and a tab for one is
+// as wrong as an empty card.
 const MODULE_NAV = [
-  { key: 'emporia', label: 'Circuits', href: '/emporia', status: '/api/emporia/status' },
+  {
+    key: 'emporia',
+    label: 'Circuits',
+    href: '/emporia',
+    status: '/api/emporia/status',
+    shows: (body) => body.enabled === true,
+  },
+  {
+    key: 'charger',
+    label: 'Charger',
+    href: '/charger',
+    status: '/api/emporia/charger',
+    shows: (body) => !!body.charger,
+  },
 ];
 
 async function revealModuleNav(current) {
@@ -1217,7 +1235,7 @@ async function revealModuleNav(current) {
     try {
       const r = await fetch(mod.status);
       if (!r.ok) continue;
-      if ((await r.json()).enabled !== true) continue;
+      if (!mod.shows(await r.json())) continue;
     } catch (e) {
       continue;
     }
