@@ -7,6 +7,22 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.10 — 15 August 2026
+
+The dashboard's three summary cards stop being unreadable on a phone.
+
+### Fixed
+
+- **Home, Battery and Grid each get the full width on a small screen.** They
+  were locked to three columns at every size, which on a phone leaves each card
+  about 109 pixels — not enough for a figure like `7.51 kW`, so every one of
+  them broke across two lines. The battery card came off worst, because its
+  level icon and the gap beside it take another 35 pixels from the same row,
+  leaving the number less room than its neighbours and stranding the icon next
+  to a wrapped figure. Below 560 pixels the three now stack, each as wide as
+  the production card above them, and the icon sits beside the reading the way
+  it was drawn to. Nothing changes on a tablet or a desktop.
+
 ## 1.0.9 — 15 August 2026
 
 The Graphs page stops opening with most of its charts blank.
