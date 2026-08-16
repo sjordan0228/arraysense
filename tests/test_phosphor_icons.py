@@ -34,11 +34,16 @@ _WEB_FILES = (
     "costs.html",
     "efficiency.html",
     "settings.html",
+    # The circuits page names its icons in a lookup table rather than in markup,
+    # because it picks one per row from Emporia's category number. _QUOTED_ID is
+    # what catches those, and without this line a mistyped name would ship as a
+    # blank square nobody notices until they own that appliance.
+    "emporia.html",
 )
 
 
 def _symbols() -> set[str]:
-    return set(_SYMBOL_ID.findall((WEB / "phosphor.svg").read_text()))
+    return set(_SYMBOL_ID.findall((WEB / "phosphor-2.svg").read_text()))
 
 
 def _references() -> set[str]:
@@ -135,4 +140,4 @@ def test_each_stale_tone_is_told_apart_by_shape_and_not_only_by_colour() -> None
     assert len(set(used)) == 3, f"two tones share a shape and differ only by colour: {shapes}"
     icons = [shape for shape in used if shape.startswith("ph-")]
     for icon in icons:
-        assert f'id="{icon}"' in (WEB / "phosphor.svg").read_text(), icon
+        assert f'id="{icon}"' in (WEB / "phosphor-2.svg").read_text(), icon

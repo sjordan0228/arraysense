@@ -593,6 +593,51 @@ LATE_APPEND_SECONDS = 2 * 3600
 PROMOTE_BATCH = 500
 
 
+def rebuild_circuit_hourly(conn: sqlite3.Connection, start: int, end: int) -> None:
+    """Aggregate ``circuit_reading`` into ``circuit_hourly`` over [start, end).
+
+    Simpler than the tiers above because there is nothing to consult the metric
+    registry about: a circuit reading is one number, and the only sensible
+    collapse of power over an hour is its mean.
+
+    ``sample_count`` counts readings rather than rows, which is the one place
+    this parts company with the module tier. There a failed poll writes no row
+    at all, so rows and readings are the same thing; here a circuit that was
+    listed but did not answer writes a row with a NULL in it, and an hour built
+    from two readings must not claim the coverage of one built from sixty. The
+    stage that prices a circuit depends on telling those apart — coverage in
+    minutes watched is not coverage in energy accounted for.
+
+    An hour in which nothing was heard averages to NULL rather than to zero, and
+    lands with a sample count of nought. Deleting and reinserting inside one
+    transaction is what makes the rebuild idempotent, and what drops a bucket
+    whose source rows have since gone.
+
+    The multiplier is deliberately not applied. Readings are stored raw and
+    scaled on the way out, so a clamp corrected upstream fixes the whole history
+    rather than only what was written after the correction.
+    """
+    aligned_start, aligned_end = _bucket_bounds(3600, start, end)
+    part = _floor_div("timestamp", 3600)
+    select = (
+        f"SELECT {part} * 3600 AS timestamp, circuit_id, "
+        "CAST(ROUND(AVG(watts)) AS INTEGER) AS watts, "
+        "COUNT(watts) AS sample_count "
+        "FROM circuit_reading WHERE timestamp >= ? AND timestamp < ? "
+        "GROUP BY 1, circuit_id"
+    )
+    with conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM circuit_hourly WHERE timestamp >= ? AND timestamp < ?",
+            (aligned_start, aligned_end),
+        )
+        cur.execute(
+            "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count) " + select,
+            (aligned_start, aligned_end),
+        )
+
+
 def merge_site_hours(conn: sqlite3.Connection, hours: Sequence[int]) -> int:
     """Fold recorded sky readings for whole past hours into the hourly tier.
 

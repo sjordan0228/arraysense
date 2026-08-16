@@ -529,7 +529,7 @@ const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 // never as a broken layout or a thrown error.
 // ---------------------------------------------------------------------------
 
-const ICON_SPRITE_URL = '/vendor/phosphor.svg';
+const ICON_SPRITE_URL = '/vendor/phosphor-2.svg';
 let iconSpriteLoading = null;
 
 function mountIconSprite() {
@@ -1200,6 +1200,54 @@ function drawWaterfall(host, segments) {
 // Called again whenever the current view changes, not only at boot: on the
 // dashboard the marker moves between two entries without the document
 // reloading, and a marker left behind is worse than none.
+// An optional module is not a page every installation has, so its entry is not
+// in NAV: a permanent tab leading to a page about hardware the owner does not
+// own is the same fault as an empty card, one level up. The entry is appended
+// after the fact, only once the module says it is switched on, and a build
+// without the endpoint — or a fetch that fails — leaves the nav exactly as it
+// was drawn. Nothing on the page waits for this.
+// Each entry names the endpoint that decides whether it exists, and the
+// question to ask of the answer. Two different questions already: the module
+// being switched on, and a charger actually being present on the account —
+// most people who enable this have no EV charger at all, and a tab for one is
+// as wrong as an empty card.
+const MODULE_NAV = [
+  {
+    key: 'emporia',
+    label: 'Circuits',
+    href: '/emporia',
+    status: '/api/emporia/status',
+    shows: (body) => body.enabled === true,
+  },
+  {
+    key: 'charger',
+    label: 'Charger',
+    href: '/charger',
+    status: '/api/emporia/charger',
+    shows: (body) => !!body.charger,
+  },
+];
+
+async function revealModuleNav(current) {
+  const el = $('nav');
+  if (!el) return;
+  for (const mod of MODULE_NAV) {
+    try {
+      const r = await fetch(mod.status);
+      if (!r.ok) continue;
+      if (!mod.shows(await r.json())) continue;
+    } catch (e) {
+      continue;
+    }
+    if (el.querySelector(`a[href="${mod.href}"]`)) continue;
+    const a = document.createElement('a');
+    a.href = mod.href;
+    a.textContent = mod.label;
+    if (mod.key === current) a.setAttribute('aria-current', 'page');
+    el.appendChild(a);
+  }
+}
+
 function drawNav(current) {
   const el = $('nav');
   if (!el) return;
@@ -1210,6 +1258,9 @@ function drawNav(current) {
     (n.icon ? `<svg class="ic" aria-hidden="true"><use href="#${n.icon}"/></svg>` : '') +
     `${esc(n.label)}</a>`
   ).join('');
+  // After the nav exists, never before: this appends to what was just written,
+  // and an append that raced the assignment would be wiped by it.
+  revealModuleNav(current);
 }
 
 // ---------------------------------------------------------------------------

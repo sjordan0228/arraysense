@@ -41,6 +41,7 @@ from arraysense.settings import (
 from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.rollup import (
     promote_pending_hours,
+    rebuild_circuit_hourly,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -362,6 +363,15 @@ class CollectorService:
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            # Circuits are core storage rather than part of the optional
+            # module: their tables exist whether or not anybody enabled it,
+            # and this collector never imports anything from modules/. On an
+            # installation that never switched it on there are no rows and
+            # the rebuild is a no-op; on one that switched it off, the last
+            # hour still gets covered, which is what lets retention prune
+            # the raw readings afterwards instead of blocking on them for
+            # ever.
+            rebuild_circuit_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             # Hours written outside that window — the archive backfill's, one
             # per past hour — are queued by the store as it writes them and
             # brought forward here. Nothing else promotes them, and the

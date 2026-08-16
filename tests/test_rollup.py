@@ -22,6 +22,7 @@ from arraysense.store.rollup import (
     merge_site_hours,
     pack_scale,
     promote_pending_hours,
+    rebuild_circuit_hourly,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -919,3 +920,107 @@ def test_the_late_write_threshold_sits_inside_the_rebuild_window() -> None:
     from arraysense.collector.service import HOURLY_REBUILD_WINDOW
 
     assert LATE_APPEND_SECONDS < HOURLY_REBUILD_WINDOW
+
+
+# --- circuits ------------------------------------------------------------
+#
+# Raw circuit readings are the fastest-growing table in the store — one row per
+# circuit per minute, 56,000 a day on a house with two monitors — and the only
+# reason they can be deleted at all is that this tier holds what they said.
+
+
+def _circuit_store(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+        " first_seen, last_seen) VALUES (1, 100000, '5', 'Dryer', 2.0, 'circuit', 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+        " first_seen, last_seen) VALUES (2, 100000, '1', 'Bathroom', 1.0, 'circuit', 0, 0)"
+    )
+
+
+def test_an_hour_of_readings_becomes_one_row_per_circuit() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(3):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+            (hour + minute * 60, 100 + minute * 100),
+        )
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 2, 50)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600)
+
+    rows = dict(
+        (row[0], (row[1], row[2]))
+        for row in conn.execute(
+            "SELECT circuit_id, watts, sample_count FROM circuit_hourly WHERE timestamp = ?",
+            (hour,),
+        )
+    )
+    assert rows[1] == (200, 3), "100, 200 and 300 average to 200 over three readings"
+    assert rows[2] == (50, 3)
+    conn.close()
+
+
+def test_an_hour_of_silence_averages_to_nothing_rather_than_zero() -> None:
+    # The rule this project exists for, carried into the coarse tier. A circuit
+    # that reported null for an hour did not use no power.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(2):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600)
+
+    row = conn.execute(
+        "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (None, 0), "no readings means no average and no coverage claimed"
+    conn.close()
+
+
+def test_a_partly_silent_hour_averages_only_what_was_heard() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 90)", (hour,)
+    )
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
+        (hour + 60,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600)
+
+    row = conn.execute(
+        "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (90, 1), "sample_count counts readings, so a partial hour says so"
+    conn.close()
+
+
+def test_rebuilding_the_same_hour_twice_does_not_double_it() -> None:
+    # The rebuild has to be idempotent: the maintenance pass runs it over a
+    # window that overlaps what it did a minute ago, every minute.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 80)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    assert conn.execute("SELECT COUNT(*) FROM circuit_hourly").fetchone()[0] == 1
+    conn.close()

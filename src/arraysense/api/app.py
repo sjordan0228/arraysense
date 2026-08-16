@@ -40,6 +40,13 @@ PAGES = {
     "/costs": "costs.html",
     "/efficiency": "efficiency.html",
     "/settings": "settings.html",
+    # An optional module's page. Served whether or not the module is enabled:
+    # the page says "off" for itself, and a 404 that depends on a setting is a
+    # link that rots in somebody's bookmarks the day they switch it off.
+    "/emporia": "emporia.html",
+    # The charger gets a page rather than a card, because it is a thing an
+    # owner acts on. Its nav entry appears only on an account that has one.
+    "/charger": "charger.html",
 }
 
 # The code every page is built from — the palette, the formatters, the nav and
@@ -114,7 +121,15 @@ NO_CACHE = {"Cache-Control": "no-cache"}
 # old bytes goes on drawing them. Its MIT licence rides beside it like the
 # others, so the notice travels with the file it licenses.
 #
-# Provenance, written down for the same reason the fonts carry it: phosphor.svg
+# The name carries a 2 because this is the second drop, not a second package:
+# the first sprite held 24 symbols and the circuits page needed eleven more.
+# Adding them under the old name would have left every browser holding the
+# old bytes drawing blank squares where the new icons are — which is what
+# happened on the bench before this rename, and is the whole reason the rule
+# above exists.
+#
+# Provenance, written down for the same reason the fonts carry it:
+# phosphor-2.svg
 # is drawn from @phosphor-icons/core@2.1.1 (github.com/phosphor-icons/core),
 # its <symbol> paths taken from that package's regular/ SVGs — ph-gear's path
 # data matches regular/gear.svg byte for byte. phosphor.LICENSE is that
@@ -133,7 +148,7 @@ VENDORED = {
     "JetBrainsMono-Medium.woff2": "font/woff2",
     "JetBrainsMono-Bold.woff2": "font/woff2",
     "JetBrainsMono.LICENSE": "text/plain",
-    "phosphor.svg": "image/svg+xml",
+    "phosphor-2.svg": "image/svg+xml",
     "phosphor.LICENSE": "text/plain",
 }
 

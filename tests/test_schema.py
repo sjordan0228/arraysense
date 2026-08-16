@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -151,6 +152,13 @@ def test_executing_ddl_creates_expected_tables() -> None:
             FORECAST_TABLE,
             EFFICIENCY_TABLE,
             PENDING_TABLE,
+            # Created whether or not the Emporia module is enabled: an empty
+            # table costs nothing, and the alternative is running DDL on a
+            # request path the first time somebody switches the module on.
+            "circuit",
+            "circuit_reading",
+            "circuit_hourly",
+            "charger_change",
         }
     )
     assert tables == expected
@@ -440,3 +448,121 @@ def test_migration_adds_only_declared_missing_columns() -> None:
     # structural on the rollup tiers. Nothing undeclared is added.
     assert added == {"battery_soc_pct", "voltage_v", "sample_count"}
     assert not any("pv1_power_w" in s for s in statements)
+
+
+# --- The Emporia module's tables -----------------------------------------
+#
+# Circuits are rows rather than columns because they have no ceiling: 32 across
+# two monitors here, 8 in an apartment, 48 with a third monitor. A fixed slot
+# count would need a migration the day somebody added one.
+
+
+def test_the_circuit_tables_are_part_of_the_schema() -> None:
+    from arraysense.store.schema import schema_ddl
+
+    ddl = schema_ddl()
+    assert "CREATE TABLE IF NOT EXISTS circuit " in ddl
+    assert "CREATE TABLE IF NOT EXISTS circuit_reading " in ddl
+
+
+def test_a_circuit_is_identified_by_device_and_channel_never_its_name() -> None:
+    from arraysense.store.schema import ddl_for
+
+    ddl = ddl_for("circuit")
+    assert "UNIQUE (device_gid, channel_num)" in ddl
+    # The name must be updatable in place without colliding.
+    assert "name TEXT NOT NULL UNIQUE" not in ddl
+
+
+def test_a_circuit_reading_may_be_absent() -> None:
+    # NULL is the whole point: an offline outlet reports null and must store as
+    # null, not zero.
+    from arraysense.store.schema import ddl_for
+
+    ddl = ddl_for("circuit_reading")
+    assert "watts INTEGER" in ddl
+    assert "watts INTEGER NOT NULL" not in ddl
+
+
+def test_the_circuit_table_can_generate_its_own_ids() -> None:
+    # A surrogate key needs SQLite to count. WITHOUT ROWID removes the rowid
+    # aliasing that does the counting, so the same table carrying both refuses
+    # its first insert — which is how this was found rather than reasoned.
+    from arraysense.store.schema import ddl_for
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(ddl_for("circuit"))
+    conn.execute(
+        "INSERT INTO circuit"
+        " (device_gid, channel_num, name, multiplier, kind, first_seen, last_seen)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (100000, "1", "Dryer", 2.0, "circuit", 0, 0),
+    )
+    assert conn.execute("SELECT id FROM circuit").fetchone()[0] == 1
+    conn.close()
+
+
+def test_the_tables_are_created_by_an_ordinary_store(tmp_path: Path) -> None:
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    names = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {"circuit", "circuit_reading"} <= names
+    store.close()
+
+
+def test_circuit_readings_use_the_same_time_column_as_everything_else() -> None:
+    # Every other table in this store calls it `timestamp`, and the retention
+    # engine reads that name directly. A table that spelled it differently
+    # could not be pruned by the machinery that prunes all the others.
+    from arraysense.store.schema import ddl_for
+
+    assert "timestamp INTEGER NOT NULL" in ddl_for("circuit_reading")
+
+
+def test_circuits_have_an_hourly_tier_to_be_pruned_into() -> None:
+    # Raw circuit readings arrive once a minute per circuit — 56,000 rows a day
+    # on the reference account. The store's answer to that everywhere else is a
+    # coarser tier that outlives the raw rows, and retention refuses to delete
+    # anything this table does not already cover.
+    from arraysense.store.schema import ddl_for, schema_ddl
+
+    ddl = ddl_for("circuit_hourly")
+    assert "PRIMARY KEY (timestamp, circuit_id)" in ddl
+    assert "watts INTEGER" in ddl
+    assert "watts INTEGER NOT NULL" not in ddl, "an hour nobody reported is absent, not zero"
+    assert "sample_count INTEGER NOT NULL" in ddl
+    assert "CREATE TABLE IF NOT EXISTS circuit_hourly " in schema_ddl()
+
+
+def test_the_charger_audit_records_what_moved_and_why() -> None:
+    # A rate that persists for ever needs a record of who last touched it and
+    # what for. Without it, a car found at 6 A in the morning has no history at
+    # all — only the number, which is the one thing that does not explain
+    # itself.
+    from arraysense.store.schema import ddl_for, schema_ddl
+
+    ddl = ddl_for("charger_change")
+    assert "from_a INTEGER" in ddl
+    assert "to_a INTEGER" in ddl
+    assert "reason TEXT NOT NULL" in ddl
+    assert "applied INTEGER NOT NULL" in ddl, "a refused change is as worth recording as a made one"
+    assert "PRIMARY KEY (timestamp, device_gid)" not in ddl, (
+        "an audit has no natural key: two decisions in one second are two rows"
+    )
+    assert "CREATE TABLE IF NOT EXISTS charger_change " in schema_ddl()
+
+
+def test_the_audit_can_record_a_change_from_a_rate_nobody_knew() -> None:
+    # from_a is nullable on purpose: the first write after a restart may find a
+    # charger it has never read. "From nothing known to 16 A" is the truth, and
+    # a zero there would be a claim that the charger had been off.
+    from arraysense.store.schema import ddl_for
+
+    assert "from_a INTEGER NOT NULL" not in ddl_for("charger_change")

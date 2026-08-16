@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Circuits · Solar ArraySense</title>
+<!-- No chart on this page, so uPlot is not loaded. The shared front end still
+     is: palette, formatters, nav and the stale banner, injected as it runs, so
+     it has to load above this page's own <style>. -->
+<script src="/common.js"></script>
+<style>
+  /* The list is read top-down to answer "what is drawing all that", so the
+     watts column is the one the eye lands on: right-aligned, tabular, and the
+     only bold thing in the row. */
+  .tablewrap{overflow-x:auto}
+  #circuits{min-width:420px;width:100%}
+  #circuits td.w{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+  #circuits td.kind{color:var(--ink3);font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+  /* The icon is decoration beside a name that already says what the circuit
+     is, so it is hidden from a screen reader — the same rule the nav follows.
+     A fixed column keeps the names aligned whether a row has one or not. */
+  #circuits td.ic{width:26px;padding-right:0;color:var(--ink3)}
+  #circuits td.ic svg{width:16px;height:16px;display:block}
+  /* The shared stylesheet left-aligns the first cell of a row and right-aligns
+     the rest, which is right for a table whose first column is a label. Here
+     the first column is the icon, so the name lands in the slot meant for
+     numbers and every circuit reads right-aligned against the watts. Naming
+     the column rather than the position puts it back. */
+  #circuits th:nth-child(2),#circuits td:nth-child(2){text-align:left}
+  /* A circuit nobody has heard from is dimmed rather than dropped. It can still
+     be the thing that spiked, and a row that vanishes takes the question with
+     it — but it must not look like a measurement either. */
+  #circuits tr.absent td{color:var(--ink3)}
+  /* The state line. reconnect_required is deliberately not styled as an error:
+     it is a job for the owner, not a fault in the service, and painting it red
+     is what teaches somebody to ignore the red. */
+  .state{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .state .dot{width:9px;height:9px;border-radius:50%;background:var(--ink3);flex:none}
+  .state.ok .dot{background:var(--good)}
+  .state.unreachable .dot{background:var(--warn)}
+  .state.reconnect_required .dot{background:var(--warn)}
+  .state .detail{color:var(--ink3)}
+  /* Borrowed from the wizard's fields and the password dialog's, rather than
+     invented here: two pages that already ask for a credential look one way,
+     and a third look would read as a different application. */
+  form.login{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+  /* display:flex beats the browser's own [hidden] rule, so without this the
+     form is on screen for ever — including under "Connected", where it
+     invites somebody to type a password nothing needs. common.js guards
+     .nowstrip, .view, .p and .stale the same way and for the same reason;
+     this page had to learn it against a real account. */
+  form.login[hidden]{display:none}
+  form.login input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
+    border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;min-width:210px}
+  form.login input:focus{outline:2px solid var(--pv);outline-offset:1px;border-color:transparent}
+  form.login button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:8px;padding:8px 14px;font:inherit;font-size:13px;cursor:pointer}
+  form.login button:hover:not(:disabled){background:var(--tint-3);color:var(--ink)}
+  form.login button:disabled{opacity:.6;cursor:default}
+  .note{color:var(--ink3);max-width:70ch;line-height:1.5}
+  /* Named for a screen reader, invisible to everyone else: the column holds a
+     decorative mark, but a header cell with nothing in it reads as a nameless
+     column rather than as no column at all. */
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .err{color:var(--bad)}
+</style>
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Circuits</h1>
+    <div class="hright">
+      <div class="conn" id="conn">loading…</div>
+    </div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <section class="p">
+    <div class="chead"><h2>Emporia</h2></div>
+    <div class="state" id="state"><span class="dot"></span><span id="stateText">loading…</span>
+      <span class="detail" id="stateDetail"></span></div>
+
+    <!-- Shown only when there is no working credential. A login form standing
+         open beside a working connection invites somebody to re-enter a
+         password nothing needs. -->
+    <form class="login" id="login" hidden autocomplete="off">
+      <input type="email" id="email" placeholder="Emporia account email" autocomplete="username">
+      <input type="password" id="password" placeholder="Password"
+             autocomplete="current-password">
+      <button type="submit" id="loginGo">Connect</button>
+      <span class="err" id="loginErr"></span>
+    </form>
+
+    <p class="note" id="reach">
+      This is the one part of the service that needs the internet: Emporia
+      offers no local access, so every circuit reading crosses their cloud.
+      Solar collection is never affected by it — an unreachable Emporia costs
+      the inverter nothing.
+    </p>
+  </section>
+
+  <section class="p" id="listPanel">
+    <div class="chead">
+      <h2>Live draw</h2>
+      <span class="legend muted" id="listNote">biggest first</span>
+    </div>
+    <div class="tablewrap">
+      <table id="circuits">
+        <thead><tr><th><span class="sr">Kind</span></th><th>Circuit</th><th></th><th class="w">Now</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+// Everything shared — $, esc, wStr, DASH, drawNav — comes from /common.js.
+// This page is only what is particular to the Emporia module.
+//
+// Two rules it exists to keep. A circuit that reported nothing draws the dash
+// and never 0 W: an outlet offline since April did not use no power, it did not
+// answer. And "log in again" is its own state, not an error — the failure the
+// reference implementation conflates with a dead connection.
+
+drawNav('emporia');
+
+// Emporia's channelTypeGid, and the icon each one earns. The numbers are the
+// owner's own choice in Emporia's app — 1 for the air conditioners, 19 for
+// septic on the reference account — and Emporia publishes no dictionary for
+// them: asked for one the API answers "apiMethod 'getChannelTypes' is invalid,
+// fell through the switch". So this table is built from an account that uses
+// them, and a number nobody here has seen draws nothing rather than guessing.
+//
+// Two are compromises Phosphor forces: it has no refrigerator and no
+// microwave, so a fridge takes the cold thermometer and a microwave the
+// cooking pot. Both read as the right sort of thing without claiming to be
+// the appliance.
+const TYPE_ICONS = {
+  1:  'ph-snowflake',        // air conditioning
+  4:  'ph-washing-machine',  // laundry
+  7:  'ph-oven',             // kitchen, oven
+  10: 'ph-thermometer-cold', // refrigeration
+  11: 'ph-fire',             // furnace, heat
+  12: 'ph-plug',             // general outlets
+  16: 'ph-fork-knife',       // kitchen plugs
+  17: 'ph-cooking-pot',      // microwave
+  18: 'ph-wrench',           // utility and outdoor
+  19: 'ph-drop',             // water, septic
+  20: 'ph-house-line',       // a room rather than an appliance
+};
+
+// What a device is, when its channels say nothing about what they feed. The
+// charger and the outlets are whole devices rather than clamps, so they are
+// typed by model and get their mark from here instead.
+const KIND_ICONS = {
+  charger: 'ph-charging-station',
+  outlet: 'ph-plugs',
+  mains: 'ph-circuitry',
+};
+
+// Its own icon or its device's, and nothing at all for a clamp nobody has set
+// up. An icon guessed for an unknown category would be a claim about somebody's
+// house made by a lookup table that had never heard of it.
+function iconFor(circuit) {
+  return TYPE_ICONS[circuit.type_gid] || KIND_ICONS[circuit.kind] || '';
+}
+
+const STATE_WORDS = {
+  off: 'Off. Switch it on in Settings, under Modules.',
+  ok: 'Connected.',
+  unreachable: 'Cannot reach Emporia. Retrying.',
+  reconnect_required: 'The saved Emporia login has expired. Connect again below.',
+};
+
+// Whether the login form should be standing open. Only the state that the owner
+// alone can clear opens it; an unreachable Emporia is going to fix itself and a
+// form offered then would have somebody typing a password at a network fault.
+const wantsLogin = (status) => status === 'reconnect_required';
+
+let enabled = false;
+
+async function loadState() {
+  let body = null;
+  try {
+    const r = await fetch('/api/emporia/status');
+    if (r.ok) body = await r.json();
+  } catch (e) {
+    body = null;
+  }
+  const box = $('state');
+  if (!body) {
+    box.className = 'state';
+    $('stateText').textContent = 'The module is not available in this build.';
+    $('stateDetail').textContent = '';
+    $('login').hidden = true;
+    return;
+  }
+  enabled = body.enabled === true;
+  // The setting wins over the poller's last word. A poller ticks once a minute,
+  // so for up to a minute after being switched off its state is still whatever
+  // it was doing — and "your login has expired" on a module the owner has just
+  // turned off is an instruction to fix something nobody asked them to fix.
+  const status = enabled ? body.status : 'off';
+  box.className = 'state ' + esc(status);
+  $('stateText').textContent = STATE_WORDS[status] || esc(status);
+  $('stateDetail').textContent = enabled && body.detail ? esc(body.detail) : '';
+  $('login').hidden = !(enabled && wantsLogin(status));
+  $('listPanel').hidden = !enabled;
+}
+
+async function loadCircuits() {
+  let rows = [];
+  try {
+    const r = await fetch('/api/emporia/circuits');
+    if (r.ok) rows = (await r.json()).circuits || [];
+  } catch (e) {
+    return;
+  }
+  const body = $('circuits').querySelector('tbody');
+  if (!rows.length) {
+    body.innerHTML =
+      '<tr><td colspan="4" class="muted">No circuits yet. They arrive with the '
+      + 'first successful read.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((c) => {
+    const w = numOrNull(c.watts);
+    const icon = iconFor(c);
+    return `<tr class="${w === null ? 'absent' : ''}">`
+      + `<td class="ic">${icon
+          ? `<svg aria-hidden="true"><use href="#${esc(icon)}"/></svg>` : ''}</td>`
+      + `<td>${esc(c.name)}</td>`
+      + `<td class="kind">${c.kind === 'circuit' ? '' : esc(c.kind)}</td>`
+      + `<td class="w">${wStr(w)}</td></tr>`;
+  }).join('');
+}
+
+async function refresh() {
+  await loadState();
+  if (enabled) await loadCircuits();
+  // Every page fills this pill for itself. Left alone it reads "loading…" for
+  // the life of the tab, which is a page that looks stuck while it is working.
+  $('conn').textContent = 'read ' + new Date().toLocaleTimeString();
+}
+
+$('login').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const err = $('loginErr');
+  err.textContent = '';
+  $('loginGo').disabled = true;
+  try {
+    const r = await fetch('/api/emporia/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({email: $('email').value, password: $('password').value}),
+    });
+    if (!r.ok) {
+      const detail = await r.json().catch(() => ({}));
+      err.textContent = detail.detail || 'That did not work.';
+    } else {
+      // The password is not kept anywhere, including here.
+      $('password').value = '';
+      await refresh();
+    }
+  } catch (e) {
+    err.textContent = 'Could not reach this service.';
+  }
+  $('loginGo').disabled = false;
+});
+
+refresh();
+// The poller's own clock is sixty seconds by default, so anything faster than
+// this is asking the database for a number that has not moved.
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
