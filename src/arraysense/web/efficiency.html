@@ -188,6 +188,14 @@
     </div>
   </section>
 
+  <section class="p" id="tiltSec" hidden>
+    <h2>Seasonal adjustment</h2>
+    <div class="worst">
+      <div class="when" id="tiltGain">—</div>
+      <div class="missing" id="tiltDetail"></div>
+    </div>
+  </section>
+
   <section class="p" id="baseSec" hidden>
     <h2>Baseline</h2>
     <dl class="baseline" id="baseInfo"></dl>
@@ -543,6 +551,36 @@ function renderWorst(worstHour) {
 // Baseline window. So a reader can tell a calibrated system from a fresh one.
 // ---------------------------------------------------------------------------
 
+// What moving the mount was worth, against having left it alone. Both sides are
+// modelled over the same hours — the road not taken has no meter on it — and
+// the hour count travels with the figure because the number means different
+// things at eight hours and at eight hundred.
+function renderTiltBenefit(tb) {
+  const sec = document.getElementById('tiltSec');
+  if (!tb) { sec.hidden = true; return; }
+  sec.hidden = false;
+  const gain = tb.gain_kwh;
+  const sign = gain >= 0 ? '+' : '';
+  document.getElementById('tiltGain').textContent = `${sign}${gain.toFixed(1)} kWh`;
+  const hours = tb.hours === 1 ? '1 hour' : `${tb.hours} hours`;
+  const against = `Modelled against never having moved the mount, over ${hours}`;
+  // Three different situations, and the wrong one reads as a contradiction: a
+  // period that contains no adjustment can still differ from never having
+  // adjusted, because the mount was moved before the period opened and is
+  // still standing where it was put. Saying "no adjustment falls in this
+  // period" beside a non-zero figure invites the reader to distrust both.
+  const moved = tb.adjustments === 1 ? 'one adjustment' : `${tb.adjustments} adjustments`;
+  let detail;
+  if (tb.adjustments > 0) {
+    detail = `${against}, covering ${moved} made in it.`;
+  } else if (Math.abs(tb.gain_kwh) < 0.05) {
+    detail = `Nothing was adjusted in this period, and the mount sat where it started.`;
+  } else {
+    detail = `${against}. The mount was moved before this period and is still there.`;
+  }
+  document.getElementById('tiltDetail').textContent = detail;
+}
+
 function renderBaseline(baseline) {
   if (!baseline) {
     $('baseSec').hidden = true;
@@ -712,6 +750,7 @@ async function refresh() {
 
   // Baseline
   renderBaseline(body.baseline);
+  renderTiltBenefit(body.tilt_benefit);
 
   renderAssumptions(period);
   pageNote(trouble.join(' '));

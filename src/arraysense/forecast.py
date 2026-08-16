@@ -54,7 +54,7 @@ import logging
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, tzinfo
 
 from arraysense.efficiency import EfficiencyRow
 from arraysense.panels import StringSpec
@@ -116,6 +116,7 @@ def modelled_watts(
     latitude: float,
     longitude: float,
     hour: SkyHour,
+    zone: tzinfo,
 ) -> float:
     """What the array should produce in this hour, before any measured scaling.
 
@@ -126,6 +127,13 @@ def modelled_watts(
 
     Zero when the sun is down. A panel at night produces nothing, and the
     ground-reflected term would otherwise keep paying out after sunset.
+
+    ``zone`` is the site's own, and is required rather than defaulted because a
+    tilt schedule is keyed on the day the owner adjusted the mount. The sky
+    hours arrive stamped in UTC, so a site east of Greenwich would otherwise
+    take the new tilt several daylight hours early on the one day a year it
+    changes — and a default of UTC is exactly the silently-wrong answer that
+    would never be noticed.
     """
     elevation, sun_azimuth = solar_position(hour.when, latitude, longitude)
     if elevation <= 0.0:
@@ -139,7 +147,7 @@ def modelled_watts(
             hour.dhi,
             elevation,
             sun_azimuth,
-            spec.tilt,
+            spec.tilt_at(hour.when.astimezone(zone).date()),
             spec.azimuth,
             day_of_year,
         )
@@ -154,6 +162,7 @@ def expected_points(
     longitude: float,
     sky: Sequence[SkyHour],
     pr: float,
+    zone: tzinfo,
 ) -> list[tuple[datetime, float]]:
     """The modelled curve scaled by what the array has been delivering.
 
@@ -162,6 +171,6 @@ def expected_points(
     measurement, and the two must never share a home.
     """
     return [
-        (hour.when, max(modelled_watts(strings, latitude, longitude, hour) * pr, 0.0))
+        (hour.when, max(modelled_watts(strings, latitude, longitude, hour, zone) * pr, 0.0))
         for hour in sky
     ]

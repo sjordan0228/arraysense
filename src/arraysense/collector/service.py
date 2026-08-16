@@ -24,10 +24,20 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from arraysense.collector.source import InverterSource
 from arraysense.drivers.base import SampleBuildError
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
+from arraysense.efficiency import (
+    CONFIG_VERSION_KEY,
+    EfficiencyRow,
+    compute_day,
+    rows_are_current,
+)
 from arraysense.models import Sample
 from arraysense.panels import StringSpec, parse_strings
-from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
+from arraysense.settings import (
+    CONFIG_VALID_FROM_KEY,
+    PANELS_STRINGS_KEY,
+    SETTING_TIMEZONE,
+    SettingsStore,
+)
 from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.rollup import (
     promote_pending_hours,
@@ -405,7 +415,7 @@ class CollectorService:
         except sqlite3.Error as exc:
             logger.warning("retention maintenance failed, will retry: %s", exc)
 
-    def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int] | None:
+    def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int, int] | None:
         """Return what scoring a day needs, or None when the installation is unconfigured.
 
         An installation with no timezone or no array described cannot be told
@@ -446,7 +456,9 @@ class CollectorService:
 
         raw_version = settings.get(CONFIG_VERSION_KEY)
         config_version = raw_version if isinstance(raw_version, int) else 0
-        return tz, strings, config_version
+        raw_floor = settings.get(CONFIG_VALID_FROM_KEY)
+        valid_from = raw_floor if isinstance(raw_floor, int) else 0
+        return tz, strings, config_version, valid_from
 
     async def maintain_efficiency(self, now: datetime | None = None) -> None:
         """Score yesterday and today once the hourly tier they read is current.
@@ -466,7 +478,7 @@ class CollectorService:
         config = self._efficiency_config()
         if config is None:
             return
-        tz, strings, config_version = config
+        tz, strings, config_version, valid_from = config
         settings = SettingsStore(self._store)
 
         # A code change that alters how scores are computed makes every stored
@@ -480,6 +492,9 @@ class CollectorService:
             # and never recompute.
             raw_version = settings.get(CONFIG_VERSION_KEY)
             config_version = raw_version if isinstance(raw_version, int) else 0
+            # A scorer change reaches the whole history, so the floor an
+            # owner's future tilt adjustment may have raised goes back down.
+            valid_from = 0
 
         local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
         for days_back in (0, 1):
@@ -500,7 +515,7 @@ class CollectorService:
                     # read is a reason to recompute, never a reason to stop.
                     logger.warning("could not read stored efficiency; recomputing: %s", exc)
                     scored = []
-                if scored and all(r.config_version == config_version for r in scored):
+                if rows_are_current(scored, config_version, valid_from):
                     continue
 
             try:
@@ -564,7 +579,7 @@ class CollectorService:
         config = self._efficiency_config()
         if config is None:
             return
-        tz, strings, config_version = config
+        tz, strings, config_version, valid_from = config
 
         try:
             span = self._store.hourly_span()
@@ -589,7 +604,7 @@ class CollectorService:
             date += timedelta(days=1)
 
         try:
-            scored = self._store.scored_days(config_version)
+            scored = self._store.scored_days(config_version, valid_from)
         except sqlite3.Error as exc:
             logger.warning("efficiency backfill: could not read scored days: %s", exc)
             return

@@ -7,6 +7,46 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.11 — 16 August 2026
+
+An adjustable mount stops costing you the performance history every time you
+adjust it.
+
+### Added
+
+- **Tilt can be a schedule rather than a single angle.** An array on a
+  seasonally adjustable mount is moved twice a year, and until now the owner
+  had to choose between a model that matched the array today and one that
+  matched what it was under last winter. The tilt field accepts a list of
+  angles with the dates they came into force — `25,40@2027-10-01` means 25°
+  until the first of October 2027 and 40° from it — and every hour is scored
+  against the angle the array really stood at. A fixed mount is still written
+  as one number and nothing about it changes.
+- **The settings page has a way to enter one.** Each string gets a collapsed
+  *I adjust this mount seasonally* fold holding a date, an angle, and a button
+  that appends the adjustment to the tilt box. The common case stays a single
+  number in a single field.
+- **The Efficiency page answers what adjusting was worth.** A new panel scores
+  the period twice — once as the array really stood, once as though the mount
+  had never been moved — and shows the difference with the number of hours it
+  was drawn from. Both sides are modelled, because the road not taken has no
+  meter on it, and a fixed mount shows nothing at all rather than a zero.
+
+### Fixed
+
+- **Adding a future adjustment no longer discards the scored history.** Editing
+  the array bumps the efficiency config version, which marks every stored day
+  stale and rescores it. That was right when any edit could change what the
+  array was expected to produce on any day, and wrong the moment tilt acquired
+  a date: appending next October's adjustment says nothing whatever about last
+  March. A companion setting now records how far back a change actually
+  reaches, so a future adjustment rescores nothing, a correction to a past one
+  rescores only from that date, and a change to anything else still rescores
+  everything. The floor is built at midnight on the site's own clock, which is
+  how the stored days are keyed — reading it as UTC midnight put the first day
+  of a new tilt on the wrong side of its own boundary anywhere east of
+  Greenwich.
+
 ## 1.0.10 — 15 August 2026
 
 The dashboard's three summary cards stop being unreadable on a phone.

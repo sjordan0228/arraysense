@@ -1742,11 +1742,28 @@ function panelMarkup(row, i) {
     <div style="display:flex;gap:12px;flex-wrap:wrap">
       <div><span class="cap">Tilt °</span>
         <input type="text" data-role="tilt" value="${esc(row.tilt)}"
-          inputmode="decimal" aria-label="Tilt degrees" style="width:6ch"></div>
+          aria-label="Tilt in degrees, or a schedule of them"
+          title="One angle for a fixed mount. An adjustable mount takes a schedule: 25,40@2027-10-01 — 25° until that date, 40° from it."
+          placeholder="25" style="width:18ch"></div>
       <div><span class="cap">Azimuth °</span>
         <input type="text" data-role="azimuth" value="${esc(row.azimuth)}"
           inputmode="decimal" aria-label="Azimuth degrees" style="width:6ch"></div>
     </div>
+    <details>
+      <summary><span style="font-size:11px;color:var(--ink3)">I adjust this mount seasonally</span></summary>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;margin-top:8px">
+        <div><span class="cap">On this date</span>
+          <input type="date" data-role="tiltdate" aria-label="Date the mount was moved"></div>
+        <div><span class="cap">it became °</span>
+          <input type="text" data-role="tiltdeg" inputmode="decimal"
+            aria-label="Tilt in degrees from that date" style="width:6ch"></div>
+        <button type="button" class="iconbtn" data-role="tiltadd">Add to the schedule</button>
+      </div>
+      <p style="font-size:11px;color:var(--ink3);margin:8px 0 0">
+        Each adjustment is added to the Tilt box above. Every hour is then scored
+        against the angle the array really stood at, so moving the mount no longer
+        discards the performance history.</p>
+    </details>
     <details>
       <summary><span style="font-size:11px;color:var(--ink3)">Advanced</span></summary>
       <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">${advRows}</div>
@@ -1820,6 +1837,34 @@ function wirePanels(host) {
   });
   host.querySelectorAll('[data-role="tilt"]').forEach((el) => {
     el.addEventListener('input', () => { rowAt(el).tilt = el.value.trim(); touchPanel(); });
+  });
+  // Appends one entry to the tilt field. Composition only: the browser never
+  // reads the schedule back, because panels.py is the single parser and a
+  // second one in a page is the Costs tariff mistake waiting to be repeated.
+  // Anything malformed is refused by the server with the offending line quoted.
+  host.querySelectorAll('[data-role="tiltadd"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const box = el.closest('.band');
+      const dateEl = box.querySelector('[data-role="tiltdate"]');
+      const degEl = box.querySelector('[data-role="tiltdeg"]');
+      const when = dateEl.value.trim();
+      const deg = degEl.value.trim();
+      // Half an adjustment is not an adjustment, and returning quietly leaves
+      // somebody clicking a button that appears to do nothing. Put the cursor
+      // in the box that is empty instead — this grammar refuses loudly
+      // everywhere else and a silent no-op is out of character for it.
+      if (!when || !deg) {
+        (when ? degEl : dateEl).focus();
+        return;
+      }
+      const field = box.querySelector('[data-role="tilt"]');
+      const current = field.value.trim();
+      field.value = current ? `${current},${deg}@${when}` : `${deg}@${when}`;
+      rowAt(field).tilt = field.value;
+      box.querySelector('[data-role="tiltdate"]').value = '';
+      box.querySelector('[data-role="tiltdeg"]').value = '';
+      touchPanel();
+    });
   });
   host.querySelectorAll('[data-role="azimuth"]').forEach((el) => {
     el.addEventListener('input', () => { rowAt(el).azimuth = el.value.trim(); touchPanel(); });

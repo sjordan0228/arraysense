@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 import pytest
 
-from arraysense.panels import EXAMPLE_STRINGS, MOUNTINGS, PANEL_CATALOGUE, parse_strings
+from arraysense.panels import (
+    EXAMPLE_STRINGS,
+    MOUNTINGS,
+    PANEL_CATALOGUE,
+    TiltEntry,
+    parse_strings,
+    parse_tilt_schedule,
+)
 
 
 def test_a_minimal_line_parses_with_every_default_named() -> None:
     (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90")
     assert s.name == "East"
-    assert (s.mppt, s.panels, s.watts, s.tilt, s.azimuth) == (1, 9, 410.0, 25.0, 90.0)
+    assert (s.mppt, s.panels, s.watts, s.azimuth) == (1, 9, 410.0, 90.0)
+    # A fixed mount is a schedule of one, in force since before anything was
+    # recorded — the shape every array described before schedules existed takes.
+    assert s.tilt_schedule == (TiltEntry(degrees=25.0, effective_from=None),)
     # Defaults applied AND named — the UI labels them; silence is the bug.
     assert s.temp_coeff == -0.35
     assert s.noct == 45.0
@@ -174,3 +186,182 @@ def test_panel_is_stored_in_known_string_keys() -> None:
     from arraysense.panels import KNOWN_STRING_KEYS
 
     assert "panel" in KNOWN_STRING_KEYS
+
+
+def test_a_bare_number_is_a_schedule_of_one_entry() -> None:
+    result = parse_tilt_schedule("25", "25")
+    assert len(result) == 1
+    assert result[0].degrees == 25.0
+    assert result[0].effective_from is None
+
+
+def test_a_number_with_date_sets_effective_from() -> None:
+    result = parse_tilt_schedule("25@2024-03-01", "25@2024-03-01")
+    assert len(result) == 1
+    assert result[0].degrees == 25.0
+    assert result[0].effective_from == date(2024, 3, 1)
+
+
+def test_multiple_entries_with_dates_are_parsed_in_order() -> None:
+    result = parse_tilt_schedule("25,40@2024-10-01,25@2025-03-15", "25,40@2024-10-01,25@2025-03-15")
+    assert len(result) == 3
+    assert result[0].degrees == 25.0 and result[0].effective_from is None
+    assert result[1].degrees == 40.0 and result[1].effective_from == date(2024, 10, 1)
+    assert result[2].degrees == 25.0 and result[2].effective_from == date(2025, 3, 15)
+
+
+def test_whitespace_around_commas_and_at_sign_is_stripped() -> None:
+    result = parse_tilt_schedule(" 25 , 40 @ 2024-10-01 ", " 25 , 40 @ 2024-10-01 ")
+    assert len(result) == 2
+    assert result[0].degrees == 25.0 and result[0].effective_from is None
+    assert result[1].degrees == 40.0 and result[1].effective_from == date(2024, 10, 1)
+
+
+def test_zero_and_ninety_degrees_are_accepted() -> None:
+    result0 = parse_tilt_schedule("0", "0")
+    assert result0[0].degrees == 0.0
+    result90 = parse_tilt_schedule("90", "90")
+    assert result90[0].degrees == 90.0
+
+
+def test_empty_string_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("", "")
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("   ", "   ")
+
+
+def test_empty_entry_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25,,30@2024-03-01", "25,,30@2024-03-01")
+
+
+def test_degrees_outside_0_to_90_raise_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("-1", "-1")
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("91", "91")
+
+
+def test_non_numeric_input_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("abc", "abc")
+
+
+def test_later_entry_without_date_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25,30", "25,30")
+
+
+def test_equal_dates_do_not_increase_raises_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25@2024-03-01,30@2024-03-01", "25@2024-03-01,30@2024-03-01")
+
+
+def test_descending_dates_raise_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25@2024-03-01,30@2024-02-01", "25@2024-03-01,30@2024-02-01")
+
+
+def test_malformed_dates_raise_value_error() -> None:
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25@2024-13-01", "25@2024-13-01")
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25@2024-03", "25@2024-03")
+    with pytest.raises(ValueError):
+        parse_tilt_schedule("25@march", "25@march")
+
+
+def test_fixed_mount_returns_same_tilt_for_any_day() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25 | 90")
+    assert s.tilt_at(date(1999, 1, 1)) == 25.0
+
+
+def test_earlier_day_returns_first_tilt_in_schedule() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2024-10-01 | 90")
+    assert s.tilt_at(date(2024, 9, 30)) == 25.0
+
+
+def test_the_boundary_day_takes_the_new_tilt() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2024-10-01 | 90")
+    assert s.tilt_at(date(2024, 10, 1)) == 40.0
+
+
+def test_far_future_day_returns_last_tilt_in_schedule() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2024-10-01 | 90")
+    assert s.tilt_at(date(2030, 1, 1)) == 40.0
+
+
+def test_three_entry_schedule_returns_correct_tilt_per_day() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2024-10-01,30@2025-03-15 | 90")
+    assert s.tilt_at(date(2024, 12, 25)) == 40.0
+    assert s.tilt_at(date(2025, 6, 1)) == 30.0
+
+
+def test_schedule_survives_tail_and_parses_additional_fields() -> None:
+    (s,) = parse_strings('East | 1 | 9 | 410 | 25,40@2024-10-01 | 90 | bifacial=9 note="hi there"')
+    assert len(s.tilt_schedule) == 2
+    assert s.bifacial_pct == 9.0
+
+
+def test_appending_an_adjustment_to_a_fixed_tilt_keeps_the_old_angle_behind_it() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2027-10-01 | 90")
+    assert len(s.tilt_schedule) == 2
+    assert s.tilt_at(date(2027, 9, 30)) == 25.0
+    assert s.tilt_at(date(2027, 10, 1)) == 40.0
+
+
+def test_appending_twice_gives_three_angles_each_in_force_in_turn() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2027-10-01,30@2028-03-15 | 90")
+    assert len(s.tilt_schedule) == 3
+    assert s.tilt_at(date(2027, 1, 1)) == 25.0
+    assert s.tilt_at(date(2027, 12, 1)) == 40.0
+    assert s.tilt_at(date(2028, 6, 1)) == 30.0
+
+
+def test_appending_to_an_empty_tilt_gives_a_dated_schedule_of_one() -> None:
+    # The composer produces this when the box was empty. A day before the only
+    # entry still reports its angle: it is the only one anybody has stated.
+    (s,) = parse_strings("East | 1 | 9 | 410 | 40@2027-10-01 | 90")
+    assert len(s.tilt_schedule) == 1
+    assert s.tilt_at(date(1999, 1, 1)) == 40.0
+
+
+def test_appending_an_out_of_order_date_is_refused() -> None:
+    with pytest.raises(ValueError):
+        parse_strings("East | 1 | 9 | 410 | 25,40@2028-03-15,30@2027-10-01 | 90")
+
+
+def test_appending_the_same_date_twice_is_refused() -> None:
+    with pytest.raises(ValueError):
+        parse_strings("East | 1 | 9 | 410 | 25,40@2027-10-01,30@2027-10-01 | 90")
+
+
+def test_appending_degrees_past_vertical_is_refused() -> None:
+    with pytest.raises(ValueError):
+        parse_strings("East | 1 | 9 | 410 | 25,95@2027-10-01 | 90")
+
+
+def test_a_schedule_and_a_tail_coexist() -> None:
+    (s,) = parse_strings("East | 1 | 9 | 410 | 25,40@2027-10-01 | 90 | mounting=ground bifacial=9")
+    assert s.tilt_schedule == (
+        TiltEntry(degrees=25.0, effective_from=None),
+        TiltEntry(degrees=40.0, effective_from=date(2027, 10, 1)),
+    )
+    assert s.mounting == "ground"
+    assert s.bifacial_pct == 9.0
+
+
+def test_a_schedule_on_one_string_leaves_the_others_fixed() -> None:
+    east, west = parse_strings(
+        "East | 1 | 9 | 410 | 25,40@2027-10-01 | 90\nWest | 2 | 9 | 410 | 30 | 270"
+    )
+    assert len(east.tilt_schedule) == 2
+    assert len(west.tilt_schedule) == 1
+    assert west.tilt_at(date(2030, 1, 1)) == 30.0
+
+
+def test_a_refused_schedule_quotes_the_line_it_came_from() -> None:
+    with pytest.raises(ValueError) as exc:
+        parse_strings("East | 1 | 9 | 410 | 25,30 | 90")
+    assert "East" in str(exc.value)
