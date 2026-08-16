@@ -16,7 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day, compute_hours
+from arraysense.efficiency import (
+    CONFIG_VERSION_KEY,
+    EfficiencyRow,
+    _never_adjusted,
+    compute_day,
+    compute_hours,
+    tilt_benefit,
+)
 from arraysense.panels import parse_strings
 from arraysense.settings import SettingsStore
 from arraysense.store.sqlite_store import SqliteStore
@@ -836,3 +843,161 @@ class TestSharedMpptGroups:
 
         assert [row.string_name for row in present] == ["[MPPT 1] East + West", "South", ""]
         assert [row.string_name for row in rows] == ["South", ""]
+
+
+class TestTiltSchedule:
+    """The array's geometry is time-dependent, and scoring has to follow it."""
+
+    def _clear_day(self, path: Path) -> tuple[SqliteStore, datetime, datetime]:
+        store = _store(str(path))
+        day_start = _summer_day(0)
+        for h in range(8, 16):
+            _insert_hourly(
+                store._conn,
+                _utc(h),
+                pv_power=3200.0,
+                ghi=800.0,
+                dni=850.0,
+                dhi=120.0,
+                wind=2.0,
+                air_c=30.0,
+            )
+        return store, day_start, day_start + timedelta(days=1)
+
+    def test_a_day_after_an_adjustment_scores_as_if_the_mount_were_fixed_there(
+        self, tmp_path: Path
+    ) -> None:
+        # The whole claim of the feature: on 10 August, an array adjusted to 40°
+        # on 5 August must be modelled at 40° — indistinguishable from one that
+        # had always been at 40°.
+        store, start, end = self._clear_day(tmp_path / "after.db")
+        settings = SettingsStore(store)
+        scheduled = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        always_40 = parse_strings("East | 1 | 10 | 400 | 40 | 90")
+        moved = compute_day(store, settings, start, end, scheduled, 1)
+        fixed = compute_day(store, settings, start, end, always_40, 1)
+        assert moved[0].expected_kwh == pytest.approx(fixed[0].expected_kwh)
+
+    def test_a_day_before_an_adjustment_keeps_the_angle_it_was_under(self, tmp_path: Path) -> None:
+        # The other half, and the one the issue exists for: adding a future
+        # adjustment must not retrospectively re-model the past at the new angle.
+        store, start, end = self._clear_day(tmp_path / "before.db")
+        settings = SettingsStore(store)
+        scheduled = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-15 | 90")
+        always_25 = parse_strings("East | 1 | 10 | 400 | 25 | 90")
+        pending = compute_day(store, settings, start, end, scheduled, 1)
+        fixed = compute_day(store, settings, start, end, always_25, 1)
+        assert pending[0].expected_kwh == pytest.approx(fixed[0].expected_kwh)
+
+    def test_the_two_angles_actually_produce_different_expectations(self, tmp_path: Path) -> None:
+        # Guards the pair above against passing vacuously. If 25° and 40° scored
+        # the same, both assertions would hold while the schedule did nothing.
+        store, start, end = self._clear_day(tmp_path / "differ.db")
+        settings = SettingsStore(store)
+        low = compute_day(
+            store, settings, start, end, parse_strings("E | 1 | 10 | 400 | 25 | 90"), 1
+        )
+        high = compute_day(
+            store, settings, start, end, parse_strings("E | 1 | 10 | 400 | 40 | 90"), 1
+        )
+        assert low[0].expected_kwh != pytest.approx(high[0].expected_kwh)
+
+    def test_the_adjustment_takes_effect_on_the_owners_calendar_day(self, tmp_path: Path) -> None:
+        # The site is US Central; the scored hours span two UTC days. An
+        # adjustment dated 10 August must apply to all of the owner's 10 August,
+        # not to whichever hours happen to fall in the UTC day of that name.
+        store, start, end = self._clear_day(tmp_path / "boundary.db")
+        settings = SettingsStore(store)
+        today = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-10 | 90")
+        always_40 = parse_strings("East | 1 | 10 | 400 | 40 | 90")
+        rows = compute_day(store, settings, start, end, today, 1)
+        fixed = compute_day(store, settings, start, end, always_40, 1)
+        assert rows[0].expected_kwh == pytest.approx(fixed[0].expected_kwh)
+
+    def test_a_fixed_mount_has_nothing_to_compare(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "fixed.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25 | 90")
+        settings = SettingsStore(store)
+        assert tilt_benefit(store, settings, day_start, day_end, strings) is None
+
+    def test_an_adjusted_mount_reports_hours_it_was_drawn_from(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "adjusted.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.hours > 0
+
+    def test_the_two_geometries_produce_different_expectations(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "diff.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.scheduled_kwh != pytest.approx(found.unadjusted_kwh)
+
+    def test_the_gain_is_the_difference_between_the_two_sides(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "gain.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.gain_kwh == pytest.approx(found.scheduled_kwh - found.unadjusted_kwh)
+
+    def test_an_adjustment_still_in_the_future_has_changed_nothing_yet(
+        self, tmp_path: Path
+    ) -> None:
+        # The schedule is real but the day sits wholly inside the first period,
+        # so there is no difference to attribute to an adjustment.
+        store, day_start, day_end = self._clear_day(tmp_path / "future.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-09-01 | 90")
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.scheduled_kwh == pytest.approx(found.unadjusted_kwh)
+        assert found.adjustments == 0
+
+    def test_an_adjustment_inside_the_range_is_counted(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "inside.db")
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-10 | 90")
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.adjustments == 1
+
+    def test_one_adjustable_string_among_fixed_ones_still_answers(self, tmp_path: Path) -> None:
+        store, day_start, day_end = self._clear_day(tmp_path / "mixed.db")
+        strings = parse_strings(
+            "East | 1 | 10 | 400 | 25,40@2026-08-05 | 90\nWest | 2 | 10 | 400 | 30 | 270"
+        )
+        settings = SettingsStore(store)
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.hours > 0
+
+    def test_both_sides_are_drawn_from_the_same_hours(self, tmp_path: Path) -> None:
+        # The subtraction only means something if the two runs saw the same
+        # hours. Tilt takes no part in which hours are skippable, and this is
+        # what holds that true rather than assuming it.
+        store, day_start, day_end = self._clear_day(tmp_path / "sameh.db")
+        settings = SettingsStore(store)
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        scheduled = compute_hours(store, settings, day_start, day_end, strings)
+        never = compute_hours(store, settings, day_start, day_end, _never_adjusted(strings))
+        assert found.hours == len(scheduled) == len(never)
+
+    def test_a_gap_removes_the_hour_from_both_sides(self, tmp_path: Path) -> None:
+        # An outage must not flatter either geometry. The hour is absent from
+        # both runs, so it cannot land on one side of the comparison only.
+        store, day_start, day_end = self._clear_day(tmp_path / "gap.db")
+        store._conn.execute(
+            "UPDATE inverter_hourly SET pv1_power_w = NULL WHERE timestamp = ?",
+            (int(_utc(12).timestamp()),),
+        )
+        settings = SettingsStore(store)
+        strings = parse_strings("East | 1 | 10 | 400 | 25,40@2026-08-05 | 90")
+        found = tilt_benefit(store, settings, day_start, day_end, strings)
+        assert found is not None
+        assert found.hours == 7  # eight staged, one silenced

@@ -66,12 +66,16 @@ from arraysense.costs import (
 )
 from arraysense.curtailment import StringBaseline
 from arraysense.efficiency import (
+    CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
     EfficiencyRow,
+    TiltBenefit,
     compute_day,
     compute_hours,
     fitted_baselines,
     mppt_groups,
+    rows_are_current,
+    tilt_benefit,
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
@@ -2388,10 +2392,16 @@ def efficiency(
             "days": [],
             "worst_hour": None,
             "baseline": dict(_NO_BASELINE),
+            # Present even here. A key that appears only sometimes is a key
+            # every caller has to guard, and the one that forgets reads a
+            # missing array as a missing answer.
+            "tilt_benefit": None,
         }
 
     config_version_raw = settings.get(CONFIG_VERSION_KEY)
     config_version = config_version_raw if isinstance(config_version_raw, int) else 0
+    valid_from_raw = settings.get(CONFIG_VALID_FROM_KEY)
+    valid_from = valid_from_raw if isinstance(valid_from_raw, int) else 0
 
     # Collect daily rows: try stored first, compute live for missing days.
     daily_rows: list[EfficiencyRow] = []
@@ -2403,7 +2413,7 @@ def efficiency(
         # count or moves the site every older day would keep a score taken
         # against an array that no longer exists -- and be served without a
         # word to say so. Recomputing is the honest answer and is cheap.
-        if stored and all(r.config_version == config_version for r in stored):
+        if rows_are_current(stored, config_version, valid_from):
             daily_rows.extend(stored)
         else:
             daily_rows.extend(compute_day(store, settings, ds, de, strings, config_version))
@@ -2423,6 +2433,10 @@ def efficiency(
             "days": [],
             "worst_hour": None,
             "baseline": dict(_NO_BASELINE),
+            # Present even here. A key that appears only sometimes is a key
+            # every caller has to guard, and the one that forgets reads a
+            # missing array as a missing answer.
+            "tilt_benefit": None,
         }
 
     # Aggregate: group by string_name.  The total row has string_name == "".
@@ -2628,6 +2642,30 @@ def efficiency(
         ],
         "worst_hour": worst_hour,
         "baseline": baseline,
+        # Null on a fixed mount, and null rather than zero on purpose: an owner
+        # who has never adjusted anything would read a zero as "adjusting won
+        # you nothing" rather than as "you have not adjusted".
+        "tilt_benefit": _tilt_benefit_info(
+            tilt_benefit(store, settings, range_start, range_end, strings)
+        ),
+    }
+
+
+def _tilt_benefit_info(found: TiltBenefit | None) -> dict[str, Any] | None:
+    """Shape the seasonal-adjustment comparison for the page, or nothing.
+
+    ``hours`` travels with the figure rather than beside it, because the number
+    means different things at eight hours and at eight hundred and a caller that
+    can drop it will.
+    """
+    if found is None:
+        return None
+    return {
+        "scheduled_kwh": round(found.scheduled_kwh, 3),
+        "unadjusted_kwh": round(found.unadjusted_kwh, 3),
+        "gain_kwh": round(found.gain_kwh, 3),
+        "hours": found.hours,
+        "adjustments": found.adjustments,
     }
 
 

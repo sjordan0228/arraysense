@@ -9,6 +9,7 @@ all rather than one scaled by a statistic that cannot support it.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -30,6 +31,9 @@ STRINGS = parse_strings(
     "PV3 | 3 | 12 | 400 | 5 | 180 | vmp=31.01 temp_coeff=-0.35"
 )
 LAT, LON = 33.088264, -97.201443
+# The site's own zone. modelled_watts needs it to pick the day a tilt
+# schedule is keyed by; UTC would move the switch by six hours here.
+ZONE = ZoneInfo("America/Chicago")
 
 
 def _day(n: int, pr: float | None, *, partial: bool = False, name: str = "") -> EfficiencyRow:
@@ -111,19 +115,19 @@ def test_the_sun_below_the_horizon_produces_nothing() -> None:
         air_c=24.0,
         wind_ms=2.0,
     )
-    assert modelled_watts(STRINGS, LAT, LON, midnight) == 0.0
+    assert modelled_watts(STRINGS, LAT, LON, midnight, ZONE) == 0.0
 
 
 def test_a_bright_hour_models_a_plausible_output() -> None:
     """Not a golden number — a bound. 14.4 kWp of panels in near-full sun."""
-    watts = modelled_watts(STRINGS, LAT, LON, _noon())
+    watts = modelled_watts(STRINGS, LAT, LON, _noon(), ZONE)
     assert 8_000 < watts < 15_000
 
 
 def test_the_ratio_scales_the_whole_curve() -> None:
     sky = [_noon()]
-    full = expected_points(STRINGS, LAT, LON, sky, 1.0)
-    half = expected_points(STRINGS, LAT, LON, sky, 0.5)
+    full = expected_points(STRINGS, LAT, LON, sky, 1.0, ZONE)
+    half = expected_points(STRINGS, LAT, LON, sky, 0.5, ZONE)
     assert half[0][1] == pytest.approx(full[0][1] / 2)
     assert half[0][0] == sky[0].when
 
@@ -139,7 +143,9 @@ def test_hotter_air_lowers_the_expectation() -> None:
         air_c=cool.air_c + 15.0,
         wind_ms=cool.wind_ms,
     )
-    assert modelled_watts(STRINGS, LAT, LON, hot) < modelled_watts(STRINGS, LAT, LON, cool)
+    assert modelled_watts(STRINGS, LAT, LON, hot, ZONE) < modelled_watts(
+        STRINGS, LAT, LON, cool, ZONE
+    )
 
 
 def test_wind_raises_the_expectation() -> None:
@@ -160,7 +166,9 @@ def test_wind_raises_the_expectation() -> None:
         air_c=calm.air_c,
         wind_ms=6.0,
     )
-    assert modelled_watts(STRINGS, LAT, LON, breezy) > modelled_watts(STRINGS, LAT, LON, calm)
+    assert modelled_watts(STRINGS, LAT, LON, breezy, ZONE) > modelled_watts(
+        STRINGS, LAT, LON, calm, ZONE
+    )
 
 
 def test_the_module_offers_no_second_best_scale() -> None:

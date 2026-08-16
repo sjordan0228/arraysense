@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 
 MOUNTINGS: tuple[str, ...] = ("open_rack", "close_roof", "ground")
 
@@ -137,11 +138,29 @@ PANEL_CATALOGUE: tuple[PanelCatalogueEntry, ...] = (
 _CATALOGUE_BY_NAME: dict[str, PanelCatalogueEntry] = {e.name: e for e in PANEL_CATALOGUE}
 
 _INSTALLED = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+# date.fromisoformat also accepts "20240301" and "2024-W01-1", neither of which a
+# person types into a tilt box on purpose. The shape is pinned first so a typo is
+# refused rather than silently read as some other day.
+_TILT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # key=value tokens; a quoted value may hold spaces. Built for the tail only.
 # A quoted value may hold spaces and escaped quotes (\"); a bare value may not.
 # The quoted branch accepts any run of non-quote characters and \" pairs, so a
 # note that quotes something round-trips instead of being refused at the door.
 _TAIL_TOKEN = re.compile(r'(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
+
+
+@dataclass(frozen=True)
+class TiltEntry:
+    """One tilt angle and the day it came into force.
+
+    ``effective_from`` of None means "since before anything was recorded", which
+    is what a fixed mount and every array described before this existed both
+    are. It is a calendar date rather than an instant because the owner adjusts
+    a mount on an afternoon and remembers the day, not the minute.
+    """
+
+    degrees: float
+    effective_from: date | None
 
 
 @dataclass(frozen=True)
@@ -152,7 +171,7 @@ class StringSpec:
     mppt: int
     panels: int
     watts: float
-    tilt: float
+    tilt_schedule: tuple[TiltEntry, ...]
     azimuth: float
     temp_coeff: float
     noct: float
@@ -171,6 +190,23 @@ class StringSpec:
     # warning requested in the spec.
     panel: str | None
     defaulted: frozenset[str]
+
+    def tilt_at(self, day: date) -> float:
+        """The tilt this string was actually standing at on ``day``.
+
+        Every consumer must ask for a day rather than reading an angle off the
+        spec, because an adjustable mount has no single tilt — asking without a
+        date is the question that made adjusting the array destroy the history.
+        The day is the owner's own calendar day, never UTC: a mount is moved on
+        a Tuesday afternoon, and an hour scored either side of midnight UTC
+        would otherwise change tilt on the wrong Tuesday.
+        """
+        degrees = self.tilt_schedule[0].degrees
+        for entry in self.tilt_schedule:
+            if entry.effective_from is not None and entry.effective_from > day:
+                break
+            degrees = entry.degrees
+        return degrees
 
 
 def _unescape(value: str) -> str:
@@ -192,6 +228,52 @@ def _number(line: str, field: str, raw: str, lo: float, hi: float) -> float:
     return value
 
 
+def parse_tilt_schedule(line: str, raw: str) -> tuple[TiltEntry, ...]:
+    """Read the tilt field as a history of angles rather than one angle.
+
+    An adjustable mount is moved twice a year, and a single tilt per string made
+    the owner choose between a model that matches the array today and one that
+    matches what it was under last winter — while the yearly comparison that
+    would show whether adjusting is worth anything is exactly what the choice
+    destroys. A schedule keeps both, because every hour can be scored against
+    the geometry it really had.
+
+    A bare number is a schedule of one, so a fixed mount is spelled exactly as
+    it always was and nothing already stored has to be rewritten. Only the first
+    entry may be dateless; a later one without a date would leave the order of
+    two angles undecidable, and guessing it is how a history quietly acquires a
+    tilt it never stood at.
+    """
+    pieces = [piece.strip() for piece in raw.split(",")]
+    if not raw.strip():
+        raise _refuse(line, "tilt must be given")
+    if any(not piece for piece in pieces):
+        raise _refuse(line, "tilt has an empty entry")
+
+    entries: list[TiltEntry] = []
+    previous: date | None = None
+    for index, piece in enumerate(pieces):
+        degrees_text, separator, date_text = piece.partition("@")
+        degrees = _number(line, "tilt", degrees_text.strip(), 0, 90)
+        if not separator:
+            if index:
+                raise _refuse(line, "only the first tilt may omit its start date")
+            entries.append(TiltEntry(degrees=degrees, effective_from=None))
+            continue
+        stamp = date_text.strip()
+        if not _TILT_DATE.match(stamp):
+            raise _refuse(line, f"tilt date must be YYYY-MM-DD, got {stamp!r}")
+        try:
+            effective = date.fromisoformat(stamp)
+        except ValueError:
+            raise _refuse(line, f"tilt date must be YYYY-MM-DD, got {stamp!r}") from None
+        if previous is not None and effective <= previous:
+            raise _refuse(line, f"tilt dates must increase; {effective} does not follow {previous}")
+        entries.append(TiltEntry(degrees=degrees, effective_from=effective))
+        previous = effective
+    return tuple(entries)
+
+
 def _parse_line(line: str) -> StringSpec:
     parts = [p.strip() for p in line.split("|")]
     if len(parts) < 6:
@@ -204,7 +286,7 @@ def _parse_line(line: str) -> StringSpec:
     mppt = int(_number(line, "mppt", parts[1], 1, 32))
     panels = int(_number(line, "panels", parts[2], 1, 100))
     watts = _number(line, "watts", parts[3], 50, 1000)
-    tilt = _number(line, "tilt", parts[4], 0, 90)
+    tilt_schedule = parse_tilt_schedule(line, parts[4])
     azimuth = _number(line, "azimuth", parts[5], 0, 360)
 
     tail = " | ".join(parts[6:]) if len(parts) > 6 else ""
@@ -321,7 +403,7 @@ def _parse_line(line: str) -> StringSpec:
         mppt=mppt,
         panels=panels,
         watts=watts,
-        tilt=tilt,
+        tilt_schedule=tilt_schedule,
         azimuth=azimuth,
         temp_coeff=temp_coeff,
         noct=noct,

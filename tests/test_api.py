@@ -3479,6 +3479,28 @@ def test_panels_serves_the_parsed_array_with_defaults_named(client: Any, monkeyp
     assert body["declared_mppts"] == 3  # the fake declares pv_strings=3
 
 
+def test_panels_serves_a_tilt_schedule_over_the_wire(client: Any, monkeypatch: Any) -> None:
+    # asdict() turns each TiltEntry into a dict holding a real datetime.date,
+    # which JSON has no notion of. The page reads the parsed array from here
+    # rather than parsing the grammar itself, so a date that cannot cross the
+    # wire is the whole array failing to render, not a cosmetic problem.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    r = client.put(
+        "/api/settings",
+        json={"panels.strings": "East | 1 | 9 | 410 | 25,40@2027-10-01 | 90"},
+    )
+    assert r.status_code == 200
+    resp = client.get("/api/panels")
+    assert resp.status_code == 200
+    (s,) = resp.json()["strings"]
+    assert s["tilt_schedule"] == [
+        {"degrees": 25.0, "effective_from": None},
+        {"degrees": 40.0, "effective_from": "2027-10-01"},
+    ]
+
+
 def test_an_unconfigured_array_serves_empty_not_error(client: Any) -> None:
     body = client.get("/api/panels").json()
     assert body["strings"] == []
@@ -4542,3 +4564,43 @@ def test_efficiency_unconfigured_still_offers_an_empty_daily_series(tmp_path: Pa
         ).json()
     assert body["configured"] is False
     assert body["days"] == []
+
+
+def test_efficiency_reports_nothing_to_compare_on_a_fixed_mount(
+    client: Any, monkeypatch: Any
+) -> None:
+    # Null rather than zero: a zero reads as "adjusting won you nothing" to an
+    # owner who has never adjusted anything.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    client.put("/api/settings", json={"panels.strings": "East | 1 | 9 | 410 | 25 | 90"})
+    body = client.get("/api/efficiency?period=day&start=2026-08-10").json()
+    assert body["tilt_benefit"] is None
+
+
+def test_efficiency_carries_the_hour_count_beside_the_tilt_gain(
+    client: Any, monkeypatch: Any
+) -> None:
+    # The figure and its coverage travel together, or a caller will show the
+    # first without the second and present a partial figure as a complete one.
+    from arraysense.api import routes
+
+    monkeypatch.setattr(routes, "_schedule_restart", lambda: None)
+    client.put(
+        "/api/settings",
+        json={"panels.strings": "East | 1 | 9 | 410 | 25,40@2026-08-05 | 90"},
+    )
+    body = client.get("/api/efficiency?period=day&start=2026-08-10").json()
+    found = body["tilt_benefit"]
+    if found is not None:
+        assert set(found) == {
+            "scheduled_kwh",
+            "unadjusted_kwh",
+            "gain_kwh",
+            "hours",
+            "adjustments",
+        }
+        assert found["gain_kwh"] == pytest.approx(
+            found["scheduled_kwh"] - found["unadjusted_kwh"], abs=0.002
+        )

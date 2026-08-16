@@ -42,7 +42,9 @@ import logging
 import sqlite3
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from arraysense.energy import resolve_zone
 from arraysense.forecast import (
     MIN_SCORED_DAYS,
     PR_WINDOW_DAYS,
@@ -56,6 +58,7 @@ from arraysense.settings import (
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
+    SETTING_TIMEZONE,
     WEATHER_INTERVAL_KEY,
     SettingsStore,
     lookup_setting,
@@ -209,6 +212,20 @@ class WeatherPoller:
         self.last_error = failure
         return wrote
 
+    def _zone(self) -> ZoneInfo:
+        """The zone whose calendar decides which tilt a predicted hour was under.
+
+        The sky hours arrive stamped in UTC and a tilt schedule is keyed on the
+        day the owner adjusted the mount, so the two have to be reconciled
+        somewhere. ``resolve_zone`` is where this project already answers "which
+        zone is this installation on", including the empty setting that means
+        "follow the host" — asking it here rather than re-deriving the fallback
+        is what keeps the forecast and the pages agreeing about where a day
+        starts.
+        """
+        configured = self._settings.get(SETTING_TIMEZONE)
+        return resolve_zone(None, configured if isinstance(configured, str) else None)
+
     def _array(self) -> tuple[StringSpec, ...]:
         """The strings as described today, or none when the array is undescribed.
 
@@ -266,7 +283,7 @@ class WeatherPoller:
                         PR_WINDOW_DAYS,
                     )
                     self._basis = "pr"
-                return expected_points(strings, latitude, longitude, sky, ratio)
+                return expected_points(strings, latitude, longitude, sky, ratio, self._zone())
 
         if self._basis != "none":
             logger.info(
