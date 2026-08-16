@@ -31,6 +31,13 @@
      be the thing that spiked, and a row that vanishes takes the question with
      it — but it must not look like a measurement either. */
   #circuits tr.absent td{color:var(--ink3)}
+  /* Why the row is blank, on its own line under the name. Two of the reference
+     account's outlets have been dead since April, and without this they read
+     as circuits that happened to be idle — the same dash, a different fact.
+     The words carry the meaning and the colour only repeats it, which is the
+     rule for every state on this page. */
+  #circuits .off{display:block;color:var(--warn);font-size:11px;margin-top:2px}
+  #circuits tr.absent .off{color:var(--warn)}
   /* The state line. reconnect_required is deliberately not styled as an error:
      it is a job for the owner, not a fault in the service, and painting it red
      is what teaches somebody to ignore the red. */
@@ -123,8 +130,10 @@
 //
 // Two rules it exists to keep. A circuit that reported nothing draws the dash
 // and never 0 W: an outlet offline since April did not use no power, it did not
-// answer. And "log in again" is its own state, not an error — the failure the
-// reference implementation conflates with a dead connection.
+// answer — and where Emporia knows which of the two it was, the row says so
+// under the name rather than leaving one dash to mean both. And "log in again"
+// is its own state, not an error — the failure the reference implementation
+// conflates with a dead connection.
 
 drawNav('emporia');
 
@@ -230,10 +239,16 @@ async function loadCircuits() {
   body.innerHTML = rows.map((c) => {
     const w = numOrNull(c.watts);
     const icon = iconFor(c);
+    // Only a device Emporia has actually declared down says so. connected is
+    // null for one it said nothing about, and printing "offline" for that would
+    // be this page inventing a fault out of silence.
+    const off = c.connected === false
+      ? `<span class="off">${esc(('offline ' + (c.offline_since || '')).trim())}</span>`
+      : '';
     return `<tr class="${w === null ? 'absent' : ''}">`
       + `<td class="ic">${icon
           ? `<svg aria-hidden="true"><use href="#${esc(icon)}"/></svg>` : ''}</td>`
-      + `<td>${esc(c.name)}</td>`
+      + `<td>${esc(c.name)}${off}</td>`
       + `<td class="kind">${c.kind === 'circuit' ? '' : esc(c.kind)}</td>`
       + `<td class="w">${wStr(w)}</td></tr>`;
   }).join('');

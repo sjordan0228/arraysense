@@ -17,7 +17,11 @@ other controllers were driving the same charger.
 
 from __future__ import annotations
 
-from arraysense.modules.emporia.parse import charger_from_status
+from arraysense.modules.emporia.parse import (
+    DeviceConnection,
+    charger_from_status,
+    connections_from_status,
+)
 
 STATUS: dict[str, list[dict[str, object]]] = {
     "evChargers": [
@@ -276,3 +280,115 @@ def test_conflicts_from_both_records_are_listed_in_a_stable_order() -> None:
     )
     assert got is not None
     assert got.conflicts == ("load management", "schedules")
+
+
+# --- which devices are still answering -------------------------------------
+#
+# The same `devicesConnected` list the charger reads its own state out of, but
+# asked about every device rather than one. It is the difference between a
+# circuit that drew nothing and a circuit nobody has heard from since April,
+# which the page could otherwise only render as the same dash. Two of the
+# reference account's outlets have been offline since 2 April and 8 August 2026.
+
+
+def test_every_device_that_reported_its_connection_is_read() -> None:
+    got = connections_from_status(
+        {
+            "devicesConnected": [
+                {"deviceGid": 100000, "connected": True, "offlineSince": None},
+                {
+                    "deviceGid": 100001,
+                    "connected": False,
+                    "offlineSince": "since Apr 2, 2026, 5:06 PM",
+                },
+            ]
+        }
+    )
+    assert got[100000].connected is True
+    assert got[100000].offline_since is None
+    assert got[100001].connected is False
+    assert got[100001].offline_since == "since Apr 2, 2026, 5:06 PM"
+
+
+def test_a_device_that_did_not_say_is_unknown_rather_than_online() -> None:
+    # The same rule as every other absence here. "Nobody said" and "it is up"
+    # are different statements, and a page that draws the first as the second
+    # is the reason this project exists.
+    got = connections_from_status({"devicesConnected": [{"deviceGid": 100000}]})
+    assert got[100000].connected is None
+    assert got[100000].offline_since is None
+
+
+def test_a_reply_with_no_connections_reads_as_nothing_known() -> None:
+    # A shape change at Emporia's end must cost the circuits page its offline
+    # marks, never its readings.
+    assert connections_from_status({}) == {}
+    assert connections_from_status({"devicesConnected": "nope"}) == {}
+    assert connections_from_status("nope") == {}
+    assert connections_from_status({"devicesConnected": [None, 7, {"connected": True}]}) == {}
+
+
+def test_a_connection_that_is_not_a_boolean_is_unknown_rather_than_up() -> None:
+    # The same trap as everywhere else in this file: 1 is truthy and is not
+    # True, and reading it as True would put "online" on a page on the strength
+    # of a field Emporia never set.
+    got = connections_from_status(
+        {
+            "devicesConnected": [
+                {"deviceGid": 100000, "connected": 1},
+                {"deviceGid": 100001, "connected": "true"},
+            ]
+        }
+    )
+    assert got[100000].connected is None
+    assert got[100001].connected is None
+
+
+def test_an_offline_date_that_is_not_text_is_dropped_rather_than_rendered() -> None:
+    got = connections_from_status({"devicesConnected": [{"deviceGid": 100000, "offlineSince": 17}]})
+    assert got[100000].offline_since is None
+
+
+def test_a_device_identifier_that_is_not_a_number_names_no_device() -> None:
+    # A bool is an int in Python, so an unguarded check would file a device
+    # under gid 1 and hand its state to whatever real device holds that number.
+    got = connections_from_status(
+        {
+            "devicesConnected": [
+                {"deviceGid": True, "connected": False},
+                {"deviceGid": "100000", "connected": False},
+                {"deviceGid": 100000, "connected": True},
+            ]
+        }
+    )
+    assert got == {100000: DeviceConnection(connected=True, offline_since=None)}
+
+
+def test_a_device_listed_twice_is_read_as_its_latest_entry() -> None:
+    got = connections_from_status(
+        {
+            "devicesConnected": [
+                {"deviceGid": 100000, "connected": False, "offlineSince": "since Apr 2, 2026"},
+                {"deviceGid": 100000, "connected": True},
+            ]
+        }
+    )
+    assert got[100000] == DeviceConnection(connected=True, offline_since=None)
+
+
+def test_the_charger_reads_its_own_connection_from_the_same_list() -> None:
+    # One reader for one field. The charger tab and the circuits page disagreeing
+    # about whether a device is up would be the same fact computed twice.
+    payload = {
+        "evChargers": [dict(STATUS["evChargers"][0])],
+        "devicesConnected": [
+            {"deviceGid": 900001, "connected": False, "offlineSince": "since Aug 8, 2026, 9:12 AM"}
+        ],
+    }
+    charger = charger_from_status(payload)
+    connections = connections_from_status(payload)
+    assert charger is not None
+    assert (charger.connected, charger.offline_since) == (
+        connections[900001].connected,
+        connections[900001].offline_since,
+    )

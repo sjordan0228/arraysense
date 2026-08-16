@@ -46,8 +46,10 @@ from arraysense.modules.emporia.control import (
 from arraysense.modules.emporia.parse import (
     SCALE_MINUTE,
     ChargerState,
+    DeviceConnection,
     charger_from_status,
     circuits_from_devices,
+    connections_from_status,
     device_gids,
     readings_from_usage,
 )
@@ -167,6 +169,12 @@ class EmporiaPoller:
         # The charger as it was last read, for the page and for the restore.
         # None on an account that has none, which is most of them.
         self.charger: ChargerState | None = None
+        # Which devices are still answering Emporia, keyed by device gid. Held
+        # rather than stored, like the charger: it is what Emporia says now, and
+        # a stored copy would keep calling a device offline after it came back.
+        # Empty until the first successful read, which reads as "nothing known"
+        # rather than as "everything is fine".
+        self.connections: dict[int, DeviceConnection] = {}
         # Restore is a startup behaviour, not a per-tick one. Repeating it
         # every minute would fight the owner for the slider all afternoon.
         self._restore_considered = False
@@ -227,6 +235,7 @@ class EmporiaPoller:
         self.client.write_charger(self._charger_record, changes, self._id_token)
         status = self.client.get("/customers/devices/status", self._id_token)
         self.charger = charger_from_status(status)
+        self.connections = connections_from_status(status)
         self._charger_record = _raw_charger(status)
         return self.charger
 
@@ -245,6 +254,10 @@ class EmporiaPoller:
         here either — under advisory it records what it would have done, which
         is what lets the page say "the charger is at a rate I set" without
         touching it.
+
+        A proposal identical to the newest audit line is not written down again.
+        Under an authority that may not write nothing about the charger moves,
+        so the same sentence was recorded on every restart for ever.
         """
         charger = self.charger
         if charger is None or self._restore_considered:
@@ -268,6 +281,21 @@ class EmporiaPoller:
             now=now,
         )
         reason = f"restored to {verdict.rate_a} A on startup: {verdict.reason}"
+        # A proposal that has not changed is not news. Under an authority that
+        # may not write, nothing about the charger moves, so the identical
+        # sentence was written down on every restart for ever — and the audit is
+        # read to answer "what has this service done to my car", which a hundred
+        # copies of one line answers less well than none. An *applied* change is
+        # never suppressed: that one did something, and it happened again.
+        previous = self.audit.last_change(charger.device_gid)
+        if (
+            not verdict.apply
+            and previous is not None
+            and previous.same_decision(
+                from_a=charger.rate_a, to_a=verdict.rate_a, reason=reason, applied=verdict.apply
+            )
+        ):
+            return
         if verdict.apply and verdict.rate_a is not None and self._charger_record is not None:
             self.client.set_charge_rate(self._charger_record, verdict.rate_a, id_token)
         self.audit.record_change(
@@ -308,6 +336,7 @@ class EmporiaPoller:
         # loop should wait once rather than three times.
         status = self.client.get("/customers/devices/status", id_token)
         self.charger = charger_from_status(status)
+        self.connections = connections_from_status(status)
         self._charger_record = _raw_charger(status)
         return devices, usage
 

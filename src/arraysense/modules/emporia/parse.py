@@ -346,6 +346,54 @@ def _int_or_none(value: object) -> int | None:
     return int(value)
 
 
+@dataclass(frozen=True)
+class DeviceConnection:
+    """Whether one device is still answering Emporia, and since when it stopped.
+
+    The distinction the circuits page cannot draw without it. A circuit reading
+    of NULL is rendered as a dash whether the clamp measured nothing or the
+    whole device died in April, and those are different answers to "why is this
+    blank". Emporia knows which it is; this is the only field that says so.
+
+    ``connected`` is None where the device did not report one, which is the
+    ordinary rule here: a device nobody spoke for has not been declared healthy.
+    """
+
+    connected: bool | None
+    offline_since: str | None
+
+
+def connections_from_status(payload: object) -> dict[int, DeviceConnection]:
+    """Every device's connection state in a ``/customers/devices/status`` reply.
+
+    Keyed by ``deviceGid``, so a circuit finds its device's state without the
+    caller walking a list per row.
+
+    An unreadable reply yields an empty mapping rather than raising. This runs
+    on a timer and the mapping only decorates a page: a shape change at
+    Emporia's end must cost the offline marks, never the readings beside them.
+    """
+    out: dict[int, DeviceConnection] = {}
+    if not isinstance(payload, dict):
+        return out
+    entries = payload.get("devicesConnected")
+    if not isinstance(entries, list):
+        return out
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        gid = _int_or_none(entry.get("deviceGid"))
+        if gid is None:
+            continue
+        state = entry.get("connected")
+        since = entry.get("offlineSince")
+        out[gid] = DeviceConnection(
+            connected=state if isinstance(state, bool) else None,
+            offline_since=since if isinstance(since, str) else None,
+        )
+    return out
+
+
 def charger_from_status(payload: object) -> ChargerState | None:
     """The first EV charger in a ``/customers/devices/status`` reply, or None.
 
@@ -374,16 +422,10 @@ def charger_from_status(payload: object) -> ChargerState | None:
             if isinstance(load, dict) and load.get("loadGid") == load_gid:
                 conflicts.extend(name for key, name in _LOAD_CONFLICTS if load.get(key) is True)
 
-    connected: bool | None = None
-    offline_since: str | None = None
-    devices = payload.get("devicesConnected")
-    if isinstance(devices, list):
-        for entry in devices:
-            if isinstance(entry, dict) and _int_or_none(entry.get("deviceGid")) == gid:
-                state = entry.get("connected")
-                connected = state if isinstance(state, bool) else None
-                since = entry.get("offlineSince")
-                offline_since = since if isinstance(since, str) else None
+    # The same reader the circuits page uses. Two walks of one list would be one
+    # fact parsed twice, and the charger tab and the circuits page disagreeing
+    # about whether a device is up is exactly the drift that costs.
+    connection = connections_from_status(payload).get(gid, DeviceConnection(None, None))
 
     on = record.get("chargerOn")
     fault = record.get("faultText")
@@ -396,7 +438,7 @@ def charger_from_status(payload: object) -> ChargerState | None:
         message=str(record.get("message") or ""),
         conflicts=tuple(conflicts),
         plugged_in=_PLUGGED_ICONS.get(str(record.get("icon") or "")),
-        connected=connected,
-        offline_since=offline_since,
+        connected=connection.connected,
+        offline_since=connection.offline_since,
         fault=fault if isinstance(fault, str) else None,
     )
