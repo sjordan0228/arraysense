@@ -26,7 +26,12 @@ from arraysense.config import Config
 from arraysense.models import Sample
 from arraysense.modules.emporia import tokens
 from arraysense.modules.emporia.client import EmporiaUnreachableError
-from arraysense.modules.emporia.parse import ChargerState, Circuit, Reading
+from arraysense.modules.emporia.parse import (
+    ChargerState,
+    Circuit,
+    Reading,
+    connections_from_status,
+)
 from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.settings import (
     CHARGE_CEILING_KEY,
@@ -303,6 +308,57 @@ def test_the_circuits_endpoint_passes_the_category_through(tmp_path: Path) -> No
     with TestClient(app) as c:
         rows = c.get("/api/emporia/circuits").json()["circuits"]
     assert rows[0]["type_gid"] == 1
+    store.close()
+
+
+def test_the_circuits_endpoint_says_which_devices_stopped_answering(tmp_path: Path) -> None:
+    # The gap this closes. Two of the reference account's outlets have been
+    # offline since April and August, and the page could only draw them as a
+    # dash — indistinguishable from a circuit that happened to be idle. Emporia
+    # knows the difference and says so; this carries it through.
+    app, store, _ = _app(tmp_path)
+    now = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+    app.state.emporia.repository.sync_circuits(
+        [
+            Circuit(100000, "5", "Dryer", 2.0, "circuit"),
+            Circuit(100001, "1,2,3", "Shed outlet", 1.0, "outlet"),
+        ],
+        now,
+    )
+    app.state.emporia.connections = connections_from_status(
+        {
+            "devicesConnected": [
+                {"deviceGid": 100000, "connected": True, "offlineSince": None},
+                {
+                    "deviceGid": 100001,
+                    "connected": False,
+                    "offlineSince": "since Apr 2, 2026, 5:06 PM",
+                },
+            ]
+        }
+    )
+    with TestClient(app) as c:
+        rows = {r["name"]: r for r in c.get("/api/emporia/circuits").json()["circuits"]}
+
+    assert rows["Dryer"]["connected"] is True
+    assert rows["Dryer"]["offline_since"] is None
+    assert rows["Shed outlet"]["connected"] is False
+    assert rows["Shed outlet"]["offline_since"] == "since Apr 2, 2026, 5:06 PM"
+    store.close()
+
+
+def test_a_circuit_emporia_said_nothing_about_is_not_reported_as_online(tmp_path: Path) -> None:
+    # Silence is not health. A device missing from devicesConnected has not been
+    # declared up, and the page must be able to say nothing rather than "fine".
+    app, store, _ = _app(tmp_path)
+    app.state.emporia.repository.sync_circuits(
+        [Circuit(100000, "5", "Dryer", 2.0, "circuit")],
+        datetime(2026, 8, 15, 12, 0, tzinfo=UTC),
+    )
+    with TestClient(app) as c:
+        rows = c.get("/api/emporia/circuits").json()["circuits"]
+    assert rows[0]["connected"] is None
+    assert rows[0]["offline_since"] is None
     store.close()
 
 

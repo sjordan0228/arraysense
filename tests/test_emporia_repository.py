@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from arraysense.modules.emporia.parse import Circuit, Reading
-from arraysense.modules.emporia.repository import ChargerAudit, CircuitRepository
+from arraysense.modules.emporia.repository import ChargerAudit, ChargerChange, CircuitRepository
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -316,3 +316,70 @@ def test_two_decisions_in_the_same_second_are_both_kept(tmp_path: Path) -> None:
         "stopped charging",
     ]
     store.close()
+
+
+def test_the_newest_decision_is_readable_whether_or_not_it_was_applied(tmp_path: Path) -> None:
+    # A different question from last_applied_rate, and asked for a different
+    # reason: that one wants the last rate this service put on the charger,
+    # this one wants the last thing it decided. A caller checking whether it is
+    # about to repeat itself has to see the refusals too, because a proposal
+    # that repeats is a proposal that was never applied.
+    repo, store = _audit(tmp_path)
+    repo.record_change(900001, from_a=None, to_a=16, reason="set", applied=True, now=NOW)
+    repo.record_change(
+        900001, from_a=16, to_a=32, reason="proposed", applied=False, now=NOW + timedelta(minutes=1)
+    )
+    newest = repo.last_change(900001)
+    assert newest is not None
+    assert (newest.to_a, newest.reason, newest.applied) == (32, "proposed", False)
+    store.close()
+
+
+def test_the_newest_decision_is_the_one_for_that_charger(tmp_path: Path) -> None:
+    repo, store = _audit(tmp_path)
+    repo.record_change(900001, from_a=None, to_a=16, reason="mine", applied=True, now=NOW)
+    repo.record_change(
+        900002, from_a=None, to_a=24, reason="theirs", applied=True, now=NOW + timedelta(minutes=1)
+    )
+    newest = repo.last_change(900001)
+    assert newest is not None and newest.reason == "mine"
+    assert repo.last_change(900003) is None
+    store.close()
+
+
+def test_a_decision_matches_an_earlier_one_only_when_every_part_of_it_does() -> None:
+    # Pure, and deliberately so: whether two decisions are the same decision is
+    # a judgement about their content, not about the table they came out of.
+    earlier = ChargerChange(
+        timestamp=1,
+        device_gid=900001,
+        from_a=6,
+        to_a=32,
+        reason="restored to 32 A on startup: advisory: proposed, not applied",
+        applied=False,
+    )
+    assert earlier.same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=False)
+    # The timestamp is the one field that must not count. Two identical
+    # proposals are one proposal made twice, and they can never share a second.
+    assert ChargerChange(
+        timestamp=999, device_gid=900001, from_a=6, to_a=32, reason=earlier.reason, applied=False
+    ).same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=False)
+
+    assert not earlier.same_decision(from_a=6, to_a=24, reason=earlier.reason, applied=False)
+    assert not earlier.same_decision(from_a=10, to_a=32, reason=earlier.reason, applied=False)
+    assert not earlier.same_decision(from_a=6, to_a=32, reason="set by hand", applied=False)
+    # Applied is the sharpest of the four. A proposal and the same figure
+    # actually reaching the charger are not the same event, and treating them
+    # as one would hide the write.
+    assert not earlier.same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=True)
+
+    # An absent rate and a rate are different decisions in both directions. A
+    # charger that never said what it was at is not one sitting at 6 A, and a
+    # comparison that let those match would suppress a genuinely new proposal.
+    unknown = ChargerChange(
+        timestamp=1, device_gid=900001, from_a=None, to_a=None, reason="r", applied=False
+    )
+    assert unknown.same_decision(from_a=None, to_a=None, reason="r", applied=False)
+    assert not unknown.same_decision(from_a=6, to_a=None, reason="r", applied=False)
+    assert not unknown.same_decision(from_a=None, to_a=32, reason="r", applied=False)
+    assert not earlier.same_decision(from_a=None, to_a=32, reason=earlier.reason, applied=False)

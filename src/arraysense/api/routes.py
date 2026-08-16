@@ -3148,10 +3148,17 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
 
     ``watts`` is null for a circuit that has not reported, and stays null all
     the way to the page. Zero would be a claim that it drew nothing.
+
+    ``connected`` and ``offline_since`` are what separates the two ways of
+    drawing nothing. Two of the reference account's outlets have been offline
+    since April and August, and without these a page can only render them the
+    same as a circuit that happened to be idle. They belong to the device rather
+    than the channel, so every circuit on a dead monitor carries the same answer.
     """
     poller = _emporia(request)
     if poller is None:
         return {"circuits": []}
+    connections = poller.connections
     return {
         "circuits": [
             {
@@ -3164,6 +3171,19 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
                 # there keeps the mapping in one place, and it is presentation
                 # rather than a reading.
                 "type_gid": circuit.type_gid,
+                # None for a device Emporia said nothing about. Silence is not
+                # health, and a default of true here would quietly declare every
+                # unmentioned device up.
+                "connected": (
+                    connections[circuit.device_gid].connected
+                    if circuit.device_gid in connections
+                    else None
+                ),
+                "offline_since": (
+                    connections[circuit.device_gid].offline_since
+                    if circuit.device_gid in connections
+                    else None
+                ),
             }
             for circuit in poller.repository.latest()
         ]

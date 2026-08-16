@@ -188,6 +188,26 @@ class ChargerChange:
     reason: str
     applied: bool
 
+    def same_decision(
+        self, *, from_a: int | None, to_a: int | None, reason: str, applied: bool
+    ) -> bool:
+        """Whether a decision being made now is the one already written here.
+
+        The timestamp is the one field deliberately left out: two identical
+        decisions can never share a second, so counting it would make every
+        comparison false and the check pointless.
+
+        ``applied`` is the sharpest of the four. A rate proposed and the same
+        rate actually reaching the charger are different events, and a caller
+        suppressing the second because it matched the first would hide a write.
+        """
+        return (self.from_a, self.to_a, self.reason, self.applied) == (
+            from_a,
+            to_a,
+            reason,
+            applied,
+        )
+
 
 class ChargerAudit:
     """The record of every charge rate this service decided on.
@@ -245,13 +265,27 @@ class ChargerAudit:
             return None
         return None if row is None else int(row[0])
 
-    def recent_changes(self, limit: int = 20) -> list[ChargerChange]:
-        """The newest decisions first, for a page to show as a history."""
+    def last_change(self, device_gid: int) -> ChargerChange | None:
+        """The newest decision about this charger, applied or not.
+
+        A different question from ``last_applied_rate``, which wants the last
+        rate that reached the charger. This one wants the last thing that was
+        decided, refusals included — because the caller that needs it is one
+        checking whether it is about to write the same proposal down twice, and
+        a repeating proposal is by definition one that was never applied.
+        """
+        rows = self._read(
+            "WHERE device_gid = ? ORDER BY timestamp DESC, id DESC LIMIT 1", (device_gid,)
+        )
+        return rows[0] if rows else None
+
+    def _read(self, tail: str, params: tuple[object, ...]) -> list[ChargerChange]:
+        """One SELECT over the audit, so the row-to-object mapping exists once."""
         try:
             rows = self._store._conn.execute(
                 "SELECT timestamp, device_gid, from_a, to_a, reason, applied"
-                " FROM charger_change ORDER BY timestamp DESC, id DESC LIMIT ?",
-                (limit,),
+                f" FROM charger_change {tail}",
+                params,
             ).fetchall()
         except sqlite3.Error as exc:
             logger.warning("could not read the charger audit: %s", exc)
@@ -267,3 +301,7 @@ class ChargerAudit:
             )
             for row in rows
         ]
+
+    def recent_changes(self, limit: int = 20) -> list[ChargerChange]:
+        """The newest decisions first, for a page to show as a history."""
+        return self._read("ORDER BY timestamp DESC, id DESC LIMIT ?", (limit,))

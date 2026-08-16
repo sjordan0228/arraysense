@@ -13,13 +13,15 @@ answering the two GETs a tick makes.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from arraysense.modules.emporia import tokens
 from arraysense.modules.emporia.client import EmporiaAuthExpiredError, EmporiaUnreachableError
 from arraysense.modules.emporia.poller import EmporiaPoller
+from arraysense.modules.emporia.repository import ChargerAudit
 from arraysense.settings import (
+    CHARGE_DEFAULT_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
     SettingsStore,
@@ -288,6 +290,20 @@ async def test_a_tick_reads_the_charger(tmp_path: Path) -> None:
     store.close()
 
 
+async def test_a_tick_reads_which_devices_are_still_answering(tmp_path: Path) -> None:
+    # Held on the poller rather than stored, exactly like the charger: it is
+    # what Emporia says right now, and a stale copy of it would tell somebody a
+    # device was offline hours after it came back.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    SettingsStore(store).set(EMPORIA_ENABLED_KEY, True)
+
+    await poller.tick(NOW)
+
+    assert poller.connections[900001].connected is True
+    store.close()
+
+
 async def test_advisory_authority_never_writes_to_the_charger(tmp_path: Path) -> None:
     # The default, and the reason it is the default: nothing this module decides
     # reaches a car until somebody has watched it decide.
@@ -350,6 +366,59 @@ async def test_the_restore_is_attempted_once_and_not_every_minute(tmp_path: Path
     await poller.tick(NOW)
 
     assert client.writes == [32]
+    store.close()
+
+
+async def test_a_restart_does_not_write_the_same_proposal_down_again(tmp_path: Path) -> None:
+    # The restore is considered once per process, so a service that restarts
+    # nightly and may not write recorded the identical proposal every night for
+    # ever. The audit is read to answer "what has this service done to my car",
+    # and a hundred copies of one sentence is a page that answers nothing.
+    client = ChargerClient()
+    store = SqliteStore(str(tmp_path / "p.db"), device=TEST_DEVICE)
+    token_path = tmp_path / "tok.json"
+    tokens.save(token_path, tokens.TokenSet("id", "refresh", "2026-08-15T00:00:00+00:00"))
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "advisory")
+    ChargerAudit(store).record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW
+    )
+
+    first = EmporiaPoller(store, token_path, client=client)
+    await first.tick(NOW)
+    second = EmporiaPoller(store, token_path, client=client)
+    await second.tick(NOW + timedelta(days=1))
+
+    assert client.writes == [], "advisory writes nothing, which is why it repeats"
+    proposals = [c for c in second.audit.recent_changes() if c.reason.startswith("restored")]
+    assert len(proposals) == 1
+    store.close()
+
+
+async def test_a_proposal_that_has_changed_is_written_down(tmp_path: Path) -> None:
+    # The rule is "not the same one twice", not "only ever once". A different
+    # proposal is news, and skipping it would be the module going quiet about a
+    # decision it actually made.
+    client = ChargerClient()
+    store = SqliteStore(str(tmp_path / "p.db"), device=TEST_DEVICE)
+    token_path = tmp_path / "tok.json"
+    tokens.save(token_path, tokens.TokenSet("id", "refresh", "2026-08-15T00:00:00+00:00"))
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "advisory")
+    ChargerAudit(store).record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW
+    )
+
+    first = EmporiaPoller(store, token_path, client=client)
+    await first.tick(NOW)
+    settings.set(CHARGE_DEFAULT_KEY, 24)
+    second = EmporiaPoller(store, token_path, client=client)
+    await second.tick(NOW + timedelta(days=1))
+
+    proposals = [c for c in second.audit.recent_changes() if c.reason.startswith("restored")]
+    assert [c.to_a for c in proposals] == [24, 32]
     store.close()
 
 
