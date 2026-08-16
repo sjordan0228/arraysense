@@ -12,7 +12,7 @@
 
 ### Inverter
 
-Developed and measured against an **EG4 18kPV** with four EG4 PowerPro WallMount
+Developed and measured against an **EG4 18kPV** with four EG4 indoor 280 Ah
 modules. EG4 is the US rebrand of LuxPower, and the 12kPV, FlexBOSS21 and FlexBOSS18
 share the same register surface, so the wizard offers them on upstream evidence
 rather than on a measured unit. The 6000XP is offered with a warning instead of a
