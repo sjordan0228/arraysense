@@ -2911,6 +2911,35 @@ function paint(id, spec, data) {
     // moment the container has one.
     const width = Math.max(Math.floor(wrap.clientWidth), 320);
     const u = new uPlot(Object.assign({ width, height: spec.height }, spec.opts), data, wrap);
+    // uPlot ranges a new chart's x scale on a later tick rather than during
+    // construction, and on a first page load that commit does not always land:
+    // the chart ends up holding all its data at the right size with
+    // `scales.x.min` still null, which draws the axes and not one series. It is
+    // the blank-chart state of #159 reached by a different route, and the reason
+    // it survived that fix is that it cannot be seen from a rebuild — tearing
+    // the charts down and painting them again always ranges them, so a test that
+    // does so passes while the page is still broken. Ranging here from the data
+    // just handed over makes the commit part of building the chart instead of
+    // something owed to it on a tick that may never come.
+    // uPlot ranges a new chart's x scale on a later tick, never during
+    // construction, and on a first page load that commit lands for the first
+    // chart built and for none of the others: they end up holding all their
+    // data at the right size with `scales.x.min` still null, which draws the
+    // axes and not one series. It is the blank-chart state of #159 by another
+    // route, and nothing already on the page rescues them — measured on the
+    // reference installation, the ResizeObserver never fires and fit() never
+    // resizes, because the container is its final width before the chart is
+    // ever built.
+    //
+    // So the scale is claimed back after that tick has passed. setData with the
+    // scales reset is the one operation measured to repair a chart stuck this
+    // way — setSize and redraw() both leave it blank — and it is the same call
+    // a refresh makes. The guard means it runs only for a chart that really did
+    // fail to range, so a page that never had the problem does no extra work.
+    setTimeout(() => {
+      if (CHARTS[id] && CHARTS[id].u === u && u.scales.x.min === null
+          && data[0] && data[0].length) u.setData(data, true);
+    }, 0);
     held = CHARTS[id] = { u, ro: null };
     if (typeof ResizeObserver === 'function') {
       held.ro = new ResizeObserver((entries) => {
@@ -3008,7 +3037,7 @@ function authDialogEl() {
   dlg.innerHTML = `
     <form id="authForm">
       <h2 id="authTitle">Authentication required</h2>
-      <p class="authp">This write needs a session. Enter the password this
+      <p class="authp">This needs a session. Enter the password this
         installation was set up with.</p>
       <label for="authPassword">Password</label>
       <input id="authPassword" name="password" type="password"

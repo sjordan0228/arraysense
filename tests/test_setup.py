@@ -42,6 +42,10 @@ def test_the_payload_carries_the_tree_requirements_and_choices() -> None:
     payload = describe_setup(_config(model="18kPV"))
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     names = [model["name"] for model in eg4["models"]]
+    # Exact equality, not a subset: the failure worth catching is a gap
+    # silently dropping OUT of the list, which means a metric silently
+    # coming back. A subset check would catch additions and miss removals,
+    # which is the wrong direction. Extend this list when a gap is added.
     assert names == ["18kPV", "12kPV", "FlexBOSS21", "FlexBOSS18", "6000XP", "12000XP"]
     assert payload["transports"]["modbus_serial"] == ["serial_device"]
     assert payload["transports"]["dongle"] == ["dongle_host", "dongle_serial"]
@@ -71,7 +75,17 @@ def test_describe_setup_carries_the_unreadable_gap_list() -> None:
     eg4 = next(m for m in payload["manufacturers"] if m["name"] == "EG4")
     six = next(m for m in eg4["models"] if m["name"] == "6000XP")
     names = [g["metric"] for g in six["unreadable"]]
-    assert names == ["generator_power_w", "generator_voltage_v", "generator_frequency_hz"]
+    # Exact equality, not a subset: the failure worth catching is a gap
+    # silently dropping OUT of the list, which means a metric silently
+    # coming back. A subset check would catch additions and miss removals,
+    # which is the wrong direction. Extend this list when a gap is added.
+    assert names == [
+        "generator_power_w",
+        "generator_voltage_v",
+        "generator_frequency_hz",
+        "grid_export_energy_today_kwh",
+        "grid_export_energy_total_kwh",
+    ]
     assert all(g["reason"] and g["citation"] for g in six["unreadable"])
     assert all("cloud_available" in g for g in six["unreadable"])
 
@@ -94,7 +108,17 @@ def test_describe_setup_offers_the_12000xp_with_citation_and_gaps() -> None:
     assert model["cited_fields"] == ["pv_strings"]
     assert model["pv_strings"] == 2
     names = [g["metric"] for g in model["unreadable"]]
-    assert names == ["generator_power_w", "generator_voltage_v", "generator_frequency_hz"]
+    # Exact equality, not a subset: the failure worth catching is a gap
+    # silently dropping OUT of the list, which means a metric silently
+    # coming back. A subset check would catch additions and miss removals,
+    # which is the wrong direction. Extend this list when a gap is added.
+    assert names == [
+        "generator_power_w",
+        "generator_voltage_v",
+        "generator_frequency_hz",
+        "grid_export_energy_today_kwh",
+        "grid_export_energy_total_kwh",
+    ]
     assert all(g["reason"] and g["citation"] for g in model["unreadable"])
 
 

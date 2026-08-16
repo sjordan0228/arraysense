@@ -7,6 +7,152 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.0.10 — 15 August 2026
+
+The dashboard's three summary cards stop being unreadable on a phone.
+
+### Fixed
+
+- **Home, Battery and Grid each get the full width on a small screen.** They
+  were locked to three columns at every size, which on a phone leaves each card
+  about 109 pixels — not enough for a figure like `7.51 kW`, so every one of
+  them broke across two lines. The battery card came off worst, because its
+  level icon and the gap beside it take another 35 pixels from the same row,
+  leaving the number less room than its neighbours and stranding the icon next
+  to a wrapped figure. Below 560 pixels the three now stack, each as wide as
+  the production card above them, and the icon sits beside the reading the way
+  it was drawn to. Nothing changes on a tablet or a desktop.
+
+## 1.0.9 — 15 August 2026
+
+The Graphs page stops opening with most of its charts blank.
+
+### Fixed
+
+- **The tab you land on draws every band, not just the first.** Opening Graphs
+  in a new session left most of its charts empty — the axes drawn, the value
+  and peak above each one correct, and no trace anywhere — until you switched
+  the range and came back. The charts had their data the whole time and were
+  the right size; what they were missing was a time axis. uPlot works one out
+  on a tick after the chart is built, and on a first page load that tick
+  arrived for the first chart built and for none of the others, which is why
+  exactly one band on the tab looked right. Nothing already on the page would
+  ever prompt the rest, so they stayed blank until something re-handed them
+  their data. They now claim that axis back for themselves. Reported against
+  both Chrome and Safari, and confirmed fixed on the reference installation.
+
+## 1.0.8 — 14 August 2026
+
+Your email and your serials stop being readable by anything on the network.
+
+### Fixed
+
+- **The inverter's serial is no longer handed out in the clear.** Anything that
+  could reach the port could read it from `/api/capabilities`, unmasked, with
+  no password anywhere in the picture. It now goes out with its middle
+  replaced, the same way the settings page has always shown it. This applies
+  whether or not you use a password, because it was never something to give
+  away. Nothing on any page read that value, so nothing looks different.
+
+- **With a password set, the settings a stranger could read are withheld
+  rather than merely masked.** Your contact email, the dongle address and both
+  serials are simply absent to a caller with no session — not blanked, not
+  starred, absent. Masking stops a value being read off the page; it does not
+  stop it being read.
+
+### Notes
+
+- **The dashboard is untouched, which is the point.** A wall display polls
+  readings, capabilities and status, and every one of those stays open — it
+  never asks for a password and cannot be logged out. Even the display
+  preferences it reads from the settings still come through; those were never
+  sensitive, so only the four identifying values are withheld.
+
+- The connection editor on the Settings page asks for the password when a
+  password is set. It uses the same prompt every protected change already uses.
+
+- **Nothing changes on an installation with no password**, apart from the
+  masked serial above.
+
+- Still open, and deliberately not decided here: whether the service should
+  listen only on the machine itself by default rather than on the whole
+  network. Changing that would take the dashboard away from every existing
+  installation on upgrade, and it deserves its own release and its own warning.
+
+## 1.0.7 — 14 August 2026
+
+The service notices when the inverter answering is not the one configured.
+
+### Added
+
+- **A wrong model is caught on connection rather than never.** The model was
+  something you told the service and it believed. It now reads the inverter's
+  own answer once when it connects, and compares. Two models a keystroke apart
+  — the 12kPV is a hybrid, the 12000XP is off-grid — are treated oppositely, so
+  choosing the wrong one meant a register storing a seconds counter as
+  generator watts, silently, forever.
+
+  **A machine of the wrong *family* stops collection**, the way a wrong serial
+  already does: off-grid and hybrid disagree about what their registers mean,
+  so the readings would be wrong rather than missing, and there is no honest
+  way to keep writing them. **A different model within the same family warns
+  and keeps collecting** — those read the same registers the same way, and only
+  the string count and the manufacturer's figures differ.
+
+  The warning appears on the dashboard and in `arraysense status`, and names
+  the risk rather than the discrepancy.
+
+- **`/api/capabilities` says where the model came from.** `configured` beside
+  `detected`, so a page or a script can tell what you declared from what the
+  wire reported.
+
+### Fixed
+
+- **The example configuration described detection that never existed.** It said
+  a blank model meant the driver would identify the machine itself. Nothing ever
+  did that — and on an off-grid inverter a blank model means it is read as a
+  hybrid, which stores exactly the readings the right model would withhold. The
+  comment now says so.
+
+### Notes
+
+- **Nothing changes for an installation with no model set.** No extra reads, no
+  warning, nothing on the page. With nothing configured there is nothing to
+  disagree with.
+
+- Detection reports; it never reconfigures. What the store writes is still
+  decided by what you configured, not by what the wire said.
+
+- The register is read once per connection, never per poll — the dongle has one
+  client slot and what the inverter *is* does not change between readings. A
+  read that fails is recorded as a gap and retried, never treated as a
+  disagreement: a crossed reply on the wire must not stop a correctly
+  configured machine from collecting.
+
+## 1.0.6 — 14 August 2026
+
+An off-grid machine stops reporting an export figure it can never earn.
+
+### Fixed
+
+- **The grid-export counters are no longer offered on the 6000XP or the
+  12000XP.** EG4 documents the family as off-grid capable with no grid
+  sellback, so those counters can only ever read zero. Nothing false was being
+  stored — unlike the generator registers, these hold exactly what they claim —
+  but a figure of 0.0 kWh reads as *measured, and it was zero* rather than as a
+  machine that cannot export at all. Absent is the honest answer.
+
+### Notes
+
+- Grid **import** is untouched and still read: these machines charge from the
+  grid even though they cannot sell back to it.
+
+- On an installation that already ran an earlier release with one of these
+  models selected, the export columns exist and hold zeros. They stop being
+  written, but the stored zeros remain — the same as any other reading recorded
+  before the release that stopped taking it. On the dashboard nothing changes
+  either way, because a zero flow and an absent one draw the same: no ribbon.
+
 ## 1.0.5 — 14 August 2026
 
 EG4's off-grid inverters are supported honestly: the 6000XP stops reporting a

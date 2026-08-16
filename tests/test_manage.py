@@ -291,6 +291,38 @@ def test_status_says_unreadable_rather_than_empty(
     assert "empty" not in out
 
 
+def test_status_names_a_model_mismatch(monkeypatch: pytest.MonkeyPatch, capsys: Any) -> None:
+    """The connect-time check's warning reaches the terminal, not just the API."""
+    monkeypatch.setattr(manage, "configured_port", lambda: 8080)
+    monkeypatch.setattr(
+        manage,
+        "service_state",
+        lambda port, timeout=5.0: (
+            "collecting",
+            {
+                "version": "1.0.6",
+                "running": True,
+                "connected": True,
+                "staleness": {"verdict": "fresh"},
+                "model_check": {
+                    "verdict": "model_mismatch",
+                    "message": "configured as 12kPV; the inverter reports 18kPV",
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(manage, "_probe", lambda url, timeout=5.0: None)
+    monkeypatch.setattr(manage, "_database_path", lambda: "/var/lib/arraysense/arraysense.db")
+    monkeypatch.setattr(
+        manage,
+        "database_facts",
+        lambda path: {"bytes": 1048576, "first": None, "last": None, "readable": True},
+    )
+    assert manage.cmd_status([]) == 0
+    out = capsys.readouterr().out
+    assert "configured as 12kPV" in out
+
+
 def test_status_reports_a_real_date_range_from_the_real_schema(
     tmp_path: Any,
 ) -> None:

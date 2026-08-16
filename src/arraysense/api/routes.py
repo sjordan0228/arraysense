@@ -84,6 +84,7 @@ from arraysense.settings import (
     SETTING_TIMEZONE,
     WEATHER_INTERVAL_KEY,
     SettingsStore,
+    _mask,
     check_backup_directory,
     check_serial_device,
     describe,
@@ -150,6 +151,22 @@ _ReadStore = Annotated[SqliteStore, Depends(_read_store)]
 _SESSION_COOKIE = "arraysense_session"
 
 
+def _has_session(request: Request) -> bool:
+    """Whether this caller may see the protected read surface.
+
+    With no password set the answer is always yes — that is the whole
+    optional-ness of the feature. With one stored, only a session cookie the
+    sessions table recognises counts. The read-side filtering and the write
+    guard share this one answer, so they cannot disagree about who is allowed
+    to see the identifying values.
+    """
+    settings = SettingsStore(request.app.state.store)
+    if not password_is_set(settings):
+        return True
+    token = request.cookies.get(_SESSION_COOKIE)
+    return token is not None and request.app.state.sessions.valid(token)
+
+
 async def _require_write(request: Request) -> None:
     """Allow an unauthenticated write only while no password is set.
 
@@ -161,13 +178,8 @@ async def _require_write(request: Request) -> None:
     on the LAN; the traffic is plain HTTP and observable, and the auth
     endpoints' docstrings say so rather than claiming more.
     """
-    settings = SettingsStore(request.app.state.store)
-    if not password_is_set(settings):
-        return
-    token = request.cookies.get(_SESSION_COOKIE)
-    if token is not None and request.app.state.sessions.valid(token):
-        return
-    raise HTTPException(status_code=401, detail="authentication required")
+    if not _has_session(request):
+        raise HTTPException(status_code=401, detail="authentication required")
 
 
 _INVERTER_NAMES = frozenset(spec.name for spec in INVERTER_METRICS)
@@ -611,6 +623,14 @@ async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
         # measurement meaning none happened, and claiming it from something that
         # never looked is the same error as rendering a missing reading as 0.
         "misroutes": getattr(service.source, "misroutes", None),
+        # What a connect-time model read found, when it found a disagreement
+        # worth saying. A family mismatch never reaches here — it raises at
+        # connect and stops the collector, like a wrong serial does — so the
+        # only shape this carries is the exact-model warning, and None is what
+        # an unconfigured, a correctly configured, and an unreadable
+        # installation all get. The dashboard polls this endpoint already; it
+        # needs no second request to say so.
+        "model_check": getattr(service.source, "model_check", None),
         # The verdict the stale banner prints. Reached here because it is a
         # judgement, and one made in the browser is one that can disagree with
         # the watchdog about whether the collector is running.
@@ -711,8 +731,10 @@ async def capabilities(request: Request) -> dict[str, Any]:
     dongle's.
 
     ``devices`` is a list because a parallel stack is several inverters behind
-    one service, even though today's collector polls one. Three states, kept
-    apart on the project's own rule that absent capability is not absent data:
+    one service, even though today's collector polls one. The serial in each
+    entry is masked unconditionally — an installation secret by this project's
+    own rules, and nothing on any page renders it. Three states, kept apart on
+    the project's own rule that absent capability is not absent data:
     a driver that describes itself gets a full entry; a bare InverterSource —
     which names its device but carries no declaration — gets an entry with its
     known serial and null everywhere a declaration would answer, because "not
@@ -723,13 +745,27 @@ async def capabilities(request: Request) -> dict[str, Any]:
     source = request.app.state.service.source
     identity = getattr(source, "identity", None)
     declared = getattr(source, "capabilities", None)
+    detection = getattr(source, "model_detection", None)
     serial = identity.serial if identity is not None else getattr(source, "device", None)
     devices: list[dict[str, Any]] = []
     if serial is not None:
         entry: dict[str, Any] = {
-            "device": serial,
+            "device": _mask(serial),
             "driver": identity.driver if identity is not None else None,
+            # ``model`` is what the installation is configured as. Detection
+            # reports, never reconfigures, so the wire's answer is a second
+            # fact carried beside it — absent entirely (None) for a source that
+            # has no detection to report, not absent data about the device.
             "model": identity.model if identity is not None else None,
+            "model_detection": (
+                {
+                    "checked": detection.checked,
+                    "detected": detection.detected,
+                    "family": detection.family,
+                }
+                if detection is not None
+                else None
+            ),
             "pv_strings": None,
             "energy": None,
             "backup_output": None,
@@ -882,11 +918,18 @@ async def read_settings(request: Request) -> dict[str, Any]:
     the moment either changes, and the drift shows up as a control offering a
     value the server then refuses.
 
-    Identifying values come back masked. There is no authentication here, so
-    this answers anything that can reach the port.
+    Identifying values come back masked. With a password set and no session
+    they are omitted entirely rather than masked — absent is the project's own
+    answer to data a caller may not have, and a wall display that never logs
+    in still gets the display defaults without ever seeing a contact email or
+    a serial. With a valid session, or with no password set, the payload is
+    exactly what it always was.
     """
     settings = SettingsStore(request.app.state.store)
-    return {"fields": describe(), "values": settings.public()}
+    values = settings.public()
+    if not _has_session(request):
+        values = {key: value for key, value in values.items() if not lookup_setting(key).secret}
+    return {"fields": describe(), "values": values}
 
 
 def _reject_unbootable_connection(request: Request, wanted: dict[str, Any]) -> None:
@@ -2006,15 +2049,21 @@ def forecast(
     }
 
 
-@router.get("/setup")
+@router.get("/setup", dependencies=[Depends(_require_write)])
 async def setup(request: Request) -> dict[str, Any]:
     """Everything the setup wizard renders, from one place.
 
     Served on the loop rather than the threadpool: the payload is registry
     metadata, a directory listing and the already-loaded config — no tier
     scan anywhere near it. The connection values it echoes are redacted the
-    same way the settings API redacts them, because this page has no auth
-    (#34) and a serial number is an installation secret.
+    same way the settings API redacts them, because a serial number is an
+    installation secret.
+
+    It carries the connection editor values, so with a password set it
+    requires a session like every other protected endpoint. The wall display
+    never requests it, and its 401 is what gives the settings page a reason
+    to prompt. First-run setup has no database and therefore no password, so
+    the guard passes through there.
     """
     return describe_setup(request.app.state.config)
 

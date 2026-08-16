@@ -368,9 +368,13 @@ def example_toml() -> str:
         f'driver = "{DEFAULT_DRIVER}"\n'
         "\n"
         "# Which model within the driver family. The wizard sets this from the\n"
-        "# model you choose; a blank value means the driver will try to identify\n"
-        "# the model from the inverter's own reply. Set it explicitly to skip\n"
-        "# that detection or to pin a model the driver does not recognise.\n"
+        "# model you choose, and it is worth setting: a blank value falls back to\n"
+        "# the family's own defaults, which describe the hybrids. On an off-grid\n"
+        "# machine — a 6000XP or a 12000XP — that is the wrong description, and\n"
+        "# readings the model would have withheld get stored instead.\n"
+        "# A blank value also stands down the check that would otherwise notice\n"
+        "# the inverter answering is not the model configured: with nothing\n"
+        "# configured there is nothing to disagree with.\n"
         'model = ""\n'
         "\n"
         "# Where battery module data comes from. A blank value derives the source\n"

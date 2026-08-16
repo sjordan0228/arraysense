@@ -31,9 +31,13 @@ poll_interval = 11.0
 driver = "eg4_luxpower"
 
 # Which model within the driver family. The wizard sets this from the
-# model you choose; a blank value means the driver will try to identify
-# the model from the inverter's own reply. Set it explicitly to skip
-# that detection or to pin a model the driver does not recognise.
+# model you choose, and it is worth setting: a blank value falls back to
+# the family's own defaults, which describe the hybrids. On an off-grid
+# machine — a 6000XP or a 12000XP — that is the wrong description, and
+# readings the model would have withheld get stored instead.
+# A blank value also stands down the check that would otherwise notice
+# the inverter answering is not the model configured: with nothing
+# configured there is nothing to disagree with.
 model = ""
 
 # Where battery module data comes from. A blank value derives the source

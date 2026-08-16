@@ -57,6 +57,23 @@ class DeviceIdentityError(Exception):
     """
 
 
+class ModelMismatchError(Exception):
+    """The inverter that answered is a different kind of machine than configured.
+
+    The hybrid and off-grid families answer at the same register addresses with
+    different meanings — the 12000XP's register 123 is a seconds counter where
+    the hybrid's is generator watts — so collecting against the wrong family
+    writes wrong numbers into a history that cannot be un-written. The exact
+    model differing inside one family is not this: those agree about what their
+    registers hold, so it warns rather than stops.
+
+    Deliberately outside every error tuple the collector catches, like
+    DeviceIdentityError. A configuration that cannot heal itself must stop the
+    loop where a watchdog and an operator can see it, rather than be filed as a
+    gap and retried politely forever.
+    """
+
+
 class SampleBuildError(Exception):
     """The inverter answered and the reply could not be made into a sample.
 
