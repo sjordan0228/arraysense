@@ -827,6 +827,22 @@ function capHasModuleMetric(caps, metric) {
   if (!caps || !Array.isArray(caps.battery_module_metrics)) return true;
   return caps.battery_module_metrics.includes(metric);
 }
+
+// Whether the per-pack views exist for this device at all — the dashboard's
+// Battery modules card and the Graphs page's Packs section. capHasModuleMetric
+// above answers which readings a pack relays; this answers whether there are
+// packs to relay them, which is the question the whole card turns on.
+//
+// Only an explicit no suppresses, the same rule as capHasMetric: a device that
+// has not declared keeps both views. The distinction matters because the card
+// carries an advisory — "the battery block is populated over CAN, check the
+// packs are in closed loop" — that is a real fault on a machine with packs and
+// a wild goose chase on a machine without them. tourHasModules asks the same
+// field and demands an explicit yes instead, because a tour that describes a
+// card the reader cannot find is worse than a tour that skips a step.
+function capHasModules(caps) {
+  return !caps || caps.per_module_battery !== false;
+}
 // <<< caps-logic
 
 // ---------------------------------------------------------------------------

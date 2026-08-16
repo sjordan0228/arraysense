@@ -515,10 +515,21 @@ const DEFAULT_GRAPH_TAB = 'all';
 const GRAPH_TAB_KEY = 'as.graphsTab';
 const GRAPH_PIN_KEY = 'as.graphsPinWeather';
 
+// The tabs this device has. Packs is hardware rather than a reading, so a
+// machine whose driver declares no per-module battery is not offered a tab
+// that opens an empty section. Everything else is on every device, and an
+// undeclared one keeps the lot — capHasModules is what decides, so the tab bar
+// and the section agree by construction rather than by both remembering to.
+function graphTabsFor(hasModules) {
+  return GRAPH_TABS.filter((t) => t.key !== 'packs' || hasModules !== false);
+}
+
 // The tab the reader should land on. The URL fragment wins when it names a tab;
-// otherwise the remembered choice, if it names a tab; otherwise All.
-function wantedGraphTab(hash, stored) {
-  const keys = GRAPH_TABS.map((t) => t.key);
+// otherwise the remembered choice, if it names a tab; otherwise All. `tabs` is
+// the bar this device actually has, so a link to /graphs#packs sent between two
+// owners lands on All rather than on nothing when the receiver has no packs.
+function wantedGraphTab(hash, stored, tabs = GRAPH_TABS) {
+  const keys = tabs.map((t) => t.key);
   if (hash && keys.includes(hash)) return hash;
   if (stored && keys.includes(stored)) return stored;
   return DEFAULT_GRAPH_TAB;
@@ -530,9 +541,13 @@ function wantedGraphTab(hash, stored) {
 // pinning can never draw it twice — the section is one element, shown once. A
 // weather section with nothing recorded stays hidden whatever the pin says,
 // because two permanently empty charts read as a fault (see load()).
-function graphSectionVisible(section, tab, pin, weatherHasData) {
+// The packs rule is the same one in a different unit: a device that declares no
+// per-module battery has no packs, so the section is hardware that does not
+// exist rather than data that has not arrived. Unknown (the default) keeps it.
+function graphSectionVisible(section, tab, pin, weatherHasData, hasModules = true) {
   if (section === 'weather' && !weatherHasData) return false;
   if (section === 'weather' && pin) return true;
+  if (section === 'packs' && hasModules === false) return false;
   return tab === 'all' || tab === section;
 }
 
@@ -551,18 +566,19 @@ let activeTab = DEFAULT_GRAPH_TAB;
 let weatherPinned = false;
 let weatherHasData = true;
 
-const sectionVisible = (key) => graphSectionVisible(key, activeTab, weatherPinned, weatherHasData);
+const sectionVisible = (key) =>
+  graphSectionVisible(key, activeTab, weatherPinned, weatherHasData, hasModules);
 
 function wantedTab() {
   let held = null;
   try { held = localStorage.getItem(GRAPH_TAB_KEY); } catch (e) { /* private browsing */ }
-  return wantedGraphTab(location.hash.replace('#', ''), held);
+  return wantedGraphTab(location.hash.replace('#', ''), held, graphTabsFor(hasModules));
 }
 
 function drawTabs() {
   const bar = $('tabs');
   if (!bar) return;
-  bar.innerHTML = GRAPH_TABS.map((t) =>
+  bar.innerHTML = graphTabsFor(hasModules).map((t) =>
     `<button type="button" role="tab" data-tab="${esc(t.key)}">${esc(t.title)}</button>`).join('');
   bar.querySelectorAll('button').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -660,9 +676,14 @@ const neededBy = (b) => b.needs || (b.metric ? [b.metric] : []);
 // hardware that does not exist is not rendered at all. capHasMetric answers
 // yes where nothing has declared — no endpoint, a failed fetch, a bare source
 // — so unknown keeps every band, which is what this page always drew. The
-// spread and pack bands carry no inverter metric and pass untouched: they key
-// on serials, not on this list.
+// spread and pack bands carry no inverter metric and pass the metric filter
+// untouched: they key on serials, not on this list. They answer to
+// `hasModules` instead, since a device that declares no per-module battery has
+// no serials to key on and a spread between packs that do not exist is not a
+// number — the band would carry "needs two or more packs reporting" for the
+// life of the installation.
 let bands = BANDS;
+let hasModules = true;
 
 async function loadCaps() {
   let device = null;
@@ -670,7 +691,9 @@ async function loadCaps() {
     const r = await fetch('/api/capabilities');
     if (r.ok) device = ((await r.json()).devices || [])[0] || null;
   } catch (err) { /* unknown: every band stays */ }
-  bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)));
+  hasModules = capHasModules(device);
+  bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)))
+    .filter((b) => hasModules || !b.derived);
 }
 
 // What the kept bands read, split by which writer's clock the metric lives on.
@@ -1140,18 +1163,25 @@ async function load() {
   const width = widthFor(range.seconds);
   const packWidth = moduleWidthFor(range.seconds);
   const problems = [];
+  // The pack ask is skipped outright on a device that declares no per-module
+  // battery: nothing draws it, so asking for it is a rollup query and a
+  // response body spent on rows that cannot exist. Skipped is not failed —
+  // it must not raise the "per-pack temperature unavailable" note below,
+  // which names a fault on a machine that has packs.
   const [inv, site, packs] = await Promise.all([
     get(`/api/history?${when}&metrics=${inverterMetricsAsk()}&width=${width}`).catch(() => null),
     get(`/api/history?${when}&metrics=${siteMetricsAsk()}&width=${width}`).catch(() => null),
-    get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
-      .catch(() => null),
+    hasModules
+      ? get(`/api/battery/history?${when}&metrics=${PACK_METRICS}&width=${packWidth}`)
+        .catch(() => null)
+      : null,
   ]);
   // A failed poll must not tear the charts down: destroying them takes the
   // owner's zoom with it over a problem that usually lasts one request, and
   // what is on screen is still the last thing the inverter actually said.
   if (!inv) problems.push('history unavailable — showing the last successful read');
   if (!site) problems.push('site weather unavailable — showing the last successful read');
-  if (!packs) problems.push('per-pack temperature unavailable');
+  if (!packs && hasModules) problems.push('per-pack temperature unavailable');
   // A rollup is not among them. On the longer spans it is exactly what this
   // page asked to have chosen for it, and each side names the tier it got
   // whenever an answer arrives — the inverter's in the header, the packs' in

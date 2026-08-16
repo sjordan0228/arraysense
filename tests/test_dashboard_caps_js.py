@@ -168,3 +168,18 @@ def test_the_bms_witness_is_state_of_charge() -> None:
         + 'capHasMetric(BARE, "battery_soc_pct")]));'
     )
     assert out == "[true,false,true]"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_only_an_explicit_no_hides_the_pack_views() -> None:
+    # The Battery modules card and the Graphs Packs section draw hardware the
+    # device may not have. A machine that declares none must not be offered a
+    # card saying its CAN link is down, since there is no link to be down; a
+    # machine that has not declared keeps both, because unknown is not absent.
+    out = _run(
+        CAPS
+        + "console.log(JSON.stringify(["
+        + "capHasModules(FULL), capHasModules(SMALL), "
+        + "capHasModules(BARE), capHasModules(null), capHasModules({})]));"
+    )
+    assert out == "[true,false,true,true,true]"
