@@ -38,6 +38,7 @@ from arraysense.modules.emporia.client import (
     EmporiaUnreachableError,
 )
 from arraysense.modules.emporia.control import (
+    APP,
     Limits,
     decide,
     restore_target,
@@ -262,7 +263,7 @@ class EmporiaPoller:
         authority = self._settings.get(CHARGER_AUTHORITY_KEY)
         verdict = decide(
             target,
-            authority=authority if isinstance(authority, str) else "advisory",
+            authority=authority if isinstance(authority, str) else APP,
             limits=self.limits(),
             now=now,
         )

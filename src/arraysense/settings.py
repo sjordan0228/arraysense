@@ -1137,18 +1137,21 @@ SETTINGS: tuple[SettingSpec, ...] = (
     SettingSpec(
         key=CHARGER_AUTHORITY_KEY,
         kind="choice",
-        choices=("advisory", "limited", "full"),
-        default="advisory",
-        label="What the module may do with the EV charger",
+        choices=("app", "advisory", "limited", "full"),
+        default="app",
+        label="Who controls the EV charger",
         help=(
-            "advisory proposes a charge rate and changes nothing, which is the "
-            "default and the only setting that is safe before you have watched "
-            "this behave. limited lets it set a rate between your floor and "
-            "ceiling. full also lets it stop and start charging. Whichever you "
-            "pick, the floor, the ceiling, the audit trail and the restore on "
-            "startup all still apply — those are not settings, because a charge "
-            "rate persists for ever once set and nothing at Emporia's end will "
-            "ever put it back."
+            "app leaves it to the Emporia app and this service never writes to "
+            "the charger — the default, because installing this is not the same "
+            "as asking it to take over your car charger. advisory lets it "
+            "propose a rate and change nothing. limited lets it set a rate "
+            "between your floor and ceiling. full also lets it stop and start "
+            "charging. Whichever you pick, the floor, the ceiling, the audit "
+            "trail and the restore on startup all still apply — those are not "
+            "settings, because a charge rate persists for ever once set and "
+            "nothing at Emporia's end will ever put it back. Only one "
+            "controller should have the charger: Emporia ships four of its own, "
+            "and the Charger page says which are switched on."
         ),
     ),
     SettingSpec(

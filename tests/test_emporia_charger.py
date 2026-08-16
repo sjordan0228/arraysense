@@ -201,3 +201,78 @@ def test_an_icon_nobody_has_seen_leaves_the_question_open() -> None:
     missing = charger_from_status({"evChargers": [_charger(icon=None)]})
     assert missing is not None
     assert missing.plugged_in is None
+
+
+# --- the shapes a reply can arrive in --------------------------------------
+
+
+def test_a_first_entry_that_is_not_a_record_reads_as_no_charger() -> None:
+    got = charger_from_status({"evChargers": ["not-a-dict", {"deviceGid": 900001}]})
+    assert got is None
+
+
+def test_another_loads_settings_are_not_read_as_this_chargers() -> None:
+    # The load list holds every load on the account. Matching on the wrong one
+    # would put somebody else's schedule in this charger's conflict warning.
+    got = charger_from_status(
+        {
+            "evChargers": [{"deviceGid": 900001, "loadGid": 900002}],
+            "loads": [{"loadGid": 900003, "schedulesEnabled": True}],
+        }
+    )
+    assert got is not None
+    assert got.conflicts == ()
+
+
+def test_a_charger_that_reported_no_rate_has_none_rather_than_zero() -> None:
+    got = charger_from_status(
+        {"evChargers": [{"deviceGid": 900001, "status": "Standby", "icon": "CarNotConnected"}]}
+    )
+    assert got is not None
+    assert got.rate_a is None
+    assert got.max_rate_a is None
+
+
+def test_a_switch_that_is_not_a_boolean_is_unknown_rather_than_off() -> None:
+    got = charger_from_status(
+        {"evChargers": [{"deviceGid": 900001, "chargerOn": "yes", "icon": "CarConnected"}]}
+    )
+    assert got is not None
+    assert got.on is None
+
+
+def test_the_first_charger_is_the_one_read() -> None:
+    # A limitation worth stating rather than leaving to be discovered: an
+    # account with two chargers gets the first, and the second is invisible.
+    got = charger_from_status(
+        {
+            "evChargers": [
+                {"deviceGid": 900001, "chargingRate": 6},
+                {"deviceGid": 900005, "chargingRate": 16},
+            ]
+        }
+    )
+    assert got is not None
+    assert got.device_gid == 900001
+
+
+def test_another_devices_connection_is_not_read_as_this_ones() -> None:
+    got = charger_from_status(
+        {
+            "evChargers": [{"deviceGid": 900001, "icon": "CarConnected"}],
+            "devicesConnected": [{"deviceGid": 900002, "connected": True}],
+        }
+    )
+    assert got is not None
+    assert got.connected is None, "unknown, not assumed online"
+
+
+def test_conflicts_from_both_records_are_listed_in_a_stable_order() -> None:
+    got = charger_from_status(
+        {
+            "evChargers": [{"deviceGid": 900001, "loadGid": 900002, "loadManagementEnabled": True}],
+            "loads": [{"loadGid": 900002, "schedulesEnabled": True}],
+        }
+    )
+    assert got is not None
+    assert got.conflicts == ("load management", "schedules")

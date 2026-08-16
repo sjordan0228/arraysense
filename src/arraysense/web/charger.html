@@ -53,6 +53,14 @@
   form.login input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
     border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;min-width:210px}
   form.login input:focus{outline:2px solid var(--pv);outline-offset:1px;border-color:transparent}
+  /* A slider rather than a number box, because amps here are a quantity you feel
+     your way to rather than type. The stops mark the ones that mean something:
+     the usual minimum a car accepts, and the common breaker sizes. The reading
+     beside it is what makes a slider honest — a handle with no number is a
+     guess, and this one has a car on the end of it. */
+  form.login input[type=range]{min-width:230px;accent-color:var(--pv);padding:0}
+  form.login output{font-variant-numeric:tabular-nums;font-weight:600;min-width:52px;
+    display:inline-block;text-align:right}
   form.login button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:8px;padding:8px 14px;font:inherit;font-size:13px;cursor:pointer}
   form.login button:hover:not(:disabled){background:var(--tint-3);color:var(--ink)}
@@ -94,7 +102,10 @@
     <p class="note err" id="chargerConflicts" hidden></p>
     <form class="login" id="rateForm">
       <label for="amps" class="muted">Set the rate</label>
-      <input type="number" id="amps" min="1" max="80" step="1" style="min-width:90px">
+      <input type="range" id="amps" min="6" max="48" step="1" list="ampstops">
+      <datalist id="ampstops"><option value="6"></option><option value="16"></option>
+        <option value="32"></option><option value="48"></option></datalist>
+      <output for="amps" id="ampsOut">—</output>
       <button type="submit" id="rateGo">Apply</button>
       <button type="button" id="powerGo">Stop charging</button>
       <span class="err" id="rateErr"></span>
@@ -155,15 +166,47 @@ async function loadCharger() {
 
   // A warning, never a block. It is the owner's charger and their account; what
   // they need is the name of the exact setting that will fight this one.
+  // One sentence, and which one depends on who the owner said has the wheel.
+  // The conflict only matters if this service is meant to be driving; while the
+  // app has it, Emporia's own controllers being on is simply how it should be.
   const conflicts = c.conflicts || [];
+  // One setting now, four positions. Anything above 'app' means this service
+  // has the charger — advisory still has it, it simply proposes.
+  const mine = c.authority !== 'app';
   const warn = $('chargerConflicts');
-  warn.hidden = conflicts.length === 0;
-  if (conflicts.length) {
-    warn.textContent = `Emporia is also controlling this charger: ${conflicts.join(', ')}. `
-      + 'Two controllers will move the same rate and undo each other. Turn those off in the '
-      + 'Emporia app if you want this service to have it.';
+  if (mine && conflicts.length) {
+    warn.hidden = false;
+    warn.className = 'note err';
+    warn.textContent = `You have given this service the charger, but Emporia is still `
+      + `controlling it too: ${conflicts.join(', ')}. Two controllers will move the same `
+      + `rate and undo each other. Turn those off in the Emporia app — Charger Settings, `
+      + `or Menu, Manage Devices, then your charger.`;
+  } else if (!mine) {
+    warn.hidden = false;
+    warn.className = 'note';
+    warn.textContent = conflicts.length
+      ? `The Emporia app manages this charger — currently with ${conflicts.join(', ')}. `
+        + `This service will not touch it. Hand it over in Settings if you want it to.`
+      : 'The Emporia app manages this charger. This service will not touch it. Hand it '
+        + 'over in Settings if you want it to.';
+  } else {
+    warn.hidden = false;
+    warn.className = 'note';
+    warn.textContent = c.authority === 'advisory'
+      ? 'This service has the charger and is only proposing — it will not write. '
+        + 'Nothing at Emporia is contesting it.'
+      : 'This service manages this charger, and nothing at Emporia is contesting it.';
   }
-  if (rate !== null && !$('amps').value) $('amps').value = rate;
+  // No controls at all while the charger is not ours. A button that would be
+  // refused is worse than no button: it invites the press and then explains.
+  $('rateForm').hidden = !mine;
+  // The slider starts where the charger actually is, so the first thing it says
+  // is true rather than a default nobody chose. Left alone once the owner has
+  // moved it: yanking a handle out from under a hand is worse than being stale.
+  if (rate !== null && !$('amps').dataset.touched) {
+    $('amps').value = String(Math.min(48, Math.max(6, rate)));
+    $('ampsOut').textContent = $('amps').value + ' A';
+  }
   // The button says what pressing it will do, not what the charger is doing.
   // A button labelled with the current state is a coin toss every time.
   $('powerGo').textContent = c.on === false ? 'Start charging' : 'Stop charging';
@@ -180,6 +223,11 @@ async function loadCharger() {
       + `<td>${esc(ch.reason)}</td></tr>`;
   }).join('') || '<tr><td colspan="3" class="muted">Nothing has changed the rate yet.</td></tr>';
 }
+
+$('amps').addEventListener('input', () => {
+  $('amps').dataset.touched = '1';
+  $('ampsOut').textContent = $('amps').value + ' A';
+});
 
 $('powerGo').addEventListener('click', async () => {
   const err = $('rateErr');
@@ -216,6 +264,8 @@ $('rateForm').addEventListener('submit', async (event) => {
     const body = await r.json().catch(() => ({}));
     if (!r.ok) err.textContent = body.detail || 'That did not work.';
     else if (body.refused) err.textContent = body.refused;
+    // Applied: let the charger's own answer drive the handle again.
+    delete $('amps').dataset.touched;
     await loadCharger();
   } catch (e) {
     err.textContent = 'Could not reach this service.';

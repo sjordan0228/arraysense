@@ -19,7 +19,11 @@ from pathlib import Path
 from arraysense.modules.emporia import tokens
 from arraysense.modules.emporia.client import EmporiaAuthExpiredError, EmporiaUnreachableError
 from arraysense.modules.emporia.poller import EmporiaPoller
-from arraysense.settings import CHARGER_AUTHORITY_KEY, EMPORIA_ENABLED_KEY, SettingsStore
+from arraysense.settings import (
+    CHARGER_AUTHORITY_KEY,
+    EMPORIA_ENABLED_KEY,
+    SettingsStore,
+)
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -346,4 +350,22 @@ async def test_the_restore_is_attempted_once_and_not_every_minute(tmp_path: Path
     await poller.tick(NOW)
 
     assert client.writes == [32]
+    store.close()
+
+
+async def test_the_charger_is_the_apps_until_the_owner_says_otherwise(tmp_path: Path) -> None:
+    # The default, and the point of it: installing this service is not the same
+    # as asking it to take over somebody's car charger. Full authority is not
+    # enough on its own.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "app")
+    poller.audit.record_change(900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW)
+
+    await poller.tick(NOW)
+
+    assert client.writes == []
+    assert "Emporia app" in poller.audit.recent_changes()[0].reason
     store.close()

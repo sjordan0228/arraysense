@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 
 from arraysense.modules.emporia.control import (
     ADVISORY,
+    APP,
     FULL,
     LIMITED,
     Limits,
@@ -208,3 +209,65 @@ def test_what_was_refused_is_reported_even_when_nothing_is_applied() -> None:
     got = decide(40, authority=ADVISORY, limits=LIMITS, now=NOW)
     assert got.apply is False
     assert "ceiling" in (got.refused or "")
+
+
+# --- who is driving ---------------------------------------------------------
+#
+# Emporia ships four of its own controllers for a charger. Rather than only
+# warning that they are on, the owner says outright which side has the wheel —
+# and while it is Emporia's, nothing here writes at all, whatever authority
+# says. Two services taking turns at one slider is worse than either alone.
+
+
+def test_while_the_app_manages_the_charger_nothing_here_writes() -> None:
+    got = decide(20, authority=APP, limits=LIMITS, now=NOW)
+    assert got.apply is False
+    assert "Emporia" in got.reason
+    assert got.rate_a == 20, "it still says what it would have done"
+
+
+def test_the_app_managing_it_also_stops_a_stop() -> None:
+    # The heavier power needs the same gate. Full authority plus "the app has
+    # this" must not add up to switching somebody's charger off.
+    got = decide(None, authority=APP, limits=LIMITS, now=NOW)
+    assert got.apply is False
+
+
+def test_when_this_service_manages_it_authority_decides_as_before() -> None:
+    assert decide(20, authority=LIMITED, limits=LIMITS, now=NOW).apply is True
+    assert decide(20, authority=ADVISORY, limits=LIMITS, now=NOW).apply is False
+
+
+def test_an_unrecognised_owner_of_the_charger_leaves_it_alone() -> None:
+    # Fails closed, like authority. A value from a newer build, or a typo, must
+    # not be read as permission to drive somebody's car charger.
+    got = decide(20, authority="something-else", limits=LIMITS, now=NOW)
+    assert got.apply is False
+
+
+def test_the_app_managing_it_is_the_answer_even_under_an_override() -> None:
+    # Both are true at once, and this is the one worth saying. Reporting the
+    # override would imply that this service takes over when the override
+    # lapses, and it does not — the charger is not ours at all.
+    got = decide(
+        20,
+        authority=APP,
+        limits=LIMITS,
+        now=NOW,
+        override_until=NOW + timedelta(hours=1),
+    )
+    assert got.apply is False
+    assert "Emporia" in got.reason
+
+
+def test_a_restore_target_outside_the_limits_is_clamped_before_it_is_sent() -> None:
+    # restore_target answers "where should this go back to" and knows nothing
+    # about limits, so on its own it can name a rate the module may not set.
+    # Everything that acts on it goes through decide() first, and this is the
+    # test that keeps it that way.
+    target = restore_target(charger_rate_a=6, last_set_a=6, default_a=10, holding=False)
+    assert target == 10, "the raw answer is unclamped by design"
+    limits = Limits(floor_a=32, ceiling_a=48)
+    got = decide(target, authority=LIMITED, limits=limits, now=NOW)
+    assert got.rate_a == 32, "and the limits still hold on the way out"
+    assert got.refused is not None

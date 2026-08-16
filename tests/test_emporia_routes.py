@@ -31,6 +31,7 @@ from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.settings import (
     CHARGE_CEILING_KEY,
     CHARGE_OVERRIDE_UNTIL_KEY,
+    CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
     HIGH_USAGE_WATTS_KEY,
     SettingsStore,
@@ -389,6 +390,8 @@ def test_setting_a_rate_clamps_it_audits_it_and_starts_the_override(tmp_path: Pa
     app, store, _ = _app(tmp_path)
     settings = SettingsStore(store)
     settings.set(CHARGE_CEILING_KEY, 32)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger()
     poller.charger = ChargerState(
@@ -425,6 +428,7 @@ def test_a_write_that_emporia_refuses_is_audited_as_not_applied(tmp_path: Path) 
     # The worst thing this could do is record a change that never happened: the
     # restore then believes the charger is at a rate it is not, and leaves it.
     app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger(fail=EmporiaUnreachableError("no route"))
     poller.charger = ChargerState(
@@ -457,6 +461,7 @@ def test_stopping_and_starting_the_charger_is_audited(tmp_path: Path) -> None:
     # switched off charges it not at all. "Why is the car not charged" has to
     # have an answer, and this is where it comes from.
     app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger()
     poller.charger = ChargerState(
@@ -493,6 +498,7 @@ def test_a_rate_the_charger_does_not_take_is_not_audited_as_applied(tmp_path: Pa
     # the change is recorded as not applied, so restore never trusts a rate the
     # charger is not actually at.
     app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     stub = _StubCharger()
     stub.rate = 6  # whatever is written, it keeps reporting 6 A
@@ -555,3 +561,50 @@ def test_the_charger_tab_appears_only_where_there_is_a_charger() -> None:
     assert entry is not None, "the charger nav entry is missing"
     assert "/api/emporia/charger" in entry.group(0)
     assert "body.charger" in entry.group(0), "it must gate on a charger existing, not on a setting"
+
+
+def test_a_charger_the_app_manages_refuses_a_rate_rather_than_ignoring_it(
+    tmp_path: Path,
+) -> None:
+    # The default. A control that takes a number and silently does nothing with
+    # it is worse than one that says why it will not — and the page hides the
+    # control entirely, so this is the belt behind the braces.
+    app, store, _ = _app(tmp_path)
+    poller = app.state.emporia
+    poller.client = _StubCharger()
+    poller.charger = ChargerState(
+        device_gid=900001,
+        rate_a=6,
+        max_rate_a=48,
+        on=True,
+        status="Standby",
+        message="Ready",
+        conflicts=(),
+        plugged_in=False,
+        connected=True,
+        offline_since=None,
+        fault=None,
+    )
+    poller._charger_record = {"deviceGid": 900001, "chargingRate": 6}
+    poller._id_token = "id-1"
+
+    with TestClient(app) as c:
+        rate = c.post("/api/emporia/charger/rate", json={"amps": 16})
+        power = c.post("/api/emporia/charger/power", json={"on": False})
+
+    assert rate.status_code == 409
+    assert "Emporia app" in rate.json()["detail"]
+    assert power.status_code == 409
+    assert poller.client.writes == [], "nothing reached the charger"
+    store.close()
+
+
+def test_the_page_decides_from_the_one_setting_that_exists(tmp_path: Path) -> None:
+    # It briefly read a second setting that had been folded away, so a charger
+    # the owner had just handed over still said the Emporia app had it. The page
+    # and the API have to be reading the same field.
+    import arraysense
+
+    html = (Path(arraysense.__file__).parent / "web" / "charger.html").read_text()
+    assert "c.managed_by" not in html, "that setting no longer exists"
+    assert "c.authority !== 'app'" in html

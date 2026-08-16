@@ -3265,6 +3265,14 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
     if poller is None or poller.charger is None:
         raise HTTPException(status_code=404, detail="no Emporia charger is being read")
     settings = SettingsStore(request.app.state.store)
+    if settings.get(CHARGER_AUTHORITY_KEY) == "app":
+        # Refused rather than quietly ignored. The owner said the Emporia app
+        # has this charger, and a control that accepts a number and does
+        # nothing with it is worse than one that is not there.
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia app manages this charger; change that in Settings first",
+        )
     charger = poller.charger
     rate, refused = clamp_rate(body.amps, poller.limits())
     now = datetime.now(tz=UTC)
@@ -3322,6 +3330,11 @@ async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, A
     poller = _emporia(request)
     if poller is None or poller.charger is None:
         raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    if SettingsStore(request.app.state.store).get(CHARGER_AUTHORITY_KEY) == "app":
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia app manages this charger; change that in Settings first",
+        )
     charger = poller.charger
     now = datetime.now(tz=UTC)
     try:

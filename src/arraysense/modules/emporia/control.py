@@ -28,8 +28,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-# Say what it would do; never write. The default, and the only setting that can
-# be safe before anybody has watched this behave against a real car.
+# One axis, four positions, each strictly more powerful than the last. It was
+# briefly two settings — who manages the charger, and how much authority this
+# service has — and the first person to meet them set the second, saw nothing
+# change, and asked why. Two settings that must agree before anything happens
+# are one setting wearing a disguise.
+#
+# The Emporia app keeps the charger; nothing here writes at all. The default,
+# because installing this service is not the same as asking it to take over
+# somebody's car charger — and because Emporia ships four controllers of its
+# own, and two services taking turns at one slider is worse than either alone.
+APP = "app"
+# Say what it would do; never write. The first position that is about this
+# service at all, and the only one that is safe before anybody has watched it
+# behave against a real car.
 ADVISORY = "advisory"
 # May set a rate between the floor and the ceiling. May not stop a charge: a
 # mode that throttles must not be able to end one the owner needed.
@@ -37,7 +49,7 @@ LIMITED = "limited"
 # May also stop and start the charger.
 FULL = "full"
 
-AUTHORITIES = (ADVISORY, LIMITED, FULL)
+CONTROL_LEVELS = (APP, ADVISORY, LIMITED, FULL)
 
 
 @dataclass(frozen=True)
@@ -109,7 +121,14 @@ def decide(
     A decision is always returned, even when nothing may be applied: the page
     shows what the module *would* do under advisory authority, and that is the
     whole of what advisory means.
+
+    ``authority`` is an allowlist at every level: a value this build does not
+    recognise leaves the charger alone. Permission to drive somebody's car
+    charger fails closed.
     """
+    if authority == APP or authority not in CONTROL_LEVELS:
+        rate = None if requested_a is None else clamp_rate(requested_a, limits)[0]
+        return Decision(rate, False, "the Emporia app manages this charger")
     if requested_a is None:
         # Stopping the charger. Clamping does not apply; authority does.
         stop = Decision(None, authority == FULL, "stop the charger")
