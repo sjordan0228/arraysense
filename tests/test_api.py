@@ -1169,7 +1169,7 @@ def test_the_phosphor_sprite_is_served(client: Any) -> None:
     # reason the chart library is. Served as anything but an SVG the icons
     # silently fail to mount, which a page answers by dropping the symbol
     # rather than by saying why.
-    r = client.get("/vendor/phosphor.svg")
+    r = client.get("/vendor/phosphor-2.svg")
     assert r.status_code == 200
     assert r.headers["content-type"] == "image/svg+xml"
     assert "ph-gear" in r.text

@@ -1,0 +1,203 @@
+"""test_emporia_charger.py — reading the charger, and who else is driving it.
+
+The record shapes here are the reference account's, captured on 16 August 2026.
+The shapes are real; every identifier in them is invented, in the same spirit as
+the CE12345678 the rest of this repository uses — this is a public repository and
+a device id is an account identifier. The breaker PIN is never a real one either,
+and is written so that nobody could mistake it for one.
+
+The conflict rules are the point of the file. Emporia ships its own automation
+for a charger and there are **four** switches for it, not the one the design
+anticipated: load management on the charger record, and schedules, peak demand
+and excess generation on the load record beside it. Two of them were on when
+this was first looked at, while the one the design checked was off — so a
+conflict check written to that design would have reported all clear while two
+other controllers were driving the same charger.
+"""
+
+from __future__ import annotations
+
+from arraysense.modules.emporia.parse import charger_from_status
+
+STATUS: dict[str, list[dict[str, object]]] = {
+    "evChargers": [
+        {
+            "deviceGid": 900001,
+            "loadGid": 900002,
+            "message": "Ready",
+            "status": "Standby",
+            "icon": "CarNotConnected",
+            "iconLabel": "Ready",
+            "chargerOn": True,
+            "chargingRate": 6,
+            "maxChargingRate": 48,
+            "loadManagementEnabled": False,
+            "faultText": None,
+        }
+    ],
+    "loads": [
+        {
+            "loadGid": 900002,
+            "schedulesEnabled": True,
+            "peakDemandEnabled": True,
+            "excessGenerationEnabled": False,
+            "energyManagementOverridden": False,
+        }
+    ],
+    "devicesConnected": [{"deviceGid": 900001, "connected": True, "offlineSince": None}],
+}
+
+
+def test_the_charger_is_read_with_its_rate_and_its_limit() -> None:
+    got = charger_from_status(STATUS)
+    assert got is not None
+    assert got.device_gid == 900001
+    assert got.rate_a == 6
+    assert got.max_rate_a == 48
+    assert got.on is True
+    assert got.status == "Standby"
+
+
+def test_every_emporia_controller_that_is_on_is_named() -> None:
+    # Two on, and neither is the one the design expected to find.
+    got = charger_from_status(STATUS)
+    assert got is not None
+    assert got.conflicts == ("schedules", "peak demand")
+
+
+def test_a_charger_with_nobody_else_driving_it_reports_no_conflict() -> None:
+    quiet = {
+        "evChargers": [dict(STATUS["evChargers"][0])],
+        "loads": [
+            {
+                "loadGid": 900002,
+                "schedulesEnabled": False,
+                "peakDemandEnabled": False,
+                "excessGenerationEnabled": False,
+            }
+        ],
+    }
+    got = charger_from_status(quiet)
+    assert got is not None
+    assert got.conflicts == ()
+
+
+def test_emporias_own_solar_charging_is_the_one_that_matters_most() -> None:
+    # It is the same job this module exists to do. Two controllers both moving
+    # the rate at the sun would fight every time a cloud passed.
+    payload = {
+        "evChargers": [dict(STATUS["evChargers"][0])],
+        "loads": [{"loadGid": 900002, "excessGenerationEnabled": True}],
+    }
+    got = charger_from_status(payload)
+    assert got is not None
+    assert "excess generation" in got.conflicts
+
+
+def test_load_management_on_the_charger_record_is_a_conflict_too() -> None:
+    charger = dict(STATUS["evChargers"][0])
+    charger["loadManagementEnabled"] = True
+    got = charger_from_status({"evChargers": [charger], "loads": []})
+    assert got is not None
+    assert "load management" in got.conflicts
+
+
+def test_an_offline_charger_says_so_rather_than_reading_as_idle() -> None:
+    payload = {
+        "evChargers": [dict(STATUS["evChargers"][0])],
+        "loads": [],
+        "devicesConnected": [
+            {"deviceGid": 900001, "connected": False, "offlineSince": "since Apr 2, 2026, 5:06 PM"}
+        ],
+    }
+    got = charger_from_status(payload)
+    assert got is not None
+    assert got.connected is False
+    assert got.offline_since == "since Apr 2, 2026, 5:06 PM"
+
+
+def test_an_account_with_no_charger_reads_as_absent_rather_than_failing() -> None:
+    assert charger_from_status({"evChargers": []}) is None
+    assert charger_from_status({}) is None
+    assert charger_from_status("nope") is None
+
+
+def test_the_breaker_pin_is_never_carried_into_the_parsed_state() -> None:
+    # It is a secret that must never be logged, echoed by a route, or written to
+    # a fixture. The surest way to keep it out of all three is for the object
+    # everything else passes around not to have it.
+    charger = dict(STATUS["evChargers"][0])
+    charger["breakerPIN"] = "NOT-A-REAL-PIN"
+    got = charger_from_status({"evChargers": [charger], "loads": []})
+    assert got is not None
+    assert "NOT-A-REAL-PIN" not in repr(got)
+    assert not hasattr(got, "breaker_pin")
+
+
+# --- is a car actually plugged in? ----------------------------------------
+#
+# Established by plugging one in and watching, on 16 August 2026. The obvious
+# field does not answer it: `status` reads "Standby" both when nothing is
+# connected and when a connected car is paused. `chargerOn` does not either —
+# it was true with no car attached at all, because it is the switch rather than
+# a statement about delivery. The icon is the one field that separates them.
+
+
+def _charger(**overrides: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "deviceGid": 900001,
+        "chargerOn": True,
+        "chargingRate": 6,
+        "maxChargingRate": 48,
+        "status": "Standby",
+        "message": "Ready",
+        "icon": "CarNotConnected",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_no_car_attached_reads_as_unplugged() -> None:
+    got = charger_from_status({"evChargers": [_charger()]})
+    assert got is not None
+    assert got.plugged_in is False
+
+
+def test_a_charging_car_reads_as_plugged_in() -> None:
+    got = charger_from_status(
+        {"evChargers": [_charger(icon="CarConnected", status="Charging", message="Charging")]}
+    )
+    assert got is not None
+    assert got.plugged_in is True
+
+
+def test_a_paused_car_is_still_plugged_in() -> None:
+    # The case that makes `status` useless here: Standby, switched off, and a
+    # car very much attached. Reported as unplugged it would tell somebody the
+    # cable was out when it was in their hand.
+    got = charger_from_status(
+        {
+            "evChargers": [
+                _charger(
+                    icon="CarConnected",
+                    status="Standby",
+                    message="Connected to EV",
+                    chargerOn=False,
+                )
+            ]
+        }
+    )
+    assert got is not None
+    assert got.plugged_in is True
+    assert got.on is False
+
+
+def test_an_icon_nobody_has_seen_leaves_the_question_open() -> None:
+    # Emporia can add a state, and guessing one way or the other would put a
+    # confident wrong answer on the page. Unknown is a fact; a guess is not.
+    got = charger_from_status({"evChargers": [_charger(icon="SomethingNew")]})
+    assert got is not None
+    assert got.plugged_in is None
+    missing = charger_from_status({"evChargers": [_charger(icon=None)]})
+    assert missing is not None
+    assert missing.plugged_in is None

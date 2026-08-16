@@ -269,6 +269,11 @@
        independent, so each needs its own box rather than the two sharing one
        and the second render overwriting the first. Same shape, same tone. -->
   <div class="p cal" id="modelCal" hidden></div>
+  <!-- The house-draw warning, drawn through the same .cal box as the two above
+       rather than through a third banner mechanism. Not dismissible: unlike a
+       drifted counter it clears itself the moment the draw drops, so a dismiss
+       button would only be a way to stop being told about the next one. -->
+  <div class="p cal" id="usageCal" hidden></div>
 
   <div class="p" id="settings" hidden>
     <!-- Two of these three also exist as installation settings on the service.
@@ -737,6 +742,9 @@ async function loadLive() {
     // The model warning rides the status poll already made above, so this needs
     // no second request.
     renderModelCheck(status);
+    // The verdict is the endpoint's, not this page's: a threshold compared in
+    // two places is two thresholds the day one of them moves.
+    renderHighUsage(live.alert);
     // Packs that stopped answering keep their last reading forever in
     // latest_modules, so they are dropped before anything compares them.
     const packs = reporting(live.modules);
@@ -855,6 +863,43 @@ function renderModelCheck(status) {
   if (message === null) { box.hidden = true; box.className = 'p cal'; return; }
   box.className = 'p cal sev-warning';
   box.innerHTML = modelCheckHtml(message);
+  box.hidden = false;
+}
+
+// What the warning says, and — the part that matters — how carefully it says
+// it. Naming circuits that account for a third of the draw as though they were
+// the cause is the completeness mistake this project has already paid for with
+// money on the Costs page, so the wording changes with `complete` rather than
+// the list being trimmed or the doubt being left out.
+function highUsageHtml(alert) {
+  const names = alert.contributors.map((c) => `${esc(c.name)} ${wStr(numOrNull(c.watts))}`);
+  // `body` is assembled from already-escaped names and text this file wrote,
+  // so it is interpolated raw. Escaping it again would turn an ampersand in a
+  // circuit name into a visible &amp; — the names are the owner's and one of
+  // them will contain one.
+  let body;
+  if (!names.length) {
+    // Either no Emporia module, or nothing it watches reported. Both are "we
+    // cannot say", and neither is "nothing is drawing".
+    body = 'No circuit readings, so nothing can be named.';
+  } else if (alert.complete) {
+    body = `Mostly ${names.join(', ')}.`;
+  } else {
+    const share = alert.accounted_w === null ? null
+      : Math.round(alert.accounted_w / alert.load_w * 100);
+    body = `${names.join(', ')}` +
+      (share === null ? '' : ` — which is ${share}% of the draw, so the rest is elsewhere.`);
+  }
+  return `<div class="calmark">●</div>
+    <div class="calbody"><h2>Drawing ${wStr(alert.load_w)}</h2>
+    <p>Above the ${wStr(alert.threshold_w)} you asked to be told about. ${body}</p></div>`;
+}
+
+function renderHighUsage(alert) {
+  const box = $('usageCal');
+  if (!alert) { box.hidden = true; box.className = 'p cal'; return; }
+  box.className = 'p cal sev-warning';
+  box.innerHTML = highUsageHtml(alert);
   box.hidden = false;
 }
 

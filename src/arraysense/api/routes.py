@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
+from arraysense.alerts import Contributor, high_usage
 from arraysense.auth import (
     MIN_PASSWORD_LENGTH,
     Sessions,
@@ -79,9 +80,24 @@ from arraysense.efficiency import (
 )
 from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
+from arraysense.modules.emporia import tokens as emporia_tokens
+from arraysense.modules.emporia.client import (
+    EmporiaAuthExpiredError,
+    EmporiaChallengeError,
+    EmporiaUnreachableError,
+)
+from arraysense.modules.emporia.control import clamp_rate
+from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
+    CHARGE_CEILING_KEY,
+    CHARGE_FLOOR_KEY,
+    CHARGE_OVERRIDE_MINUTES_KEY,
+    CHARGE_OVERRIDE_UNTIL_KEY,
+    CHARGER_AUTHORITY_KEY,
+    EMPORIA_ENABLED_KEY,
+    HIGH_USAGE_WATTS_KEY,
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -702,6 +718,52 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
         },
         "battery": battery_block,
         "sky": sky,
+        # The high-usage warning rides this response rather than a second poll:
+        # it is decided from the same inverter reading already in hand, and a
+        # wall display should not have to ask twice to be told its house is
+        # drawing hard. Null when the threshold is off or the house is under it.
+        "alert": _high_usage_alert(request, inverter),
+    }
+
+
+def _high_usage_alert(
+    request: Request, inverter: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """Whether the house is drawing more than the owner asked to hear about.
+
+    The verdict is computed here rather than in the browser for the reason the
+    Costs page settled: a threshold compared in two places is two thresholds the
+    day one of them changes. The page prints what this says.
+
+    Attribution is the Emporia module's, and only if it is running. Without it
+    the warning still fires and names nobody, which is the difference between
+    "your house is drawing 11 kW" and silence.
+    """
+    settings = SettingsStore(request.app.state.store)
+    threshold = settings.get(HIGH_USAGE_WATTS_KEY)
+    if not isinstance(threshold, int) or threshold <= 0:
+        return None
+    load = inverter.get("load_power_w") if inverter else None
+    poller = _emporia(request)
+    contributors: tuple[Contributor, ...] = ()
+    if poller is not None:
+        contributors = tuple(
+            Contributor(circuit.name, circuit.watts, circuit.kind)
+            for circuit in poller.repository.latest()
+        )
+    verdict = high_usage(
+        int(load) if isinstance(load, int | float) else None, threshold, contributors
+    )
+    if verdict is None:
+        return None
+    return {
+        "load_w": verdict.load_w,
+        "threshold_w": verdict.threshold_w,
+        "accounted_w": verdict.accounted_w,
+        "complete": verdict.complete,
+        "contributors": [
+            {"name": c.name, "watts": c.watts, "kind": c.kind} for c in verdict.contributors
+        ],
     }
 
 
@@ -3028,6 +3090,282 @@ async def resume(request: Request) -> dict[str, Any]:
     """Take the dongle back before the yield timer runs out."""
     await request.app.state.service.resume()
     return {"yielding": False}
+
+
+# --- The Emporia module -------------------------------------------------------
+#
+# Every one of these answers when the module is absent rather than raising: a
+# build with the module never started, or an installation that has not enabled
+# it, must serve a page that says "off" rather than a 500. The reads stay open
+# like every other read — the wall display is not logged in — while anything
+# that stores a credential or changes what the service does sits behind the
+# password.
+
+
+class EmporiaLogin(BaseModel):
+    """An Emporia account login. The password is used once and never stored."""
+
+    email: str
+    password: str
+
+
+def _emporia(request: Request) -> EmporiaPoller | None:
+    """The running poller, or None when this build is not running one."""
+    poller = getattr(request.app.state, "emporia", None)
+    return poller if isinstance(poller, EmporiaPoller) else None
+
+
+@router.get("/emporia/status")
+async def emporia_status(request: Request) -> dict[str, Any]:
+    """What the module is doing, and whether it needs the owner.
+
+    Reports the poller's own state because nothing else can: circuits live in
+    their own tables specifically so they never satisfy the store's staleness
+    witness, which means an outage here leaves no symptom anywhere else.
+    """
+    # ``enabled`` is the owner's setting and ``status`` is what the poller is
+    # doing, and they are deliberately two questions. Deriving the first from
+    # the second would make the module invisible for the first interval after
+    # it was switched on, because a poller that has not ticked yet reports
+    # "off" — which is exactly when somebody is looking for it.
+    settings = SettingsStore(request.app.state.store)
+    enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
+    poller = _emporia(request)
+    if poller is None:
+        return {"status": "off", "detail": "", "last_success": None, "enabled": enabled}
+    state = poller.state
+    return {
+        "status": state.status,
+        "detail": state.detail,
+        "last_success": state.last_success,
+        "enabled": enabled,
+    }
+
+
+@router.get("/emporia/circuits")
+async def emporia_circuits(request: Request) -> dict[str, Any]:
+    """Every known circuit with its latest reading, biggest draw first.
+
+    ``watts`` is null for a circuit that has not reported, and stays null all
+    the way to the page. Zero would be a claim that it drew nothing.
+    """
+    poller = _emporia(request)
+    if poller is None:
+        return {"circuits": []}
+    return {
+        "circuits": [
+            {
+                "name": circuit.name,
+                "kind": circuit.kind,
+                "watts": circuit.watts,
+                "ts": circuit.ts,
+                # Emporia's own category number, passed through raw. Which icon
+                # it earns is the page's business: a number here and a picture
+                # there keeps the mapping in one place, and it is presentation
+                # rather than a reading.
+                "type_gid": circuit.type_gid,
+            }
+            for circuit in poller.repository.latest()
+        ]
+    }
+
+
+@router.post("/emporia/login", dependencies=[Depends(_require_write)])
+async def emporia_login(request: Request, body: EmporiaLogin) -> dict[str, Any]:
+    """Exchange a password for tokens. The password is not retained anywhere."""
+    poller = _emporia(request)
+    if poller is None:
+        raise HTTPException(status_code=404, detail="the Emporia module is not available")
+    try:
+        token_set = await asyncio.to_thread(poller.client.login, body.email, body.password)
+    except EmporiaChallengeError as exc:
+        raise HTTPException(status_code=409, detail=f"Emporia asked for {exc}") from exc
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(
+            status_code=401, detail="Emporia rejected that email or password"
+        ) from exc
+    except EmporiaUnreachableError as exc:
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    await asyncio.to_thread(emporia_tokens.save, poller.token_path, token_set)
+    # Tick once, here, before answering. The page reads the poller's state, and
+    # the poller's clock is a minute wide — so without this a login that worked
+    # leaves "the saved Emporia login has expired" on screen with the form still
+    # open, for up to a minute. Somebody watching that types their password
+    # again, which is precisely what happened the first time this was tried
+    # against a real account. The tick is one extra call at the one moment the
+    # owner is certainly watching, and it never raises.
+    await poller.tick(datetime.now(tz=UTC))
+    return {"ok": True}
+
+
+class ChargeRate(BaseModel):
+    """A charge rate somebody asked for, in amps."""
+
+    amps: int
+
+
+@router.get("/emporia/charger")
+async def emporia_charger(request: Request) -> dict[str, Any]:
+    """The charger, who else is driving it, and what this service has done to it.
+
+    ``conflicts`` names Emporia's own controllers that are switched on for this
+    charger. It is a warning and never a refusal — it is the owner's charger and
+    their account — but it has to be said, because two controllers moving one
+    rate will undo each other and neither will look broken.
+    """
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        return {"charger": None, "changes": []}
+    state = poller.charger
+    settings = SettingsStore(request.app.state.store)
+    return {
+        "charger": {
+            "device_gid": state.device_gid,
+            "rate_a": state.rate_a,
+            "max_rate_a": state.max_rate_a,
+            "on": state.on,
+            "status": state.status,
+            "message": state.message,
+            "conflicts": list(state.conflicts),
+            "plugged_in": state.plugged_in,
+            "connected": state.connected,
+            "offline_since": state.offline_since,
+            "fault": state.fault,
+            "authority": settings.get(CHARGER_AUTHORITY_KEY),
+            "floor_a": settings.get(CHARGE_FLOOR_KEY),
+            "ceiling_a": settings.get(CHARGE_CEILING_KEY),
+        },
+        "changes": [
+            {
+                "timestamp": change.timestamp,
+                "from_a": change.from_a,
+                "to_a": change.to_a,
+                "reason": change.reason,
+                "applied": change.applied,
+            }
+            for change in poller.audit.recent_changes()
+        ],
+    }
+
+
+@router.post("/emporia/charger/rate", dependencies=[Depends(_require_write)])
+async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]:
+    """Set the charge rate by hand, through every guard the module has.
+
+    A request from this route is the owner asking, so it is applied whatever the
+    authority setting says — advisory means the *module* proposes rather than
+    acts, not that the owner may not act. The floor, the ceiling and the
+    hardware maximum still hold, because those are about what the charger and
+    the wiring can take rather than about who is asking.
+
+    It also starts the override window. Somebody who has just set a rate by hand
+    should not have it moved out from under them by the next automatic decision.
+    """
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    settings = SettingsStore(request.app.state.store)
+    charger = poller.charger
+    rate, refused = clamp_rate(body.amps, poller.limits())
+    now = datetime.now(tz=UTC)
+    try:
+        confirmed = await asyncio.to_thread(poller.write_rate, rate)
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(status_code=401, detail="Emporia rejected the saved login") from exc
+    except EmporiaUnreachableError as exc:
+        poller.audit.record_change(
+            charger.device_gid,
+            from_a=charger.rate_a,
+            to_a=rate,
+            reason=f"failed: {exc}",
+            applied=False,
+            now=now,
+        )
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    # Applied means the charger says so, not that Emporia returned a 200. The
+    # write is accepted asynchronously, and auditing on the status code alone
+    # made a working write look like a failed one the first time this ran
+    # against a real car — worse, a restore that trusts a rate the charger is
+    # not at will happily leave it there.
+    took = confirmed is not None and confirmed.rate_a == rate
+    poller.audit.record_change(
+        charger.device_gid,
+        from_a=charger.rate_a,
+        to_a=rate,
+        reason=("set by hand" if took else "set by hand, but the charger still reads differently")
+        + (f" ({refused})" if refused else ""),
+        applied=took,
+        now=now,
+    )
+    minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
+    hold = int(minutes) if isinstance(minutes, int) else 120
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
+    return {"ok": True, "rate_a": rate, "refused": refused, "confirmed": took}
+
+
+class ChargerPower(BaseModel):
+    """Whether the charger should be delivering at all."""
+
+    on: bool
+
+
+@router.post("/emporia/charger/power", dependencies=[Depends(_require_write)])
+async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, Any]:
+    """Stop or start charging.
+
+    A different power from setting a rate, and a heavier one: a rate that is too
+    low charges a car slowly, while a charger switched off charges it not at
+    all. For the *module* that distinction is the ``full`` authority level. This
+    route is the owner asking, so it acts either way — but it is audited like
+    everything else, because "why is the car not charged" has to have an answer.
+    """
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    charger = poller.charger
+    now = datetime.now(tz=UTC)
+    try:
+        confirmed = await asyncio.to_thread(poller.write_charger, {"chargerOn": body.on})
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(status_code=401, detail="Emporia rejected the saved login") from exc
+    except EmporiaUnreachableError as exc:
+        poller.audit.record_change(
+            charger.device_gid,
+            from_a=charger.rate_a,
+            to_a=charger.rate_a,
+            reason=f"failed to {'start' if body.on else 'stop'} charging: {exc}",
+            applied=False,
+            now=now,
+        )
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    took = confirmed is not None and confirmed.on is body.on
+    poller.audit.record_change(
+        charger.device_gid,
+        from_a=charger.rate_a,
+        to_a=charger.rate_a,
+        reason=("started charging" if body.on else "stopped charging")
+        + ("" if took else ", but the charger still reads otherwise"),
+        applied=took,
+        now=now,
+    )
+    return {"ok": True, "on": body.on, "confirmed": took}
+
+
+@router.post("/emporia/disconnect", dependencies=[Depends(_require_write)])
+async def emporia_disconnect(request: Request) -> dict[str, Any]:
+    """Forget the stored credential.
+
+    Revoking it at AWS as well is the right behaviour and is Stage 3 work: the
+    Cognito ``RevokeToken`` call is documented but has never been tested against
+    Emporia's pool, and claiming to revoke while only forgetting would be worse
+    than saying plainly that this forgets. ``revoked`` is false so that nothing
+    reading this can believe otherwise.
+    """
+    poller = _emporia(request)
+    if poller is None:
+        raise HTTPException(status_code=404, detail="the Emporia module is not available")
+    emporia_tokens.clear(poller.token_path)
+    return {"ok": True, "revoked": False}
 
 
 def _battery_block(inverter: Mapping[str, Any] | None) -> dict[str, Any]:

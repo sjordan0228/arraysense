@@ -12,7 +12,7 @@ from typing import Any
 from arraysense.settings import SettingsStore
 from arraysense.store import retention as retention_module
 from arraysense.store.retention import RetentionPolicy, policy_from_settings, run_retention
-from arraysense.store.rollup import promote_pending_hours
+from arraysense.store.rollup import promote_pending_hours, rebuild_circuit_hourly
 from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, PENDING_TABLE
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
@@ -223,7 +223,9 @@ def test_raw_outside_minute_retention_does_not_hold_the_minute_tier(tmp_path: Pa
     _insert_inverter_destination(store._conn, "inverter_minute", timestamp + 60)
     _archive(tmp_path, NOW)
     report = run_retention(store._conn, _policy(tmp_path), now=NOW)
-    raw, _module, minute = report.tables
+    # Four sources now: the two inverter tiers, the packs, and the circuit
+    # readings the Emporia module writes.
+    raw, _module, minute, _circuits = report.tables
     assert raw.blocked is None
     assert raw.rows == 1
     assert minute.rows == 1
@@ -471,7 +473,9 @@ def test_raw_crosses_a_pruned_unaligned_minute_boundary(tmp_path: Path) -> None:
 
     report = run_retention(store._conn, policy, now=now)
 
-    raw, _module, minute = report.tables
+    # Four sources now: the two inverter tiers, the packs, and the circuit
+    # readings the Emporia module writes.
+    raw, _module, minute, _circuits = report.tables
     assert raw.blocked is None
     assert raw.rows == 2
     assert _rows(store._conn, "inverter_raw") == 0
@@ -526,4 +530,65 @@ def test_settings_policy_defaults_come_from_declared_tiers(tmp_path: Path) -> No
     assert not policy.enabled
     assert raw_days == {policy.raw_days}
     assert policy.minute_days == minute_days
+    store.close()
+
+
+# --- circuits ------------------------------------------------------------
+
+
+def _old_circuit_hour() -> int:
+    """An hour comfortably past the raw cutoff, aligned to the bucket."""
+    return int((NOW - timedelta(days=RAW_DAYS + 10)).timestamp()) // 3600 * 3600
+
+
+def _a_circuit(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+        " first_seen, last_seen) VALUES (1, 100000, '5', 'Dryer', 2.0, 'circuit', 0, 0)"
+    )
+
+
+def test_circuit_readings_are_pruned_once_the_hourly_tier_covers_them(tmp_path: Path) -> None:
+    # The fastest-growing table in the store — one row per circuit per minute —
+    # and the same rule as everything else: nothing is deleted until a coarser
+    # table already holds what it said.
+    store = _store(tmp_path)
+    _archive(tmp_path, NOW)
+    _a_circuit(store._conn)
+    hour = _old_circuit_hour()
+    for minute in range(3):
+        store._conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 100)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(store._conn, hour, hour + 3600)
+
+    report = run_retention(store._conn, _policy(tmp_path), now=NOW)
+
+    pruned = {table.table: table for table in report.tables}
+    assert "circuit_reading" in pruned, "circuit readings must be in the retention pass at all"
+    assert pruned["circuit_reading"].blocked is None
+    assert pruned["circuit_reading"].rows == 3
+    assert _rows(store._conn, "circuit_reading") == 0
+    assert _rows(store._conn, "circuit_hourly") == 1, "the coarse row outlives what it covers"
+    store.close()
+
+
+def test_uncovered_circuit_readings_are_left_alone(tmp_path: Path) -> None:
+    # No rollup, no deletion. Without this, switching the module off and leaving
+    # a final unrolled hour would let the next pass destroy it.
+    store = _store(tmp_path)
+    _archive(tmp_path, NOW)
+    _a_circuit(store._conn)
+    store._conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 100)",
+        (_old_circuit_hour(),),
+    )
+
+    report = run_retention(store._conn, _policy(tmp_path), now=NOW)
+
+    pruned = {table.table: table for table in report.tables}
+    assert pruned["circuit_reading"].rows == 0
+    assert pruned["circuit_reading"].blocked is not None
+    assert _rows(store._conn, "circuit_reading") == 1
     store.close()

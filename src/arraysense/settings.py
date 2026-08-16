@@ -129,6 +129,29 @@ SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
 WEATHER_INTERVAL_KEY = "collector.weather_interval"
+# The optional Emporia module's enable. Named here beside the other feature keys
+# rather than inside the module, because the settings registry is what renders
+# the page and validates a write; a module holding its own flag would be a
+# second answer to the same question.
+EMPORIA_ENABLED_KEY = "emporia.enabled"
+EMPORIA_INTERVAL_KEY = "emporia.interval"
+# Charger control. How much autonomy the module has is the owner's choice;
+# the floor, the ceiling and the audit are not, because a charge rate
+# persists for ever once set and nothing at Emporia's end will put it back.
+CHARGER_AUTHORITY_KEY = "emporia.charger_authority"
+CHARGE_FLOOR_KEY = "emporia.charge_floor_a"
+CHARGE_CEILING_KEY = "emporia.charge_ceiling_a"
+CHARGE_DEFAULT_KEY = "emporia.charge_default_a"
+CHARGE_OVERRIDE_MINUTES_KEY = "emporia.charge_override_minutes"
+# When the current manual override lapses, as a unix epoch. Written by the
+# service rather than chosen, like the efficiency rescore floor: it has to
+# survive a restart, because an owner who set a rate by hand ten minutes ago
+# should not have the module take the wheel back because the process bounced.
+CHARGE_OVERRIDE_UNTIL_KEY = "emporia.charge_override_until"
+# The house-draw warning. Not an Emporia setting: the threshold is compared
+# against the inverter's own load figure, so it works on an installation that
+# has never heard of Emporia — which only supplies the names of the culprits.
+HIGH_USAGE_WATTS_KEY = "alerts.high_usage_watts"
 # The daily backup, which used to be compiled into manage.py and overridden only
 # by flags nobody types twice. manage.py cannot import this module — it runs on
 # the distribution's Python 3.8 while the package needs 3.12 — so it reads these
@@ -1090,6 +1113,145 @@ SETTINGS: tuple[SettingSpec, ...] = (
         max_length=7,
         label="Bank installed (YYYY-MM)",
         help="For future capacity-fade context; empty is fine.",
+    ),
+    # --- Alerts -------------------------------------------------------------
+    SettingSpec(
+        key=HIGH_USAGE_WATTS_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=100000,
+        unit="W",
+        label="Warn when the house draws more than",
+        help=(
+            "Show a warning when the house is drawing more than this. Zero is "
+            "off, which is the default — a threshold nobody chose would warn "
+            "about a kettle. The figure compared against it is the inverter's "
+            "own load reading, which arrives every eleven seconds, so the "
+            "warning does not wait on anything else. If the Emporia module is "
+            "on, the warning also names the circuits responsible; without it "
+            "the warning still appears and simply cannot say what caused it."
+        ),
+    ),
+    # --- Modules ------------------------------------------------------------
+    SettingSpec(
+        key=CHARGER_AUTHORITY_KEY,
+        kind="choice",
+        choices=("advisory", "limited", "full"),
+        default="advisory",
+        label="What the module may do with the EV charger",
+        help=(
+            "advisory proposes a charge rate and changes nothing, which is the "
+            "default and the only setting that is safe before you have watched "
+            "this behave. limited lets it set a rate between your floor and "
+            "ceiling. full also lets it stop and start charging. Whichever you "
+            "pick, the floor, the ceiling, the audit trail and the restore on "
+            "startup all still apply — those are not settings, because a charge "
+            "rate persists for ever once set and nothing at Emporia's end will "
+            "ever put it back."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_FLOOR_KEY,
+        kind="int",
+        default=6,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Never charge below",
+        help=(
+            "The least current the module will ever command. Six amps is the "
+            "usual minimum a car will accept at all; below it some simply stop "
+            "charging rather than charge slowly."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_CEILING_KEY,
+        kind="int",
+        default=32,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Never charge above",
+        help=(
+            "The most current the module will ever command. Your charger's own "
+            "maximum still wins if it is lower — a command it cannot honour is "
+            "a command whose effect nobody can predict."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_DEFAULT_KEY,
+        kind="int",
+        default=32,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Put the charger back to",
+        help=(
+            "Where the rate is returned to when the module has no reason to "
+            "hold it anywhere else — including after a restart. This is what "
+            "stops a service that died mid-throttle leaving a car at the floor "
+            "all night. It only ever restores a rate it set itself; one you "
+            "moved by hand is left alone."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_OVERRIDE_UNTIL_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=253402300799,
+        label="Manual override lapses at (epoch)",
+        help=(
+            "Set by the service when you change the charge rate yourself, so "
+            "the override survives a restart. Leave it alone — it is not a "
+            "setting to choose."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_OVERRIDE_MINUTES_KEY,
+        kind="int",
+        default=120,
+        lower=1,
+        upper=1440,
+        unit="minutes",
+        label="A manual change holds for",
+        help=(
+            "How long the module keeps its hands off after you set a rate "
+            "yourself. Somebody standing at the car knows something this "
+            "service does not."
+        ),
+    ),
+    SettingSpec(
+        key=EMPORIA_INTERVAL_KEY,
+        kind="int",
+        default=60,
+        lower=10,
+        upper=3600,
+        unit="seconds",
+        label="Emporia poll interval",
+        help=(
+            "How often to read circuit power from Emporia. Sixty seconds by "
+            "default, which is what Emporia's own Home Assistant integration "
+            "uses. The round trip was measured at 133-206 ms, so this is not "
+            "limited by speed: Emporia publishes no rate limit, and a shorter "
+            "interval means more calls against a quota nobody can see. Lower it "
+            "by measurement rather than by hope."
+        ),
+    ),
+    SettingSpec(
+        key=EMPORIA_ENABLED_KEY,
+        kind="bool",
+        default=False,
+        label="Emporia circuit monitoring",
+        help=(
+            "Read circuit-level power from Emporia Vue monitors and an Emporia "
+            "EV charger. Off by default. This is the one part of the service "
+            "that needs the internet: Emporia offers no local access, so every "
+            "circuit reading crosses their cloud. Solar collection is never "
+            "affected — an unreachable Emporia costs the inverter nothing, and "
+            "turning this off stops all of it within one poll interval."
+        ),
     ),
 )
 
