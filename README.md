@@ -7,8 +7,9 @@ subscription, and your data never leaves the house.
 ![The dashboard, showing live production, house load, battery and grid](docs/images/dashboard-now.jpg)
 
 > **Status: 1.0, running unattended on real hardware.** The reference installation —
-> an EG4 18kPV with four PowerPro WallMount modules — has collected **289,310
-> full-cadence readings across 36 days**, on top of **672 days of hourly history**,
+> an EG4 18kPV with four EG4 indoor 280 Ah battery modules — has collected
+> **308,678 full-cadence readings across 38 days**, on top of **674 days of
+> hourly history**,
 > polling over RS485 every eleven seconds. Every screenshot on this page is that
 > installation, live, with hardware serials replaced by the documented placeholders.
 >
@@ -33,10 +34,32 @@ than a missing one.
 | **EG4 12kPV** | Confirmed upstream — shares device type code 2092 with the 18kPV. |
 | **EG4 FlexBOSS21** | Confirmed upstream — device type code 10284. |
 | **EG4 FlexBOSS18** | Confirmed upstream — device type code 10284. |
-| **EG4 6000XP** | ⚠️ Partial, and not recommended yet. An off-grid family: several registers this driver reads mean something different there, and the PV string count is unconfirmed. Readings may be *wrong* rather than missing — see [#122](https://github.com/sjordan0228/arraysense/issues/122). |
+| **EG4 6000XP** | Supported, off-grid family. Two PV strings, from the spec sheet. Five readings are withheld rather than guessed — see below. |
+| **EG4 12000XP** | Supported, off-grid family. Two MPPT trackers behind four PV inputs, so two strings paralleled into one input share a measurement. The same five readings are withheld. |
 
 EG4 is the US rebrand of LuxPower, so LuxPower units speaking the same protocol
 should work.
+
+### What the off-grid family changes
+
+A 6000XP or 12000XP is not a smaller hybrid, and the driver says so rather than
+reading the same registers and hoping. Five readings are declared **unreadable**
+on those models, which is a different state from missing: the page shows nothing
+there and says why, instead of a figure that looks measured.
+
+| Withheld | Why |
+| --- | --- |
+| Generator power | Register 123 is a **seconds counter**, not generator power. A firmware disassembly found the comms handler answering it from a RAM word a timer increments about once a second, with no path from the power-conversion processor. |
+| Generator voltage and frequency | Never examined by that firmware work. In a register block otherwise full of housekeeping words, assuming these two alone are genuine measurements is a weak bet, and a wrong reading cannot be un-stored. |
+| Grid export today and lifetime | This family cannot sell back, so the counters have nothing to hold. |
+
+Those last two are deliberately more conservative than upstream, which withheld
+only the power and energy sensors. Adding a reading back once somebody confirms
+it costs nothing; months of wrong readings cannot be taken back.
+
+Everything else reads locally, including **your house load total**. Only the
+*itemisation* of smart-load circuits has no local register, which is the part
+still open in [#122](https://github.com/sjordan0228/arraysense/issues/122).
 
 ### How it connects — read this before buying a dongle
 
