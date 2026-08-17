@@ -831,9 +831,12 @@ function drawSankey(p) {
   // it carries the same qualification the cards do.
   const short = p.costShort || p.savingsShort;
   $('sankeyShort').hidden = !short;
-  $('sankeyShort').textContent = `${words.theMonth} the diagram is drawn from a partial `
-    + 'measurement — energy the meter counted could not all be placed in a band, and the '
-    + 'cards above say what is missing.';
+  // "This month the diagram…" reads as a sentence; "July 2026 the diagram…" reads as a
+  // typo, because a bare month name cannot open a clause the way "this month" can. The
+  // preposition is the whole difference and it belongs to the finished form alone.
+  $('sankeyShort').textContent = (words.running ? `${words.theMonth} the` : `In ${words.theMonth} the`)
+    + ' diagram is drawn from a partial measurement — energy the meter counted could not all '
+    + 'be placed in a band, and the cards above say what is missing.';
   $('sankeyTotal').textContent =
     `${money(p.noSolarCost, cur)} of electricity at grid rates ${words.inMonth}`
     + (short ? ' · not the whole month' : '');
@@ -1146,9 +1149,17 @@ function renderAssumptions(p, hasTariff, unreadable) {
     bits.push('The saving is what the same house load would have cost at the same tariff, less '
       + 'what the grid actually cost. It excludes the connection charge, which is payable '
       + 'whatever the roof does.');
-    bits.push('The estimated bill projects each rate band from its own measured rate, adds the '
-      + 'whole connection charge once, and nets off any export credit. It assumes the rest of '
-      + 'the month behaves like the part already measured.');
+    // A finished month is not projected, so the projection's premise is not an assumption
+    // it rests on. Left unconditional, this list told the reader the figure assumed the rest
+    // of the month behaved like the measured part, three inches below the bill card saying
+    // the month was over and the figure was what it came to. Of the two the card was right.
+    bits.push(words && !words.running
+      ? 'The bill adds the whole connection charge once and nets off any export credit. The '
+        + 'month is over, so nothing in it is projected: each rate band is priced from the '
+        + 'energy actually measured in it.'
+      : 'The estimated bill projects each rate band from its own measured rate, adds the '
+        + 'whole connection charge once, and nets off any export credit. It assumes the rest of '
+        + 'the month behaves like the part already measured.');
     bits.push('Every figure is rounded once, where it is shown. A breakdown can therefore be a '
       + 'cent away from its total — pricing the total is exact, and summing rounded parts '
       + 'drifts from it.');
