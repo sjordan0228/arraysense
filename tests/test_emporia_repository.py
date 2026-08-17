@@ -332,6 +332,28 @@ def test_history_marks_a_partly_recorded_hour_partial(tmp_path: Path) -> None:
     assert series.kwh == pytest.approx(3000 * (2 / 60) / 1000)
 
 
+def test_history_marks_a_half_recorded_hour_partial_at_a_fast_poll(tmp_path: Path) -> None:
+    # settings.py permits a 10 s interval (lower=10). Thirty minutes of it is
+    # 180 samples, which at a hard-coded 60 s multiplies past a full hour and
+    # clamps to one — reporting a half-recorded hour as whole. Told the real
+    # cadence, the same row is 1,800 seconds and says so.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], hour)
+    for tick in range(180):
+        repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(seconds=10 * tick))
+    rebuild_circuit_hourly(
+        store._conn, int(hour.timestamp()), int((hour + timedelta(hours=1)).timestamp())
+    )
+
+    got = repo.history(hour, hour + timedelta(hours=1), tier="hourly", cadence_seconds=10)
+
+    (series,) = got.series
+    assert series.partial is True
+    # Half an hour at 1 kW is 0.5 kWh, not the 1.0 a clamped full hour claims.
+    assert series.kwh == pytest.approx(0.5)
+
+
 def test_history_can_be_narrowed_to_named_circuits(tmp_path: Path) -> None:
     # The page draws five strips out of thirty-nine. Fetching all of them and
     # discarding thirty-four is the query this argument exists to avoid.

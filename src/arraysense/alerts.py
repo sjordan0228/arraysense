@@ -44,7 +44,12 @@ DEFAULT_TOP = 5
 # Circuit kinds that are totals rather than parts. A monitor's mains channel is
 # the sum of the circuits beside it, so naming it is a tautology — and adding it
 # to ``accounted_w`` would double every house.
-_NOT_A_CULPRIT = frozenset({"mains"})
+#
+# Public because the same set answers the same question elsewhere: the circuit
+# history endpoint ranks parts against the house and would double it in exactly
+# the same way. One definition rather than two, which is the whole difference
+# between a rule and a coincidence.
+NOT_A_CULPRIT = frozenset({"mains"})
 
 
 @dataclass(frozen=True)
@@ -110,7 +115,7 @@ def high_usage(
     measured = [
         circuit
         for circuit in circuits
-        if circuit.watts is not None and circuit.kind not in _NOT_A_CULPRIT
+        if circuit.watts is not None and circuit.kind not in NOT_A_CULPRIT
     ]
     accounted = sum(int(circuit.watts or 0) for circuit in measured) if measured else None
     ranked = sorted(measured, key=lambda circuit: (-(circuit.watts or 0), circuit.name))

@@ -30,29 +30,32 @@ logger = logging.getLogger(__name__)
 _CIRCUIT_TABLES = {"full": "circuit_reading", "hourly": "circuit_hourly"}
 
 _HOUR_SECONDS = 3600
-# What one reading is taken to cover: the Emporia poll interval's own default,
-# which settings.py sets to 60 s. Used twice — as how much of an hour each of a
-# bucket's ``sample_count`` readings accounts for, and as the fallback when a
-# window holds too few raw rows to measure their spacing.
+# What one reading is taken to cover when the caller does not say: the Emporia
+# poll interval's own default, which settings.py registers as 60 s. It is used
+# twice — as how much of an hour each of a bucket's ``sample_count`` readings
+# accounts for, and as the fallback when a window holds too few raw rows to
+# measure their spacing — and both are wrong by six times on an installation
+# polling at the ten seconds the setting permits, which is why ``history``
+# takes the figure rather than assuming this one.
 _POLL_SECONDS = 60
 
 
-def _elapsed_or_default(stamps: Sequence[int]) -> int:
+def _elapsed_or_default(stamps: Sequence[int], cadence_seconds: int = _POLL_SECONDS) -> int:
     """How long one raw reading covers, taken from the window's own spacing.
 
-    Measured rather than assumed because the repository is not told the poll
-    interval, and because the spacing actually achieved need not be the one
-    configured. The median gap is taken rather than the mean so that a poller
-    stopped for an hour inside the window does not inflate every reading's
-    share — the hole then simply goes uncounted, which is the right answer for
-    a stretch nobody measured.
+    Measured rather than assumed because the spacing actually achieved need not
+    be the one configured — a poll takes as long as it takes, and the interval
+    is a floor rather than a promise. The median gap is taken rather than the
+    mean so that a poller stopped for an hour inside the window does not
+    inflate every reading's share; the hole then simply goes uncounted, which
+    is the right answer for a stretch nobody measured.
 
     Fewer than two readings leaves no spacing to measure, so this falls back to
-    the module's default interval: a lone reading has to be worth some duration
-    or a one-sample window reports no energy at all.
+    the interval the caller says is in force: a lone reading has to be worth
+    some duration or a one-sample window reports no energy at all.
     """
     if len(stamps) < 2:
-        return _POLL_SECONDS
+        return cadence_seconds
     gaps = sorted(b - a for a, b in pairwise(stamps))
     return max(1, gaps[len(gaps) // 2])
 
@@ -252,6 +255,7 @@ class CircuitRepository:
         end: datetime,
         tier: str,
         circuit_ids: Sequence[int] | None = None,
+        cadence_seconds: int = _POLL_SECONDS,
     ) -> CircuitHistory:
         """Circuits over a window, ranked by the energy each one used.
 
@@ -270,6 +274,15 @@ class CircuitRepository:
         ``sample_count`` is stored precisely so that hour is not read as a
         full one — coverage in minutes watched is not coverage in energy
         accounted for, and this is the figure the second question depends on.
+
+        ``cadence_seconds`` is the poll interval in force, and on the hourly
+        tier it is arithmetic rather than a hint: each of a bucket's
+        ``sample_count`` readings accounts for that many seconds of the hour.
+        The default matches the setting's own, but the owner may set it as low
+        as ten, and at ten a half-recorded hour holds 180 readings — which
+        multiplied by an assumed sixty runs past the hour, clamps back to it,
+        and reports half an hour as a whole one. The caller knows the interval;
+        an hourly row cannot be asked.
 
         A database error yields an empty history rather than raising. This runs
         unattended on someone's inverter and a page saying it has no circuits
@@ -307,7 +320,7 @@ class CircuitRepository:
         # stretch nobody recorded contributes nothing instead of being smeared
         # over the readings either side of it. Not consulted on the hourly
         # tier, where sample_count says how much of each hour was recorded.
-        reading_seconds = _elapsed_or_default(stamps)
+        reading_seconds = _elapsed_or_default(stamps, cadence_seconds)
         watts: dict[int, list[int | None]] = {
             circuit_id: [None] * len(stamps) for circuit_id in meta
         }
@@ -323,10 +336,15 @@ class CircuitRepository:
             seen.add(key)
             if counted:
                 # An hour holds 3,600 seconds however many readings landed in
-                # it, and the poll interval is the owner's to set as low as ten
-                # seconds. Without the clamp a faster poller than the one
-                # assumed here would credit an hour with six hours of energy.
-                covered = min(int(samples) * _POLL_SECONDS, _HOUR_SECONDS)
+                # it. Told the interval that was actually running, a full hour's
+                # sample count multiplies back to exactly 3,600 and a
+                # half-recorded one to exactly 1,800 — but the interval is the
+                # owner's to change, and rows recorded at ten seconds read back
+                # under a setting since raised to sixty would credit an hour
+                # with six hours of energy. The clamp is what stops that, and
+                # ``partial`` is read off the same figure so the flag and the
+                # arithmetic cannot drift apart.
+                covered = min(int(samples) * cadence_seconds, _HOUR_SECONDS)
                 if covered < _HOUR_SECONDS:
                     partial.add(key)
             else:
