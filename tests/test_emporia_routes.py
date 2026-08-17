@@ -914,6 +914,91 @@ def test_costs_circuits_says_how_much_of_the_month_it_accounts_for(tmp_path: Pat
     assert body["coverage"]["circuits_kwh"] == pytest.approx(5.5)
 
 
+def test_costs_circuits_converts_an_aware_bound_to_the_owners_zone(tmp_path: Path) -> None:
+    """``with_zone`` attaches a zone to a naive bound and does nothing at all
+    to an aware one -- the month picker sends aware instants, and
+    ``bands_in_effect`` has to read the *converted* calendar or it disagrees
+    with ``band_intervals``, which does convert (via ``costs._local``).
+
+    Chicago runs behind UTC, so 9pm on 31 October local has already rolled
+    over to 1 November in UTC. Read without converting, ``bands_in_effect``
+    would price the hour against a winter-only band list while the energy is
+    correctly keyed "summer" by ``band_kwh`` -- two names that do not match,
+    which is a sharper failure than the mispriced-window trap CLAUDE.md
+    describes: a mismatch severe enough that every circuit prices as unknown
+    rather than merely at the wrong rate.
+    """
+    app, store, _ = _app(tmp_path)
+    hour = datetime(2026, 11, 1, 2, 0, tzinfo=UTC)  # 21:00 CDT on 31 October -- still autumn
+    _seed_spend_circuits(app, store, hour)
+    with TestClient(app) as c:
+        c.put(
+            "/api/settings",
+            json={
+                "tariff.bands": (
+                    "Summer | 0.30 | 00:00-24:00 | May-Oct; Winter | 0.10 | 00:00-24:00 | Nov-Apr"
+                )
+            },
+        )
+        response = c.get(
+            "/api/costs/circuits",
+            params={
+                "start": hour.isoformat(),
+                "end": (hour + timedelta(hours=1)).isoformat(),
+                "tz": "America/Chicago",
+            },
+        )
+    store.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    dryer = next(entry for entry in body["circuits"] if entry["name"] == "Dryer")
+    assert dryer["cost"] is not None, (
+        "the hour priced as unknown -- bands_in_effect read the UTC calendar, "
+        "which had already turned over to November, rather than the Chicago one"
+    )
+    assert dryer["cost"] == pytest.approx(3.0 * 0.30)
+
+
+def test_a_rounding_noise_house_reading_is_treated_as_no_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``house_kwh`` is rounded to three places for display below; "greater
+    than zero" alone lets a real but tiny positive figure — the same scale of
+    rounding noise the hours either side of sunrise produce on the efficiency
+    chart — divide a real circuits_kwh out to a percentage nobody could check
+    against the 0.000 the same response prints.
+
+    ``_coverage_end`` and ``counter_kwh`` are stubbed rather than seeded
+    through the store: the real counter's storage scale of ten cannot hold a
+    delta this small at all, so a sub-floor house_kwh can only ever arise from
+    interpolation across a boundary, and asserting the guard should not also
+    depend on reproducing that interpolation exactly.
+    """
+    from arraysense.api import routes
+
+    end = datetime(2026, 8, 16, 18, 0, tzinfo=UTC)
+    start = end - timedelta(hours=1)
+    monkeypatch.setattr(routes, "_coverage_end", lambda *a, **k: end)
+    monkeypatch.setattr(routes, "counter_kwh", lambda *a, **k: 0.0002)
+    store = SqliteStore(str(tmp_path / "cov.db"), device=TEST_DEVICE)
+
+    coverage = routes._circuit_coverage(
+        store,
+        start,
+        end,
+        circuits_kwh=0.05,
+        recorded_seconds=3600,
+        window_seconds=3600,
+    )
+    store.close()
+
+    assert coverage["house_kwh"] == 0.0, "0.0002 rounds to 0.000 at the displayed precision"
+    assert coverage["fraction"] is None, (
+        "a percentage was printed against a denominator that reads as no reading at all"
+    )
+
+
 def test_costs_circuits_refuses_a_period_too_long_to_price(tmp_path: Path) -> None:
     """band_intervals raises past MAX_SCAN_DAYS; that has to be a 400, not a 500.
     A month never reaches it, which is exactly why nothing else would catch a

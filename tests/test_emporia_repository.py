@@ -888,6 +888,55 @@ def test_band_kwh_spreads_a_half_covered_hour_evenly_across_a_boundary_inside_it
     store.close()
 
 
+def test_band_kwh_does_not_double_apportion_the_in_progress_hour(tmp_path: Path) -> None:
+    # The current month, always: a window ending mid-hour asks about a bucket
+    # whose covered_seconds already IS the part of the hour that has
+    # happened, because the rest of it has not happened yet. Spreading that
+    # already-exact figure across a remainder that does not exist applies the
+    # same 30-of-60-minutes fraction a second time and halves it.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    hour = day + timedelta(hours=12)
+    # Thirty one-minute-apart readings, the real rollup's own coverage for an
+    # hour that has only half elapsed.
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000, minutes=30)
+    window_end = hour + timedelta(minutes=30)
+    intervals = [(hour, window_end, "off-peak")]
+
+    result = repo.band_kwh(day, window_end, intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # Not 0.25, which is what applying the 30-of-60-minute fraction twice gives.
+    assert energy.by_band["off-peak"] == pytest.approx(0.5)
+    store.close()
+
+
+def test_band_kwh_reads_the_hour_the_windows_start_lands_inside(tmp_path: Path) -> None:
+    # Local midnight in a zone off a whole-hour UTC offset -- Asia/Kolkata, at
+    # +5:30 -- puts the query's own start half an hour into an hourly bucket.
+    # circuit_hourly stamps a bucket at the floor of the hour it covers, so
+    # that bucket sits *before* first and a plain ``timestamp >= first``
+    # dropped it whole, losing the slice of it the window actually asked for
+    # instead of apportioning it the way an interior band boundary is.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], hour)
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000)  # a full, fully-recorded hour
+    window_start = hour + timedelta(minutes=30)
+    window_end = hour + timedelta(hours=2)
+    intervals = [(window_start, window_end, "off-peak")]
+
+    result = repo.band_kwh(window_start, window_end, intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # Only the second half of the hour lies inside the window; not 0.0, which
+    # is what dropping the bucket entirely gives, and not 1.0, which is what
+    # counting the whole hour without clipping to the window's own start gives.
+    assert energy.by_band["off-peak"] == pytest.approx(0.5)
+    store.close()
+
+
 def test_band_kwh_ignores_a_stretch_no_band_covers(tmp_path: Path) -> None:
     # A gap in the schedule is unpriced energy, not energy in a band named
     # None -- the Costs page already warns about unpriced minutes separately.

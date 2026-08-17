@@ -13,7 +13,7 @@ from __future__ import annotations
 import pytest
 
 from arraysense.spend import CircuitEnergy, top_spenders
-from arraysense.tariff import parse_bands
+from arraysense.tariff import AdjustmentRate, parse_bands
 
 BANDS = parse_bands("peak | 0.40 | 15:00-20:00; off-peak | 0.10 | 00:00-24:00")
 
@@ -118,3 +118,46 @@ def test_a_band_the_tariff_does_not_have_is_dropped_not_raised_on() -> None:
     )
     ranked = top_spenders([odd], BANDS)
     assert ranked[0].cost is None
+
+
+def test_a_missing_band_marks_the_circuit_total_partial() -> None:
+    """A total that quietly omits a whole band is exactly as partial as one
+    built from thin buckets -- #23 draws no distinction between the two ways a
+    sum can fall short of the period."""
+    ranked = top_spenders([circuit("Dryer", peak=None, off=5.0)], BANDS)
+    assert ranked[0].cost == pytest.approx(0.5)
+    assert ranked[0].partial is True
+
+
+def test_a_circuit_silent_everywhere_is_not_also_flagged_partial() -> None:
+    """cost is already None for a circuit nobody heard from -- that is a
+    stronger claim than partial, and flagging it too would put a hatch
+    caption beside a row that renders no hatch at all."""
+    ranked = top_spenders([circuit("Dead outlet")], BANDS)
+    assert ranked[0].cost is None
+    assert ranked[0].partial is False
+
+
+def test_the_monthly_adjustment_rides_on_the_circuits_total_too() -> None:
+    """compute_cost adds the PCRF/SCRF rider on top of the band price for the
+    whole house; a circuit priced without it is wrong by the same rider, and
+    the ranking can invert because the rider scales with energy rather than
+    with the band's own price."""
+    adjustment = AdjustmentRate(
+        status="applied", per_kwh=0.01, pcrf_per_kwh=0.006, scrf_per_kwh=0.004
+    )
+    ranked = top_spenders([circuit("Dryer", peak=10.0, off=5.0)], BANDS, adjustment=adjustment)
+    # Band price alone is 10*0.40 + 5*0.10 = 4.5; the rider adds 15 kWh * 0.01.
+    assert ranked[0].cost == pytest.approx(4.65)
+    assert ranked[0].kwh == pytest.approx(15.0)
+
+
+def test_an_unpublished_months_adjustment_poisons_the_circuits_cost() -> None:
+    """The rider is not zero when nobody has published it for this month, and
+    a circuit cost that silently omitted an unrecorded rider would be the
+    same #23 mistake compute_cost already refuses to make for the house."""
+    ranked = top_spenders(
+        [circuit("Dryer", peak=10.0, off=5.0)], BANDS, adjustment=AdjustmentRate(status="unknown")
+    )
+    assert ranked[0].cost is None
+    assert ranked[0].kwh == pytest.approx(15.0)

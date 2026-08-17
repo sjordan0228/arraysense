@@ -569,6 +569,17 @@ class CircuitRepository:
         counted = tier == "hourly"
         first = int(start.timestamp())
         last = int(end.timestamp())
+        # circuit_hourly's own timestamp is the floor of the hour it covers
+        # (rebuild_circuit_hourly), so the bucket straddling ``first`` is
+        # stamped *before* it whenever the boundary does not land on the
+        # hour — local midnight in a zone off a whole-hour UTC offset, for
+        # one. Read from the hour that contains ``first`` rather than from
+        # ``first`` itself, or that bucket is dropped whole and the window
+        # silently loses the slice of it lying inside [first, last). The
+        # overlap arithmetic below clips every row to [first, last) and to
+        # ``intervals``' own bounds regardless of where the query started, so
+        # widening it here cannot pull in energy from outside what was asked.
+        query_first = (first // _HOUR_SECONDS) * _HOUR_SECONDS if counted else first
         try:
             circuits = self._store._conn.execute(
                 "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
@@ -579,7 +590,7 @@ class CircuitRepository:
                 f"  FROM {table}"
                 "  WHERE timestamp >= ? AND timestamp < ?"
                 "  ORDER BY timestamp",
-                (first, last),
+                (query_first, last),
             ).fetchall()
         except sqlite3.Error as exc:
             logger.warning("could not read circuit band energy: %s", exc)
@@ -614,10 +625,20 @@ class CircuitRepository:
                     if stored is not None
                     else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
                 )
-                # The span the energy is spread across is the hour, not the part
-                # of it that was recorded: where in the hour those seconds fell
-                # is precisely what the row does not say.
-                span = _HOUR_SECONDS
+                # The span the energy is spread across is the hour, not the
+                # part of it that was recorded — where in the hour those
+                # seconds fell is precisely what the row does not say — except
+                # at the trailing edge, where it is not a guess at all. The
+                # current month always ends mid-hour, and there the rollup's
+                # own covered_seconds already IS the part of the hour that
+                # existed by ``last``, because the rest of it has not happened
+                # yet. Smearing that already-exact figure across a remainder
+                # that does not exist applied the same fraction twice: a 1 kW
+                # row covering 12:00-12:30, asked about a window ending 12:30,
+                # returned 0.25 kWh instead of the 0.5 it actually measured.
+                # Shrinking span to match is what stops the second reduction.
+                hour_end = when + _HOUR_SECONDS
+                span = last - when if hour_end > last else _HOUR_SECONDS
             else:
                 nxt = following.get(when)
                 covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
@@ -627,7 +648,13 @@ class CircuitRepository:
             value = round(float(raw) * float(meta[key][5]))
             energy = float(value) * covered
             for iv_start, iv_end, band in windows:
-                overlap = min(when + span, iv_end) - max(when, iv_start)
+                # ``first`` is intersected here, on the same footing as a band
+                # edge, rather than folded into ``span`` above: a query start
+                # landing mid-hour (a Kolkata month, half an hour off UTC) is
+                # an ordinary clip on the smear, not a claim that the row's
+                # own recorded seconds are known to sit exactly at the
+                # window's edge the way the trailing one is.
+                overlap = min(when + span, iv_end) - max(when, iv_start, first)
                 if overlap <= 0:
                     continue
                 joules[key][band] = joules[key].get(band, 0.0) + energy * (overlap / span)

@@ -983,7 +983,7 @@ function renderSplit(p) {
       const short = Boolean(shortFlag && shortFlag[i]);
       const why = short ? ' — part of this window was not measured' : '';
       return `<span${short ? ' class="part"' : ''}`
-        + ` style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+        + ` style="flex:${(share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
         + ` title="${esc(v.name)} ${esc(pctStr(share))}${esc(why)}">`
         + `${share > 0.13 ? esc(pctStr(share)) : ''}</span>`;
     }).join('');
@@ -1015,23 +1015,31 @@ function renderSplit(p) {
 // no denominator, two spans that do not describe the same stretch, and a share
 // above one — which is not coverage at all but a fault announcing itself, since
 // a part cannot exceed the whole.
+//
+// "The circuits this system monitors" throughout, never "these circuits" —
+// the sentence sits beside a five-row panel titled "The five circuits that
+// cost the most", and the fraction it states is computed over every
+// monitored circuit before top_spenders truncates to five. On the reference
+// thirty-nine-circuit installation, "these circuits account for 62%" beside
+// five rows credits the five with all thirty-nine's share.
 function coverageWords(coverage) {
   if (!coverage) return '';
   const share = coverage.fraction;
   if (share === null || share === undefined || !isFinite(share)) {
     return coverage.spans_match === false
-      ? 'These circuits and the house counter do not cover the same stretch of this period, '
-        + 'so what share of it they account for cannot be said.'
-      : 'What share of this period’s energy these circuits account for could not be measured, '
-        + 'so treat the list as a part of the bill rather than as the whole of it.';
+      ? 'The circuits this system monitors and the house counter do not cover the same '
+        + 'stretch of this period, so what share of it they account for cannot be said.'
+      : 'What share of this period’s energy the circuits this system monitors account for '
+        + 'could not be measured, so treat the list as a part of the bill rather than as the '
+        + 'whole of it.';
   }
   if (share > 1) {
-    return `These circuits add up to ${pctStr(share)} of the house’s own measured energy, `
-      + 'which cannot be right — the two figures disagree, and the list is not to be read as '
-      + 'a share of the bill until they agree.';
+    return `The circuits this system monitors add up to ${pctStr(share)} of the house’s own `
+      + 'measured energy, which cannot be right — the two figures disagree, and the list is '
+      + 'not to be read as a share of the bill until they agree.';
   }
-  return `These circuits account for ${pctStr(share)} of this period’s energy. `
-    + 'The rest is branches nobody has clamped, and is not in this list.';
+  return `The circuits this system monitors account for ${pctStr(share)} of this period’s `
+    + 'energy. The rest is branches nobody has clamped, which no page here measures.';
 }
 // <<< costs-coverage-words
 
@@ -1041,22 +1049,36 @@ function coverageWords(coverage) {
 // the split to explain it.
 function renderSpenders(body, cur) {
   const list = Array.isArray(body && body.circuits) ? body.circuits : [];
-  if (!list.length) { $('spendSec').hidden = true; return; }
+  // A selected month before circuit collection began still returns every
+  // known circuit's metadata with a null cost each — five dashed rows, not
+  // the empty array the length check alone catches. At least one circuit has
+  // to have actually reported before there is anything here worth drawing.
+  const measured = list.some((c) => c.cost !== null);
+  if (!list.length || !measured) { $('spendSec').hidden = true; return; }
   $('spendSec').hidden = false;
   $('spendCoverage').textContent = coverageWords(body.coverage);
   const shades = [0.9, 0.62, 0.42, 0.28];
   $('spendList').innerHTML = list.map((c) => {
-    const priced = c.bands.filter((b) => b.cost !== null && b.cost > 0);
+    // A band this circuit never reported in is absent, not zero — dropped
+    // here as it is everywhere else. A band it reported at exactly $0 is a
+    // different claim and stays in the bar: filtering it out too used to
+    // strip the very segment a partial hatch was about, and left an
+    // all-zero-but-measured circuit under the same hatch as one silent all
+    // month.
+    const priced = c.bands.filter((b) => b.cost !== null);
     const total = priced.reduce((a, b) => a + b.cost, 0);
     // A circuit whose bands were all unmeasured gets the hatch the rest of the
     // page gives an unknown, never an empty bar reading as "spent nothing".
-    const bar = total > 0
+    const bar = priced.length
       ? `<div class="splitbar">${priced.map((b, i) => {
-          const share = b.cost / total;
+          // total can be zero when every measured band genuinely cost
+          // nothing — an equal share draws a real bar instead of dividing by
+          // zero, which is a different claim from "nothing was measured".
+          const share = total > 0 ? b.cost / total : 1 / priced.length;
           const shade = shades[Math.min(i, shades.length - 1)];
           const why = b.partial ? ' — part of this band’s window was not measured' : '';
           return `<span${b.partial ? ' class="part"' : ''}`
-            + ` style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+            + ` style="flex:${Math.max(2, share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
             + ` title="${esc(b.band)} ${esc(money(b.cost, cur))}${esc(why)}">`
             + `${share > 0.18 ? esc(b.band) : ''}</span>`;
         }).join('')}</div>`

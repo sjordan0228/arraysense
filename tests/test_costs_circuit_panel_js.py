@@ -91,3 +91,219 @@ def test_mismatched_spans_say_so_rather_than_dividing_them_out() -> None:
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_no_coverage_at_all_says_nothing_rather_than_nothing_measured() -> None:
     assert _words(None) == ""
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_share_is_attributed_to_every_monitored_circuit_not_the_five_shown() -> None:
+    """The sentence renders beside a panel titled "The five circuits that cost
+    the most", and the coverage figure it states is computed server-side over
+    every non-mains circuit before top_spenders truncates to five. "These
+    circuits account for X%" beside five rows credits the five with all
+    thirty-nine's share on the reference installation; the wording has to name
+    what is actually being measured."""
+    said = _words(_MATCHED)
+    assert "monitor" in said.lower()
+    assert "these circuits" not in said.lower()
+
+
+# --- renderSpenders ---------------------------------------------------------
+#
+# The row renderer, sliced through renderBands' opening line rather than its
+# own markers because it calls coverageWords and both have to be in scope
+# together. fade() is stubbed to a string a test can grep for rather than
+# reproduced, since the point here is that the renderer *calls* the
+# token-derived helper, not what that helper's own arithmetic does.
+
+_SPEND_SLICE_TO = "function renderBands("
+
+_SPEND_PRELUDE = (
+    _PRELUDE
+    + """
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const gnum = (v, d) => v.toLocaleString(undefined,
+  { minimumFractionDigits: d, maximumFractionDigits: d });
+const uStr = (v, d, unit) => (v === null ? DASH : gnum(v, d) + (unit ? ' ' + unit : ''));
+function money(v, cur) {
+  if (v === null || v === undefined || !isFinite(v)) return DASH;
+  return String(cur || '$') + Math.abs(v).toFixed(2);
+}
+function fade(name, alpha) { return `FADE(${name},${alpha})`; }
+const _els = {};
+function $(id) {
+  return _els[id] || (_els[id] = { hidden: false, textContent: '', innerHTML: '' });
+}
+"""
+)
+
+
+def _spend_slice() -> str:
+    text = COSTS.read_text()
+    start = text.index(_START)
+    end = text.index(_SPEND_SLICE_TO, start)
+    assert start < end, "costs-coverage-words / renderSpenders markers are out of order"
+    return text[start:end]
+
+
+def _render(
+    circuits: list[dict[str, Any]], coverage: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    assert NODE is not None
+    body = {"circuits": circuits, "coverage": coverage}
+    script = (
+        f"{_SPEND_PRELUDE}\n{_spend_slice()}\n"
+        f"renderSpenders({json.dumps(body)}, '$');\n"
+        f"console.log(JSON.stringify(_els));"
+    )
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    out: dict[str, Any] = json.loads(result.stdout)
+    return out
+
+
+def _circuit(
+    name: str,
+    cost: float | None,
+    kwh: float | None,
+    bands: list[dict[str, Any]],
+    partial: bool = False,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "kind": "circuit",
+        "cost": cost,
+        "kwh": kwh,
+        "partial": partial,
+        "bands": bands,
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_panel_hides_when_no_circuit_reported() -> None:
+    """A selected month before circuit collection began still returns every
+    known circuit's metadata with a null cost apiece -- five dashed rows, not
+    the empty list the length check alone catches, so at least one circuit
+    has to have actually reported before the panel is worth showing."""
+    circuits = [_circuit(f"C{i}", None, None, []) for i in range(5)]
+    els = _render(circuits)
+    assert els["spendSec"]["hidden"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_panel_shows_once_one_circuit_has_reported() -> None:
+    circuits = [
+        _circuit("Dryer", 4.5, 15.0, [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}])
+    ]
+    els = _render(circuits)
+    assert els["spendSec"]["hidden"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_zero_cost_partial_band_stays_in_the_bar() -> None:
+    """A band a circuit reported at exactly $0 is a different claim from one it
+    never reported in at all, and filtering out the zero-cost one used to strip
+    the very segment a partial hatch was about — leaving the caption's "a
+    hatched segment" claim with no hatch anywhere on the row to point at."""
+    circuits = [
+        _circuit(
+            "Fridge",
+            2.0,
+            5.0,
+            [
+                {"band": "peak", "kwh": 0.0, "cost": 0.0, "partial": True},
+                {"band": "off-peak", "kwh": 5.0, "cost": 2.0, "partial": False},
+            ],
+            partial=True,
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert "splitbar none" not in html, (
+        "the zero-cost band was dropped and the row read as unmeasured"
+    )
+    assert 'class="part"' in html, "the partial band itself disappeared from the bar"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_circuit_measured_at_zero_everywhere_is_not_hatched_like_an_unmeasured_one() -> None:
+    """Every measured band costing nothing is "it used no energy" -- the same
+    claim ``spend.py`` already distinguishes from "nobody heard from it" at
+    the circuit level, extended to the bar drawn from the individual bands."""
+    circuits = [
+        _circuit(
+            "Quiet lamp",
+            0.0,
+            0.0,
+            [
+                {"band": "peak", "kwh": 0.0, "cost": 0.0, "partial": False},
+                {"band": "off-peak", "kwh": 0.0, "cost": 0.0, "partial": False},
+            ],
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert "splitbar none" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_bar_fill_is_derived_from_the_grid_token_not_a_literal() -> None:
+    """A palette or theme override updates --grid but leaves a hard-coded rgba
+    on the old colour, bypassing the CVD-validated palette the token carries."""
+    circuits = [
+        _circuit("Dryer", 4.5, 15.0, [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}])
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert "FADE(--grid," in html
+    assert "176,72,110" not in html
+
+
+# --- renderSplit -------------------------------------------------------------
+#
+# The house-wide Energy/Cost bars predate this branch, but they hard-code the
+# same literal renderSpenders' bar used to. Fixing only the new function would
+# leave the two nearly-identical renderers in this file disagreeing about
+# where their colour comes from, so both are derived from the token together.
+
+_SPLIT_SLICE_FROM = "function renderSplit("
+
+_SPLIT_PRELUDE = """
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const pctStr = (v) => v === null || v === undefined || !isFinite(v)
+  ? '\\u2014' : `${(v * 100).toFixed(0)}%`;
+function fade(name, alpha) { return `FADE(${name},${alpha})`; }
+const _els = {};
+function $(id) {
+  return _els[id] || (_els[id] = { hidden: false, textContent: '', innerHTML: '' });
+}
+"""
+
+
+def _split_slice() -> str:
+    text = COSTS.read_text()
+    start = text.index(_SPLIT_SLICE_FROM)
+    end = text.index(_START, start)
+    assert start < end, "renderSplit / costs-coverage-words markers are out of order"
+    return text[start:end]
+
+
+def _render_split(rows: list[dict[str, Any]]) -> str:
+    assert NODE is not None
+    script = (
+        f"{_SPLIT_PRELUDE}\n{_split_slice()}\n"
+        f"renderSplit({{ rows: {json.dumps(rows)} }});\n"
+        f"console.log(_els.bandSplit.innerHTML);"
+    )
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_house_wide_split_bars_are_also_derived_from_the_grid_token() -> None:
+    rows = [
+        {"band": {"name": "Peak"}, "cost": 4.0, "importKwh": 10.0, "importShort": False},
+        {"band": {"name": "Off-peak"}, "cost": 1.0, "importKwh": 5.0, "importShort": False},
+    ]
+    html = _render_split(rows)
+    assert "FADE(--grid," in html
+    assert "176,72,110" not in html

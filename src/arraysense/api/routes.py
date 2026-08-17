@@ -1534,12 +1534,15 @@ def costs_circuits(
     that distinction is what #23 was reverted twice for missing, and money
     depends on the second.
 
-    The zone is resolved and applied with ``with_zone`` rather than
-    ``.astimezone()``, and for the reason ``costs()`` does the same: a naive
+    The zone is resolved with ``with_zone`` *and* converted with
+    ``.astimezone(zone)``, matching ``costs.py``'s own ``_local``. A naive
     bound is what the browser sends when it means local midnight in the
-    installation's own zone, and reading it against the *server's* zone
-    instead is the bug that put a 15:00-20:00 peak window at 10:00-15:00
-    local on the reference installation.
+    installation's own zone, so it is attached — but the month picker also
+    sends an aware instant, and ``with_zone`` leaves an aware one exactly as
+    it arrived. Left unconverted, ``tariff.bands_in_effect`` reads its
+    calendar fields off whatever zone the browser happened to send, which is
+    the bug that put a 15:00-20:00 peak window at 10:00-15:00 local on the
+    reference installation.
 
     The hourly tier, always. ``circuit_hourly`` is written before the raw
     readings are pruned and is itself never pruned, so every month the page
@@ -1556,9 +1559,9 @@ def costs_circuits(
         zone = _request_zone(store, tz)
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    # Attached to the installation's zone, not merely to whichever zone the
-    # server happens to run in — see the docstring above.
-    start, end = with_zone(start, zone), with_zone(end, zone)
+    # Attached to the installation's zone for a naive bound, and *converted*
+    # to it for an aware one — see the docstring above.
+    start, end = with_zone(start, zone).astimezone(zone), with_zone(end, zone).astimezone(zone)
     _check_range(start, end)
 
     tariff = load_tariff(SettingsStore(store).all())
@@ -1601,7 +1604,10 @@ def costs_circuits(
     # tariff's bands instead leaves an out-of-season one permanently
     # unmeasured, which makes every total permanently absent.
     bands = tariff.bands_in_effect(start, end) or tariff.bands
-    ranked = top_spenders(energies, bands)
+    # The same PCRF/SCRF rider compute_cost charges the house's own total —
+    # resolved once here, the way bands is, rather than inside top_spenders,
+    # which has no business knowing what a tariff's adjustment table is.
+    ranked = top_spenders(energies, bands, adjustment=tariff.adjustment_at(start, end))
     return {
         "configured": True,
         "currency": tariff.currency,
@@ -3299,6 +3305,16 @@ COVERAGE_SHORTFALL = 0.01
 # Only the browser checked, so the promise was not kept for any other consumer.
 CIRCUIT_SPAN_ENOUGH = 0.9
 
+# house_kwh is rounded to three places below for display, same as the
+# efficiency page's own EFF_RATIO_FLOOR_KWH guards a ratio whose denominator
+# is rounded to two. "Greater than zero" alone lets a real but tiny positive
+# figure — 0.00004 kWh of house energy against a nonzero circuit total —
+# divide out to a percentage in the thousands while the printed house_kwh
+# reads 0.000, the same rounding-noise ratio the hours either side of sunrise
+# produce on the efficiency chart. Half the smallest displayed unit is the
+# threshold below which house_kwh reads the same as no counter reading at all.
+_COVERAGE_HOUSE_FLOOR_KWH = 0.0005
+
 # An empty coverage answer, so a module that is not running says "unknown" in
 # the same shape a running one says a number. A page that had to branch on a
 # missing key would be one refactor away from rendering "0%" for "no module".
@@ -3530,6 +3546,11 @@ def _circuit_coverage(
     one of those as perfect coverage, which is the one reading guaranteed to
     be wrong, and would hide the fault for as long as it lasted. The page
     renders anything above one as a disagreement rather than as a full bar.
+
+    The denominator's guard is a floor at ``_COVERAGE_HOUSE_FLOOR_KWH``, not
+    merely "greater than zero" — a short range whose real ``house_kwh`` is a
+    rounding-noise fraction of a watt-hour still divides out to a percentage
+    nobody could check against the ``0.000`` the same figure prints as.
     """
     span = timedelta(seconds=window_seconds)
     coverage_end = _coverage_end(store, start, end, span)
@@ -3549,7 +3570,10 @@ def _circuit_coverage(
         "house_kwh": None if house_kwh is None else round(house_kwh, 3),
         "fraction": (
             None
-            if circuits_kwh is None or house_kwh is None or house_kwh <= 0 or not spans_match
+            if circuits_kwh is None
+            or house_kwh is None
+            or house_kwh < _COVERAGE_HOUSE_FLOOR_KWH
+            or not spans_match
             else round(circuits_kwh / house_kwh, 4)
         ),
         # What the span check was decided on, so the page can say it without
