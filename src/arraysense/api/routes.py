@@ -1359,12 +1359,21 @@ def costs(
     # the beginning. Falling straight from minute to raw — which is kept thirty
     # days — found nothing and priced August 2025 as unknown, while the History
     # page read the same month out of the hourly tier and showed $87.65.
+    #
+    # A candidate is only taken if its earliest row actually reaches back to
+    # ``lead`` — merely being non-empty is not enough. Retention prunes the
+    # minute tier from its oldest end, so a month straddling that cutoff still
+    # gets *some* minute rows back: the stretch after the cutoff. The old
+    # "if rows: break" took them anyway, and the stretch before the cutoff,
+    # having no rows at all, priced as though it had never happened rather
+    # than falling to the hourly tier, which is kept indefinitely and always
+    # reaches back this far.
     rows: list[dict[str, Any]] = []
     tier = "minute"
     for candidate in ("minute", "hourly", "full"):
         tier = candidate
         rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if rows:
+        if rows and cast(datetime, rows[0]["timestamp"]) - lead <= MAX_EDGE_GAP:
             break
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)

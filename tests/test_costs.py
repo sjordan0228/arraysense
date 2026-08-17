@@ -333,6 +333,59 @@ def test_the_projection_scales_by_what_was_watched_not_by_what_was_asked_for() -
     assert bill.projected_energy_cost == pytest.approx(12 * 0.10 * (744 / 12), rel=0.02)
 
 
+def test_a_month_the_counters_covered_start_to_finish_is_not_projected() -> None:
+    # is_projected is a different question from fraction_elapsed reaching 1.0:
+    # it has to come out false by itself once the counted span genuinely
+    # reaches the whole month, which is the only case the bill card's "so
+    # this is what it came to rather than a projection" is actually true.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"), fixed_monthly=0.0)
+    start, end = _day(2026, 7, 1), _day(2026, 8, 1)
+    energy = period_energy(flat, _counter(start, tuple(range(745))), start, end, TZ)
+    bill = estimate_bill(flat, energy)
+    assert bill is not None
+    assert bill.is_projected is False
+    assert bill.projected_energy_cost == pytest.approx(744 * 0.10, rel=1e-6)
+
+
+def test_collection_beginning_mid_month_still_projects_a_finished_month() -> None:
+    # The exact case named in the review: fraction_elapsed reads 1.0 the
+    # instant the calendar month ends, whether or not the collector was
+    # running for all of it. An installation whose collection began on the
+    # fifteenth still has its bill scaled up on the thirty-first from half a
+    # month of readings, and the bill card must not call that "what it came
+    # to rather than a projection" on the strength of the calendar alone.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"), fixed_monthly=0.0)
+    start, end = _day(2026, 7, 1), _day(2026, 8, 1)
+    mid = _day(2026, 7, 15)
+    hours = int((end - mid).total_seconds() // 3600)
+    energy = period_energy(flat, _counter(mid, tuple(range(hours + 1))), start, end, TZ)
+    bill = estimate_bill(flat, energy)
+    assert bill is not None
+    # Fully elapsed calendar-wise even though only about half was measured —
+    # exactly where the old wording read the fraction and believed it.
+    assert bill.fraction_elapsed == pytest.approx(1.0)
+    assert bill.is_projected is True
+
+
+def test_the_last_forty_three_minutes_of_a_month_still_projects() -> None:
+    # renderMonth's own 0.999 display tolerance calls a month "over" within
+    # three-quarters of an hour of its end — the right laxity for a label,
+    # and the wrong one for a claim about what estimate_bill actually did:
+    # 43 minutes of the month are still unmeasured, and the total is still
+    # scaled up from what came before them.
+    flat = Tariff(bands=parse_bands("Flat | 0.10 | 00:00-24:00"), fixed_monthly=0.0)
+    start = _day(2026, 7, 1)
+    near_end = _day(2026, 8, 1) - timedelta(minutes=43)
+    hours = int((near_end - start).total_seconds() // 3600)
+    energy = period_energy(flat, _counter(start, tuple(range(hours + 1))), start, near_end, TZ)
+    bill = estimate_bill(flat, energy)
+    assert bill is not None
+    # Within renderMonth's own tolerance for calling the month done —
+    # and still a projection, because the counters do not yet reach August.
+    assert bill.fraction_elapsed > 0.999
+    assert bill.is_projected is True
+
+
 def test_a_gap_inside_a_band_does_not_inflate_the_projection() -> None:
     # Counters keep counting while nobody is watching — that is the whole
     # reason this reads them instead of integrating power — so a delta across

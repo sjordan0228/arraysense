@@ -34,7 +34,7 @@ from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.settings import _mask
-from arraysense.store.rollup import rebuild_inverter_hourly
+from arraysense.store.rollup import rebuild_inverter_hourly, rebuild_inverter_minute
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -1860,6 +1860,56 @@ def test_costs_reads_a_month_older_than_the_minute_tier_keeps(client: Any) -> No
     assert body["tier"] == "hourly"
     assert body["cost"] is not None
     assert body["cost"]["energy_cost"] is not None
+
+
+def test_a_month_straddling_the_minute_tiers_cutoff_prices_from_the_whole_month(
+    client: Any,
+) -> None:
+    # Retention prunes the minute tier from its oldest end (see
+    # store.retention), so a month whose start falls before that cutoff still
+    # answers a minute-tier query with *something* — the days after the
+    # cutoff — while the days before it have no minute rows at all. The old
+    # "if rows: break" took that partial answer because it was non-empty, and
+    # priced only the second half of the month with nothing on screen saying
+    # a whole fortnight of it was never even attempted from the hourly tier
+    # that actually holds it, kept as that tier is for ever.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 1, 1, tzinfo=UTC)
+    month_end = datetime(2025, 2, 1, tzinfo=UTC)
+    lead = month_start - timedelta(hours=3)
+    tail = month_end + timedelta(hours=3)
+    hours = int((tail - lead).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=lead + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(lead.timestamp()), int(tail.timestamp()))
+    # Only the last five days of the month still have minute rows — the shape
+    # retention leaves once it has pruned everything older than its cutoff.
+    surviving = month_end - timedelta(days=5)
+    rebuild_inverter_minute(conn, int(surviving.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    conn.execute("DELETE FROM inverter_raw")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-01-01T00:00:00Z", "end": "2025-02-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    assert body["tier"] == "hourly"
+    assert body["cost"]["cost_is_short"] is False
+    # A full month at 1 kWh of grid import an hour, 744 kWh at $0.12.
+    assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
 
 
 def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:

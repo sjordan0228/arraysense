@@ -597,6 +597,13 @@ class BillEstimate:
     coverage and was the only money figure without a coverage statement; its
     projection was also the figure the second reverted attempt understated by
     $23.54 through a minutes-based denominator, which is finding 1 of #23.
+
+    ``is_projected`` is a different question from ``fraction_elapsed`` reaching
+    1.0, and the page that read them as the same thing lied: ``fraction_elapsed``
+    is 1.0 for any month the calendar has finished, whether or not the collector
+    was recording for all of it, while ``is_projected`` is false only once the
+    counted span itself reaches the whole month — a collector that started on
+    the tenth still scales its estimate up on the thirty-first.
     """
 
     currency: str
@@ -614,6 +621,7 @@ class BillEstimate:
     projected_adjustment: float | None = None
     is_short: bool = False
     assumed_kwh: float | None = None
+    is_projected: bool = False
 
 
 def _parse_clock(token: str, entry: str) -> time:
@@ -1271,6 +1279,17 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     # counter kept counting through every gap between those minutes.
     accounted = covered if energy.counted_minutes is None else energy.counted_minutes * 60
     scale = max(month_seconds / accounted, 1.0) if accounted > 0 else None
+    # Whether the total below is a genuine projection or the month priced as
+    # it stands. ``fraction_elapsed`` answers a different question — it is 1.0
+    # for any finished calendar month regardless of what was actually
+    # recorded in it — so an installation whose collection began mid-month
+    # still has ``scale`` above 1.0 once the month is over: ``estimated_total``
+    # is still being scaled up from the part that was measured, and calling
+    # that "what it came to rather than a projection" would be false. Only a
+    # ``scale`` of exactly 1.0 means the counted span already reaches the
+    # whole month, which needs both the month to be over and the collector to
+    # have covered all of it.
+    is_projected = scale is not None and scale > 1.0
 
     # Then by the energy the bands account for, which is a different question
     # from the time: a counter can sit silent for a day while polls keep
@@ -1346,4 +1365,5 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
         is_short=(import_entry is not None and import_entry.short)
         or (pays_for_export and export_entry is not None and export_entry.short),
         assumed_kwh=assumed,
+        is_projected=is_projected,
     )
