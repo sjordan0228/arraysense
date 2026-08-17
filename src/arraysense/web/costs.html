@@ -161,9 +161,13 @@
       <div>
         <span class="lbl">Billing month</span>
         <div class="mnav">
-          <button id="prevMonth" type="button" aria-label="Previous month">←</button>
+          <!-- Both start disabled: the page does not know which month it is on
+               until the first refresh() resolves siteZone() and sets the cursor,
+               and a click before then has no month to move from. renderPicker
+               turns them back on once the cursor is real. -->
+          <button id="prevMonth" type="button" aria-label="Previous month" disabled>←</button>
           <h2 id="monthName">—</h2>
-          <button id="nextMonth" type="button" aria-label="Next month">→</button>
+          <button id="nextMonth" type="button" aria-label="Next month" disabled>→</button>
         </div>
       </div>
       <div class="mstat" id="monthStat"></div>
@@ -504,6 +508,11 @@ function shortNote(entry, what) {
 // because the month in progress becomes a finished one at midnight on the first
 // and the forward button has to open at that moment without a reload.
 function renderPicker(today) {
+  // Both buttons start disabled in the markup, before cursor is set — a click
+  // during the first refresh()'s await on siteZone() would otherwise reach
+  // shiftMonth(null, -1). Reaching here means cursor is real, so prevMonth is
+  // always safe to re-enable; nextMonth depends on where the cursor sits.
+  $('prevMonth').disabled = false;
   const forward = $('nextMonth');
   const allowed = canGoForward(cursor, today);
   forward.disabled = !allowed;
