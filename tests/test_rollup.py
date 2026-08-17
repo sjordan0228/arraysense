@@ -1205,6 +1205,52 @@ def test_a_rebuild_still_grows_an_hour_that_late_readings_filled_in() -> None:
     conn.close()
 
 
+def test_a_rebuild_writes_the_watts_and_the_coverage_as_one_unit_or_not_at_all() -> None:
+    # The only-grows rule has to cover the whole row, because the reader
+    # multiplies the two columns together. Keeping the larger coverage while
+    # replacing the watts outright left a row holding watts measured at the new
+    # cadence beside coverage measured at the old one, and their product matched
+    # neither: 100 W for five seconds then 1,000 W with nothing after is 60,500 J
+    # at a sixty-second interval and 10,500 J at a ten-second one, and the mixed
+    # row read 45,500 J — a figure no rule produced, so no reader could tell
+    # which one had.
+    def measured(cadences: tuple[int, ...]) -> tuple[int, int, int]:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_ddl())
+        _circuit_store(conn)
+        hour = 3600 * 100
+        for offset, watts in ((0, 100), (5, 1000)):
+            conn.execute(
+                "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+                (hour + offset, watts),
+            )
+        for cadence in cadences:
+            rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=cadence)
+        row = conn.execute(
+            "SELECT watts, sample_count, covered_seconds FROM circuit_hourly"
+            " WHERE circuit_id = 1 AND timestamp = ?",
+            (hour,),
+        ).fetchone()
+        conn.close()
+        return (int(row[0]), int(row[1]), int(row[2]))
+
+    slow = measured((60,))
+    fast = measured((10,))
+    assert slow == (931, 2, 65), "5 s of 100 W and 60 s of 1,000 W, averaging 931"
+    assert fast == (700, 2, 15), "the same readings re-capped at ten seconds"
+    # Rounding the watts to an integer is worth 15 J out of 60,500 here; the
+    # mixture this test exists for was out by a quarter of the figure.
+    assert slow[0] * slow[2] == pytest.approx(100 * 5 + 1000 * 60, rel=1e-3)
+    assert fast[0] * fast[2] == pytest.approx(100 * 5 + 1000 * 10, rel=1e-3)
+
+    # Lowering the interval measures less, so the row is left exactly as the
+    # earlier pass wrote it rather than half-rewritten.
+    assert measured((60, 10)) == slow, "a smaller measurement leaves the whole row alone"
+    # Raising it measures at least as much, so all three columns move together
+    # and the product is the new pass's own answer.
+    assert measured((10, 60)) == slow, "a larger measurement replaces the whole row"
+
+
 def test_an_hour_nobody_answered_stores_zero_coverage_rather_than_unknown() -> None:
     # NULL in this column means one thing only: a row written before the column
     # existed, which a reader falls back to a guess for. An hour that really

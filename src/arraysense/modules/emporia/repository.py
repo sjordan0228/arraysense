@@ -57,8 +57,9 @@ def _reading_seconds(stamps: Sequence[int], cadence_seconds: int) -> int:
     polls between them were never recorded and their energy is unknown rather
     than attributable to the neighbours. Measured spacing can only *lower* that
     bound, never raise it — which is the whole of the rule, ``min(median gap,
-    cadence)``, and what stops a window holding two readings three hours apart
-    from reporting six kilowatt-hours where thirty watt-hours were measured.
+    cadence)``, and what stops a window holding two 1 kW readings three hours
+    apart at a sixty-second interval from reporting the 6 kWh the gap would carry
+    where the two minutes of poll period actually sampled are worth 33 Wh.
 
     The median gap is what lowers it, and it is taken rather than the mean so a
     poller stopped for an hour inside the window does not inflate every

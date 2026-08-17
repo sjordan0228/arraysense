@@ -62,25 +62,34 @@ rewritten**, and hours recorded from the upgrade onwards are exact.
   today.** How much of each hour its readings account for is measured when the
   hour is summarised, minutes after the readings arrived, and stored with it.
   Changing `emporia.interval` used to move the energy of every hour already
-  recorded — raising it from ten seconds to sixty doubled them, and each then
-  reported itself as a whole hour rather than the half it was. The rebuild
-  reaches three hours back, so a change made now still meets readings collected
-  under the old setting; an hour's coverage is therefore only ever raised by a
-  rebuild and never lowered, and lowering the interval cannot rewrite three
-  hours of honest readings as a fraction of the energy they recorded. A window
-  read at full resolution is bounded the same way: one reading accounts for at
-  most one poll interval, so two readings three hours apart are worth two
-  minutes of energy rather than six kilowatt-hours, and the three hours nobody
+  recorded: an hour holding thirty minutes of ten-second readings accounts for
+  1,800 of its seconds, and read back at a sixty-second setting the same 180
+  readings claimed 10,800 — clamped to the hour, so the half hour doubled into a
+  whole one and took its energy with it. The rebuild reaches three hours back,
+  so a change made now still meets readings collected under the old setting; an
+  hour's coverage is therefore only ever raised by a rebuild and never lowered,
+  and lowering the interval cannot rewrite three hours of honest readings as a
+  fraction of the energy they recorded. A window read at full resolution is
+  bounded the same way: one reading accounts for at most one poll interval, so
+  two 1 kW readings three hours apart at a sixty-second interval are worth the
+  two minutes they were taken for — 33 Wh — rather than the 6 kWh that crediting
+  each of them with the whole gap would give, and the three hours nobody
   recorded break the line instead of being drawn straight across.
 - **An hour's stored watts and its stored coverage are measured from the same
-  spans.** Each reading holds until the next one arrives, capped at one poll
-  interval; the span is cut where it crosses the hour, and both figures come
-  from those same pieces. A plain average beside a duration-weighted coverage
-  is two different weightings of one hour multiplied together by whatever reads
-  them: 100 W held for five seconds followed by 1,000 W held for two minutes
-  stored 700 W where the hour really averaged 964, and the energy came out 27%
-  short. Cutting at the boundary is the other half — a reading at 12:59:59 used
-  to take a whole interval inside the 12:00 bucket and give 13:00 nothing.
+  spans, and are written together or not at all.** Each reading holds until the
+  next one arrives, capped at one poll interval; the span is cut where it
+  crosses the hour, and both figures come from those same pieces. A plain
+  average beside a duration-weighted coverage is two different weightings of
+  one hour multiplied together by whatever reads them: 100 W held for five
+  seconds followed by 1,000 W held for two minutes stored 700 W where the hour
+  really averaged 964, and the energy came out 27% short. Cutting at the
+  boundary is the other half — a reading at 12:59:59 used to take a whole
+  interval inside the 12:00 bucket and give 13:00 nothing. And because the two
+  columns are multiplied, a rebuild replaces both or neither: keeping the larger
+  coverage while overwriting the watts left 100 W for five seconds followed by
+  1,000 W reading as 45,500 J, where those readings account for 60,500 J at a
+  sixty-second interval and 10,500 J at a ten-second one — a figure neither
+  setting produces, and so one nothing downstream could attribute to either.
 - **The recorded-for figure describes the module rather than the circuits
   asked for.** A poll that reached one clamp reached the monitor, so asking for
   a single outlet that has been offline since April no longer reads as a module

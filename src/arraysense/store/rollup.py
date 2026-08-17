@@ -644,17 +644,33 @@ def rebuild_circuit_hourly(
     that is the question it answers — how many times the module was heard from —
     and the coverage is what answers the other one.
 
-    **Coverage is written once and afterwards only grows.** A rebuild that
-    measures less than the row already holds leaves the row alone, and this is
-    the answer to the cadence a rebuild cannot ask about. The rebuild window
-    reaches three hours back, so lowering ``emporia.interval`` from sixty
-    seconds to ten would otherwise re-cap three hours of sixty-second readings
-    at ten seconds apiece and rewrite them as one sixth of the energy they
-    recorded — readings measured honestly, overwritten by a setting they were
-    never collected under. Raising the interval needs no such guard, because the
-    cap only ever lowers a span and the real gaps are already the shorter
-    figure. Nothing else in the range only-grows: watts and the sample count are
-    replaced outright, which is what lets a late-arriving reading correct them.
+    **Coverage is written once and afterwards only grows, and the row moves as
+    one piece or not at all.** A rebuild that measures less than the row already
+    holds leaves the whole row alone; one that measures at least as much replaces
+    all three columns together. This is the answer to the cadence a rebuild
+    cannot ask about. The rebuild window reaches three hours back, so lowering
+    ``emporia.interval`` from sixty seconds to ten would otherwise re-cap three
+    hours of sixty-second readings at ten seconds apiece and rewrite them as one
+    sixth of the energy they recorded — readings measured honestly, overwritten
+    by a setting they were never collected under. Raising the interval needs no
+    such guard, because the cap only ever lowers a span and the real gaps are
+    already the shorter figure.
+
+    Keeping the larger coverage while replacing the watts anyway is the version
+    of this that does not work, and it is the one written first. The reader
+    multiplies the two columns, so a row holding watts measured at the new
+    cadence beside coverage measured at the old one describes neither: 100 W for
+    five seconds followed by 1,000 W with nothing after is 60,500 J at a
+    sixty-second interval and 10,500 J at a ten-second one, and the mixed row
+    read 45,500 J. A figure no rule produced is worse than either rule's answer,
+    because nothing downstream can tell which rule wrote it.
+
+    The cost is that a reading arriving late into an hour whose coverage has
+    since been re-measured smaller — that is, into one of the three hours open
+    when the interval was lowered — is not booked. That is the right way round:
+    a late circuit reading is rare, the window is three hours wide, and the
+    alternative is trading a correction nobody asked for against energy that was
+    really recorded.
 
     An hour in which nothing was heard averages to NULL rather than to zero, and
     lands with a sample count of nought. An hour with no readings stores 0
@@ -741,8 +757,14 @@ def rebuild_circuit_hourly(
             " ON CONFLICT (timestamp, circuit_id) DO UPDATE SET"
             "  watts = excluded.watts,"
             "  sample_count = excluded.sample_count,"
-            "  covered_seconds ="
-            "   MAX(excluded.covered_seconds, COALESCE(circuit_hourly.covered_seconds, 0))",
+            "  covered_seconds = excluded.covered_seconds"
+            # The whole row moves or none of it does. A DO UPDATE whose WHERE is
+            # false leaves the row exactly as it stands rather than raising, so
+            # the two columns a reader multiplies together always come from one
+            # pass. COALESCE, because a row written before the column existed
+            # holds NULL and any real measurement is an improvement on it.
+            " WHERE excluded.covered_seconds"
+            "  >= COALESCE(circuit_hourly.covered_seconds, 0)",
             reach,
         )
 

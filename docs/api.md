@@ -241,7 +241,10 @@ the coverage each bucket recorded at the moment it was rolled up, when the poll
 interval that produced its readings was still the one in force — so changing
 `emporia.interval` no longer moves the energy or the coverage of anything
 already stored, and a rebuild can only ever raise an hour's coverage, never
-lower it. On the raw tier one reading accounts for at most one poll interval,
+lower it. It raises the whole row or none of it: an hour's watts and its coverage
+are always the ones a single rebuild measured, because their product is the
+energy and a product of two different intervals' figures is neither interval's
+answer. On the raw tier one reading accounts for at most one poll interval,
 and for less where the next reading came sooner; a stretch further apart than
 the interval was not recorded, and its energy is unknown rather than credited to
 the readings either side. Hours stored before this release carry no coverage
