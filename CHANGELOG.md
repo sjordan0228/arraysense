@@ -80,6 +80,12 @@ nothing else.
 
 ### Fixed
 
+- **The first-run wizard asks where the installation is before the button, not
+  after it.** "Where is this installation?" sat below *Set up and start*, so
+  the obvious way through the form was to fill in the inverter and press the
+  button — and the location, which the weather poller cannot work without and
+  which needs an explicit backfill to recover, was below the fold and easy to
+  walk straight past.
 - **Restore on startup no longer overrules a rate you set by hand.** The
   service puts a rate back after a restart so that dying mid-throttle does not
   leave a car at 6 A all night — but it decided a rate was its own to put back

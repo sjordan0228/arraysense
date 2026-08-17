@@ -2210,7 +2210,7 @@ function showWizard(payload) {
            service cannot reconstruct on its own — the weather poller
            records nothing without it, and recovery needs an explicit
            backfill — so it is worth offering before the first start. -->
-      <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
+      <div id="wizLocation" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
         <div style="font-size:14px;font-weight:600;margin-bottom:8px">Where is this installation?</div>
         <p style="font-size:11px;color:var(--ink3);margin:0 0 10px;max-width:65ch">
           Enter a postcode or place name so the weather service knows which sky
@@ -2242,6 +2242,19 @@ function showWizard(payload) {
     return _wizOriginalApply(body, ui);
   }
   const setupShell = mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: wizApply });
+  // Seat the location block just above the button — fields, then location,
+  // then "Set up and start" — instead of below it. mountSetup refills the
+  // host whenever the model or connection changes, so a one-time move would
+  // drop the block on the first refill (typed postcode and all); the observer
+  // puts it back after every rebuild.
+  const locHost = $('wizardHost');
+  const locBlock = $('wizLocation');
+  function seatLocation() {
+    const actions = locHost.querySelector('.actions');
+    if (actions && locBlock.parentNode !== locHost) locHost.insertBefore(locBlock, actions);
+  }
+  seatLocation();
+  new MutationObserver(seatLocation).observe(locHost, { childList: true });
   // The postcode lookup. Reads nothing and writes nothing — it only resolves
   // a name to coordinates, and the apply carries them. The decision is made
   // by the shared geocodeOutcome in common.js, so the wizard and the settings
