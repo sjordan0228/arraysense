@@ -123,9 +123,16 @@ def backfill(
 ) -> tuple[int, int]:
     """Fetch every circuit's archive and insert the hours not already held.
 
-    Returns what was written and what was left alone, because those are the two
-    numbers that say whether a run did what it claimed: a second run of the same
-    command should write nothing at all.
+    Returns what was written and how many hours the rollup had already measured,
+    because those are the two numbers that say whether a run did what it
+    claimed: a second run of the same command should write nothing at all.
+
+    ``now`` is read once and the whole run works to it, so every circuit is
+    asked for the same window and the report adds up. The cost is that an hour
+    which finishes while the run is still going is outside the window and is not
+    fetched — run it again to pick that hour up. Re-reading the clock per
+    circuit would trade one missing hour for thirty-nine circuits covering
+    thirty-nine slightly different spans, which is the worse of the two.
     """
     now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
     start = now - timedelta(days=days)
@@ -156,12 +163,18 @@ def backfill(
                 logger.warning("%s: %s", name, exc)
             time.sleep(PAUSE_SECONDS)
 
+        # The hour in progress is dropped before anything is counted. Emporia
+        # answers for it, and that answer covers only the minutes so far —
+        # stored as a whole hour it would understate the circuit for good, since
+        # nothing here ever overwrites. Counting it as "already measured" would
+        # also be a lie in the one line this run reports.
+        finished = [timestamp for timestamp in sorted(hours) if timestamp < int(now.timestamp())]
         rows = [
-            (timestamp, circuit_id, round(kwh * 1000), 1, SECONDS_PER_HOUR)
-            for timestamp, kwh in sorted(hours.items())
-            if timestamp not in held and timestamp < int(now.timestamp())
+            (timestamp, circuit_id, round(hours[timestamp] * 1000), 1, SECONDS_PER_HOUR)
+            for timestamp in finished
+            if timestamp not in held
         ]
-        skipped += len(hours) - len(rows)
+        skipped += sum(1 for timestamp in finished if timestamp in held)
         logger.info(
             "%-28s fetched %4d  new %4d  already held %3d",
             name[:28],
