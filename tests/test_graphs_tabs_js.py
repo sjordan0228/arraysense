@@ -420,27 +420,110 @@ def test_the_coverage_line_says_the_right_one_of_its_four_things() -> None:
     )
     results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
     assert results["normal"] == (
-        "Monitored circuits cover 71% of the house this window — 8.10 kWh of 11.40 kWh."
+        "Monitored circuits cover 71% of the house this window — 8.10 kWh of the 11.40 kWh "
+        "the inverter's own counter recorded."
     )
     assert results["unknown"] == (
-        "The house's own energy is unknown for this window, so the share these circuits "
-        "account for cannot be given."
+        "The house's own energy counter did not report for this window, so the share these "
+        "circuits account for cannot be given."
     ), "a null share is neither 0% nor 100%"
     assert "0%" not in results["unknown"] and "100%" not in results["unknown"]
     assert results["over"].startswith(
-        "These circuits account for 12.40 kWh against the house's own 9.80 kWh."
+        "These circuits account for 12.40 kWh against the 9.80 kWh on the inverter's own counter."
     ), "a part above the whole is a fault reporting itself, shown as both figures"
     assert "127%" not in results["over"] and "100%" not in results["over"], (
         "the endpoint stopped clamping so this line could tell the truth; it must not clamp either"
     )
     assert results["short"] == (
         "The circuits recorded for 6.0 h of this 7-day window, so their 18.39 kWh is not a "
-        "share of the house's 254.8 kWh across the whole of it. A range the module was "
-        "running for will give the share."
+        "share of the 254.8 kWh the inverter's own counter recorded across the whole of it. "
+        "A range the module was running for will give the share."
     )
     assert "7%" not in results["short"], (
         "the ratio of two different spans is not a coverage figure and must not be printed"
     )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_counter_that_read_nothing_is_not_a_counter_that_said_nothing() -> None:
+    # Three different facts leave the endpoint's share null, and saying any of
+    # them as another is the founding error of this project in miniature. The
+    # middle one is measured on the bench, where a fake source holds
+    # load_energy_total_kwh at 44,721.0 across every reading in the window: the
+    # counter answered, and what it answered was that nothing moved.
+    out = _run(
+        "const w6 = 6 * 3600;\n"
+        "console.log('flat:' + circuitCoverageWords("
+        "{circuits_kwh: 13.568, house_kwh: 0.0, fraction: null}, w6, w6));\n"
+        "console.log('absent:' + circuitCoverageWords("
+        "{circuits_kwh: 13.568, house_kwh: null, fraction: null}, w6, w6));\n"
+        "console.log('nocircuits:' + circuitCoverageWords("
+        "{circuits_kwh: null, house_kwh: 11.4, fraction: null}, w6, w6));",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["flat"] == (
+        "The house's own energy counter did not move across this window, so there is no total "
+        "for these circuits to be a share of."
+    )
+    assert results["absent"] == (
+        "The house's own energy counter did not report for this window, so the share these "
+        "circuits account for cannot be given."
+    )
+    assert results["nocircuits"] == (
+        "None of these circuits reported any energy in this window, so there is no share to "
+        "give against the house."
+    )
+    assert len({results["flat"], results["absent"], results["nocircuits"]}) == 3, (
+        "a counter that read nothing, one that said nothing, and circuits that said nothing "
+        "are three facts and must not share a sentence"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_split_caption_never_claims_a_remainder_that_is_not_there() -> None:
+    # The chart's half of the rule the endpoint's uncapped fraction states in
+    # energy. Measured on the bench: the monitored stack peaked at 14,059 W
+    # against a house line flat at 2,810 W, above it at 93 of 127 shared
+    # instants and five times it at worst — under a caption that called that
+    # line the top of the picture. The caption must not narrate a remainder
+    # where the stack is drawn above the line it is supposed to sit under.
+    out = _run(
+        "const flat = Array(20).fill(2810);\n"
+        "const bad = stackDisagreement(Array(20).fill(14059), flat);\n"
+        "const good = stackDisagreement(Array(20).fill(900), flat);\n"
+        "const skew = stackDisagreement("
+        "[2820, ...Array(19).fill(900)], flat);\n"
+        "const say = (d) => (d ? d.share.toFixed(2) + '/' + d.worst.toFixed(1) : 'null');\n"
+        "console.log('bad:' + say(bad));\n"
+        "console.log('good:' + good);\n"
+        "console.log('skew:' + skew);\n"
+        "console.log('nohouse:' + stackDisagreement(Array(20).fill(14059), null));\n"
+        "console.log('agreeCap:' + circuitStackWords(['A', 'B'], true, null));\n"
+        "console.log('badCap:' + circuitStackWords(['A', 'B'], true, "
+        "{share: 0.732, worst: 5.0}));\n"
+        "console.log('noneCap:' + circuitStackWords(['A', 'B'], false, null));",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["bad"] == "1.00/5.0", "a stack five times the house line is not a remainder"
+    assert results["good"] == "null"
+    assert results["skew"] == "null", (
+        "one bucket of resampling skew must not fire a warning on a healthy installation"
+    )
+    assert results["nohouse"] == "null", "with no house line there is nothing to disagree with"
+    assert "space between it and the stack" in results["agreeCap"]
+    assert "disagree rather than leaving a remainder" in results["badCap"]
+    assert "remainder" not in results["badCap"].split("disagree rather than leaving a")[0], (
+        "the disagreement caption must not lead with a remainder it then denies"
+    )
+    assert "73% of this window" in results["badCap"] and "5.0 times it" in results["badCap"]
+    assert "It is not zero." in results["noneCap"], "an undrawable remainder is not a zero one"
+    for key in ("agreeCap", "badCap", "noneCap"):
+        assert "load power, read separately from the energy counter" in results[key], (
+            "the line is a power register and the sentence below it is a kWh counter; a "
+            "reader shown both is owed the difference"
+        )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

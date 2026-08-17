@@ -1563,26 +1563,111 @@ function circuitCoverageWords(coverage, recorded, windowSeconds) {
   const span = `The circuits recorded for ${circuitSpanWords(recorded)} of this `
     + `${circuitWindowWords(windowSeconds)} window`;
   if (f === null) {
-    return short
-      ? `${span}, and the house's own energy is unknown for it, so the share these circuits `
-        + 'account for cannot be given.'
-      : "The house's own energy is unknown for this window, so the share these circuits "
-        + 'account for cannot be given.';
+    // Three different facts arrive here and none of them may be said as
+    // another. The endpoint leaves the share null when the circuits reported no
+    // energy, when the house counter did not report, and when it reported but
+    // did not move — and "unknown" said over the third of those would be wrong:
+    // the counter answered, and what it answered was nothing. Measured on the
+    // bench, where a fake source holds load_energy_total_kwh at 44,721.0 across
+    // every reading in the window.
+    const known = (v) => typeof v === 'number' && isFinite(v);
+    // Named once, because the clause below is either a sentence of its own or
+    // the tail of the span one, and "of this 6-hour window, and … across this
+    // window" says it twice in a row.
+    const where = short ? 'it' : 'this window';
+    const why = !known(cov.circuits_kwh)
+      ? `none of these circuits reported any energy in ${where}, so there is no share to `
+        + 'give against the house'
+      : known(cov.house_kwh)
+        ? `the house's own energy counter did not move across ${where}, so there is no `
+          + 'total for these circuits to be a share of'
+        : `the house's own energy counter did not report for ${where}, so the share these `
+          + 'circuits account for cannot be given';
+    // One clause, said either as a sentence of its own or as the tail of the
+    // span one. Written out twice it would be two places for the wording to
+    // drift apart.
+    return short ? `${span}, and ${why}.` : why.charAt(0).toUpperCase() + why.slice(1) + '.';
   }
   if (f > 1) {
     return `These circuits account for ${circuitEnergyWords(cov.circuits_kwh)} against the `
-      + `house's own ${circuitEnergyWords(cov.house_kwh)}. A part cannot exceed the whole, so `
-      + 'the two figures disagree rather than describing coverage — a mains channel counted as '
-      + 'a part, or a multiplier set for the wrong circuit.'
+      + `${circuitEnergyWords(cov.house_kwh)} on the inverter's own counter. A part cannot `
+      + 'exceed the whole, so the two figures disagree rather than describing coverage — a '
+      + 'mains channel counted as a part, or a multiplier set for the wrong circuit.'
       + (short ? ` ${span}, which is the other way two figures stop being comparable.` : '');
   }
   if (short) {
     return `${span}, so their ${circuitEnergyWords(cov.circuits_kwh)} is not a share of the `
-      + `house's ${circuitEnergyWords(cov.house_kwh)} across the whole of it. A range the `
-      + 'module was running for will give the share.';
+      + `${circuitEnergyWords(cov.house_kwh)} the inverter's own counter recorded across the `
+      + 'whole of it. A range the module was running for will give the share.';
   }
   return `Monitored circuits cover ${circuitShareWords(f)} of the house this window — `
-    + `${circuitEnergyWords(cov.circuits_kwh)} of ${circuitEnergyWords(cov.house_kwh)}.`;
+    + `${circuitEnergyWords(cov.circuits_kwh)} of the ${circuitEnergyWords(cov.house_kwh)} the `
+    + "inverter's own counter recorded.";
+}
+
+// Whether the stack and the house line stand where a caption may say they do.
+//
+// This is the chart's half of the rule the endpoint's uncapped fraction states
+// in energy: a part cannot exceed the whole, so monitored circuits drawn above
+// the house's own load are not a picture with a remainder in it — they are a
+// fault reporting itself, and the caption must not narrate a remainder that is
+// not there. Measured on the bench at 93 of 127 shared instants and 5.00 times
+// the house line, under a caption that called that line the top of the picture.
+//
+// Two guards, because the alternative to a threshold here is a warning that
+// fires on every healthy installation and so means nothing. The margin clears
+// resampling skew: the house is averaged into the circuits' own buckets, and a
+// minute-wide bucket on a house that swings a few hundred watts is worth a
+// couple of per cent either way. The share clears the odd genuine transient —
+// a compressor starting inside one bucket — while leaving a missed mains
+// exclusion or a wrong multiplier nowhere to hide, because both of those are
+// present at nearly every instant and by a wide margin.
+const STACK_OVER_MARGIN = 0.02;
+const STACK_OVER_SHARE = 0.05;
+
+function stackDisagreement(total, house) {
+  if (!house) return null;
+  let seen = 0;
+  let over = 0;
+  let worst = 0;
+  for (let i = 0; i < total.length; i++) {
+    const t = total[i];
+    const h = house[i];
+    if (typeof t !== 'number' || !isFinite(t)) continue;
+    if (typeof h !== 'number' || !isFinite(h)) continue;
+    seen += 1;
+    if (t <= h * (1 + STACK_OVER_MARGIN)) continue;
+    over += 1;
+    if (h > 0 && t / h > worst) worst = t / h;
+  }
+  if (!seen || over <= seen * STACK_OVER_SHARE) return null;
+  return { share: over / seen, worst };
+}
+
+// What the line under the split chart says, which depends on where the two
+// actually stand rather than on where they are expected to.
+function circuitStackWords(names, hasHouse, disagree) {
+  const order = `Bottom to top: ${names.join(', then ')}.`;
+  // Said in every state: the line is a power register read on the inverter's
+  // own clock and the sentence beneath it is a kilowatt-hour counter, and a
+  // reader shown a confident line over the words "the counter did not report"
+  // is owed the difference rather than left to reconcile it.
+  const kind = "The line is the house's own load power, read separately from the energy "
+    + 'counter below';
+  if (!hasHouse) {
+    return `${order} ${kind} — and it is unknown for this window, so the unmonitored `
+      + 'remainder cannot be drawn. It is not zero.';
+  }
+  if (disagree) {
+    return `${order} The monitored circuits are drawn above that line at `
+      + `${circuitShareWords(disagree.share)} of this window`
+      + (disagree.worst ? `, reaching ${disagree.worst.toFixed(1)} times it` : '')
+      + '. A part cannot exceed the whole, so the two disagree rather than leaving a '
+      + 'remainder — a mains channel counted as a part, or a multiplier set for the wrong '
+      + `circuit. ${kind}.`;
+  }
+  return `${order} ${kind}, and the space between it and the stack is what no circuit is `
+    + 'clamped to.';
 }
 // <<< circuit-summary
 
@@ -1742,6 +1827,11 @@ let circuitBarKey = '';
 // and it must be torn down when the panel has nothing to draw.
 const CIRCUIT_SPLIT_ID = 'circSplit';
 const SPLIT_H = 190;
+
+// Which bands the split chart labels, held here rather than closed over by the
+// plugin. The chart is built once and only fed data afterwards, so the plugin
+// has to read this at draw time or it draws the first window's answer for ever.
+let circuitStackSpec = [];
 
 // The geometry of the ranked bars, in the SVG's own user units. The name column
 // is wide enough for the reference account's longest circuit name, the track is
@@ -1904,11 +1994,32 @@ function circuitsSumAt(list, i) {
 // to hold its name goes unlabelled and is named in the line under the chart
 // instead; text painted over a 6px band is unreadable whatever it says.
 const LABEL_MIN_PX = 15;
+// Half a line of text either side of the anchor. Nine rather than seven,
+// because seven let two names land fifteen pixels apart with the house line
+// running between them, which measured as legal and read as cramped.
+const LABEL_PAD_PX = 9;
+// How many places along the chart a name may try before giving up, and how many
+// slices of the window those places are drawn from. Spread matters more than
+// count: the twelve thickest instants of one band are usually twelve
+// neighbours, so a label refused at the widest point would be refused at all
+// twelve. One candidate per slice makes the retries land somewhere else.
+const LABEL_SLICES = 8;
 
-function stackLabels(spec) {
+// ``getSpec`` is a function, not an array, and that is load-bearing — the same
+// rule common.js's band shading records for getWindows(). paint() builds a
+// chart once and afterwards only calls setData on it, so a plugin handed a
+// fresh spec on a later draw is discarded and the chart keeps the one it was
+// constructed with. Measured on the bench: the first paint of the section
+// happened before the inverter answer had landed, so the spec baked in had no
+// house line and no disagreement in it — and the chart went on drawing that
+// spec after both arrived, silently omitting the one label that says the stack
+// and the house contradict each other. Destroying the chart and building it
+// again made the label appear, which is what proved it.
+function stackLabels(getSpec, houseIdx) {
   return {
     hooks: {
       draw: (u) => {
+        const spec = getSpec();
         const ratio = (typeof uPlot !== 'undefined' && uPlot.pxRatio) || 1;
         const ctx = u.ctx;
         const xs = u.data[0] || [];
@@ -1927,42 +2038,80 @@ function stackLabels(spec) {
         // the same height, and overlapping text is less readable than one label
         // and the reading order printed under the chart.
         const placed = [];
+        // The house line is an obstacle rather than a band: a name laid across
+        // it hides the one series the reader is measuring the stack against.
+        const crossesHouse = (box) => {
+          if (houseIdx === null || houseIdx === undefined) return false;
+          for (let i = 0; i < xs.length; i++) {
+            const v = u.data[houseIdx][i];
+            if (typeof v !== 'number' || !isFinite(v)) continue;
+            const px = u.valToPos(xs[i], 'x', true);
+            if (px < box.x0 || px > box.x1) continue;
+            const py = u.valToPos(v, 'y', true);
+            if (py > box.y0 && py < box.y1) return true;
+          }
+          return false;
+        };
         for (const band of spec) {
-          let best = -1;
-          let thick = 0;
+          const width = ctx.measureText(band.name).width;
+          if (width + 10 * ratio > u.bbox.width) continue;
+          // The thickest instant in each slice of the window, widest slice
+          // first, so a name refused for want of room tries elsewhere along the
+          // chart instead of being dropped where it stood.
+          const slice = Math.max(1, Math.ceil(xs.length / LABEL_SLICES));
+          const best = new Map();
           for (let i = 0; i < xs.length; i++) {
             if (xs[i] < u.scales.x.min || xs[i] > u.scales.x.max) continue;
             const lo = band.lo === null ? 0 : u.data[band.lo][i];
             const hi = u.data[band.hi][i];
             if (typeof lo !== 'number' || typeof hi !== 'number' || hi <= lo) continue;
             const d = u.valToPos(lo, 'y', true) - u.valToPos(hi, 'y', true);
-            if (d > thick) { thick = d; best = i; }
+            if (d < LABEL_MIN_PX * ratio) continue;
+            const key = Math.floor(i / slice);
+            if (!best.has(key) || d > best.get(key)[0]) best.set(key, [d, i]);
           }
-          if (best < 0 || thick < LABEL_MIN_PX * ratio) continue;
-          const width = ctx.measureText(band.name).width;
-          if (width + 10 * ratio > u.bbox.width) continue;
-          const lo = band.lo === null ? 0 : u.data[band.lo][best];
-          const y = (u.valToPos(lo, 'y', true) + u.valToPos(u.data[band.hi][best], 'y', true)) / 2;
-          const x = Math.max(
-            u.bbox.left + 4 * ratio,
-            Math.min(u.valToPos(xs[best], 'x', true) - width / 2,
-              u.bbox.left + u.bbox.width - width - 4 * ratio),
-          );
-          // Half a line of text either side of the baseline, which is what an
-          // 11px name actually occupies. A more generous box refused three of
-          // the four labels on the bench over five pixels of clearance.
-          const box = { x0: x, x1: x + width, y0: y - 7 * ratio, y1: y + 7 * ratio };
-          if (placed.some((p) => box.x0 < p.x1 && p.x0 < box.x1
-            && box.y0 < p.y1 && p.y0 < box.y1)) continue;
-          placed.push(box);
+          const tries = [...best.values()].sort((a, b) => b[0] - a[0]);
+          const place = (avoidHouse) => {
+            for (const [, i] of tries) {
+              const lo = band.lo === null ? 0 : u.data[band.lo][i];
+              const yMid = (u.valToPos(lo, 'y', true)
+                + u.valToPos(u.data[band.hi][i], 'y', true)) / 2;
+              const xAt = Math.max(
+                u.bbox.left + 4 * ratio,
+                Math.min(u.valToPos(xs[i], 'x', true) - width / 2,
+                  u.bbox.left + u.bbox.width - width - 4 * ratio),
+              );
+              const box = {
+                x0: xAt,
+                x1: xAt + width,
+                y0: yMid - LABEL_PAD_PX * ratio,
+                y1: yMid + LABEL_PAD_PX * ratio,
+              };
+              if (placed.some((p) => box.x0 < p.x1 && p.x0 < box.x1
+                && box.y0 < p.y1 && p.y0 < box.y1)) continue;
+              if (avoidHouse && crossesHouse(box)) continue;
+              return { x: xAt, y: yMid, box };
+            }
+            return null;
+          };
+          // Clear of the house line if anywhere is, and over it rather than
+          // nowhere if not. The bottom band is the tallest on a healthy chart
+          // and the house line runs through the middle of it, so a guard that
+          // only ever refused would cost the largest circuit its name at every
+          // instant — and an unlabelled band is worse than a label a line
+          // passes behind.
+          const spot = place(true) || place(false);
+          if (!spot) continue;
+          placed.push(spot.box);
           // A halo in the readout's own background token, so the name stays
-          // legible over a light band and a dark one alike without any new
-          // colour being introduced to do it.
+          // legible over a light band and a dark one alike — and over the house
+          // line where it came to that — without any new colour being
+          // introduced to do it.
           ctx.strokeStyle = ink('--tip');
           ctx.lineWidth = 3 * ratio;
-          ctx.strokeText(band.name, x, y);
+          ctx.strokeText(band.name, spot.x, spot.y);
           ctx.fillStyle = ink('--ink');
-          ctx.fillText(band.name, x, y);
+          ctx.fillText(band.name, spot.x, spot.y);
         }
         ctx.restore();
       },
@@ -2020,12 +2169,38 @@ function drawCircuitSplit(body, rows) {
   const total = stamps.map((_, i) => circuitsSumAt(ranked, i));
   const step = stamps.length > 1 ? stamps[1] - stamps[0] : circuitCadence;
   const house = houseWattsOn(stamps, step);
-  const cols = house ? [total, both, first, house] : [total, both, first];
-  const spec = [
+  // The house column is always present, carrying nulls where it is unknown, so
+  // the chart never has to be rebuilt to gain it. The series list is baked at
+  // construction exactly as the plugins are, and the section's first paint can
+  // happen before the inverter answer lands — a house line added only once it
+  // was known would therefore never be drawn at all. A column of nulls draws
+  // nothing, which is what "unknown" is supposed to look like here.
+  const cols = [total, both, first, house || stamps.map(() => null)];
+  // Where the stack and the house line actually stand. It decides both what the
+  // top of the picture is called and what the caption is allowed to claim: a
+  // stack drawn above the house line has no remainder under it, so labelling
+  // one "unmonitored" would narrate a quantity that is not there.
+  const disagree = stackDisagreement(total, house);
+  const stackNames = [
+    named[0].name,
+    ...(named.length > 1 ? [named[1].name] : []),
+    ...(rest.length ? [`${rest.length} other monitored`] : []),
+  ];
+  // Placement priority, not stacking order. The disagreement leads because it
+  // is the one statement on this chart that must not be crowded out: it is the
+  // page's half of the rule that stopped the endpoint clamping its fraction,
+  // and a circuit squeezed out of a label is still named in the line below
+  // while an unspoken contradiction is not.
+  circuitStackSpec = [
+    // The remainder, and its opposite. The second entry is the first with its
+    // bounds swapped, so it draws in exactly the instants where the stack rises
+    // above the house line and in no others — which is the chart saying the two
+    // disagree, in the same channel and with no colour added to do it.
+    ...(disagree ? [{ name: 'monitored above house load', lo: 4, hi: 1 }] : []),
     { name: named[0].name, lo: null, hi: 3 },
     ...(named.length > 1 ? [{ name: named[1].name, lo: 3, hi: 2 }] : []),
     ...(rest.length ? [{ name: `${rest.length} other monitored`, lo: 2, hi: 1 }] : []),
-    ...(house ? [{ name: 'unmonitored', lo: 1, hi: 4 }] : []),
+    ...(house && !disagree ? [{ name: 'unmonitored', lo: 1, hi: 4 }] : []),
   ];
   const at = (hi, lo) => (u, i) => {
     const a = u.data[hi][i];
@@ -2036,7 +2211,13 @@ function drawCircuitSplit(body, rows) {
     [named[0].name, at(3, null), kw],
     ...(named.length > 1 ? [[named[1].name, at(2, 3), kw]] : []),
     ...(rest.length ? [[`${rest.length} other monitored`, at(1, 2), kw]] : []),
-    ...(house ? [['House load', 4, kw], ['Unmonitored', at(4, 1), kw]] : []),
+    // Named for the subtraction rather than for the happy reading of it. These
+    // rows are baked into the chart at construction like everything else in
+    // opts, so a label chosen from the state of the first paint would outlive
+    // it — and "Unmonitored: −11.2 kW", which is what this row says when the
+    // stack is above the house line, is a nonsense reading of a real number.
+    ['House load power', 4, kw],
+    ['House less monitored', at(4, 1), kw],
   ];
   if (!sectionVisible('circuits') && !CHARTS[CIRCUIT_SPLIT_ID]) return;
   paint(CIRCUIT_SPLIT_ID, {
@@ -2052,27 +2233,23 @@ function drawCircuitSplit(body, rows) {
       series: [
         {},
         ...STACK_ALPHAS.map(stackFill),
-        ...(house ? [{
-          label: 'House load',
+        {
+          label: 'House load power',
           scale: 'y',
           spanGaps: false,
           width: 1.6,
           stroke: () => ink('--ink2'),
           points: { show: false },
-        }] : []),
+        },
       ],
-      plugins: [readout(CIRCUIT_SPLIT_ID, readRows), stackLabels(spec)],
+      plugins: [
+        readout(CIRCUIT_SPLIT_ID, readRows),
+        // Read through a function, never handed the array: see stackLabels.
+        stackLabels(() => circuitStackSpec, 4),
+      ],
     }),
   }, [stamps, ...cols]);
-  if (order) {
-    order.textContent = 'Bottom to top: '
-      + spec.map((b) => b.name).join(', then ')
-      + (house
-        ? '. The line above the stack is the house\'s own load, and the space under it is what '
-          + 'no circuit is clamped to.'
-        : '. The house\'s own load is unknown for this window, so the unmonitored remainder '
-          + 'cannot be drawn — it is not zero.');
-  }
+  if (order) order.textContent = circuitStackWords(stackNames, !!house, disagree);
 }
 
 // The switch. Built once and only its pressed state updated afterwards, so the
