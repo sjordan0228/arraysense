@@ -168,6 +168,66 @@ Modules are keyed by serial number, never by slot. The inverter rotates modules
 through four register slots when a bank has more than four, so a slot index is
 positional metadata and not an identity.
 
+## `GET /api/emporia/history`
+
+Circuits from the optional Emporia module, over a range, ranked by the energy each
+one used.
+
+| Parameter | Meaning |
+| --- | --- |
+| `start`, `end` | ISO 8601 timestamps |
+| `ids` | comma-separated circuit ids, to narrow the answer to named circuits |
+| `width` | the chart's width in pixels, default 1000 |
+
+```json
+{
+  "tier": "full",
+  "timestamps": [1755345600, 1755345660],
+  "circuits": [
+    {"id": 3, "name": "Dryer", "kind": "circuit", "watts": [4000, null],
+     "kwh": 0.133, "partial": false, "offline_since": null}
+  ],
+  "coverage": {"circuits_kwh": 8.1, "house_kwh": 11.4, "fraction": 0.71}
+}
+```
+
+`tier` is chosen by the same fit rule `/api/history` uses, scored against the
+module's own poll interval rather than the inverter's — a week asked for on a
+circuit chart would otherwise be scored at the inverter's eleven seconds and land
+on a resolution ten times finer than the data actually has.
+
+Ranked by energy rather than by the newest reading: a kettle at 5 kW for one
+minute used less than a heat pump at 1 kW for half an hour, and the live list on
+the Emporia page already answers "what is on now."
+
+`watts` carries `null` where a circuit recorded nothing at that instant, never
+`0` — a dead outlet and an idle one are different facts, and the point of this
+project is not to say they are the same. `kwh` is `null` for a circuit that
+recorded nothing across the whole window, for the same reason. `partial` is
+`true` when the energy figure was built from an hourly bucket holding fewer
+readings than a full hour implies, so a half-recorded hour is never read as a
+whole one. `offline_since` is the device's own timestamp for when it stopped
+answering, `null` while it is connected — what lets a page show a reason instead
+of an empty chart.
+
+`mains` circuits are excluded from both `circuits` and `coverage`. A monitor's
+mains channel is the sum of the branches beside it, and counting it as a part
+would double the house.
+
+`coverage.fraction` is the share of the house's own energy counter the returned
+circuits account for, computed from energy and never from how many minutes
+either side happened to record. It is `null` when the house figure cannot be
+read for the window, or when the circuits and the house counter do not cover
+closely enough the same span to be compared honestly. A fraction above `1.0` is
+reported rather than clamped — a part cannot exceed the whole, so a value over
+one is not a coverage figure at all but a fault reporting itself, and clamping
+it would hide a mains channel that escaped exclusion or a multiplier set for the
+wrong circuit behind a bar that looked merely full.
+
+A build with no Emporia module configured answers an empty history —
+`circuits: []` and `coverage` all `null` — rather than `404`, since a link to
+this page can outlive the account it was made on. A reversed range is `400`.
+
 ## `GET /api/calibration`
 
 How far the per-pack state-of-charge estimates have drifted from reality.

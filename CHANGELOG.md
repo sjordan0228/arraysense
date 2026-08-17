@@ -7,6 +7,52 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.2.0 — 16 August 2026
+
+The Graphs page can now show what is actually drawing the power, for an
+installation with an Emporia Vue connected — the per-circuit history the
+Emporia module has been recording since it shipped in 1.1.0, and nothing had
+ever queried.
+
+A minor version rather than a patch because a new endpoint and a new page tab
+are a feature, not a correction to an existing one. No migration is needed:
+the circuits' own raw and hourly tables already existed for the module's own
+readings, and this release only adds a way to read them. Nothing already
+stored is rewritten.
+
+### Added
+
+- **A Circuits tab on the Graphs page, shown only where an Emporia account is
+  connected.** The top five circuits by energy over the range on screen, each
+  drawn as its own strip scaled to its own peak with that peak printed beside
+  it — a circuit at 40 W and one at 4,000 W sharing an axis would erase the
+  smaller one. Change the range and the ranking follows it: a kettle that led
+  a one-hour window can drop out of the top five over a week. An expander
+  reveals the rest. A gap in a strip means the circuit recorded nothing there,
+  not that it drew nothing — a dead outlet and an idle one look different. A
+  circuit that has gone quiet for good, rather than for a poll or two, draws
+  no strip at all: just the reason and how long, in place of an empty box that
+  would read as a bug.
+- **A summary panel above the strips, with two readings of the same window.**
+  A ranked kWh bar chart by default — length alone carries the meaning, so it
+  needs no colour at all — and a stacked view of the same circuits under the
+  house's own load over time, behind a switch that is remembered per browser.
+- **A coverage line stating what share of the house the monitored circuits
+  account for.** Computed from energy rather than from minutes watched, which
+  is the distinction #23 was reverted twice for missing — a numerator that
+  only recorded for part of the window a house counter covers is a different
+  question from one that recorded for the whole of it, and the line answers
+  the one it can rather than dividing the two together as though they agreed.
+  It is qualified or withheld outright rather than guessed whenever an honest
+  share cannot be given, and it never reads as full or empty coverage merely
+  because the house figure is absent.
+- **`GET /api/emporia/history`.** Circuits over a range, ranked by energy, at
+  raw or hourly resolution chosen from the range and the chart's own width —
+  the same fit rule the inverter and per-module charts already use.
+- **A circuit's name on the Emporia page is now a link to its own history**,
+  a real link that can be copied and sent rather than a row that only means
+  something inside that page.
+
 ## 1.1.0 — 16 August 2026
 
 The first optional module. An Emporia Vue's circuits, and an Emporia EV
