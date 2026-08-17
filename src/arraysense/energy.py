@@ -706,3 +706,97 @@ def energy_totals(
 ) -> list[EnergyBucket]:
     """Return just the buckets from a ``read_energy``, for a caller wanting no more."""
     return read_energy(store, start, end, period, zone, max_gap).buckets
+
+
+def counter_kwh(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    field: str = "load_kwh",
+    max_gap: timedelta = MAX_EDGE_GAP,
+) -> float | None:
+    """One counter's energy between two exact instants, or None if that is unknowable.
+
+    Deliberately not ``read_energy`` with a narrow range. That widens outward
+    to whole calendar buckets, which is right for a day or a month and wrong
+    for a window: asked about six hours it answers about a day, and a caller
+    dividing something by it — the Circuits tab's coverage share — would print
+    a quarter of the truth as though it were the truth.
+
+    Deliberately not integrated from power either. Every kWh this project shows
+    is read from a counter the inverter keeps itself, and an integrated figure
+    sitting beside counter-read ones is an estimate wearing a meter reading's
+    clothes. A caller that cannot have a real figure is given None and can say
+    so.
+
+    Only the one counter is read, rather than all six. That is what makes the
+    answer's completeness a statement about *this* counter: ``attribute_energy``
+    marks a bucket incomplete for the whole bucket rather than per field, so a
+    grid-export glitch would otherwise blank the house's load, and a boundary
+    could be certified as bracketed by a reading of some other counter
+    entirely.
+
+    None in three cases, and they are one case: the number is not known. Either
+    bound unbracketed by readings within ``max_gap`` means the energy at that
+    edge belongs to nobody — which includes a window ending later than the
+    newest reading, so a range running to "now" answers None until the next
+    poll lands. A counter that went backwards is a reset or a bad reading and
+    ``_delta`` already refuses to attribute it. And a counter that never
+    reported is not a house that used nothing.
+    """
+    if start.tzinfo is None or end.tzinfo is None:
+        raise ValueError("counter_kwh needs timezone-aware bounds; see with_zone")
+    if end <= start:
+        raise ValueError(f"end must be after start, got {start.isoformat()} to {end.isoformat()}")
+    if field not in ENERGY_FIELDS:
+        raise ValueError(f"unknown energy counter {field!r}")
+
+    # Widened at both ends so the window's own edges have readings to be
+    # measured *from*, exactly as ``_counter_rows`` widens a calendar read. The
+    # widening decides which rows are fetched and never which instants are
+    # attributed: the edges handed to the bucketing below are the window as
+    # asked for.
+    metrics = [ENERGY_FIELDS[field]]
+    tier = _window_tier(end - start)
+    rows = store.query(metrics, start - max_gap, end + max_gap, tier=tier)
+    if not rows:
+        # Falling through to the finest tier, which is named "full" — the prose
+        # around ``_FALLBACK_TIERS`` calls it raw and a query for "raw" reaches
+        # no table at all. An empty preferred tier means either that the rollup
+        # has not run or that the window is older than that tier is kept for,
+        # and full is the one tier that could still hold rows behind a stalled
+        # rollup.
+        logger.debug("%s tier empty over the window; trying full", tier)
+        rows = store.query(metrics, start - max_gap, end + max_gap, tier="full")
+
+    # One bucket, cut at the window's own bounds. ``attribute_energy`` already
+    # knows a reset from a bad reading, already refuses to attribute an
+    # interval straddling an edge by more than ``max_gap``, and already leaves
+    # out a bucket with nothing to report rather than returning it as zero.
+    # Walking the readings here instead would be a second copy of the rule that
+    # prices this project's money — and one that has to measure from the
+    # widened rows, which is the very widening this function exists to avoid.
+    buckets = bucket_totals(rows, [start, end], max_gap)
+    if not buckets or not buckets[0].complete:
+        return None
+    return buckets[0].totals[field]
+
+
+def _window_tier(span: timedelta) -> str:
+    """Which tier answers a counter read over ``span``, trading cost against precision.
+
+    Two days is the hinge, and precision is what sits on the near side of it. A
+    tier can only cut a window at a reading it holds, so hourly rows place both
+    edges on the whole hour: a six-hour window opening at 12:34 is measured
+    from 12:00 to 18:00, and what it is wrong by is the difference between
+    those two part-hours — up to an hour's energy, which on the reference
+    house's 11 kW evening is up to 11 kWh. A coverage share computed against
+    that denominator inherits all of it. Minute rows place the same edge to
+    within a minute, and the read is cheap at this length: six hours widened by
+    ``MAX_EDGE_GAP`` at each end is about six hundred rows.
+
+    Past two days the trade reverses. Thirty days of minute rows is over forty
+    thousand to produce one number, and an hour's imprecision against a month
+    is a fraction of a percent.
+    """
+    return "minute" if span <= timedelta(days=2) else "hourly"
