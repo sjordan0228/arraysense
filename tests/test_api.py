@@ -34,7 +34,7 @@ from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
 from arraysense.settings import _mask
-from arraysense.store.rollup import rebuild_inverter_hourly
+from arraysense.store.rollup import rebuild_inverter_hourly, rebuild_inverter_minute
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -1889,6 +1889,227 @@ def test_costs_reads_a_month_older_than_the_minute_tier_keeps(client: Any) -> No
     assert body["tier"] == "hourly"
     assert body["cost"] is not None
     assert body["cost"]["energy_cost"] is not None
+
+
+def test_a_month_straddling_the_minute_tiers_cutoff_prices_from_the_whole_month(
+    client: Any,
+) -> None:
+    # Retention prunes the minute tier from its oldest end (see
+    # store.retention), so a month whose start falls before that cutoff still
+    # answers a minute-tier query with *something* — the days after the
+    # cutoff — while the days before it have no minute rows at all. The old
+    # "if rows: break" took that partial answer because it was non-empty, and
+    # priced only the second half of the month with nothing on screen saying
+    # a whole fortnight of it was never even attempted from the hourly tier
+    # that actually holds it, kept as that tier is for ever.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 1, 1, tzinfo=UTC)
+    month_end = datetime(2025, 2, 1, tzinfo=UTC)
+    lead = month_start - timedelta(hours=3)
+    tail = month_end + timedelta(hours=3)
+    hours = int((tail - lead).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=lead + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(lead.timestamp()), int(tail.timestamp()))
+    # Only the last five days of the month still have minute rows — the shape
+    # retention leaves once it has pruned everything older than its cutoff.
+    surviving = month_end - timedelta(days=5)
+    rebuild_inverter_minute(conn, int(surviving.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    conn.execute("DELETE FROM inverter_raw")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-01-01T00:00:00Z", "end": "2025-02-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    assert body["tier"] == "hourly"
+    assert body["cost"]["cost_is_short"] is False
+    # A full month at 1 kWh of grid import an hour, 744 kWh at $0.12.
+    assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
+
+
+def test_costs_picks_the_minute_tier_for_a_well_covered_month(client: Any) -> None:
+    """The common path — the current month, every reader, every day — has to
+    keep resolving to "minute". Every other minute-tier test here targets
+    retention or the straddling fallback; none of them asserts what an
+    ordinary, fully-covered window chooses, so a future change to the
+    bracket check in ``costs()`` could silently move today's figures onto a
+    coarser tier with nothing here noticing.
+
+    Characterisation, not regression: the bracket check only changes the
+    answer for a candidate whose earliest row falls short of ``lead`` — the
+    straddling test above exercises that. A window this well covered
+    satisfied the old "if rows: break" loop too, so this test cannot tell the
+    two loops apart; it exists to catch a *future* regression, not the one
+    the bracket check was written to fix.
+    """
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 3, 1, tzinfo=UTC)
+    month_end = datetime(2025, 4, 1, tzinfo=UTC)
+    lead = month_start - timedelta(hours=3)
+    tail = month_end + timedelta(hours=3)
+    hours = int((tail - lead).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=lead + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_minute(conn, int(lead.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    # Nothing may remain in the tiers this test does not mean to exercise: an
+    # untouched hourly table and an emptied raw one mean a failure to pick
+    # "minute" shows up as no cost at all rather than a silent fallback.
+    conn.execute("DELETE FROM inverter_raw")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-03-01T00:00:00Z", "end": "2025-04-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    assert body["tier"] == "minute"
+    assert body["cost"]["cost_is_short"] is False
+    # A full month at 1 kWh of grid import an hour, 744 kWh at $0.12.
+    assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
+
+
+def test_costs_keeps_a_partial_tier_when_none_of_them_reaches_lead(client: Any) -> None:
+    # Collection genuinely began five hours into the month — past the two-hour
+    # lead every candidate is checked against — so no tier's earliest row ever
+    # brackets it: minute and raw both stand for the retention that has since
+    # expired and hold nothing at all, and hourly's own earliest row is still
+    # five hours short. The old "if rows and brackets: break" loop falls
+    # through every candidate and lands on the last one tried, "full", whose
+    # query is empty — overwriting the nonempty hourly rows that were sitting
+    # right there and turning a labelled partial month into dashes.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2024, 6, 1, tzinfo=UTC)
+    month_end = datetime(2024, 7, 1, tzinfo=UTC)
+    began = month_start + timedelta(hours=5)
+    for hour in range(24):
+        store.append(
+            Sample(
+                timestamp=began + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 100.0 + hour,
+                    "load_energy_total_kwh": 200.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(began.timestamp()) - 3600, int(month_end.timestamp()) + 3600)
+    conn.commit()
+    # Stand in for the tiers whose retention has already pruned this month away.
+    conn.execute("DELETE FROM inverter_raw")
+    conn.execute("DELETE FROM inverter_minute")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2024-06-01T00:00:00Z",
+            "end": "2024-07-01T00:00:00Z",
+            "tz": "UTC",
+        },
+    ).json()
+    assert body["tier"] == "hourly"
+    assert body["cost"] is not None
+    assert body["cost"]["energy_cost"] is not None
+    # Genuinely short — the five hours before collection began were never
+    # measured by anything, so the figure has to say so rather than read whole.
+    assert body["cost"]["cost_is_short"] is True
+
+
+def test_costs_picks_the_furthest_reaching_tier_when_none_of_them_brackets(
+    client: Any,
+) -> None:
+    # The other partial-tier test above leaves "full" genuinely empty, which
+    # the old loop happened to get right by accident — an empty candidate
+    # never overwrites ``rows``. This is the case that accident does not
+    # cover: collection began four days into the month, so nothing brackets
+    # ``lead`` on any tier, but the month is now old enough that thirty-day
+    # retention has pruned the raw tier down to its last eleven days —
+    # "full" is not empty, just worse than what came before it. The old
+    # "keep the last nonempty candidate" loop tried minute, then hourly,
+    # then full, and full — reaching back the least of the three — was
+    # tried last and so overwrote the better hourly rows sitting right
+    # there. The fix has to choose by how far back a candidate's earliest
+    # row actually reaches, not by which one happened to be asked last.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 7, 1, tzinfo=UTC)
+    month_end = datetime(2025, 8, 1, tzinfo=UTC)
+    tail = month_end + timedelta(hours=3)
+    # What the collector actually recorded, before any retention pruned it:
+    # every tier starts here, four days into the month.
+    collection_began = month_start + timedelta(days=4)
+    # The minute tier's own retention has already pruned three of those four
+    # days away, in the same shape the straddling test above exercises.
+    minute_survives_from = collection_began + timedelta(days=3)
+    # The raw tier's thirty-day retention has pruned it far harder still —
+    # down to its last eleven days — which is what makes it nonempty rather
+    # than the empty last resort the other partial-tier test relies on.
+    raw_survives_from = month_end - timedelta(days=11)
+
+    hours = int((tail - collection_began).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=collection_began + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(collection_began.timestamp()), int(tail.timestamp()))
+    rebuild_inverter_minute(conn, int(minute_survives_from.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    conn.execute(
+        "DELETE FROM inverter_raw WHERE timestamp < ?", (int(raw_survives_from.timestamp()),)
+    )
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-07-01T00:00:00Z", "end": "2025-08-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    # Hourly reaches back to collection_began, four days further than minute
+    # and over a week further than the pruned raw tier — it is the one
+    # candidate that actually holds the most complete answer.
+    assert body["tier"] == "hourly"
+    assert body["cost"] is not None
+    assert body["cost"]["energy_cost"] is not None
+    # Genuinely short — the four days before collection began were never
+    # measured by anything, so the figure has to say so rather than read whole.
+    assert body["cost"]["cost_is_short"] is True
 
 
 def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:

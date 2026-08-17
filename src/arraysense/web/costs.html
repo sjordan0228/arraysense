@@ -486,6 +486,48 @@ const canGoForward = (month, today) =>
 // change, so re-reading it is a month of counter history read for nothing.
 const shouldAutoRefresh = (cursor, today) =>
   cursor === null || (cursor.year === today.year && cursor.month === today.month);
+
+// A month left open across midnight on the first rolls the calendar forward
+// while cursor still names the month that was current — and from that tick on
+// shouldAutoRefresh reads false forever, because cursor and today have parted
+// ways and nothing moves cursor to bring them back together. Without one more
+// refresh through, that month never picks up its last few hours of counter
+// history, and the forward arrow — which only renderPicker inside refresh()
+// re-evaluates — never opens onto the month that just began.
+//
+// ``seen`` is the month the timer itself last observed; a mismatch against
+// ``today`` means the clock has turned over since the previous tick, and is
+// true for exactly that one tick — the next one updates ``seen`` to match and
+// polling for the now-finished month goes back to being suppressed. That
+// mismatch alone says only that *some* month rolled over, not whose — a
+// reader who deliberately paged back to June keeps seeing false there while
+// the real calendar turns from July to August, and a rollover test that never
+// looked at cursor gave that reader a bonus refresh anyway, of a June nobody
+// asked to re-read. ``cursor`` has to equal ``seen`` — the month that just
+// became historical — for the extra refresh to be for the reader actually
+// looking at it; a cursor pointing anywhere else, including the reader's own
+// past navigation, gets none.
+const monthRolledOver = (cursor, today, seen) =>
+  seen !== null &&
+  (seen.year !== today.year || seen.month !== today.month) &&
+  cursor !== null &&
+  cursor.year === seen.year &&
+  cursor.month === seen.month;
+
+// One tick of the five-minute timer: whether it should refresh, and what it
+// should remember having seen for next time. Pulled out of boot() so the
+// seeding bug that shipped beside it (#216) has something to test directly —
+// boot() used to hand this ``seen === null``, which reads exactly like "the
+// timer has never run" and cannot be told apart from a tab that booted in the
+// last few minutes before midnight on the first. On that tab's very first
+// tick, ``today`` has already rolled over but ``seen`` has no baseline to
+// compare it against, so neither the bonus refresh nor the forward button
+// (only re-enabled inside refresh()'s own renderPicker) ever fires — both sit
+// stuck on the month that just finished until the reader reloads the page.
+const rolloverTick = (cursor, today, seen) => ({
+  seen: { year: today.year, month: today.month },
+  shouldRefresh: shouldAutoRefresh(cursor, today) || monthRolledOver(cursor, today, seen),
+});
 // <<< costs-month-cursor
 
 // What this refresh calls the month, set by renderMonth and read by every
@@ -495,6 +537,40 @@ const shouldAutoRefresh = (cursor, today) =>
 // safe direction: a finished month labelled "so far" is clumsy, a running one
 // labelled as a finished bill is the mistake this page exists to avoid.
 let words = null;
+
+// Which month the cards, the Sankey and the band table currently show money
+// for — as "year-month", the same shape a JS object key needs. renderMonth and
+// renderEnergy update the moment their own fetch lands, but the money sections
+// wait on a second, slower request, and between those two points a reader who
+// has just paged to a new month would otherwise see the *previous* month's
+// figures sitting under the new one's heading — permanently, if that second
+// request then fails, since the old error path left whatever was on screen
+// alone. null until the first render, which is also "nothing rendered yet"
+// and so never equal to a real key.
+let moneyMonth = null;
+
+// >>> costs-money-freshness
+// Whether the money on screen might belong to a different month than the one
+// refresh() is about to fetch. moneyMonth is set only once a month's cards,
+// Sankey and band table have actually finished painting, so this reads true
+// for a navigation — including the very first refresh, when moneyMonth is
+// still null — and false for the ordinary five-minute poll of the same
+// month. That is the whole distinction the fix needed: hide before a
+// navigation's slower request lands, and leave an already-correct render
+// alone through a same-month retry that happens to fail.
+const moneyIsStale = (monthKey, seenMonth) => monthKey !== seenMonth;
+// <<< costs-money-freshness
+
+// Take the money off screen rather than leave it captioned wrong. Called only
+// when the month being fetched differs from moneyMonth, so an ordinary
+// five-minute refresh of the same month never flickers — this month's figures
+// still stand through a failed poll exactly as before; only a navigation to a
+// different month clears them first.
+function hideMoney() {
+  $('cards').hidden = true;
+  $('sankeySec').hidden = true;
+  $('bandSec').hidden = true;
+}
 
 // >>> costs-refresh-generation
 // Which refresh() call is the current one. refresh() awaits two network reads
@@ -600,39 +676,58 @@ function shortNote(entry, what) {
 }
 
 // >>> costs-month-words
-// The page's words for a month that is over, against one still running. One
-// helper rather than eleven scattered ternaries: "Cost so far", "Month to date"
-// and "Estimated bill" are the same claim said three ways, and a page that
-// relabelled some of them and not the others would mislead more than one that
-// relabelled none.
+// The page's words for a month that is over, against one still running — and,
+// answering a separate question, for a figure whose own inputs were actually
+// measured, against one that was not. The original signature took only the
+// calendar's own fraction and let it answer both, which is the bug #216 found
+// four times over: the energy grid captioned a bucket "Month total" with
+// `complete:false` sitting right there unread; a bill whose internal dropped
+// span was restored at a blended rate still read "Bill" because only the
+// *time* axis had reached 1.0, not the energy one; and the last forty-five
+// minutes of a real month — past the 0.999 slop that makes "This month" versus
+// the month's name a reasonable place to round early — still had "Cost",
+// "Bill" and "Month total" sitting over figures that excluded exactly that
+// stretch. One helper rather than eleven scattered ternaries: "Cost so far",
+// "Month to date" and "Estimated bill" are the same claim said three ways, and
+// relabelling some of them and not the others would mislead more than
+// relabelling none.
 //
 // ``fraction`` is the service's own fraction_elapsed where it has one and the
 // page's own day count where it does not; ``name`` is the month written out.
-// 0.999 is renderMonth's own threshold and is deliberately the same number —
-// within three-quarters of an hour of a month's end, calling it unfinished is
-// pedantry rather than honesty, and the strip and the labels disagreeing about
-// which month it is would be worse than either answer.
+// ``complete`` is the second, independent verdict — whether every counter
+// behind the figures these words are about to label was actually measured —
+// and it is the caller's job to answer it from whichever reply said so
+// (`bucket.complete`, `p.isProjected`, ...), never assumed from the calendar.
+// It defaults to `true` so a caller with nothing more specific to say gets the
+// calendar's own answer and no existing call site has to change.
 //
-// An absent fraction keeps every qualifier. Absent is not complete, and a month
-// whose elapsed share could not be read is the last thing to relabel as a bill.
+// The two questions use different thresholds on purpose. ``running`` keeps the
+// 0.999 slop and answers only which *tense* to write the month's name in —
+// "This month" three-quarters of an hour early is a grammar choice, not a
+// claim any number is finished, unlike "Bill" or "Month total". ``whole``
+// answers the completeness question and needs the *true* boundary
+// (`fraction >= 1`): a bracket gap or a scaled-up bill is exactly as untrue at
+// 99.9% as it is at noon, and rounding it away early is what finding 5 was.
 //
-// renderMonth's own `partial` disagrees with `running` on a null fraction —
-// `partial` treats it as NOT partial (a null reads as the finished "all N
-// days" case), while `running` here treats it as still running. That
-// divergence is unreachable today: every `fraction` that reaches either place
-// is either `Math.min(1, done / days)`, never null, or `priced.fractionElapsed`,
-// which the service always computes numerically whenever a tariff is
-// configured — an unconfigured tariff returns before either function runs. If
-// a future caller ever does produce a null fraction here, `renderMonth` is the
-// one that has to change to match `running`, not the other way round: absent
-// rendering as complete is exactly the mistake this project exists to catch.
-function monthWords(fraction, name) {
+// An absent fraction keeps every qualifier on both questions. Absent is not
+// complete, and a month whose elapsed share could not be read is the last
+// thing to relabel as a bill.
+//
+// renderMonth's own day-count text disagrees with `running` on a null
+// fraction only in the sense that it, too, now reads `running` directly
+// rather than keeping a second copy of the threshold — the two used to be
+// duplicated on the promise they would always agree, and a duplicate is
+// exactly the kind of thing that stops.
+function monthWords(fraction, name, complete = true) {
   const running = fraction === null || fraction === undefined || fraction < 0.999;
+  const calendarOver = fraction !== null && fraction !== undefined && fraction >= 1;
+  const whole = calendarOver && complete;
   return {
     running,
-    cost: running ? 'Cost so far' : 'Cost',
-    bill: running ? 'Estimated bill' : 'Bill',
-    total: running ? 'Month to date' : 'Month total',
+    whole,
+    cost: whole ? 'Cost' : 'Cost so far',
+    bill: whole ? 'Bill' : 'Estimated bill',
+    total: whole ? 'Month total' : 'Month to date',
     energy: running ? 'Energy this month' : `Energy in ${name}`,
     // "this month" reads as the current one wherever it lands in a sentence, so
     // a finished month is named rather than pointed at.
@@ -641,6 +736,34 @@ function monthWords(fraction, name) {
   };
 }
 // <<< costs-month-words
+
+// >>> costs-bill-caveat
+// The one sentence under the bill card that says what the figure is. It reads
+// ``isProjected``, which the service decides from the span its own counters
+// cover, and deliberately not ``words.running``: ``fraction_elapsed`` is 1.0
+// for any calendar month that has finished whether or not the collector
+// recorded all of it, so an install where collection began mid-month still
+// has its bill scaled up on the thirty-first, and "the month is over, so this
+// is what it came to rather than a projection" was false there. It is also
+// not renderMonth's 0.999 display tolerance, so the last three-quarters of an
+// hour of a real month still reads as a projection for as long as it is one —
+// a threshold right for "call the label finished" is not right for "was this
+// number actually scaled".
+function billCaveat(isProjected, seasonChanges) {
+  if (!isProjected) {
+    return 'The month is over, so this is what it came to rather than a projection.';
+  }
+  // A month that changes season breaks the projection's own premise: the
+  // remaining days are priced by a different set of bands than the measured
+  // ones, so scaling one to the other is arithmetic across two tariffs.
+  return seasonChanges
+    ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
+      + 'different bands than the part measured — treat the projection as the roughest of '
+      + 'guides.'
+    : 'An estimate: it assumes the part of the month that was not measured uses each rate '
+      + 'band at the rate the part that was did.';
+}
+// <<< costs-bill-caveat
 
 // The picker's own state. Called on every refresh rather than only on a click,
 // because the month in progress becomes a finished one at midnight on the first
@@ -657,19 +780,20 @@ function renderPicker(today) {
   forward.title = allowed ? 'Next month' : 'This is the month in progress';
 }
 
-function renderMonth(win, priced) {
+// ``complete`` is passed straight through to monthWords — the calendar day
+// count below reads `words.running`, the 0.999-slop grammar question, on
+// purpose: "3.9 of 31 days" is a fact about the clock regardless of whether
+// the energy or the bill behind it has been fully measured, so it stays on
+// the looser threshold rather than borrowing the stricter one meant for
+// figures that claim to be whole.
+function renderMonth(win, priced, complete = true) {
   $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
   const days = win.days;
   const done = win.done;
   const fraction = priced ? priced.fractionElapsed : Math.min(1, done / days);
-  // Within the last three-quarters of an hour of a month, calling it a part
-  // month is pedantry rather than honesty; before that, saying so is the whole
-  // point — a mid-month figure read as the finished bill is this page's
-  // easiest way to mislead.
-  const partial = fraction !== null && fraction < 0.999;
-  words = monthWords(fraction, win.start.toLocaleDateString(undefined, MONTH_FMT));
+  words = monthWords(fraction, win.start.toLocaleDateString(undefined, MONTH_FMT), complete);
   const parts = [
-    partial
+    words.running
       ? `<b>${done.toFixed(1)}</b> of ${days} days — this is a part month, not a bill`
       : `all ${days} days`,
   ];
@@ -741,17 +865,9 @@ function renderCards(p) {
     const bits = [`Energy <b>${esc(money(p.projectedCost, cur))}</b>`];
     if (p.fixedMonthly) bits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
     if (p.projectedCredit) bits.push(`less export credit <b>${esc(money(p.projectedCredit, cur))}</b>`);
-    // A month that changes season breaks the projection's own premise: the
-    // remaining days are priced by a different set of bands than the measured
-    // ones, so scaling one to the other is arithmetic across two tariffs.
-    const caveat = !words.running
-      ? 'The month is over, so this is what it came to rather than a projection.'
-      : p.seasonChanges
-        ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
-          + 'different bands than the part measured — treat the projection as the roughest of '
-          + 'guides.'
-        : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
-          + 'one has so far.';
+    // See costs-bill-caveat for why this reads p.isProjected and not
+    // words.running or p.seasonChanges' own tense.
+    const caveat = billCaveat(p.isProjected, p.seasonChanges);
     $('billSub').innerHTML = `${bits.join(' · ')}. ${caveat}${billCoverage(p)}`;
   }
 
@@ -1369,7 +1485,12 @@ function renderAssumptions(p, hasTariff, unreadable) {
     // it rests on. Left unconditional, this list told the reader the figure assumed the rest
     // of the month behaved like the measured part, three inches below the bill card saying
     // the month was over and the figure was what it came to. Of the two the card was right.
-    bits.push(words && !words.running
+    //
+    // Reads p.isProjected, the same server-decided fact the bill card's own caveat reads,
+    // rather than words.running: a month the calendar has finished but that the collector
+    // only recorded part of still has its bill scaled up, and words.running cannot tell the
+    // two apart because fraction_elapsed is 1.0 for both.
+    bits.push(!p.isProjected
       ? 'The bill adds the whole connection charge once and nets off any export credit. The '
         + 'month is over, so nothing in it is projected: each rate band is priced from the '
         + 'energy actually measured in it.'
@@ -1486,6 +1607,11 @@ function fromQuote(quote) {
     projectedCredit: numOrNull(bill.projected_export_credit),
     seasonChanges: bill.season_changes === true,
     fractionElapsed: numOrNull(bill.fraction_elapsed),
+    // Whether the bill above is actually scaled up from part of the month, as
+    // opposed to fraction_elapsed reading 1.0 for any finished calendar month
+    // regardless of what the collector actually recorded in it. The caveat
+    // sentence reads this, never the fraction — see the caveat's own comment.
+    isProjected: bill.is_projected !== false,
     coverage: measured === null || !elapsedMin ? null : Math.min(1, measured / elapsedMin),
     unpricedMinutes: numOrNull(quote.unpriced_minutes),
     tier: quote.tier || null,
@@ -1529,6 +1655,12 @@ async function refresh() {
   if (cursor === null) cursor = { year: today.year, month: today.month };
   const win = monthWindow(cursor, today);
   renderPicker(today);
+  // Cleared the moment a navigation is detected, before either fetch has even
+  // started — not after the cost read comes back — so there is no window in
+  // which the new month's heading (set below by renderMonth) is on screen
+  // above the previous month's money.
+  const monthKey = `${cursor.year}-${cursor.month}`;
+  if (moneyIsStale(monthKey, moneyMonth)) hideMoney();
   // Collected rather than set as they happen: two reads can fail in one pass,
   // and a second failure overwriting the first would leave the page explaining
   // only half of what went wrong.
@@ -1541,7 +1673,12 @@ async function refresh() {
     trouble.push(`The month’s energy could not be read: ${e.message}.`);
   }
   if (isStale(gen)) return;
-  renderMonth(win, null);
+  // The service's own verdict on this bucket's bracket, not the calendar's —
+  // see costs-month-words. A missing bucket has no energy total for the
+  // completeness word to qualify in the first place, so it defaults true and
+  // is simply never read by that branch of renderEnergy.
+  const bucketComplete = bucket ? bucket.complete === true : true;
+  renderMonth(win, null, bucketComplete);
   renderEnergy(bucket);
 
   let quote = null;
@@ -1576,7 +1713,10 @@ async function refresh() {
   $('notariff').hidden = true;
 
   const priced = fromQuote(quote);
-  renderMonth(win, priced);
+  // Both verdicts are known now: the energy bucket's own bracket, and whether
+  // the bill had to be scaled up for a dropped span. Either one being false
+  // is enough to keep every "so far" qualifier — see costs-month-words.
+  renderMonth(win, priced, bucketComplete && !priced.isProjected);
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
@@ -1598,6 +1738,11 @@ async function refresh() {
   }
 
   renderAssumptions(priced, true, false);
+  // Only now does the screen actually hold this month's money, so only now
+  // does moneyMonth say so — a later refresh of the same month can fail
+  // without hideMoney firing, and a refresh of a different month cannot skip
+  // hiding this one's figures by arriving before they were ever drawn.
+  moneyMonth = monthKey;
   pageNote(trouble.join(' '));
   stamp();
 }
@@ -1626,9 +1771,22 @@ async function boot() {
     await refresh();
   };
   await refresh();
+  // The month the timer itself last checked, so it can tell a genuine
+  // rollover — the clock has turned over since the previous tick — from
+  // cursor simply naming a month the reader picked on purpose. Local to
+  // boot() because nothing outside this interval needs it.
+  //
+  // Seeded from the month refresh() just displayed, not left null: a tab
+  // that boots less than one interval before midnight on the first would
+  // otherwise reach its first tick with today already rolled over and no
+  // baseline to compare it against — see rolloverTick's own comment for what
+  // that silently breaks.
+  let lastPolled = { year: cursor.year, month: cursor.month };
   setInterval(async () => {
     const today = civilNow(await siteZone());
-    if (!shouldAutoRefresh(cursor, today)) return;
+    const tick = rolloverTick(cursor, today, lastPolled);
+    lastPolled = tick.seen;
+    if (!tick.shouldRefresh) return;
     await refresh();
   }, 5 * 60 * 1000);
 }

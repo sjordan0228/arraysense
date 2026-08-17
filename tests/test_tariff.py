@@ -565,6 +565,29 @@ def test_the_export_credit_is_projected_on_the_restored_export() -> None:
     assert bill.is_short is True
 
 
+def test_is_projected_reflects_a_shortfall_correction_even_at_full_scale() -> None:
+    """A month whose counters bracket start to end has ``scale`` of exactly
+    1.0 — the counted span already reaches the whole month — but an internal
+    dropped span can still force the total to price the measured energy while
+    restoring the rest at a blended rate. Reading only ``scale`` called that
+    "what the month came to" beside a total that was still assuming a rate
+    for kilowatt-hours nobody measured — a projection under any other name.
+    """
+    bill = estimate_bill(
+        tariff(**FLAT),
+        PeriodEnergy(
+            start=datetime(2026, 1, 1, tzinfo=EAST),
+            end=datetime(2026, 2, 1, tzinfo=EAST),
+            grid_import_kwh={"Flat": 100.0},
+            shortfall={"grid_import": _entry(100.0, 20.0)},
+        ),
+    )
+    assert bill is not None
+    assert bill.fraction_elapsed == pytest.approx(1.0)
+    assert bill.assumed_kwh == pytest.approx(20.0)
+    assert bill.is_projected is True
+
+
 # --- Export credit ----------------------------------------------------------
 
 
