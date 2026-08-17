@@ -647,13 +647,38 @@ function graphTabsFor(hasModules, hasCircuits) {
     .filter((t) => t.key !== 'circuits' || hasCircuits === true);
 }
 
+// The tab name a fragment carries, with any id it names beside it stripped
+// off — `#circuits=7` names the Circuits tab exactly as `#circuits` does.
+// Split out so a fragment naming an id is not read as a fragment naming an
+// unknown tab, which would otherwise fall through wantedGraphTab to the
+// remembered tab or the default instead of opening Circuits at all.
+function graphHashTab(hash) {
+  if (!hash) return hash;
+  const at = hash.indexOf('=');
+  return at < 0 ? hash : hash.slice(0, at);
+}
+
+// The circuit id a fragment names beside its tab, or null if it names none or
+// one that does not parse as an integer. Only `circuits=<id>` is given a
+// meaning; the caller that reads this already knows whether the tab matched,
+// so this does not have to guard against a stray `=` on another tab's hash.
+function graphHashCircuitId(hash) {
+  if (!hash || hash.indexOf('=') < 0) return null;
+  const id = Number(hash.slice(hash.indexOf('=') + 1));
+  return Number.isInteger(id) ? id : null;
+}
+
 // The tab the reader should land on. The URL fragment wins when it names a tab;
 // otherwise the remembered choice, if it names a tab; otherwise All. `tabs` is
 // the bar this device actually has, so a link to /graphs#packs sent between two
 // owners lands on All rather than on nothing when the receiver has no packs.
+// A fragment this installation cannot fill — an unknown tab, or a circuit id
+// naming an account with no such id — takes exactly that same fallback: it is
+// not this function's job to know which ids exist, only which tabs do.
 function wantedGraphTab(hash, stored, tabs = GRAPH_TABS) {
   const keys = tabs.map((t) => t.key);
-  if (hash && keys.includes(hash)) return hash;
+  const tab = graphHashTab(hash);
+  if (tab && keys.includes(tab)) return tab;
   if (stored && keys.includes(stored)) return stored;
   return DEFAULT_GRAPH_TAB;
 }
@@ -705,6 +730,13 @@ let activeTab = DEFAULT_GRAPH_TAB;
 let weatherPinned = false;
 let weatherHasData = true;
 let circuitsHaveData = false;
+// The circuit id `#circuits=<id>` named, if the fragment on screen names one.
+// Read once per call to wantedTab() — boot, and every hashchange — because
+// that is the one place this page already parses the hash, and a second
+// parse elsewhere would be a second place for the two to drift apart. null
+// means no id was named, not that circuit 0 was: there is no circuit 0, ids
+// come from SQLite's own rowid and start at 1.
+let wantedCircuitId = null;
 
 const sectionVisible = (key) =>
   graphSectionVisible(
@@ -714,9 +746,13 @@ const sectionVisible = (key) =>
 function wantedTab() {
   let held = null;
   try { held = localStorage.getItem(GRAPH_TAB_KEY); } catch (e) { /* private browsing */ }
-  return wantedGraphTab(
-    location.hash.replace('#', ''), held, graphTabsFor(hasModules, hasCircuits)
-  );
+  const raw = location.hash.replace('#', '');
+  const tab = wantedGraphTab(raw, held, graphTabsFor(hasModules, hasCircuits));
+  // Only honoured when the fragment actually landed on Circuits — an id
+  // riding a hash that named a different tab, or one that fell back because
+  // this installation has no Circuits tab at all, is not a circuit to pin.
+  wantedCircuitId = tab === 'circuits' ? graphHashCircuitId(raw) : null;
+  return tab;
 }
 
 function drawTabs() {
@@ -1354,13 +1390,31 @@ function circuitSilent(c) {
   return !circuitReported(c) && (c ? c.kwh : null) === null;
 }
 
+// The circuit a `#circuits=<id>` link named, moved to the front of the
+// endpoint's own ranking, everything else left in the order it arrived in. An
+// id this window's answer does not carry — a stale link, one sent to another
+// installation, or none named at all — leaves the list exactly as ranked,
+// the same fallback wantedGraphTab already takes for a tab a receiver lacks.
+// This is what lets a long-offline outlet, sorted last by circuitsDrawn's own
+// rule, still open first when a link points straight at it.
+function pinWanted(circuits, wantedId) {
+  if (wantedId == null) return circuits;
+  const at = circuits.findIndex((c) => c.id === wantedId);
+  if (at < 0) return circuits;
+  return [circuits[at], ...circuits.slice(0, at), ...circuits.slice(at + 1)];
+}
+
 // Which strips are drawn now, and how many the expander is holding back. The
 // order is the endpoint's ranking, so the five drawn are the five that used the
 // most energy over the window and the ones behind the expander are the tail of
 // the same list — a circuit nobody heard from sorts below one measured at
-// nothing, so the silent ones are ordinarily the last of all.
-function circuitsDrawn(circuits, expanded) {
-  return expanded ? circuits.slice() : circuits.slice(0, CIRCUIT_STRIPS);
+// nothing, so the silent ones are ordinarily the last of all. A wanted id
+// overrides only the position, never the membership: pinning happens before
+// the slice, so a circuit named by a link is drawn even when it would
+// otherwise have fallen behind the expander.
+function circuitsDrawn(circuits, expanded, wantedId) {
+  const ordered = pinWanted(circuits, wantedId);
+  return expanded ? ordered.slice() : ordered.slice(0, CIRCUIT_STRIPS);
 }
 
 // What the expander says. Named for what pressing it does rather than for the
@@ -1769,7 +1823,7 @@ function circuitResolution(body) {
 function drawCircuits(body) {
   if (!body) return;
   const circuits = body.circuits || [];
-  const rows = circuitsDrawn(circuits, circuitsExpanded).map((c) => ({
+  const rows = circuitsDrawn(circuits, circuitsExpanded, wantedCircuitId).map((c) => ({
     id: c.id,
     name: c.name,
     kind: c.kind,

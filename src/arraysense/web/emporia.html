@@ -38,6 +38,17 @@
      rule for every state on this page. */
   #circuits .off{display:block;color:var(--warn);font-size:11px;margin-top:2px}
   #circuits tr.absent .off{color:var(--warn)}
+  /* Each row is a link to that circuit's own history, so it can be
+     middle-clicked and sent — "look at what the septic pump did" is exactly
+     that message. It has to read as an ordinary row rather than as a link:
+     color:inherit takes the row's own ink (dimmed the same way under
+     tr.absent, since that rule already targets every td), and only the
+     underline says it is clickable, the way the nav's own links behave. The
+     focus ring is the one thing a hover state cannot stand in for. */
+  #circuits td a.circuitLink{color:inherit;text-decoration:none;display:block}
+  #circuits td a.circuitLink:hover{text-decoration:underline}
+  #circuits td a.circuitLink:focus-visible{outline:2px solid var(--pv);outline-offset:2px;
+    border-radius:4px}
   /* The state line. reconnect_required is deliberately not styled as an error:
      it is a job for the owner, not a fault in the service, and painting it red
      is what teaches somebody to ignore the red. */
@@ -245,10 +256,17 @@ async function loadCircuits() {
     const off = c.connected === false
       ? `<span class="off">${esc(('offline ' + (c.offline_since || '')).trim())}</span>`
       : '';
+    // The name cell is the anchor, not the row: a <tr> cannot itself be an
+    // <a> in valid HTML, and the name is the one cell every reader already
+    // reads to find "this is the circuit I want" — putting the link there
+    // rather than on the icon or the watts column puts it where the eye
+    // already lands. The offline line rides inside it too, since it is the
+    // same circuit's own history the link goes to either way.
     return `<tr class="${w === null ? 'absent' : ''}">`
       + `<td class="ic">${icon
           ? `<svg aria-hidden="true"><use href="#${esc(icon)}"/></svg>` : ''}</td>`
-      + `<td>${esc(c.name)}${off}</td>`
+      + `<td><a class="circuitLink" href="/graphs#circuits=${esc(String(c.id))}">`
+          + `${esc(c.name)}${off}</a></td>`
       + `<td class="kind">${c.kind === 'circuit' ? '' : esc(c.kind)}</td>`
       + `<td class="w">${wStr(w)}</td></tr>`;
   }).join('');

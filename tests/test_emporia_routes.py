@@ -599,6 +599,27 @@ def test_the_circuits_endpoint_says_which_devices_stopped_answering(tmp_path: Pa
     store.close()
 
 
+def test_the_live_list_and_the_history_endpoint_agree_on_circuit_ids(tmp_path: Path) -> None:
+    # The whole reason an id was added to the live list: a row on /emporia
+    # links to /graphs#circuits=<id>, and the link is worthless unless the
+    # circuits endpoint answers to the same id for the same circuit. Every row
+    # carries an id, and it is the surrogate history() already keys its series
+    # on — never a name, which sync_circuits updates in place on a rename.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        live = c.get("/api/emporia/circuits").json()["circuits"]
+        history = _history(c, hours=1)
+    store.close()
+
+    assert live, "the seeded circuits should be listed"
+    assert all(isinstance(row["id"], int) for row in live), "every circuit carries an id"
+    live_ids = {row["name"]: row["id"] for row in live}
+    history_ids = {row["name"]: row["id"] for row in history["circuits"]}
+    assert history_ids, "the history endpoint should report the dryer circuit"
+    for name, circuit_id in history_ids.items():
+        assert live_ids[name] == circuit_id, f"the live list and history disagree about {name}'s id"
+
+
 def test_a_circuit_emporia_said_nothing_about_is_not_reported_as_online(tmp_path: Path) -> None:
     # Silence is not health. A device missing from devicesConnected has not been
     # declared up, and the page must be able to say nothing rather than "fine".

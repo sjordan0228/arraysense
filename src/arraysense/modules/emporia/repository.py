@@ -112,8 +112,16 @@ class CircuitLatest:
     ``watts`` is None both when the circuit has never been read and when its
     last reading was absent. A page must say "no reading" for either, so they do
     not need separating here — but neither may be drawn as a zero.
+
+    ``circuit_id`` is the surrogate ``history()`` already keys its own series
+    on. A page linking a live row to that circuit's chart has to name the same
+    circuit both endpoints agree on, and identity here is ``(device_gid,
+    channel_num)`` with this id as its handle — never the name, which
+    ``sync_circuits`` updates in place the moment an owner renames a circuit in
+    Emporia's app.
     """
 
+    circuit_id: int
     device_gid: int
     channel_num: str
     name: str
@@ -283,7 +291,7 @@ class CircuitRepository:
         try:
             rows = self._store._conn.execute(
                 "SELECT c.device_gid, c.channel_num, c.name, c.kind, c.multiplier,"
-                "       r.watts, r.timestamp, c.type_gid"
+                "       r.watts, r.timestamp, c.type_gid, c.id"
                 "  FROM circuit c"
                 "  LEFT JOIN circuit_reading r"
                 "    ON r.circuit_id = c.id"
@@ -296,6 +304,7 @@ class CircuitRepository:
             return []
         out = [
             CircuitLatest(
+                circuit_id=int(row[8]),
                 device_gid=int(row[0]),
                 channel_num=str(row[1]),
                 name=str(row[2]),

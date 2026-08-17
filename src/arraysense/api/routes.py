@@ -3293,6 +3293,11 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     since April and August, and without these a page can only render them the
     same as a circuit that happened to be idle. They belong to the device rather
     than the channel, so every circuit on a dead monitor carries the same answer.
+
+    ``id`` is what lets a row on this page link to that circuit's own chart on
+    ``/graphs#circuits=<id>``. It is the same surrogate ``/api/emporia/history``
+    reports for the same circuit — the two must agree, since a link is only as
+    good as the id it names being the id the other endpoint answers to.
     """
     poller = _emporia(request)
     if poller is None:
@@ -3301,6 +3306,7 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     return {
         "circuits": [
             {
+                "id": circuit.circuit_id,
                 "name": circuit.name,
                 "kind": circuit.kind,
                 "watts": circuit.watts,

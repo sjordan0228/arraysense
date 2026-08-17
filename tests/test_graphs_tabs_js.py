@@ -218,6 +218,42 @@ def test_a_link_to_the_circuits_tab_lands_on_all_where_there_are_none() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_circuit_id_on_the_fragment_lands_on_circuits_and_is_kept() -> None:
+    # /graphs#circuits=7 is the link a live row on the Emporia page builds.
+    # graphHashTab strips the id so wantedGraphTab still matches the tab by
+    # name — it does not have to know an id can ride along at all — and
+    # graphHashCircuitId is the one place that id is ever parsed out.
+    out = _run(
+        "const tabs = graphTabsFor(true, true);"
+        "console.log('tab:' + wantedGraphTab('circuits=7', null, tabs));"
+        "console.log('id:' + graphHashCircuitId('circuits=7'));"
+        "console.log('no_id:' + graphHashCircuitId('circuits'));"
+        "console.log('junk_id:' + graphHashCircuitId('circuits=abc'));"
+        "console.log('bare_tab:' + graphHashTab('circuits'));"
+        "console.log('split_tab:' + graphHashTab('circuits=7'));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["tab"] == "circuits"
+    assert results["id"] == "7"
+    assert results["no_id"] == "null", "a bare #circuits names no id"
+    assert results["junk_id"] == "null", "an id that does not parse is not silently kept"
+    assert results["bare_tab"] == "circuits"
+    assert results["split_tab"] == "circuits", "the id must not stop the tab from matching"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_circuit_id_lands_on_all_where_there_are_no_circuits() -> None:
+    # The same fallback /graphs#packs already takes on a device with no packs:
+    # an id riding a tab this installation does not offer at all must not
+    # strand the reader on a hash it can never satisfy.
+    out = _run(
+        "const tabs = graphTabsFor(true, false);"
+        "console.log(wantedGraphTab('circuits=7', null, tabs));"
+    )
+    assert out == "all"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_the_circuits_section_hides_until_something_has_been_read() -> None:
     # Enabled is not the same fact as having data. The tab is offered on the
     # owner's switch, so a module turned on a minute ago — or one whose saved
@@ -267,6 +303,35 @@ def test_five_strips_are_drawn_and_the_expander_counts_the_rest() -> None:
     assert results["words"] == "show the other 34", "the count is the offer"
     assert results["one"] == "show the other one"
     assert results["back"] == "show fewer"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_wanted_circuit_is_pinned_first_regardless_of_its_ranking() -> None:
+    # /graphs#circuits=<id> is what a row on the Emporia page links to, and it
+    # has to draw that circuit first whatever its energy ranking says — a
+    # long-offline outlet sorts last under the ordinary rule and still has to
+    # open first when a link points straight at it, rather than sending the
+    # reader hunting behind the expander for the thing they clicked.
+    out = _run(
+        "const list = Array.from({length: 39}, (_, i) => ({id: i, name: 'c' + i}));\n"
+        "console.log('pinned:' + circuitsDrawn(list, false, 30)"
+        ".map(c => c.name).join(','));\n"
+        "console.log('unknown:' + circuitsDrawn(list, false, 999)"
+        ".map(c => c.name).join(','));\n"
+        "console.log('none:' + circuitsDrawn(list, false, null)"
+        ".map(c => c.name).join(','));\n"
+        "console.log('expanded:' + circuitsDrawn(list, true, 30).length);",
+        marker="circuit-rules",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["pinned"] == "c30,c0,c1,c2,c3", (
+        "the wanted circuit leads, everything else keeps its ranked order"
+    )
+    assert results["unknown"] == "c0,c1,c2,c3,c4", (
+        "an id this window's answer does not carry changes nothing — the plain ranking stands"
+    )
+    assert results["none"] == "c0,c1,c2,c3,c4", "no id named is the ordinary ranking"
+    assert results["expanded"] == "39", "pinning does not change how many the expander draws"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
