@@ -39,6 +39,17 @@ _HOUR_SECONDS = 3600
 # takes the figure rather than assuming this one.
 _POLL_SECONDS = 60
 
+# How far apart two readings have to be before the stretch between them counts
+# as unrecorded rather than as an ordinary late poll: two cadences, the first
+# spacing that leaves a whole period with nothing written in it. Two is the
+# allowance ``store.tiers.select_tier_for_range`` already spends on the same
+# question of whether a tier holds a stretch, so it is this project's figure
+# rather than a new one. The comparison is inclusive where that one is
+# exclusive, and the hourly tier is why: its stamps are aligned to the hour, so
+# an hour nobody recorded puts its neighbours at exactly two cadences and an
+# exclusive test would draw a straight line through every one of them.
+_GAP_CADENCES = 2
+
 
 def _elapsed_or_default(stamps: Sequence[int], cadence_seconds: int = _POLL_SECONDS) -> int:
     """How long one raw reading covers, taken from the window's own spacing.
@@ -58,6 +69,40 @@ def _elapsed_or_default(stamps: Sequence[int], cadence_seconds: int = _POLL_SECO
         return cadence_seconds
     gaps = sorted(b - a for a, b in pairwise(stamps))
     return max(1, gaps[len(gaps) // 2])
+
+
+def _with_breaks(stamps: Sequence[int], cadence_seconds: int) -> list[int]:
+    """The window's stamps, plus one carrying nothing at the start of each hole.
+
+    A series is built from the rows that exist, so a poller stopped for three
+    hours leaves two readings three hours apart sitting *adjacent* in the
+    array — and a chart that breaks a line only where a null sits joins them,
+    drawing an air conditioner ramping gently down and back up across three
+    hours nobody measured. The inverter path never had this to deal with
+    because the collector writes a row even when a poll fails, and that row
+    enters the series as a null; the Emporia poller writes nothing at all while
+    the module is off, so there is no row to become one and it has to be made
+    here.
+
+    Here rather than in the browser because a page draws what an endpoint tells
+    it. A series a consumer has to know to distrust has only pushed the problem
+    outward, and there is more than one consumer.
+
+    One stamp per hole is all a break needs — measured on the bench against
+    uPlot itself, which leaves 1,035 pixels of a strip unpainted on the
+    strength of a single null. Filling the hole would say the same thing in the
+    hundred and seventy-six points a three-hour hole takes at a minute's
+    cadence. It sits at ``previous + cadence``, the first instant that should
+    have carried a reading and did not; at the midpoint the break would float
+    away from the moment collection stopped.
+    """
+    out: list[int] = []
+    for previous, current in pairwise(stamps):
+        out.append(previous)
+        if current - previous >= _GAP_CADENCES * cadence_seconds:
+            out.append(previous + cadence_seconds)
+    out.extend(stamps[-1:])
+    return out
 
 
 @dataclass(frozen=True)
@@ -96,6 +141,15 @@ class CircuitSeries:
     part as a whole. Only the hourly tier can raise it, because only the hourly
     tier stores a sample count — a raw row is one reading, and how much of the
     window those readings between them cover is already in the energy.
+
+    A hole in the window does not raise it. "Thinly sampled bucket" and "the
+    module was off for three hours" are different facts, and an hour recorded
+    end to end is whole however long the silence either side of it ran.
+
+    ``watts`` therefore holds two kinds of null and deliberately does not
+    separate them: a circuit that was listed and did not answer, and an instant
+    nothing was recorded at. Both are absences, and neither may be drawn as a
+    number.
     """
 
     circuit_id: int
@@ -117,6 +171,12 @@ class CircuitHistory:
     takes one ``now`` for the whole batch — so they genuinely share sample
     times, and a chart drawing five strips against five near-identical x arrays
     pays five times for one fact.
+
+    Not every instant here was polled. Where the module went quiet, one stamp
+    is added carrying nothing for any circuit, so a line breaks at the moment
+    collection stopped instead of being drawn straight across the outage. See
+    ``_with_breaks``; it is the same claim as any other null in the series, and
+    a consumer needs no separate rule for it.
     """
 
     timestamps: tuple[int, ...]
@@ -284,6 +344,13 @@ class CircuitRepository:
         and reports half an hour as a whole one. The caller knows the interval;
         an hourly row cannot be asked.
 
+        The timestamps are the ones that were recorded plus one per hole, so a
+        stretch the module missed arrives as a null rather than as a straight
+        line drawn across it — ``_with_breaks`` says why that is this
+        endpoint's job and not the page's. The energy is untouched by it: a
+        synthetic stamp carries no reading, so it is worth nothing and cannot
+        move a kWh figure or mark an hour partial.
+
         A database error yields an empty history rather than raising. This runs
         unattended on someone's inverter and a page saying it has no circuits
         tells the owner more than a page returning 500.
@@ -313,16 +380,25 @@ class CircuitRepository:
         wanted = None if circuit_ids is None else set(circuit_ids)
         meta = {int(row[0]): row for row in circuits if wanted is None or int(row[0]) in wanted}
         stamps = sorted({int(row[0]) for row in rows})
-        slot = {stamp: index for index, stamp in enumerate(stamps)}
 
         # What one row of the raw tier is taken to cover. Measured from the
         # stamps the poll actually landed on rather than from the window, so a
         # stretch nobody recorded contributes nothing instead of being smeared
         # over the readings either side of it. Not consulted on the hourly
         # tier, where sample_count says how much of each hour was recorded.
+        # Measured before the breaks are added, or the synthetic stamps would
+        # be counted as spacing and move the energy.
         reading_seconds = _elapsed_or_default(stamps, cadence_seconds)
+        # An hourly row covers an hour however often the module polled, so that
+        # tier is judged against the hour. The raw tier is judged against the
+        # spacing it actually achieved rather than the interval in force, which
+        # is what stops an installation whose polls run long — or a stretch of
+        # history recorded at a different interval — from breaking at every
+        # ordinary reading.
+        drawn = _with_breaks(stamps, _HOUR_SECONDS if counted else reading_seconds)
+        slot = {stamp: index for index, stamp in enumerate(drawn)}
         watts: dict[int, list[int | None]] = {
-            circuit_id: [None] * len(stamps) for circuit_id in meta
+            circuit_id: [None] * len(drawn) for circuit_id in meta
         }
         joules: dict[int, float] = dict.fromkeys(meta, 0.0)
         seen: set[int] = set()
@@ -368,7 +444,7 @@ class CircuitRepository:
         # Ordering a silence above a fact is what latest() already refuses to do
         # and this list is read top-down for the same reason.
         series.sort(key=lambda s: (s.kwh is None, -(s.kwh or 0.0), s.name))
-        return CircuitHistory(timestamps=tuple(stamps), series=tuple(series), tier=tier)
+        return CircuitHistory(timestamps=tuple(drawn), series=tuple(series), tier=tier)
 
 
 # Who decided a change. Two values rather than a boolean because the audit is

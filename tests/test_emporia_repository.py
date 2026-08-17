@@ -413,6 +413,133 @@ def test_history_returns_nothing_rather_than_raising_on_a_database_error(
     assert got.series == ()
 
 
+def test_history_breaks_the_series_where_nothing_was_recorded(tmp_path: Path) -> None:
+    # The defect this guards is a line, not a number. The stamps come from the
+    # rows that exist, so two readings three hours apart land next to each other
+    # in the array and uPlot — which breaks a line only at a null — draws a
+    # straight diagonal across the outage. A reader sees an air conditioner
+    # ramping down over three hours that were never measured at all.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "8", "Air conditioner", 1.0, "circuit")], start)
+    for minute in range(5):
+        repo.append_readings([Reading(100000, "8", 2000)], start + timedelta(minutes=minute))
+    resume = start + timedelta(hours=3)
+    for minute in range(5):
+        repo.append_readings([Reading(100000, "8", 2100)], resume + timedelta(minutes=minute))
+
+    got = repo.history(start, resume + timedelta(minutes=10), tier="full")
+
+    (series,) = got.series
+    quiet = int((start + timedelta(minutes=4)).timestamp()) + 60
+    assert quiet in got.timestamps, "the break sits one cadence after the last real reading"
+    assert series.watts[got.timestamps.index(quiet)] is None
+    # Exactly one of them, and it is the synthetic one: filling the whole hole
+    # with nulls would add a hundred and seventy points to say what one says.
+    assert series.watts.count(None) == 1
+    assert len(got.timestamps) == 11
+
+
+def test_history_does_not_break_between_ordinary_consecutive_readings(tmp_path: Path) -> None:
+    # The other half of the rule. A break inserted between readings a cadence
+    # apart would dash every line on the page and make a healthy poller look
+    # like a failing one.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Fridge", 1.0, "circuit")], start)
+    for minute in range(6):
+        repo.append_readings([Reading(100000, "1", 120)], start + timedelta(minutes=minute))
+
+    got = repo.history(start, start + timedelta(minutes=10), tier="full")
+
+    (series,) = got.series
+    assert got.timestamps == tuple(
+        int((start + timedelta(minutes=minute)).timestamp()) for minute in range(6)
+    )
+    assert None not in series.watts
+
+
+def test_a_gap_changes_the_line_and_not_the_energy(tmp_path: Path) -> None:
+    # A stretch nobody recorded is missing knowledge, not missing energy: the
+    # synthetic reading is worth nothing, so the ten readings either side of the
+    # hole add up to exactly what the same ten in a row do. A break that moved
+    # the kWh would be pricing a circuit off a drawing decision.
+    dense, holed = tmp_path / "dense", tmp_path / "holed"
+    dense.mkdir()
+    holed.mkdir()
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+
+    unbroken, _store = _repo(dense)
+    unbroken.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], start)
+    for minute in range(10):
+        unbroken.append_readings([Reading(100000, "1", 3000)], start + timedelta(minutes=minute))
+    steady = unbroken.history(start, start + timedelta(hours=4), tier="full")
+
+    broken, _store2 = _repo(holed)
+    broken.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], start)
+    for minute in range(5):
+        broken.append_readings([Reading(100000, "1", 3000)], start + timedelta(minutes=minute))
+    resume = start + timedelta(hours=3)
+    for minute in range(5):
+        broken.append_readings([Reading(100000, "1", 3000)], resume + timedelta(minutes=minute))
+    interrupted = broken.history(start, start + timedelta(hours=4), tier="full")
+
+    assert interrupted.series[0].watts.count(None) == 1, "the interrupted window really broke"
+    assert interrupted.series[0].kwh == steady.series[0].kwh
+    # Ten readings a minute apart at 3 kW, and not a watt-second of the hole.
+    assert interrupted.series[0].kwh == pytest.approx(3000 * (10 / 60) / 1000)
+
+
+def test_a_gap_does_not_make_a_full_hour_look_thinly_sampled(tmp_path: Path) -> None:
+    # ``partial`` says this bucket was thinly sampled, which is a claim about
+    # the hours that were recorded. An hour recorded end to end stays whole
+    # however long the module was off either side of it, and a flag raised by
+    # the break would put a "part of the window" label on a complete figure.
+    repo, store = _repo(tmp_path)
+    first = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    third = first + timedelta(hours=2)
+    repo.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], first)
+    for hour in (first, third):
+        for tick in range(60):
+            repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(minutes=tick))
+    rebuild_circuit_hourly(
+        store._conn, int(first.timestamp()), int((third + timedelta(hours=1)).timestamp())
+    )
+
+    got = repo.history(first, third + timedelta(hours=1), tier="hourly")
+
+    (series,) = got.series
+    assert series.partial is False
+    assert series.watts.count(None) == 1, "the missing hour still broke the line"
+    # Two whole hours at 1 kW. The hour nobody recorded contributes nothing.
+    assert series.kwh == pytest.approx(2.0)
+
+
+def test_the_hourly_tier_breaks_a_missing_hour_at_the_hour(tmp_path: Path) -> None:
+    # An hourly row covers an hour whatever the poll interval is, so the cadence
+    # this tier is judged against is 3,600 seconds. Measured against a sixty
+    # second poll instead, the break would land a minute after the last bucket
+    # rather than on the hour that went unrecorded — pointing at the wrong
+    # moment on a chart whose whole job is to say when.
+    repo, store = _repo(tmp_path)
+    first = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    third = first + timedelta(hours=2)
+    repo.sync_circuits([Circuit(100000, "1", "Oven", 1.0, "circuit")], first)
+    for hour in (first, third):
+        for tick in (0, 30):
+            repo.append_readings([Reading(100000, "1", 2000)], hour + timedelta(minutes=tick))
+    rebuild_circuit_hourly(
+        store._conn, int(first.timestamp()), int((third + timedelta(hours=1)).timestamp())
+    )
+
+    got = repo.history(first, third + timedelta(hours=1), tier="hourly")
+
+    (series,) = got.series
+    missing = int((first + timedelta(hours=1)).timestamp())
+    assert got.timestamps == (int(first.timestamp()), missing, int(third.timestamp()))
+    assert series.watts[1] is None
+
+
 # --- the charger audit ----------------------------------------------------
 
 
