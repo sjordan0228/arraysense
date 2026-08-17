@@ -7,15 +7,12 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 1.2.0 — 16 August 2026
+## 1.1.1 — 16 August 2026
 
 The Graphs page can now show what is actually drawing the power, for an
 installation with an Emporia Vue connected — the per-circuit history the
 Emporia module has been recording since it shipped in 1.1.0, and nothing had
 ever queried.
-
-A minor version rather than a patch because a new endpoint and a new page tab
-are a feature, not a correction to an existing one.
 
 **This release adds a column, and it is applied automatically on the first
 start.** `circuit_hourly` gains `covered_seconds` — how much of each hour the
