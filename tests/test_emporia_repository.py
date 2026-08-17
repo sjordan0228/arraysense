@@ -697,6 +697,44 @@ def test_recorded_seconds_counts_coverage_and_not_the_buckets_that_hold_it(
     store.close()
 
 
+def test_recorded_seconds_describes_the_module_even_when_one_circuit_is_asked_for(
+    tmp_path: Path,
+) -> None:
+    # A poll that reached one clamp reached the monitor, so this is a fact about
+    # the module. Measured after the narrowing, a request for the shed outlet
+    # that has been offline since April reported the module as barely running
+    # and the endpoint withheld a share the module could honestly support.
+    repo, store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    ids = repo.sync_circuits(
+        [
+            Circuit(100000, "1", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "9", "Shed outlet", 1.0, "circuit"),
+        ],
+        start,
+    )
+    for minute in range(60):
+        when = start + timedelta(minutes=minute)
+        readings = [Reading(100000, "1", 1000)]
+        # The outlet stops answering half way through; the monitor does not.
+        if minute < 30:
+            readings.append(Reading(100000, "9", 40))
+        repo.append_readings(readings, when)
+
+    shed = repo.history(
+        start,
+        start + timedelta(hours=1),
+        tier="full",
+        circuit_ids=[ids[(100000, "9")]],
+        cadence_seconds=60,
+    )
+    everything = repo.history(start, start + timedelta(hours=1), tier="full", cadence_seconds=60)
+
+    assert shed.recorded_seconds == everything.recorded_seconds == 3600
+    assert [s.name for s in shed.series] == ["Shed outlet"], "the series is still narrowed"
+    store.close()
+
+
 # --- the charger audit ----------------------------------------------------
 
 

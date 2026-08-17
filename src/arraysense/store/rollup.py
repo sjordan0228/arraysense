@@ -620,64 +620,130 @@ def rebuild_circuit_hourly(
     seconds to sixty. The caller knows the interval; an hourly row cannot be
     asked, so it is written down here.
 
-    Each reading accounts for the distance to the next one inside its own hour,
-    capped at one poll interval, and the last reading of the hour accounts for
-    one interval. Capped because a reading covers the period it was taken for
-    and no more — the stretch after a poller stopped belongs to nobody — and
-    measured from the real stamps rather than multiplying the count, so a
-    retried poll landing five seconds after its predecessor adds five seconds
-    and not a whole interval. The total is clamped to the 3,600 seconds an hour
-    holds. An hour with no readings stores 0, never NULL: NULL is reserved for a
-    row written before the column existed, and the two must stay
-    distinguishable.
+    **The stored watts and the stored coverage come from the same spans, and
+    that is the whole shape of this query.** A reading holds until the next one
+    arrives, capped at one poll interval — capped because a reading covers the
+    period it was taken for and no more, and the stretch after a poller stopped
+    belongs to nobody. Each span is then cut at the hour boundaries it crosses,
+    and every piece feeds both figures: the coverage is the pieces added up,
+    and the watts is the pieces' own duration-weighted mean. A plain ``AVG``
+    beside a duration-weighted coverage is two different weightings of the same
+    hour multiplied together by the reader, and it under-reported by 27% on
+    100 W held for five seconds followed by 1,000 W held for two minutes — 700 W
+    stored where the hour really averaged 964.
+
+    Cutting at the boundary is the other half. While the window function
+    partitioned by the hour, a reading at 12:59:59 took a whole interval inside
+    the 12:00 bucket and gave 13:00 nothing, so the energy either side of every
+    hour edge was misfiled. A span now lands in both buckets in the proportion
+    it really occupies them, which is also why a bucket can hold coverage with a
+    sample count of nought: the hour before it ended on a reading whose period
+    ran over the line.
+
+    ``sample_count`` stays a count of readings *stamped* inside the hour, since
+    that is the question it answers — how many times the module was heard from —
+    and the coverage is what answers the other one.
+
+    **Coverage is written once and afterwards only grows.** A rebuild that
+    measures less than the row already holds leaves the row alone, and this is
+    the answer to the cadence a rebuild cannot ask about. The rebuild window
+    reaches three hours back, so lowering ``emporia.interval`` from sixty
+    seconds to ten would otherwise re-cap three hours of sixty-second readings
+    at ten seconds apiece and rewrite them as one sixth of the energy they
+    recorded — readings measured honestly, overwritten by a setting they were
+    never collected under. Raising the interval needs no such guard, because the
+    cap only ever lowers a span and the real gaps are already the shorter
+    figure. Nothing else in the range only-grows: watts and the sample count are
+    replaced outright, which is what lets a late-arriving reading correct them.
 
     An hour in which nothing was heard averages to NULL rather than to zero, and
-    lands with a sample count of nought. Deleting and reinserting inside one
-    transaction is what makes the rebuild idempotent, and what drops a bucket
-    whose source rows have since gone.
+    lands with a sample count of nought. An hour with no readings stores 0
+    coverage, never NULL: NULL is reserved for a row written before the column
+    existed, and the two must stay distinguishable. A bucket whose source rows
+    have since gone is deleted rather than left behind.
+
+    The readings are read one interval either side of the aligned range, so a
+    bucket's figures depend only on the readings around it and never on the
+    range the rebuild was asked for: the reading before the range can spill into
+    its first hour, and the reading after it is what bounds the last span inside.
 
     The multiplier is deliberately not applied. Readings are stored raw and
     scaled on the way out, so a clamp corrected upstream fixes the whole history
     rather than only what was written after the correction.
     """
     aligned_start, aligned_end = _bucket_bounds(3600, start, end)
-    part = _floor_div("timestamp", 3600)
-    # The window function partitions by the bucket as well as the circuit, so
-    # each hour is measured from its own readings alone and a rebuild gives the
-    # same answer whatever range it was asked for. A reading with nothing after
-    # it in its hour takes the full interval.
-    spans = (
-        f"SELECT {part} * 3600 AS bucket, circuit_id, watts, "
-        "MIN(COALESCE("
-        f"  LEAD(timestamp) OVER (PARTITION BY circuit_id, {part} ORDER BY timestamp) - timestamp,"
-        "  ?"
-        "), ?) AS covered "
-        "FROM circuit_reading WHERE timestamp >= ? AND timestamp < ?"
-    )
-    select = (
-        "SELECT bucket AS timestamp, circuit_id, "
-        "CAST(ROUND(AVG(watts)) AS INTEGER) AS watts, "
-        "COUNT(watts) AS sample_count, "
+    bucket = f"({_floor_div('ts', 3600)} * 3600)"
+    # One span per reading, measured to its successor whatever hour that fell
+    # in, then cut into the piece that lies in the reading's own hour and the
+    # piece that runs over into the next. A tail of no length is dropped by the
+    # ``covered > 0`` filter below rather than being carried as an empty bucket.
+    cte = (
+        "WITH spanned AS ("
+        # The trailing 3600 is what keeps the two pieces below sufficient: a
+        # span longer than an hour would cross two boundaries and the middle
+        # hour would be silently dropped. The registry caps the interval at an
+        # hour so this never bites in practice, and a rebuild called by hand
+        # with a longer one credits an hour rather than losing a day.
+        " SELECT timestamp AS ts, circuit_id, watts, MIN(COALESCE("
+        "  LEAD(timestamp) OVER (PARTITION BY circuit_id ORDER BY timestamp) - timestamp, ?"
+        " ), ?, 3600) AS held"
+        " FROM circuit_reading WHERE timestamp >= ? AND timestamp < ?"
+        "), pieces AS ("
+        f" SELECT {bucket} AS bucket, circuit_id, watts, 1 AS head,"
+        f"  MIN(held, {bucket} + 3600 - ts) AS covered FROM spanned"
+        " UNION ALL"
+        f" SELECT {bucket} + 3600 AS bucket, circuit_id, watts, 0 AS head,"
+        f"  held - ({bucket} + 3600 - ts) AS covered FROM spanned"
+        "), measured AS ("
+        " SELECT bucket AS timestamp, circuit_id,"
+        # The duration-weighted mean, from the same pieces the coverage is
+        # summed from. ``* 1.0`` because both sums are integers and SQLite
+        # divides those by truncating, which would put the ROUND outside a
+        # value that had already lost its fraction.
+        " CAST(ROUND("
+        "  SUM(CASE WHEN watts IS NULL THEN NULL ELSE watts * covered END) * 1.0"
+        "  / SUM(CASE WHEN watts IS NULL THEN NULL ELSE covered END)"
+        " ) AS INTEGER) AS watts,"
+        " SUM(CASE WHEN head = 1 AND watts IS NOT NULL THEN 1 ELSE 0 END) AS sample_count,"
         # COALESCE, not a bare SUM: an hour holding only unanswered readings
         # sums to NULL, and NULL here would be indistinguishable from a row
-        # written before this column existed. The outer MIN is the hour itself —
-        # at a long interval the last reading's own period can run past the end
-        # of the hour it was taken in, and an hour holds 3,600 seconds however
-        # the polls fell inside it.
-        "MIN(COALESCE(SUM(CASE WHEN watts IS NULL THEN NULL ELSE covered END), 0), 3600) "
-        "AS covered_seconds "
-        f"FROM ({spans}) GROUP BY 1, circuit_id"
+        # written before this column existed. The outer MIN is the hour itself,
+        # which no set of pieces should exceed and none may claim to.
+        " MIN(COALESCE(SUM(CASE WHEN watts IS NULL THEN NULL ELSE covered END), 0), 3600)"
+        "  AS covered_seconds"
+        " FROM pieces WHERE covered > 0 AND bucket >= ? AND bucket < ?"
+        " GROUP BY 1, circuit_id"
+        ") "
+    )
+    reach = (
+        cadence_seconds,
+        cadence_seconds,
+        aligned_start - cadence_seconds,
+        aligned_end + cadence_seconds,
+        aligned_start,
+        aligned_end,
     )
     with conn:
         cur = conn.cursor()
         cur.execute(
-            "DELETE FROM circuit_hourly WHERE timestamp >= ? AND timestamp < ?",
-            (aligned_start, aligned_end),
+            cte + "DELETE FROM circuit_hourly WHERE timestamp >= ? AND timestamp < ?"
+            " AND NOT EXISTS (SELECT 1 FROM measured m WHERE m.timestamp = circuit_hourly.timestamp"
+            " AND m.circuit_id = circuit_hourly.circuit_id)",
+            (*reach, aligned_start, aligned_end),
         )
         cur.execute(
-            "INSERT INTO circuit_hourly"
-            " (timestamp, circuit_id, watts, sample_count, covered_seconds) " + select,
-            (cadence_seconds, cadence_seconds, aligned_start, aligned_end),
+            cte + "INSERT INTO circuit_hourly"
+            " (timestamp, circuit_id, watts, sample_count, covered_seconds)"
+            " SELECT timestamp, circuit_id, watts, sample_count, covered_seconds"
+            # ``WHERE 1`` is for SQLite's parser, which cannot otherwise tell
+            # this ON CONFLICT from a join constraint on the SELECT.
+            " FROM measured WHERE 1"
+            " ON CONFLICT (timestamp, circuit_id) DO UPDATE SET"
+            "  watts = excluded.watts,"
+            "  sample_count = excluded.sample_count,"
+            "  covered_seconds ="
+            "   MAX(excluded.covered_seconds, COALESCE(circuit_hourly.covered_seconds, 0))",
+            reach,
         )
 
 

@@ -364,6 +364,11 @@ class CollectorService:
         stored. A reader arriving a month later has only the interval in force
         then, and that is a different number the moment the owner edits the
         setting.
+
+        The window reaches three hours back, though, so the interval read here
+        is *not* the one that produced the two oldest hours in it if the owner
+        has just changed the setting. That is why the rebuild only ever raises
+        an hour's coverage and never lowers it; see ``rebuild_circuit_hourly``.
         """
         moment = now or datetime.now(tz=UTC)
         end = int(moment.timestamp()) + 60

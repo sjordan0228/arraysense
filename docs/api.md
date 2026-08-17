@@ -206,8 +206,8 @@ the Emporia page already answers "what is on now."
 `0` — a dead outlet and an idle one are different facts, and the point of this
 project is not to say they are the same. `kwh` is `null` for a circuit that
 recorded nothing across the whole window, for the same reason. `partial` is
-`true` when the energy figure was built from an hourly bucket holding fewer
-readings than a full hour implies, so a half-recorded hour is never read as a
+`true` when the energy figure was built from an hourly bucket whose readings
+account for less than the whole hour, so a half-recorded hour is never read as a
 whole one. `offline_since` is the device's own timestamp for when it stopped
 answering, `null` while it is connected — what lets a page show a reason instead
 of an empty chart.
@@ -240,12 +240,25 @@ the Graphs page offers.
 the coverage each bucket recorded at the moment it was rolled up, when the poll
 interval that produced its readings was still the one in force — so changing
 `emporia.interval` no longer moves the energy or the coverage of anything
-already stored. On the raw tier one reading accounts for at most one poll
-interval, and for less where the next reading came sooner; a stretch further
-apart than the interval was not recorded, and its energy is unknown rather than
-credited to the readings either side. Hours stored before this release carry no
-coverage figure and fall back to the older estimate, sample count times the
-interval currently set.
+already stored, and a rebuild can only ever raise an hour's coverage, never
+lower it. On the raw tier one reading accounts for at most one poll interval,
+and for less where the next reading came sooner; a stretch further apart than
+the interval was not recorded, and its energy is unknown rather than credited to
+the readings either side. Hours stored before this release carry no coverage
+figure and fall back to the older estimate, sample count times the interval
+currently set.
+
+It describes the module, not the circuits `ids` asked for: a poll that reached
+one clamp reached the monitor, so it is measured across every circuit the window
+holds. Narrowing to one outlet that has been offline since April would otherwise
+report a module outage and withhold a share the module could honestly support.
+
+An hourly bucket's watts is the duration-weighted mean of the readings in it, on
+the same spans the coverage is summed from — 100 W held for five seconds beside
+1,000 W held for two minutes is an hour averaging 964 W, not 700. A reading
+whose period runs over the end of its hour is split between the two hours in the
+proportion it occupies them, so a bucket can carry coverage and energy with a
+sample count of zero.
 
 A build with no Emporia module configured answers an empty history —
 `circuits: []`, every energy figure in `coverage` `null`, and nothing recorded —

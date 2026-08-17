@@ -202,13 +202,16 @@ class CircuitHistory:
     a consumer needs no separate rule for it.
 
     ``recorded_seconds`` is how much of the window the module was recording for
-    at all — the union across circuits, since a poll that reached one clamp
-    reached the monitor. It is here because it is measured from the same
-    coverage the energy is, and a caller that recomputed it from the timestamps
-    would be deriving in a second place the one figure that says whether these
-    circuits and the house counter describe the same span. A seven-day window
-    holding one reading an hour recorded seven hours, not seven days, and only
-    this number can say so.
+    at all — the union across every circuit the window holds, since a poll that
+    reached one clamp reached the monitor. Across every circuit and not only
+    the requested ones: narrowing to a single outlet that has been offline
+    since April would otherwise report a module outage and withhold a share the
+    module could honestly support. It is here because it is measured from the
+    same coverage the energy is, and a caller that recomputed it from the
+    timestamps would be deriving in a second place the one figure that says
+    whether these circuits and the house counter describe the same span. A
+    seven-day window holding one reading an hour recorded seven hours, not
+    seven days, and only this number can say so.
     """
 
     timestamps: tuple[int, ...]
@@ -455,13 +458,10 @@ class CircuitRepository:
         # than about a circuit.
         recorded_at: dict[int, int] = {}
         for stamp, circuit_id, raw, samples, stored in rows:
-            key = int(circuit_id)
-            if key not in meta or raw is None:
+            if raw is None:
                 continue
+            key = int(circuit_id)
             when = int(stamp)
-            value = round(float(raw) * float(meta[key][5]))
-            watts[key][slot[when]] = value
-            seen.add(key)
             if counted:
                 # An hour holds 3,600 seconds however many readings landed in
                 # it. ``covered_seconds`` is what the rollup measured while the
@@ -477,13 +477,24 @@ class CircuitRepository:
                     if stored is not None
                     else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
                 )
-                if covered < _HOUR_SECONDS:
-                    partial.add(key)
             else:
                 nxt = following.get(when)
                 covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
-            joules[key] += value * covered
+            # Taken from every circuit the window returned, before the narrowing
+            # below. This is a fact about the module, not about a circuit: a
+            # poll that reached one clamp reached the monitor. Measured after
+            # the narrowing, a request for one circuit read that circuit's
+            # silence as a module outage and withheld a share the module could
+            # honestly support.
             recorded_at[when] = max(recorded_at.get(when, 0), covered)
+            if key not in meta:
+                continue
+            value = round(float(raw) * float(meta[key][5]))
+            watts[key][slot[when]] = value
+            seen.add(key)
+            if counted and covered < _HOUR_SECONDS:
+                partial.add(key)
+            joules[key] += value * covered
 
         series = [
             CircuitSeries(

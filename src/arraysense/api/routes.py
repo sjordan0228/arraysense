@@ -3235,7 +3235,7 @@ def _emporia_cadence_seconds(request: Request) -> int:
 
 
 def _coverage_end(
-    store: SqliteStore, start: datetime, end: datetime, field: str = "load_kwh"
+    store: SqliteStore, start: datetime, end: datetime, span: timedelta, field: str = "load_kwh"
 ) -> datetime | None:
     """The last instant the house's own counter is known for, or None.
 
@@ -3267,11 +3267,17 @@ def _coverage_end(
     Reading forward as far as ``MAX_EDGE_GAP`` is what keeps a historical
     window unclamped: if any reading lands at or after ``end`` then the window
     is bracketed as asked and nothing needs pulling back.
+
+    ``span`` is handed in rather than measured from the two bounds, because
+    subtracting two aware datetimes ignores the zone they share: a window
+    running midnight to midnight across the November clock change is 49 hours
+    long and reads as 48. The caller has already measured it through
+    ``tariff._elapsed``, and one request must not measure one window twice.
     """
     metric = ENERGY_FIELDS[field]
-    allowance = max(COVERAGE_SLACK, (end - start) * COVERAGE_SHORTFALL)
+    allowance = max(COVERAGE_SLACK, span * COVERAGE_SHORTFALL)
     floor, ceiling = end - allowance, end + MAX_EDGE_GAP
-    rows = store.query([metric], floor, ceiling, tier=_window_tier(end - start))
+    rows = store.query([metric], floor, ceiling, tier=_window_tier(start, end))
     if not rows:
         rows = store.query([metric], floor, ceiling, tier="full")
     moments = [
@@ -3406,11 +3412,14 @@ def emporia_history(
     start, end = _aware(start), _aware(end)
     _check_range(start, end)
     poller = _emporia(request)
-    # Through ``_elapsed``, not by subtraction. A range that spans a clock
-    # change is 23 or 25 hours long and the naive difference says 24, which
-    # would put a fully recorded autumn window under the span threshold and
-    # withhold a share that was perfectly good.
+    # Through ``_elapsed``, not by subtraction, and measured once for the whole
+    # request. A range that spans a clock change is 23 or 25 hours long and the
+    # naive difference says 24, which would put a fully recorded autumn window
+    # under the span threshold and withhold a share that was perfectly good —
+    # and would have this one request answer "how long is this window" three
+    # different ways, for the tier, for the coverage allowance, and here.
     window_seconds = int(_elapsed(start, end))
+    span = timedelta(seconds=window_seconds)
     if poller is None:
         return {
             "tier": "full",
@@ -3421,7 +3430,7 @@ def emporia_history(
 
     wanted = _parse_circuit_ids(ids)
     cadence = _emporia_cadence_seconds(request)
-    tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, circuit=True)
+    tier = select_tier(span, width_px=width, cadence_seconds=cadence, circuit=True)
     with _inside_the_calendar():
         # Read through the injected view, not through ``poller.repository``.
         # The poller's repository holds the primary connection — the one the
@@ -3435,7 +3444,7 @@ def emporia_history(
         history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
-        coverage_end = _coverage_end(store, start, end)
+        coverage_end = _coverage_end(store, start, end, span)
         house_kwh = (
             counter_kwh(store, start, coverage_end)
             if coverage_end is not None and coverage_end > start

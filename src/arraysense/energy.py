@@ -44,6 +44,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from arraysense.metrics import lookup
 from arraysense.store.sqlite_store import SqliteStore
 
+# Private to tariff.py, and imported rather than copied because it is this
+# project's single answer to "how long is it between these two instants". Two
+# aware datetimes subtract as though they were naive, so every duration here has
+# to convert to UTC first; a second copy of that conversion is a second place
+# for it to be forgotten. tariff imports nothing from this module, so this costs
+# no cycle.
+from arraysense.tariff import _elapsed
+
 logger = logging.getLogger(__name__)
 
 Period = Literal["day", "month"]
@@ -757,7 +765,7 @@ def counter_kwh(
     # attributed: the edges handed to the bucketing below are the window as
     # asked for.
     metrics = [ENERGY_FIELDS[field]]
-    tier = _window_tier(end - start)
+    tier = _window_tier(start, end)
     rows = store.query(metrics, start - max_gap, end + max_gap, tier=tier)
     if not rows:
         # Falling through to the finest tier, which is named "full" — the prose
@@ -782,8 +790,16 @@ def counter_kwh(
     return buckets[0].totals[field]
 
 
-def _window_tier(span: timedelta) -> str:
-    """Which tier answers a counter read over ``span``, trading cost against precision.
+def _window_tier(start: datetime, end: datetime) -> str:
+    """Which tier answers a counter read over this window, trading cost against precision.
+
+    Takes the two bounds rather than a span so that nothing has to subtract
+    them, which is the point. Two aware datetimes sharing a ``tzinfo`` subtract
+    as though they were naive, so a window running from midnight to midnight
+    across the November clock change measures 48 hours where 49 really passed —
+    which is exactly enough to move a read from one side of the hinge below to
+    the other, and the caller could not see it happen. ``tariff._elapsed`` is
+    the one rule for a duration in this project and this goes through it.
 
     Two days is the hinge, and precision is what sits on the near side of it. A
     tier can only cut a window at a reading it holds, so hourly rows place both
@@ -799,4 +815,4 @@ def _window_tier(span: timedelta) -> str:
     thousand to produce one number, and an hour's imprecision against a month
     is a fraction of a percent.
     """
-    return "minute" if span <= timedelta(days=2) else "hourly"
+    return "minute" if _elapsed(start, end) <= timedelta(days=2).total_seconds() else "hourly"

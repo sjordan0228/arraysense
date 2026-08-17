@@ -433,7 +433,6 @@ def test_a_circuit_with_no_energy_figure_is_listed_rather_than_ranked() -> None:
     assert results["empty"] == "0"
 
 
-@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_the_page_no_longer_measures_the_recorded_span_itself() -> None:
     # The count that used to live here credited every non-null hourly bucket
     # with a full 3,600 seconds, so a seven-day window holding one reading an

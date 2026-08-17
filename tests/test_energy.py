@@ -27,6 +27,7 @@ from arraysense.energy import (
     ENERGY_FIELDS,
     MAX_EDGE_GAP,
     EnergyBucket,
+    _window_tier,
     attribute_energy,
     bucket_edges,
     bucket_totals,
@@ -1077,3 +1078,16 @@ def test_counter_kwh_rejects_a_backwards_range(tmp_path: Path) -> None:
             store, datetime(2026, 8, 16, 15, tzinfo=UTC), datetime(2026, 8, 16, 12, tzinfo=UTC)
         )
     store.close()
+
+
+def test_a_counter_window_across_a_clock_change_is_judged_by_the_hours_that_passed() -> None:
+    # Two aware datetimes sharing a tzinfo subtract as though they were naive:
+    # Python takes the identical zone as identical offsets and cancels them.
+    # Midnight to midnight across the November clock change is 49 real hours and
+    # reads as 48 — which is exactly the two-day hinge this tier choice turns
+    # on, so the window was answered from minute rows it is too long for.
+    start = datetime(2026, 11, 1, tzinfo=NY)
+    end = datetime(2026, 11, 3, tzinfo=NY)
+
+    assert end - start == timedelta(days=2), "what Python says, and it is wrong"
+    assert _window_tier(start, end) == "hourly"

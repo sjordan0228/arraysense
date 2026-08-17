@@ -1700,17 +1700,26 @@ def emporia_interval_seconds(settings: SettingsStore) -> int:
     A second copy of the fallback is a second answer to "what does one reading
     cover", and that question decides an energy figure.
 
-    A stored value that is not a usable number falls back to the registered
+    A stored value the registry would not accept falls back to the registered
     default rather than propagating. Settings are decoded on read but not
-    clamped to their bounds, so a database written by another build — or edited
-    by hand — can hand this a string or a zero, and a zero divides an hour into
-    infinitely many samples.
+    checked against their bounds, so a database written by another build — or
+    edited by hand — can hand this a string, a zero, or an hour and a second.
+
+    Checked through the spec's own ``validate`` rather than against a bound
+    written out here. The registry is where a setting's limits live, and a
+    reader that hard-codes them drifts from the page and the API the moment
+    either limit moves — which is the same rule ``settings.html`` renders
+    itself by. The lower bound is what matters most: this figure is a divisor
+    and a multiplier both, and one second would credit a reading with a
+    sixtieth of what it covers.
     """
-    value = settings.get(EMPORIA_INTERVAL_KEY)
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    default = lookup_setting(EMPORIA_INTERVAL_KEY).default
-    return default if isinstance(default, int) else 60
+    spec = lookup_setting(EMPORIA_INTERVAL_KEY)
+    try:
+        value = spec.validate(settings.get(EMPORIA_INTERVAL_KEY))
+    except ValueError:
+        logger.warning("%s is out of range; falling back to the default", EMPORIA_INTERVAL_KEY)
+        value = spec.default
+    return value if isinstance(value, int) and not isinstance(value, bool) else 60
 
 
 def _mask(value: str) -> str:

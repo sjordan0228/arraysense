@@ -24,6 +24,7 @@ from arraysense.settings import (
     BACKUP_MINUTE_KEY,
     CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
+    EMPORIA_INTERVAL_KEY,
     PANELS_STRINGS_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
@@ -34,6 +35,7 @@ from arraysense.settings import (
     _schedule_reach,
     check_backup_directory,
     describe,
+    emporia_interval_seconds,
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
@@ -974,3 +976,31 @@ def test_the_reach_is_the_first_day_the_two_descriptions_actually_disagree() -> 
             assert reach == date.min, f"{before!r} -> {after!r} should reach everything"
         else:
             assert reach == truth, f"{before!r} -> {after!r}: want {truth}, got {reach}"
+
+
+def test_the_emporia_interval_refuses_a_stored_value_outside_its_registered_bounds(
+    settings: SettingsStore,
+) -> None:
+    # The registry permits 10 to 3600 and a reader that checks only "is it a
+    # positive whole number" accepts 1 and 3601. This figure is both a divisor
+    # and a multiplier for an energy figure — one second would credit a reading
+    # with a sixtieth of what it covers — and it is what the poller spaces its
+    # calls to Emporia's cloud by. Written straight into the table because
+    # ``set`` already refuses these; the case is a database another build wrote
+    # or somebody edited by hand.
+    spec = lookup_setting(EMPORIA_INTERVAL_KEY)
+    for stored in ("1", "3601", "0", "soon", ""):
+        settings._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (EMPORIA_INTERVAL_KEY, stored),
+        )
+        settings._conn.commit()
+        assert emporia_interval_seconds(settings) == spec.default, stored
+
+
+def test_the_emporia_interval_reads_a_value_the_registry_accepts(
+    settings: SettingsStore,
+) -> None:
+    settings.set(EMPORIA_INTERVAL_KEY, 10)
+    assert emporia_interval_seconds(settings) == 10

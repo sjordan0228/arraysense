@@ -63,11 +63,28 @@ rewritten**, and hours recorded from the upgrade onwards are exact.
   hour is summarised, minutes after the readings arrived, and stored with it.
   Changing `emporia.interval` used to move the energy of every hour already
   recorded — raising it from ten seconds to sixty doubled them, and each then
-  reported itself as a whole hour rather than the half it was. A window read at
-  full resolution is bounded the same way: one reading accounts for at most one
-  poll interval, so two readings three hours apart are worth two minutes of
-  energy rather than six kilowatt-hours, and the three hours nobody recorded
-  break the line instead of being drawn straight across.
+  reported itself as a whole hour rather than the half it was. The rebuild
+  reaches three hours back, so a change made now still meets readings collected
+  under the old setting; an hour's coverage is therefore only ever raised by a
+  rebuild and never lowered, and lowering the interval cannot rewrite three
+  hours of honest readings as a fraction of the energy they recorded. A window
+  read at full resolution is bounded the same way: one reading accounts for at
+  most one poll interval, so two readings three hours apart are worth two
+  minutes of energy rather than six kilowatt-hours, and the three hours nobody
+  recorded break the line instead of being drawn straight across.
+- **An hour's stored watts and its stored coverage are measured from the same
+  spans.** Each reading holds until the next one arrives, capped at one poll
+  interval; the span is cut where it crosses the hour, and both figures come
+  from those same pieces. A plain average beside a duration-weighted coverage
+  is two different weightings of one hour multiplied together by whatever reads
+  them: 100 W held for five seconds followed by 1,000 W held for two minutes
+  stored 700 W where the hour really averaged 964, and the energy came out 27%
+  short. Cutting at the boundary is the other half — a reading at 12:59:59 used
+  to take a whole interval inside the 12:00 bucket and give 13:00 nothing.
+- **The recorded-for figure describes the module rather than the circuits
+  asked for.** A poll that reached one clamp reached the monitor, so asking for
+  a single outlet that has been offline since April no longer reads as a module
+  outage and no longer withholds a share the module could honestly support.
 
 ## 1.1.0 — 16 August 2026
 

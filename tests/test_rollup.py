@@ -1071,19 +1071,137 @@ def test_coverage_comes_from_the_stamps_and_never_exceeds_the_hour() -> None:
         (hour + 1800,),
     )
     rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
-    rebuild_circuit_hourly(conn, hour + 3600, hour + 7200, cadence_seconds=3600)
 
     retried = conn.execute(
-        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
     ).fetchone()
     assert retried == (125,), "5 + 60 + 60, not three whole intervals"
 
     conn.execute("DELETE FROM circuit_hourly")
     rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=3600)
     lone = conn.execute(
-        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 2"
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 2 AND timestamp = ?",
+        (hour,),
     ).fetchone()
-    assert lone == (3600,), "capped at the hour it sits in"
+    # A reading at the half hour covers the half hour after it, not the half
+    # hour before it existed. The remaining 1,800 seconds of its period belong
+    # to the next hour and are booked there.
+    assert lone == (1800,), "a reading credits the time after it, never before"
+    conn.close()
+
+
+def test_a_span_crossing_the_hour_is_split_between_the_two_hours() -> None:
+    # The partition used to be by hour, so a reading at 12:59:59 took a whole
+    # interval inside the 12:00 bucket and gave 13:00 nothing at all — the
+    # energy either side of every hour edge misfiled, and one second of it
+    # claiming sixty.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 900)",
+        (hour + 3599,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 7200, cadence_seconds=60)
+
+    rows = dict(
+        (row[0], (row[1], row[2], row[3]))
+        for row in conn.execute(
+            "SELECT timestamp, watts, sample_count, covered_seconds"
+            " FROM circuit_hourly WHERE circuit_id = 1"
+        )
+    )
+    assert rows[hour] == (900, 1, 1), "one second of the period lies in this hour"
+    # Stamped in the hour before, so it is not a sample of this one — but the
+    # fifty-nine seconds it covers are this hour's energy and are booked here.
+    assert rows[hour + 3600] == (900, 0, 59)
+    conn.close()
+
+
+def test_the_stored_watts_are_weighted_by_how_long_each_reading_held() -> None:
+    # 100 W for five seconds and 1,000 W for two minutes is an hour averaging
+    # 964 W, not 700. The reader multiplies these watts by the coverage below
+    # them, so an unweighted mean beside a duration-weighted coverage is two
+    # different weightings of the same hour — it under-reported this one by 27%.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for offset, watts in ((0, 100), (5, 1000), (65, 1000)):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+            (hour + offset, watts),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT watts, covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert row == (964, 125)
+    # And the two multiply out to the energy that was really measured.
+    assert row[0] * row[1] / 3_600_000 == pytest.approx(
+        (100 * 5 + 1000 * 60 + 1000 * 60) / 3_600_000, rel=1e-3
+    )
+    conn.close()
+
+
+def test_a_rebuild_at_a_new_interval_does_not_shrink_what_was_already_measured() -> None:
+    # The rebuild reaches three hours back, so lowering emporia.interval used to
+    # re-cap three hours of sixty-second readings at the new ten seconds and
+    # rewrite them as one sixth of the energy they recorded. Coverage is written
+    # once and afterwards only grows.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(60):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    measured = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert measured == (3600,)
+
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=10)
+
+    again = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert again == (3600,), "600 seconds is what the new setting says, not what was recorded"
+    conn.close()
+
+
+def test_a_rebuild_still_grows_an_hour_that_late_readings_filled_in() -> None:
+    # The other half of the same rule. Only-grows must not mean frozen: a
+    # reading that lands after the first pass has to be able to raise the hour.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+        (hour + 60,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly"
+        " WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert row == (2, 120)
     conn.close()
 
 
