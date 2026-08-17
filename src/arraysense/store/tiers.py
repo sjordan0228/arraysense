@@ -35,7 +35,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, Tier
+from arraysense.store.schema import CIRCUIT_TIERS, INVERTER_TIERS, MODULE_TIERS, Tier
 
 # The coarse tiers' bucket periods, in seconds — the fixed periods the rollup
 # writes (see store.rollup), not table names. The full tier's resolution is
@@ -87,6 +87,7 @@ def select_tier(
     width_px: int,
     cadence_seconds: int,
     module: bool = False,
+    circuit: bool = False,
 ) -> str:
     """Return the resolution tier whose point count best fits the target width.
 
@@ -97,12 +98,21 @@ def select_tier(
     the module tiers, which have no minute tier, so a module chart lands on
     full cadence or hourly and never in between.
 
+    Circuits are a third family, scored against the Emporia module's two
+    tables. Their cadence is that module's own poll interval rather than the
+    inverter's, which is why the caller supplies it here as everywhere else —
+    a circuit chart scored at the inverter's eleven seconds would put seven
+    days at 55,000 points and pick the raw tier for a range that has ten
+    thousand rows in it.
+
     The polling interval has to be supplied because it is the full tier's
     resolution and only the caller knows it. A width of no pixels, a range that
     ends before it starts, or a cadence of zero is a programming error rather
     than a bad request, and raises ValueError — unguarded, the last of those
     divides by zero or takes the log of a negative and surfaces as "math domain
-    error" from somewhere far less obvious.
+    error" from somewhere far less obvious. Asking for two families at once is
+    the same kind of error and raises for the same reason: resolved quietly, it
+    would score one family's range against the other's tables.
     """
     if width_px <= 0:
         raise ValueError(f"width_px must be positive, got {width_px}")
@@ -112,9 +122,23 @@ def select_tier(
         # Unguarded this divides by zero, or takes the log of a negative and
         # surfaces as "math domain error" from deep inside the scoring.
         raise ValueError(f"cadence_seconds must be positive, got {cadence_seconds}")
+    if module and circuit:
+        raise ValueError("module and circuit are different tier families; ask for one")
 
-    tiers = MODULE_TIERS if module else INVERTER_TIERS
+    tiers = _family(module=module, circuit=circuit)
     return _best_fit(tiers, span.total_seconds(), width_px, cadence_seconds).name
+
+
+def _family(*, module: bool, circuit: bool) -> tuple[Tier, ...]:
+    """The tier tuple a request names, so the choice is spelled in one place.
+
+    Three call sites picked between two families with the same inline
+    conditional; a third family turns that into three copies of a rule that has
+    to agree. Callers validate the combination before asking.
+    """
+    if circuit:
+        return CIRCUIT_TIERS
+    return MODULE_TIERS if module else INVERTER_TIERS
 
 
 def _best_fit(
@@ -238,7 +262,7 @@ def select_tier_for_range(
     if end <= start:
         raise ValueError(f"end must be after start, got {start} to {end}")
     span = end - start
-    tiers = MODULE_TIERS if module else INVERTER_TIERS
+    tiers = _family(module=module, circuit=False)
     # Validation and the plain fit both live in select_tier, so this cannot
     # diverge from the rule the width and cadence are checked against.
     fallback = select_tier(span, width_px, cadence_seconds, module=module)

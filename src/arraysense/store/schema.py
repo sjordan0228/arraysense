@@ -117,6 +117,21 @@ MODULE_TIERS: tuple[Tier, ...] = (
     Tier("hourly", "module_hourly", None),
 )
 
+# The optional Emporia module's tiers. Raw and hourly only, for the reason the
+# module tiers have no minute tier and the opposite reason besides: a circuit
+# is polled once a minute already, so a minute tier would be a copy of the raw
+# one under another name. Named here with the other two so tier selection reads
+# one list rather than keeping a third copy of the table names in step by hand.
+#
+# ``keep_days`` describes the retention that is already running — the raw tier
+# is pruned into the hourly one by store.retention, and the hourly tier appears
+# in no prune table of its own, which is what None means here and why a
+# thirteen-month circuit history is readable.
+CIRCUIT_TIERS: tuple[Tier, ...] = (
+    Tier("full", "circuit_reading", 30),
+    Tier("hourly", "circuit_hourly", None),
+)
+
 SERIALS_TABLE = "serials"
 INVALID_TABLE = "invalid_readings"
 SETTINGS_TABLE = "settings"
