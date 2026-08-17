@@ -254,6 +254,8 @@ the coarser tiers already holding every bucket being dropped. See
   missing battery data, and other things people run into
 - [docs/migrating-from-solar-assistant.md](docs/migrating-from-solar-assistant.md) —
   bringing your SolarAssistant history across, so switching does not cost you it
+- [docs/backfilling-emporia-history.md](docs/backfilling-emporia-history.md) —
+  filling the Circuits tab with the months your Vue recorded before you connected it
 
 ## Development
 
