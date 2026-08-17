@@ -127,6 +127,7 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.setup import describe_setup
+from arraysense.spend import top_spenders
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -1539,6 +1540,159 @@ def _band_rows(
             }
         )
     return rows
+
+
+@router.get("/costs/circuits")
+def costs_circuits(
+    request: Request,
+    store: _ReadStore,
+    start: datetime,
+    end: datetime,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """Which circuits spent the most over a period, and what they account for.
+
+    The Costs page answers "how much" and "in which band" and could not answer
+    "on what". This is that half — the same window every other figure on the
+    page is asked about, priced through the same band walk, and ranked by
+    money because the page is about money.
+
+    Nothing is computed here. ``band_intervals`` cuts the period, ``band_kwh``
+    reads the rows, ``top_spenders`` ranks them and prices them; this route
+    resolves the zone, picks the band set and forwards the answer. A second
+    implementation of any of that is how this page came to hold its own
+    tariff parser, which disagreed with the Python one inside a day.
+
+    ``coverage`` is the figure that keeps the list honest. Thirty-nine
+    channels do not add up to a house, and naming five circuits over a
+    month's bill invites the reader to believe those five are the bill. It is
+    the same block the circuit history endpoint reports, from the same
+    helper, and it is measured in energy rather than in minutes watched —
+    that distinction is what #23 was reverted twice for missing, and money
+    depends on the second.
+
+    The zone is resolved with ``with_zone`` *and* converted with
+    ``.astimezone(zone)``, matching ``costs.py``'s own ``_local``. A naive
+    bound is what the browser sends when it means local midnight in the
+    installation's own zone, so it is attached — but the month picker also
+    sends an aware instant, and ``with_zone`` leaves an aware one exactly as
+    it arrived. Left unconverted, ``tariff.bands_in_effect`` reads its
+    calendar fields off whatever zone the browser happened to send, which is
+    the bug that put a 15:00-20:00 peak window at 10:00-15:00 local on the
+    reference installation.
+
+    The hourly tier, always. ``circuit_hourly`` is written before the raw
+    readings are pruned and is itself never pruned, so every month the page
+    can select is answerable from it; the raw tier is a million rows to the
+    hourly tier's twenty-five thousand and buys nothing, because a tariff's
+    band edges fall on the hour.
+
+    The route answers rather than 500s on the two ways an installation can be
+    unready to price this: no tariff entered yet, and no Emporia module
+    running at all. Both report the same empty shape a page can render
+    without branching on which one happened.
+    """
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Attached to the installation's zone for a naive bound, and *converted*
+    # to it for an aware one — see the docstring above.
+    start, end = with_zone(start, zone).astimezone(zone), with_zone(end, zone).astimezone(zone)
+    _check_range(start, end)
+
+    tariff = load_tariff(SettingsStore(store).all())
+    window_seconds = int(_elapsed(start, end))
+    empty: dict[str, Any] = {
+        "configured": tariff is not None,
+        "currency": tariff.currency if tariff is not None else None,
+        "circuits": [],
+        "coverage": {**_NO_COVERAGE, "window_seconds": window_seconds},
+    }
+    poller = _emporia(request)
+    if tariff is None or poller is None:
+        return empty
+
+    cadence = _emporia_cadence_seconds(request)
+    with _inside_the_calendar():
+        intervals = [
+            (interval.start, interval.end, interval.band)
+            for interval in band_intervals(tariff, start, end, zone)
+        ]
+        history = CircuitRepository(store).history(
+            start, end, tier="hourly", cadence_seconds=cadence
+        )
+        energies = CircuitRepository(store).band_kwh(
+            start,
+            end,
+            intervals,
+            tier="hourly",
+            cadence_seconds=cadence,
+            now=datetime.now(tz=UTC),
+        )
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        measured = [s.kwh for s in parts if s.kwh is not None]
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=sum(measured) if measured else None,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
+        )
+
+    # The bands actually present in the interval walk, not every band the
+    # period's season admits — bands_in_effect only excludes an out-of-season
+    # band, so a current-month request ending before the first peak window
+    # still got peak back, top_spenders treated it as unmeasured rather than
+    # not-yet-occurred, and every circuit's total came back partial for a
+    # band the clock had not reached. Narrowed from ``intervals`` the same
+    # way price_period already narrows a whole tariff to the bands a split
+    # period's own energy names (costs.py's own ``entered``/``narrowed``),
+    # because band_intervals has already applied the season filter internally
+    # by the time it names them — matching that safeguard rather than a
+    # second one answers the season question and the not-yet-occurred one at
+    # once. The season-only fallback stays for the edge a window carries no
+    # named interval at all — a wholly unpriced stretch — so bands is never
+    # emptied outright.
+    entered = {name.strip().casefold() for _, _, name in intervals if name is not None}
+    bands = (
+        tuple(band for band in tariff.bands if band.key in entered)
+        or tariff.bands_in_effect(start, end)
+        or tariff.bands
+    )
+    # The same PCRF/SCRF rider compute_cost charges the house's own total —
+    # resolved once here, the way bands is, rather than inside top_spenders,
+    # which has no business knowing what a tariff's adjustment table is.
+    ranked = top_spenders(energies, bands, adjustment=tariff.adjustment_at(start, end))
+    return {
+        "configured": True,
+        "currency": tariff.currency,
+        "circuits": [
+            {
+                "name": c.name,
+                "kind": c.kind,
+                "cost": None if c.cost is None else round(c.cost, 2),
+                "kwh": None if c.kwh is None else round(c.kwh, 3),
+                "partial": c.partial,
+                # The PCRF/SCRF rider already folded into cost but not into
+                # any band below it — a page summing the bands alone would
+                # come up short of cost with nothing explaining the gap.
+                "rider": None if c.rider is None else round(c.rider, 2),
+                "bands": [
+                    {
+                        "band": b.band,
+                        "kwh": None if b.kwh is None else round(b.kwh, 3),
+                        "cost": None if b.cost is None else round(b.cost, 2),
+                        "partial": b.partial,
+                    }
+                    for b in c.bands
+                ],
+            }
+            for c in ranked
+        ],
+        "coverage": coverage,
+    }
 
 
 @router.get("/history")
@@ -3212,6 +3366,16 @@ COVERAGE_SHORTFALL = 0.01
 # Only the browser checked, so the promise was not kept for any other consumer.
 CIRCUIT_SPAN_ENOUGH = 0.9
 
+# house_kwh is rounded to three places below for display, same as the
+# efficiency page's own EFF_RATIO_FLOOR_KWH guards a ratio whose denominator
+# is rounded to two. "Greater than zero" alone lets a real but tiny positive
+# figure — 0.00004 kWh of house energy against a nonzero circuit total —
+# divide out to a percentage in the thousands while the printed house_kwh
+# reads 0.000, the same rounding-noise ratio the hours either side of sunrise
+# produce on the efficiency chart. Half the smallest displayed unit is the
+# threshold below which house_kwh reads the same as no counter reading at all.
+_COVERAGE_HOUSE_FLOOR_KWH = 0.0005
+
 # An empty coverage answer, so a module that is not running says "unknown" in
 # the same shape a running one says a number. A page that had to branch on a
 # missing key would be one refactor away from rendering "0%" for "no module".
@@ -3406,6 +3570,84 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     }
 
 
+def _circuit_coverage(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    *,
+    circuits_kwh: float | None,
+    recorded_seconds: int,
+    window_seconds: int,
+) -> dict[str, Any]:
+    """What share of the house's energy the monitored circuits account for.
+
+    Written once and called twice: the circuit history endpoint draws bars
+    against it and the Costs page's circuit ranking prices against it, and two
+    copies of this arithmetic would answer the same question two ways on two
+    tabs of the same page. It is also the arithmetic #23 was reverted over
+    twice, which is reason enough for there to be one of it.
+
+    Computed from energy, never from minutes watched. The monitored circuits are
+    not the house — unmonitored branches are real, and two of the reference
+    account's outlets have been offline since April and August — so a page
+    naming a handful of circuits without this invites the reader to believe they
+    are the whole bill.
+
+    A numerator that recorded for a fraction of the window its denominator
+    covers is arithmetic between two different spans, not a share. ``fraction``
+    is withheld rather than re-based on the recorded span, because the answer
+    carries no house figure for that span — only for the whole window — and
+    inventing one by assuming the house drew power evenly is exactly the
+    estimate this project refuses to dress as a meter reading.
+
+    It is reported uncapped: a part cannot exceed the whole, so a figure above
+    one is not coverage at all but a fault saying so — a mains channel that
+    escaped the exclusion, a multiplier set for the wrong circuit, or two
+    windows that stopped being comparable. Clamping it to 1.0 renders every
+    one of those as perfect coverage, which is the one reading guaranteed to
+    be wrong, and would hide the fault for as long as it lasted. The page
+    renders anything above one as a disagreement rather than as a full bar.
+
+    The denominator's guard is a floor at ``_COVERAGE_HOUSE_FLOOR_KWH``, not
+    merely "greater than zero" — a short range whose real ``house_kwh`` is a
+    rounding-noise fraction of a watt-hour still divides out to a percentage
+    nobody could check against the ``0.000`` the same figure prints as.
+    """
+    span = timedelta(seconds=window_seconds)
+    coverage_end = _coverage_end(store, start, end, span)
+    house_kwh = (
+        counter_kwh(store, start, coverage_end)
+        if coverage_end is not None and coverage_end > start
+        else None
+    )
+    # Whether the two figures describe the same stretch of time closely enough
+    # for one to be read as a share of the other. ``_check_range`` has already
+    # refused anything that does not run forwards, so the guard is for a range
+    # whose seconds round to nothing: there is no shortfall to find in a window
+    # of no length, and the house figure over one is zero anyway.
+    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
+    return {
+        "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
+        "house_kwh": None if house_kwh is None else round(house_kwh, 3),
+        "fraction": (
+            None
+            if circuits_kwh is None
+            or house_kwh is None
+            or house_kwh < _COVERAGE_HOUSE_FLOOR_KWH
+            or not spans_match
+            else round(circuits_kwh / house_kwh, 4)
+        ),
+        # What the span check was decided on, so the page can say it without
+        # measuring it again. The old browser-side count credited every hourly
+        # bucket that held anything with a full 3,600 seconds, which reported
+        # a seven-day window holding one reading an hour as seven days
+        # recorded and defeated the check from the other side.
+        "recorded_seconds": recorded_seconds,
+        "window_seconds": window_seconds,
+        "spans_match": spans_match,
+    }
+
+
 @router.get("/emporia/history")
 def emporia_history(
     request: Request,
@@ -3481,27 +3723,22 @@ def emporia_history(
         history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
-        coverage_end = _coverage_end(store, start, end, span)
-        house_kwh = (
-            counter_kwh(store, start, coverage_end)
-            if coverage_end is not None and coverage_end > start
-            else None
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        measured = [s.kwh for s in parts if s.kwh is not None]
+        circuits_kwh = sum(measured) if measured else None
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=circuits_kwh,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
         )
 
     # The poller holds this, not the repository: it is what the last status call
     # said, refreshed on the module's own clock. emporia_circuits already reads
     # it from the same place.
     connections = poller.connections
-    parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
-    measured = [s.kwh for s in parts if s.kwh is not None]
-    circuits_kwh = sum(measured) if measured else None
-    # Whether the two figures describe the same stretch of time closely enough
-    # for one to be read as a share of the other. ``_check_range`` has already
-    # refused anything that does not run forwards, so the guard is for a range
-    # whose seconds round to nothing: there is no shortfall to find in a window
-    # of no length, and the house figure over one is zero anyway.
-    recorded_seconds = history.recorded_seconds
-    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
     return {
         "tier": history.tier,
         "timestamps": list(history.timestamps),
@@ -3519,42 +3756,7 @@ def emporia_history(
             }
             for s in parts
         ],
-        "coverage": {
-            "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
-            "house_kwh": None if house_kwh is None else round(house_kwh, 3),
-            "fraction": (
-                None
-                if circuits_kwh is None
-                or house_kwh is None
-                or house_kwh <= 0
-                # A numerator that recorded for a fraction of the window its
-                # denominator covers is arithmetic between two different spans,
-                # not a share. Withheld rather than re-based on the recorded
-                # span, because this response carries no house figure for that
-                # span — only for the whole window — and inventing one by
-                # assuming the house drew power evenly is exactly the estimate
-                # this project refuses to dress as a meter reading.
-                or not spans_match
-                # Reported uncapped, deliberately. A part cannot exceed the
-                # whole, so a fraction above one is not a coverage figure at
-                # all — it is a fault saying so: a mains channel that escaped
-                # the exclusion, a multiplier set for the wrong circuit, or two
-                # windows that stopped being comparable. Clamping it to 1.0
-                # would render every one of those as perfect coverage, which is
-                # the one reading guaranteed to be wrong, and would hide the
-                # fault for as long as it lasted. The page renders anything
-                # above one as a disagreement rather than as a full bar.
-                else round(circuits_kwh / house_kwh, 4)
-            ),
-            # What the span check was decided on, so the page can say it
-            # without measuring it again. The old browser-side count credited
-            # every hourly bucket that held anything with a full 3,600 seconds,
-            # which reported a seven-day window holding one reading an hour as
-            # seven days recorded and defeated the check from the other side.
-            "recorded_seconds": recorded_seconds,
-            "window_seconds": window_seconds,
-            "spans_match": spans_match,
-        },
+        "coverage": coverage,
     }
 
 

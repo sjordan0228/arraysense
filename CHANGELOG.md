@@ -7,6 +7,46 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.5 — 17 August 2026
+
+The Costs page can say which circuits the money went on.
+
+### Added
+
+- **The five circuits that cost the most in the month being shown**, ranked by
+  what they cost rather than by what they drew, each with its split across the
+  rate bands. A circuit that only ever runs at peak can outrank one that used
+  twice the energy, which is the useful thing to learn and a baffling one to
+  meet without the split beside it.
+
+  Priced through the same band walk every other figure on the page goes
+  through. Nothing about money is computed twice.
+
+- **`GET /api/costs/circuits`**, which answers it. Measured on the bench at 16
+  to 23 ms for a calendar month across thirty-three circuits, reading the
+  hourly tier — which is kept indefinitely, so a month the picker can reach is
+  a month this can price.
+
+### The figure that keeps the list honest
+
+Thirty-nine monitored channels do not add up to a house. The remainder is real:
+unmonitored branches, and on the reference account two outlets that have been
+offline since April and August. So the list is drawn beside a statement of what
+share of the period's energy those circuits account for, computed from energy
+rather than from minutes watched — the distinction #23 was reverted twice for
+missing, and the one money depends on.
+
+That share is withheld rather than guessed when the circuits and the house
+counter do not describe the same stretch of time, and it is reported uncapped:
+a share above one is not coverage at all but a fault announcing itself, and
+clamping it to 100% would render every such fault as perfect coverage.
+
+A circuit thin in one band is labelled in that band, not across the month — a
+circuit can be recorded end to end through the off-peak stretch and thin in the
+one evening hour that costs the most. A circuit that reported nothing is a dash
+and sorts below one measured at nothing. `mains` never appears: it is the total,
+not a part.
+
 ## 1.1.4 — 17 August 2026
 
 The Costs page can be pointed at a month other than the one in progress.

@@ -1499,6 +1499,35 @@ def test_costs_reports_hours_no_band_covers(client: Any) -> None:
     assert body["unpriced_minutes"] == 12 * 60
 
 
+def test_costs_circuits_answers_without_a_tariff_rather_than_500ing(client: Any) -> None:
+    """The same shape /api/costs uses: an install that has never entered a
+    tariff sees no money anywhere, not an error."""
+    response = client.get(
+        "/api/costs/circuits",
+        params={"start": "2026-07-15T00:00:00Z", "end": "2026-07-16T00:00:00Z"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["configured"] is False
+    assert body["circuits"] == []
+
+
+def test_costs_circuits_answers_empty_with_no_emporia_module(client: Any) -> None:
+    """A bookmark outlives the account it was made on, the same reason
+    emporia_history answers an empty history rather than 404ing.
+
+    A tariff is configured first so this test isolates the missing module —
+    without one, an absent tariff alone would already explain an empty list.
+    """
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    body = client.get(
+        "/api/costs/circuits",
+        params={"start": "2026-07-15T00:00:00Z", "end": "2026-07-16T00:00:00Z"},
+    ).json()
+    assert body["configured"] is True
+    assert body["circuits"] == []
+
+
 def test_the_settings_page_is_served(client: Any) -> None:
     # The tariff, the connection and the poll interval are all database
     # settings with a PUT endpoint, and until this route existed there was no

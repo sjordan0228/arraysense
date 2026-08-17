@@ -113,8 +113,63 @@
      second encoding the palette rule asks for, and it is already this file's
      word for absent data: .splitbar.none hatches the whole bar the same way. */
   .splitbar span.part{min-width:7px;position:relative}
-  .splitbar span.part::after{content:'';position:absolute;inset:0;pointer-events:none;
+  /* The hatch runs along the top and bottom edges and leaves the middle clear.
+     Drawn across the whole segment it struck the label out — and raising the
+     label above it did not help, because the hatch is --ink and the label is
+     near-white, so on a dark theme the text was white on white however the
+     stacking resolved. A clear channel is the only fix that keeps both, and the
+     texture reads as well from two edges as from a full fill. */
+  .splitbar span.part::before,
+  .splitbar span.part::after{content:'';position:absolute;left:0;right:0;height:4px;
+    pointer-events:none;z-index:0;
     background:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 5px)}
+  .splitbar span.part::before{top:0}
+  .splitbar span.part::after{bottom:0}
+  /* The label rides above the hatch rather than under it. With ``inset:0`` the
+     overlay covered the whole segment including its text, and at row height with
+     a band's name in it — rather than a percentage — that struck every character
+     through and left the bar unreadable. The owner reported it from a screenshot;
+     no test could have. The <i> exists only to carry a stacking context, since a
+     bare text node cannot take one. */
+  .splitbar span i{position:relative;z-index:1;font-style:normal}
+  /* A hard edge between neighbouring bands. The segments are one hue separated by
+     lightness, which is the palette rule — but lightness alone is what the hatch
+     washes out, and a reader who cannot see hue then has nothing left telling them
+     where peak ends. Carved in the panel's own colour so it reads as a gap in both
+     themes rather than as a line of its own.
+
+     Deliberately unscoped to renderSpenders' bar alone: .splitbar is the class
+     renderSplit's own "By rate band" bar carries too, and a seam is a stronger
+     boundary cue than lightness there as well — for the same colour-blind reader,
+     not a side effect worth narrowing back out. */
+  .splitbar span + span{box-shadow:inset 2px 0 0 var(--panel)}
+  /* One row per circuit: the name, what it cost, what it used, and where the
+     money went inside it. The band bar is renderSplit's bar at row height —
+     same hue, same shades, same hatch for a partly-unmeasured segment — because
+     a second way of drawing a band split on one page is a second thing to learn
+     for no new information. */
+  .spend{display:flex;flex-direction:column;gap:9px;margin-top:4px}
+  .spendrow{display:grid;grid-template-columns:minmax(0,1.4fr) 78px 82px minmax(120px,1fr);
+    align-items:center;gap:10px}
+  @media(max-width:700px){.spendrow{grid-template-columns:minmax(0,1fr) 78px 82px}
+    .spendrow .splitbar{grid-column:1/-1}}
+  .spendrow .cn{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+  .spendrow .cv{font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
+  /* The row-total marker for a band this circuit is entirely missing rather
+     than merely thin in (#31 again, at the scale of a whole band with no
+     width of its own to hatch). Same dot, same colour, same reasoning as
+     td.part above — reused rather than a second convention for one more
+     shape of "this figure is not the whole of it". */
+  .spendrow .cv.part{position:relative;padding-right:9px}
+  .spendrow .cv.part::after{content:'·';position:absolute;right:1px;top:1px;color:var(--warn)}
+  .spendrow .ck{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
+    color:var(--ink3)}
+  /* The same height as the band split above it, and for the same reason that bar
+     is that height: a 10px label needs the room. Squeezed to 14 for compactness,
+     the hatch's edge strips ate the ascenders and descenders of the band name and
+     the row became the thing it exists to explain. */
+  .spendrow .splitbar{height:19px}
   /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
      it — uppercase at .17em tracking turns an explanation into shouting. */
   .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
@@ -247,6 +302,15 @@
       </table>
     </div>
     <span class="cap" id="bandCap"></span>
+  </section>
+
+  <section class="p" id="spendSec" hidden>
+    <div class="chead">
+      <h2>The five circuits that cost the most</h2>
+      <span class="legend muted" id="spendCoverage"></span>
+    </div>
+    <div class="spend" id="spendList"></div>
+    <span class="cap" id="spendCap"></span>
   </section>
 
   <section class="p">
@@ -759,6 +823,7 @@ function renderNoTariff(unreadable) {
   $('cards').hidden = true;
   $('sankeySec').hidden = true;
   $('bandSec').hidden = true;
+  $('spendSec').hidden = true;
 }
 
 function renderCards(p) {
@@ -1073,9 +1138,9 @@ function renderSplit(p) {
       const short = Boolean(shortFlag && shortFlag[i]);
       const why = short ? ' — part of this window was not measured' : '';
       return `<span${short ? ' class="part"' : ''}`
-        + ` style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+        + ` style="flex:${(share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
         + ` title="${esc(v.name)} ${esc(pctStr(share))}${esc(why)}">`
-        + `${share > 0.13 ? esc(pctStr(share)) : ''}</span>`;
+        + `${share > 0.13 ? `<i>${esc(pctStr(share))}</i>` : ''}</span>`;
     }).join('');
     return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
       + `<div class="splitbar">${cells}</div></div>`;
@@ -1087,6 +1152,157 @@ function renderSplit(p) {
   box.innerHTML =
     bar('Energy', p.rows.map((r) => ({ name: r.band.name, v: r.importKwh })), importShort)
     + bar('Cost', p.rows.map((r) => ({ name: r.band.name, v: r.cost })), importShort);
+}
+
+// >>> costs-coverage-words
+// What the list is allowed to claim. The monitored circuits are not the house —
+// the reference account runs thirty-nine channels against a whole-home load, and
+// two of its outlets have been offline since April and August — so a panel
+// naming five circuits over a month's bill without this invites the reader to
+// believe those five are the bill.
+//
+// Measured in energy and said in those words. The strip above already carries a
+// minutes-watched figure, and the two answering different questions is the
+// distinction #23 was reverted twice for losing; a reader comparing them has to
+// be able to see which is which without being told.
+//
+// Three refusals, each of which would otherwise read as full coverage:
+// no denominator, two spans that do not describe the same stretch, and a share
+// above one — which is not coverage at all but a fault announcing itself, since
+// a part cannot exceed the whole.
+//
+// "The circuits this system monitors" throughout, never "these circuits" —
+// the sentence sits beside a five-row panel titled "The five circuits that
+// cost the most", and the fraction it states is computed over every
+// monitored circuit before top_spenders truncates to five. On the reference
+// thirty-nine-circuit installation, "these circuits account for 62%" beside
+// five rows credits the five with all thirty-nine's share.
+function coverageWords(coverage) {
+  if (!coverage) return '';
+  const share = coverage.fraction;
+  if (share === null || share === undefined || !isFinite(share)) {
+    return coverage.spans_match === false
+      ? 'The circuits this system monitors and the house counter do not cover the same '
+        + 'stretch of this period, so what share of it they account for cannot be said.'
+      : 'What share of this period’s energy the circuits this system monitors account for '
+        + 'could not be measured, so treat the list as a part of the bill rather than as the '
+        + 'whole of it.';
+  }
+  if (share > 1) {
+    return `The circuits this system monitors add up to ${pctStr(share)} of the house’s own `
+      + 'measured energy, which cannot be right — the two figures disagree, and the list is '
+      + 'not to be read as a share of the bill until they agree.';
+  }
+  return `The circuits this system monitors account for ${pctStr(share)} of this period’s `
+    + 'energy. The rest is unmonitored or unrecorded — real branches with no clamp on them, '
+    + 'and any monitored circuit that went quiet during this period — and no page here '
+    + 'measures which.';
+}
+// <<< costs-coverage-words
+
+// One row per circuit. Ranked by cost, both figures shown, and the band split
+// beside them — a circuit that only ever runs at peak outranking one that used
+// twice the energy is the useful thing here and a baffling one to meet without
+// the split to explain it.
+function renderSpenders(body, cur) {
+  const list = Array.isArray(body && body.circuits) ? body.circuits : [];
+  // A selected month before circuit collection began still returns every
+  // known circuit's metadata with a null cost each — five dashed rows, not
+  // the empty array the length check alone catches. At least one circuit has
+  // to have actually reported before there is anything here worth drawing.
+  const measured = list.some((c) => c.cost !== null);
+  if (!list.length || !measured) { $('spendSec').hidden = true; return; }
+  $('spendSec').hidden = false;
+  $('spendCoverage').textContent = coverageWords(body.coverage);
+  const shades = [0.9, 0.62, 0.42, 0.28];
+  // >>> costs-hatch-earns-its-place
+  // Whether a hatched segment would distinguish anything. A marker every segment
+  // carries marks nothing: on an installation whose circuit history is younger
+  // than the month being priced, every band of every circuit is partial, and the
+  // bars came back solid diagonal — the labels struck through, and the lightness
+  // difference between peak and off-peak washed out, which is the encoding a
+  // colour-blind reader has instead of hue. The fact is not dropped; it moves to
+  // the caption, which can say it once in words rather than five times in texture.
+  const everyBandPartial = (rows) => {
+    const bands = rows.flatMap((c) => c.bands.filter((b) => b.cost !== null));
+    return bands.length > 0 && bands.every((b) => b.partial);
+  };
+  // <<< costs-hatch-earns-its-place
+  const blanket = everyBandPartial(list);
+  $('spendList').innerHTML = list.map((c) => {
+    // A band this circuit never reported in is absent, not zero — dropped
+    // here as it is everywhere else. A band it reported at exactly $0 is a
+    // different claim and stays in the bar: filtering it out too used to
+    // strip the very segment a partial hatch was about, and left an
+    // all-zero-but-measured circuit under the same hatch as one silent all
+    // month.
+    const priced = c.bands.filter((b) => b.cost !== null);
+    const total = priced.reduce((a, b) => a + b.cost, 0);
+    // A circuit whose bands were all unmeasured gets the hatch the rest of the
+    // page gives an unknown, never an empty bar reading as "spent nothing".
+    const bar = priced.length
+      ? `<div class="splitbar">${priced.map((b, i) => {
+          // total can be zero when every measured band genuinely cost
+          // nothing — an equal share draws a real bar instead of dividing by
+          // zero, which is a different claim from "nothing was measured".
+          const share = total > 0 ? b.cost / total : 1 / priced.length;
+          const shade = shades[Math.min(i, shades.length - 1)];
+          const why = b.partial ? ' — part of this band’s window was not measured' : '';
+          // The title still tells the truth about every segment; only the
+          // texture is withheld when it would cover the whole panel.
+          const hatch = b.partial && !blanket;
+          return `<span${hatch ? ' class="part"' : ''}`
+            + ` style="flex:${Math.max(2, share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
+            + ` title="${esc(b.band)} ${esc(money(b.cost, cur))}${esc(why)}">`
+            + `${share > 0.18 ? `<i>${esc(b.band)}</i>` : ''}</span>`;
+        }).join('')}</div>`
+      : '<div class="splitbar none"></div>';
+    // A band this circuit is short a whole hour of, or never reported in at
+    // all over an in-effect band, has no width to hatch — cost is null, so
+    // it never reaches `priced` and no segment above can carry the mark. The
+    // row's own total is still qualified by it (c.partial says so), so the
+    // total needs its own marker or the row reads as unqualified with the
+    // caption below still claiming a hatch explains every qualified figure.
+    const missingBand = c.bands.some((b) => b.cost === null);
+    const cvNotes = [];
+    if (missingBand) {
+      cvNotes.push('A band this circuit did not report in over this period is left out of '
+        + 'this total, so it is not the whole of it.');
+    }
+    // The PCRF/SCRF rider rides on the total but on no band below it — the
+    // bands alone would sum to less than this figure with nothing saying
+    // why, which is a different question from missingBand above and gets
+    // its own sentence rather than being folded into it.
+    if (c.rider !== null && c.rider !== undefined && c.rider !== 0) {
+      cvNotes.push(`Includes ${money(c.rider, cur)} of rate rider (PCRF/SCRF), which is not `
+        + 'split out in the bar below.');
+    }
+    const cvTitle = cvNotes.length ? ` title="${esc(cvNotes.join(' '))}"` : '';
+    return `<div class="spendrow">
+      <span class="cn" title="${esc(c.name)}">${esc(c.name)}</span>
+      <span class="cv${missingBand ? ' part' : ''}"${cvTitle}>${esc(money(c.cost, cur))}</span>
+      <span class="ck">${esc(uStr(c.kwh, 1, 'kWh'))}</span>
+      ${bar}
+    </div>`;
+  }).join('');
+  const anyPartial = list.some((c) => c.partial);
+  const anySilent = list.some((c) => c.cost === null);
+  const notes = [];
+  if (blanket) {
+    // Said once, in words, because saying it five times in texture said nothing
+    // and cost the bars their labels. Same claim, and it still qualifies every
+    // figure in the panel — it simply names them all at once.
+    notes.push('Every band above was only partly recorded, so each figure is what was '
+      + 'measured rather than the whole of it.');
+  } else if (anyPartial) {
+    notes.push('A hatched segment is a band whose window was only partly recorded, so that '
+      + 'part of the figure is what was measured rather than the whole of it.');
+  }
+  if (anySilent) {
+    notes.push('A circuit showing ' + DASH + ' reported nothing at all over this period. That '
+      + 'is not a circuit that used nothing.');
+  }
+  $('spendCap').innerHTML = notes.join(' ');
 }
 
 function renderBands(p) {
@@ -1321,6 +1537,17 @@ async function monthCost(win) {
     + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
 }
 
+// Which circuits cost the most over the same window, and what share of the
+// month's energy they account for. A separate endpoint from monthCost — see
+// the try/catch around its call in refresh() for why a failure here must not
+// take the month's money off the page with it.
+async function monthSpenders(win) {
+  const zone = browserZone();
+  return getJSON(`/api/costs/circuits?start=${encodeURIComponent(win.startParam)}`
+    + `&end=${encodeURIComponent(win.endParam)}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
+}
+
 // The service's answer in the shape the drawing below reads. A mapping, not a
 // calculation: every figure here was computed server-side, and the only
 // arithmetic is adding a band's cost to the counterfactual it is subtracted
@@ -1468,6 +1695,7 @@ async function refresh() {
 
   if (quote && !quote.configured) {
     renderNoTariff(quote.unreadable === true);
+    $('spendSec').hidden = true;
     renderAssumptions(null, false, quote.unreadable === true);
     pageNote(trouble.join(' '));
     stamp();
@@ -1476,6 +1704,7 @@ async function refresh() {
   if (!quote || !quote.cost) {
     // Configured but unpriceable: the service has a tariff and could not apply
     // it to this month. Nothing is invented to fill the gap.
+    $('spendSec').hidden = true;
     renderAssumptions(null, Boolean(quote), !quote);
     pageNote(trouble.join(' '));
     stamp();
@@ -1491,6 +1720,23 @@ async function refresh() {
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
+
+  // Its own read and its own failure. A circuit list that could not be fetched
+  // must not take the month's money off the page with it — that money came from
+  // a different endpoint and is unaffected.
+  let spend = null;
+  try {
+    spend = await monthSpenders(win);
+  } catch (e) {
+    trouble.push(`The circuit spending could not be read: ${e.message}.`);
+  }
+  if (isStale(gen)) return;
+  if (spend) {
+    renderSpenders(spend, priced.currency);
+  } else {
+    $('spendSec').hidden = true;
+  }
+
   renderAssumptions(priced, true, false);
   // Only now does the screen actually hold this month's money, so only now
   // does moneyMonth say so — a later refresh of the same month can fail
