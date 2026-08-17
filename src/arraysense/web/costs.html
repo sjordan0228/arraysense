@@ -528,6 +528,17 @@ function shortNote(entry, what) {
 //
 // An absent fraction keeps every qualifier. Absent is not complete, and a month
 // whose elapsed share could not be read is the last thing to relabel as a bill.
+//
+// renderMonth's own `partial` disagrees with `running` on a null fraction —
+// `partial` treats it as NOT partial (a null reads as the finished "all N
+// days" case), while `running` here treats it as still running. That
+// divergence is unreachable today: every `fraction` that reaches either place
+// is either `Math.min(1, done / days)`, never null, or `priced.fractionElapsed`,
+// which the service always computes numerically whenever a tariff is
+// configured — an unconfigured tariff returns before either function runs. If
+// a future caller ever does produce a null fraction here, `renderMonth` is the
+// one that has to change to match `running`, not the other way round: absent
+// rendering as complete is exactly the mistake this project exists to catch.
 function monthWords(fraction, name) {
   const running = fraction === null || fraction === undefined || fraction < 0.999;
   return {

@@ -68,7 +68,7 @@ def test_a_finished_month_drops_them_and_names_itself() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_the_threshold_is_renderMonths_own() -> None:  # noqa: N802
+def test_the_threshold_matches_rendermonths_own() -> None:
     """0.999 — within three-quarters of an hour of a month's end, calling it
     unfinished is pedantry rather than honesty, and the two places that decide
     it must agree or the strip and the labels contradict each other."""
