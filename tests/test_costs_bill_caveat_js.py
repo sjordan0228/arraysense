@@ -46,9 +46,13 @@ def _caveat(is_projected: bool, season_changes: bool = False) -> str:
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_genuine_projection_says_so() -> None:
+    # Worded so it holds whether the unmeasured stretch sits at the start of
+    # the month, the end, or both — "the rest of the month" named only the
+    # end, which was backwards for an install whose collection began partway
+    # through: there the gap is behind the measured part, not ahead of it.
     assert _caveat(True) == (
-        "An estimate: it assumes the rest of the month uses each rate band at the rate this "
-        "one has so far."
+        "An estimate: it assumes the part of the month that was not measured uses each rate "
+        "band at the rate the part that was did."
     )
 
 

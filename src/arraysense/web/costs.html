@@ -434,9 +434,21 @@ const shouldAutoRefresh = (cursor, today) =>
 // ``seen`` is the month the timer itself last observed; a mismatch against
 // ``today`` means the clock has turned over since the previous tick, and is
 // true for exactly that one tick — the next one updates ``seen`` to match and
-// polling for the now-finished month goes back to being suppressed.
-const monthRolledOver = (today, seen) =>
-  seen !== null && (seen.year !== today.year || seen.month !== today.month);
+// polling for the now-finished month goes back to being suppressed. That
+// mismatch alone says only that *some* month rolled over, not whose — a
+// reader who deliberately paged back to June keeps seeing false there while
+// the real calendar turns from July to August, and a rollover test that never
+// looked at cursor gave that reader a bonus refresh anyway, of a June nobody
+// asked to re-read. ``cursor`` has to equal ``seen`` — the month that just
+// became historical — for the extra refresh to be for the reader actually
+// looking at it; a cursor pointing anywhere else, including the reader's own
+// past navigation, gets none.
+const monthRolledOver = (cursor, today, seen) =>
+  seen !== null &&
+  (seen.year !== today.year || seen.month !== today.month) &&
+  cursor !== null &&
+  cursor.year === seen.year &&
+  cursor.month === seen.month;
 // <<< costs-month-cursor
 
 // What this refresh calls the month, set by renderMonth and read by every
@@ -650,8 +662,8 @@ function billCaveat(isProjected, seasonChanges) {
     ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
       + 'different bands than the part measured — treat the projection as the roughest of '
       + 'guides.'
-    : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
-      + 'one has so far.';
+    : 'An estimate: it assumes the part of the month that was not measured uses each rate '
+      + 'band at the rate the part that was did.';
 }
 // <<< costs-bill-caveat
 
@@ -1477,7 +1489,7 @@ async function boot() {
   let lastPolled = null;
   setInterval(async () => {
     const today = civilNow(await siteZone());
-    const justRolledOver = monthRolledOver(today, lastPolled);
+    const justRolledOver = monthRolledOver(cursor, today, lastPolled);
     lastPolled = { year: today.year, month: today.month };
     if (!shouldAutoRefresh(cursor, today) && !justRolledOver) return;
     await refresh();

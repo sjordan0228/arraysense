@@ -1912,6 +1912,59 @@ def test_a_month_straddling_the_minute_tiers_cutoff_prices_from_the_whole_month(
     assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
 
 
+def test_costs_picks_the_minute_tier_for_a_well_covered_month(client: Any) -> None:
+    """The common path — the current month, every reader, every day — has to
+    keep resolving to "minute". Every other minute-tier test here targets
+    retention or the straddling fallback; none of them asserts what an
+    ordinary, fully-covered window chooses, so a future change to the
+    bracket check in ``costs()`` could silently move today's figures onto a
+    coarser tier with nothing here noticing.
+
+    Characterisation, not regression: the bracket check only changes the
+    answer for a candidate whose earliest row falls short of ``lead`` — the
+    straddling test above exercises that. A window this well covered
+    satisfied the old "if rows: break" loop too, so this test cannot tell the
+    two loops apart; it exists to catch a *future* regression, not the one
+    the bracket check was written to fix.
+    """
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 3, 1, tzinfo=UTC)
+    month_end = datetime(2025, 4, 1, tzinfo=UTC)
+    lead = month_start - timedelta(hours=3)
+    tail = month_end + timedelta(hours=3)
+    hours = int((tail - lead).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=lead + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_minute(conn, int(lead.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    # Nothing may remain in the tiers this test does not mean to exercise: an
+    # untouched hourly table and an emptied raw one mean a failure to pick
+    # "minute" shows up as no cost at all rather than a silent fallback.
+    conn.execute("DELETE FROM inverter_raw")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-03-01T00:00:00Z", "end": "2025-04-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    assert body["tier"] == "minute"
+    assert body["cost"]["cost_is_short"] is False
+    # A full month at 1 kWh of grid import an hour, 744 kWh at $0.12.
+    assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
+
+
 def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:
     # The History page shows saving beside cost. It is the counterfactual — the
     # same house load bought entirely from the grid, less what the grid actually
