@@ -41,6 +41,7 @@ from arraysense.settings import (
     HIGH_USAGE_WATTS_KEY,
     SettingsStore,
 )
+from arraysense.store.rollup import rebuild_circuit_hourly
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -782,6 +783,157 @@ def test_the_alert_fires_without_the_module_and_names_nobody(tmp_path: Path) -> 
     assert alert["contributors"] == []
     assert alert["accounted_w"] is None
     store.close()
+
+
+# --- costs/circuits ---------------------------------------------------------
+
+# These live here rather than in test_api.py because the Costs page's circuit
+# ranking is only reachable with a running poller: the route answers empty for
+# a build with no Emporia module before it ever touches a circuit row, so
+# exercising the ranked path needs the poller test_api.py's own client fixture
+# does not carry. The tariff-only paths (no tariff, no module) are covered
+# there instead, against a fixture that already matches their shape.
+
+SPEND_HOUR = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+
+# Flat, so the arithmetic under every test here is the wattage times the rate
+# and the band split is trivially one entry — the band-splitting arithmetic
+# itself belongs to test_emporia_repository.py's own band_kwh tests, not to a
+# route test whose job is wiring, not pricing.
+FLAT_TARIFF = {"tariff.bands": "Flat | 0.20 | 00:00-24:00"}
+
+
+def _seed_spend_circuits(app: Any, store: SqliteStore, hour: datetime) -> None:
+    """Three circuits and a mains channel, an hour of one-minute readings each,
+    then the real hourly rollup — so the route is tested against a
+    circuit_hourly row built the way a production one is, not one typed into
+    the table by hand.
+
+    The wattages are chosen so cost order and arrival order disagree with each
+    other in nothing — Dryer, Oven and Fridge rank the same way by energy as by
+    money under a flat rate — which is enough to prove the route ranks by the
+    figure ``top_spenders`` returns rather than by the order ``sync_circuits``
+    was called in.
+    """
+    repo = app.state.emporia.repository
+    repo.sync_circuits(
+        [
+            Circuit(100000, "1", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "2", "Oven", 1.0, "circuit"),
+            Circuit(100000, "3", "Fridge", 1.0, "circuit"),
+            Circuit(100000, "4", "Main panel", 1.0, "mains"),
+        ],
+        hour,
+    )
+    for minute in range(60):
+        when = hour + timedelta(minutes=minute)
+        repo.append_readings(
+            [
+                Reading(100000, "1", 3000),
+                Reading(100000, "2", 2000),
+                Reading(100000, "3", 500),
+                # The mains total of the three circuits above it, so a test
+                # that failed to exclude it would see it outrank every one of
+                # them rather than merely appear among them.
+                Reading(100000, "4", 5500),
+            ],
+            when,
+        )
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
+    )
+
+
+def _spend_app(tmp_path: Path) -> tuple[Any, SqliteStore]:
+    app, store, _ = _app(tmp_path)
+    _seed_spend_circuits(app, store, SPEND_HOUR)
+    return app, store
+
+
+def _spend_window() -> dict[str, str]:
+    return {
+        "start": SPEND_HOUR.isoformat(),
+        "end": (SPEND_HOUR + timedelta(hours=1)).isoformat(),
+    }
+
+
+def test_costs_circuits_names_the_dearest_first(tmp_path: Path) -> None:
+    """Ranked by money, both figures reported, and the band split beside them."""
+    app, store = _spend_app(tmp_path)
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        response = c.get("/api/costs/circuits", params=_spend_window())
+    store.close()
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["configured"] is True
+    names = [entry["name"] for entry in body["circuits"]]
+    assert names == ["Dryer", "Oven", "Fridge"]
+    assert names == sorted(
+        names, key=lambda n: -next(e["cost"] for e in body["circuits"] if e["name"] == n)
+    )
+    assert all("bands" in entry for entry in body["circuits"])
+
+
+def test_costs_circuits_never_names_mains(tmp_path: Path) -> None:
+    # A monitor's mains channel is the sum of the circuits beside it, and the
+    # readings above set it higher than any one of them — the strongest check
+    # that exclusion, not merely low rank, is what keeps it off the list.
+    app, store = _spend_app(tmp_path)
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        body = c.get("/api/costs/circuits", params=_spend_window()).json()
+    store.close()
+
+    assert all(entry["kind"] != "mains" for entry in body["circuits"])
+
+
+def test_costs_circuits_says_how_much_of_the_month_it_accounts_for(tmp_path: Path) -> None:
+    """Beside the list, not in a footnote, and measured in energy rather than in
+    minutes watched — money depends on the second."""
+    app, store = _spend_app(tmp_path)
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        body = c.get("/api/costs/circuits", params=_spend_window()).json()
+    store.close()
+
+    assert set(body["coverage"]) == {
+        "circuits_kwh",
+        "house_kwh",
+        "fraction",
+        "recorded_seconds",
+        "window_seconds",
+        "spans_match",
+    }
+    # The three named circuits: 3 + 2 + 0.5 kWh over the hour, with the mains
+    # channel that would double it excluded.
+    assert body["coverage"]["circuits_kwh"] == pytest.approx(5.5)
+
+
+def test_costs_circuits_refuses_a_period_too_long_to_price(tmp_path: Path) -> None:
+    """band_intervals raises past MAX_SCAN_DAYS; that has to be a 400, not a 500.
+    A month never reaches it, which is exactly why nothing else would catch a
+    regression here.
+
+    No circuits are seeded for this one — the period is refused before the
+    route ever reaches a circuit row, and a poller with nothing to report is
+    the whole point: this is the calendar guard, not the ranking.
+    """
+    app, store, _ = _app(tmp_path)
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        response = c.get(
+            "/api/costs/circuits",
+            params={"start": "2026-01-01T00:00:00Z", "end": "2026-06-01T00:00:00Z"},
+        )
+    store.close()
+
+    assert response.status_code == 400
+    assert "days" in response.json()["detail"]
 
 
 # --- the charger ----------------------------------------------------------

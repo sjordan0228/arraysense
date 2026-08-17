@@ -127,6 +127,7 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.setup import describe_setup
+from arraysense.spend import top_spenders
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -1502,6 +1503,129 @@ def _band_rows(
             }
         )
     return rows
+
+
+@router.get("/costs/circuits")
+def costs_circuits(
+    request: Request,
+    store: _ReadStore,
+    start: datetime,
+    end: datetime,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """Which circuits spent the most over a period, and what they account for.
+
+    The Costs page answers "how much" and "in which band" and could not answer
+    "on what". This is that half — the same window every other figure on the
+    page is asked about, priced through the same band walk, and ranked by
+    money because the page is about money.
+
+    Nothing is computed here. ``band_intervals`` cuts the period, ``band_kwh``
+    reads the rows, ``top_spenders`` ranks them and prices them; this route
+    resolves the zone, picks the band set and forwards the answer. A second
+    implementation of any of that is how this page came to hold its own
+    tariff parser, which disagreed with the Python one inside a day.
+
+    ``coverage`` is the figure that keeps the list honest. Thirty-nine
+    channels do not add up to a house, and naming five circuits over a
+    month's bill invites the reader to believe those five are the bill. It is
+    the same block the circuit history endpoint reports, from the same
+    helper, and it is measured in energy rather than in minutes watched —
+    that distinction is what #23 was reverted twice for missing, and money
+    depends on the second.
+
+    The zone is resolved and applied with ``with_zone`` rather than
+    ``.astimezone()``, and for the reason ``costs()`` does the same: a naive
+    bound is what the browser sends when it means local midnight in the
+    installation's own zone, and reading it against the *server's* zone
+    instead is the bug that put a 15:00-20:00 peak window at 10:00-15:00
+    local on the reference installation.
+
+    The hourly tier, always. ``circuit_hourly`` is written before the raw
+    readings are pruned and is itself never pruned, so every month the page
+    can select is answerable from it; the raw tier is a million rows to the
+    hourly tier's twenty-five thousand and buys nothing, because a tariff's
+    band edges fall on the hour.
+
+    The route answers rather than 500s on the two ways an installation can be
+    unready to price this: no tariff entered yet, and no Emporia module
+    running at all. Both report the same empty shape a page can render
+    without branching on which one happened.
+    """
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Attached to the installation's zone, not merely to whichever zone the
+    # server happens to run in — see the docstring above.
+    start, end = with_zone(start, zone), with_zone(end, zone)
+    _check_range(start, end)
+
+    tariff = load_tariff(SettingsStore(store).all())
+    window_seconds = int(_elapsed(start, end))
+    empty: dict[str, Any] = {
+        "configured": tariff is not None,
+        "currency": tariff.currency if tariff is not None else None,
+        "circuits": [],
+        "coverage": {**_NO_COVERAGE, "window_seconds": window_seconds},
+    }
+    poller = _emporia(request)
+    if tariff is None or poller is None:
+        return empty
+
+    cadence = _emporia_cadence_seconds(request)
+    with _inside_the_calendar():
+        intervals = [
+            (interval.start, interval.end, interval.band)
+            for interval in band_intervals(tariff, start, end, zone)
+        ]
+        history = CircuitRepository(store).history(
+            start, end, tier="hourly", cadence_seconds=cadence
+        )
+        energies = CircuitRepository(store).band_kwh(
+            start, end, intervals, tier="hourly", cadence_seconds=cadence
+        )
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        measured = [s.kwh for s in parts if s.kwh is not None]
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=sum(measured) if measured else None,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
+        )
+
+    # The bands in effect over the period, not every band the tariff holds —
+    # the same set estimate_bill prices against. Pricing all of a seasonal
+    # tariff's bands instead leaves an out-of-season one permanently
+    # unmeasured, which makes every total permanently absent.
+    bands = tariff.bands_in_effect(start, end) or tariff.bands
+    ranked = top_spenders(energies, bands)
+    return {
+        "configured": True,
+        "currency": tariff.currency,
+        "circuits": [
+            {
+                "name": c.name,
+                "kind": c.kind,
+                "cost": None if c.cost is None else round(c.cost, 2),
+                "kwh": None if c.kwh is None else round(c.kwh, 3),
+                "partial": c.partial,
+                "bands": [
+                    {
+                        "band": b.band,
+                        "kwh": None if b.kwh is None else round(b.kwh, 3),
+                        "cost": None if b.cost is None else round(b.cost, 2),
+                        "partial": b.partial,
+                    }
+                    for b in c.bands
+                ],
+            }
+            for c in ranked
+        ],
+        "coverage": coverage,
+    }
 
 
 @router.get("/history")
