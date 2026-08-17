@@ -37,6 +37,7 @@ from arraysense.settings import (
     PANELS_STRINGS_KEY,
     SETTING_TIMEZONE,
     SettingsStore,
+    emporia_interval_seconds,
 )
 from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.rollup import (
@@ -355,11 +356,19 @@ class CollectorService:
         a connection owned by the event loop means a cancellation can close it
         from underneath a statement still running — which blocks the loop on
         SQLite's own mutex, exactly the stall this change exists to remove.
+
+        The Emporia interval is read here, on the event loop, and handed to the
+        circuit rebuild. This pass runs minutes after the readings it
+        summarises, so the interval it reads is the one that produced them —
+        which is the whole reason the coverage is measured at rollup time and
+        stored. A reader arriving a month later has only the interval in force
+        then, and that is a different number the moment the owner edits the
+        setting.
         """
         moment = now or datetime.now(tz=UTC)
         end = int(moment.timestamp()) + 60
 
-        def _rebuild_all(conn: sqlite3.Connection) -> None:
+        def _rebuild_all(conn: sqlite3.Connection, circuit_cadence: int) -> None:
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
@@ -371,30 +380,37 @@ class CollectorService:
             # hour still gets covered, which is what lets retention prune
             # the raw readings afterwards instead of blocking on them for
             # ever.
-            rebuild_circuit_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            rebuild_circuit_hourly(
+                conn, end - HOURLY_REBUILD_WINDOW, end, cadence_seconds=circuit_cadence
+            )
             # Hours written outside that window — the archive backfill's, one
             # per past hour — are queued by the store as it writes them and
             # brought forward here. Nothing else promotes them, and the
             # efficiency engine reads irradiance from the hourly tier alone.
             promote_pending_hours(conn)
 
-        def _rebuild_on_own_connection() -> None:
+        def _rebuild_on_own_connection(circuit_cadence: int) -> None:
             conn = self._store.maintenance_connection()
             try:
-                _rebuild_all(conn)
+                _rebuild_all(conn, circuit_cadence)
             finally:
                 conn.close()
 
         try:
+            # Inside the guard, because it is a read of the primary connection
+            # and a pass racing shutdown finds that closed. This is housekeeping
+            # either way, and a settings read that failed outside the guard
+            # would take down the poll loop the guard exists to protect.
+            cadence = emporia_interval_seconds(SettingsStore(self._store))
             if self._store.is_memory_backed:
                 # A second connection to ":memory:" is a *different*, empty
                 # database, so a threaded pass would rebuild nothing and report
                 # success — the tiers would sit empty with no error anywhere.
                 # An in-memory store is a test fixture and costs microseconds,
                 # so it runs inline rather than silently doing nothing.
-                _rebuild_all(self._store._conn)
+                _rebuild_all(self._store._conn, cadence)
             else:
-                await asyncio.to_thread(_rebuild_on_own_connection)
+                await asyncio.to_thread(_rebuild_on_own_connection, cadence)
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
 

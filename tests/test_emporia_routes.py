@@ -220,8 +220,13 @@ def _seed_counters(store: SqliteStore, newest: datetime, hours: float = 7.0) -> 
         )
 
 
-def _seed_circuits(app: Any, newest: datetime, hours: float = 1.0) -> None:
-    """A dryer and a mains channel, both reporting every minute back from ``newest``."""
+def _seed_circuits(app: Any, newest: datetime, minutes: int = 60) -> None:
+    """A dryer and a mains channel, both reporting every minute back from ``newest``.
+
+    Counted in whole minutes rather than in hours because the span check turns
+    on exactly how many readings landed, and a fraction of an hour multiplied
+    back out lands one reading either side of what was asked for.
+    """
     repo = app.state.emporia.repository
     repo.sync_circuits(
         [
@@ -230,7 +235,7 @@ def _seed_circuits(app: Any, newest: datetime, hours: float = 1.0) -> None:
         ],
         newest,
     )
-    for step in range(int(hours * 60)):
+    for step in range(minutes):
         when = newest - timedelta(minutes=step)
         repo.append_readings([Reading(100000, "5", 1000), Reading(100000, "1", 4000)], when)
 
@@ -322,7 +327,14 @@ def test_coverage_is_reported_for_a_window_ending_now(tmp_path: Path) -> None:
     # The regression this guards is silent and total: _covered cannot bracket a
     # bound with no reading after it, so an unclamped window ending at the wall
     # clock blanks this line on every live request, for ever.
-    app, store = _app_with_history(tmp_path)
+    #
+    # The circuits are seeded across the whole window on purpose. This is about
+    # the *house* side of the clamp, and a window the module only recorded part
+    # of withholds the share for its own reason — which would leave this passing
+    # or failing for something other than what it is here to watch.
+    app, store, _ = _app(tmp_path)
+    _seed_circuits(app, END - timedelta(seconds=30), minutes=6 * 60)
+    _seed_counters(store, END - INVERTER_LAG)
     with TestClient(app) as c:
         body = _history(c, hours=6)
     store.close()
@@ -368,6 +380,79 @@ def test_history_reports_a_fraction_above_one_rather_than_capping_it(tmp_path: P
 
     assert body["coverage"]["house_kwh"] == pytest.approx(6.0)
     assert body["coverage"]["fraction"] > 1.0
+
+
+def test_history_withholds_the_share_when_the_circuits_recorded_part_of_the_window(
+    tmp_path: Path,
+) -> None:
+    # The check docs/api.md has promised since this endpoint shipped and only
+    # the browser was making. _coverage_end bounds the house side; nothing
+    # bounded the circuits', so an hour of circuit readings inside a six-hour
+    # window was divided by six hours of house counter and reported as a share.
+    # Every figure in it correct, and the sentence it produced — "monitored
+    # circuits cover 3% of the house" — invites the reader to conclude the house
+    # is barely monitored when the truth is the module was not running.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=6)
+    store.close()
+
+    coverage = body["coverage"]
+    assert coverage["circuits_kwh"] == pytest.approx(1.0), "an hour of dryer really was recorded"
+    assert coverage["house_kwh"] is not None, "and the house counter really did report"
+    assert coverage["fraction"] is None, "but the two do not describe the same span"
+    assert coverage["spans_match"] is False
+    assert coverage["recorded_seconds"] == 60 * 60
+    assert coverage["window_seconds"] == 6 * 3600
+
+
+@pytest.mark.parametrize(
+    ("minutes", "matches"),
+    [
+        (60, True),
+        # One poll lost at each edge of the shortest range the page offers.
+        (58, True),
+        # Exactly ninety per cent: the threshold is a floor, not an exclusive bound.
+        (54, True),
+        (53, False),
+        (20, False),
+    ],
+)
+def test_the_span_threshold_clears_ordinary_operation_and_catches_a_gappy_window(
+    tmp_path: Path, minutes: int, matches: bool
+) -> None:
+    # Ninety per cent of the window, and the number has to clear ordinary
+    # operation or the qualification fires on every healthy installation and so
+    # means nothing. A healthy one loses at most one poll at each edge, which is
+    # two minutes of the shortest range the page offers. Below the threshold the
+    # share would be understated by more than a tenth of its own value, which is
+    # more than a percentage rounded to whole numbers can absorb.
+    app, store, _ = _app(tmp_path)
+    _seed_circuits(app, END - timedelta(seconds=30), minutes=minutes)
+    _seed_counters(store, END - INVERTER_LAG)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["spans_match"] is matches
+    assert (body["coverage"]["fraction"] is not None) is matches
+
+
+def test_history_reports_the_span_it_measured_the_check_against(tmp_path: Path) -> None:
+    # The page says how long the circuits recorded for, and it has to be the
+    # figure the endpoint decided on rather than one measured again in the
+    # browser — the browser's own count credited every hourly bucket holding
+    # anything with a full 3,600 seconds and so could never find a window short.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    coverage = body["coverage"]
+    assert coverage["window_seconds"] == 3600
+    assert coverage["recorded_seconds"] == 3600
+    assert coverage["spans_match"] is True
+    assert coverage["fraction"] is not None
 
 
 def test_history_leaves_the_fraction_null_when_the_house_is_unknown(tmp_path: Path) -> None:

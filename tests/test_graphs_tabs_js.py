@@ -434,28 +434,16 @@ def test_a_circuit_with_no_energy_figure_is_listed_rather_than_ranked() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_recorded_seconds_count_what_was_heard_and_not_the_holes() -> None:
-    # The measurement the coverage sentence is qualified by. A stamp that
-    # carried a reading is credited with the distance to the next one, capped at
-    # the spacing the window achieved — so the stamp on the near side of a
-    # three-hour hole cannot claim the hole. The repository's synthetic nulls
-    # are what mark the far side of it.
-    out = _run(
-        "const solid = [{watts: [10, 10, 10, 10]}];\n"
-        "console.log('solid:' + circuitRecordedSeconds([0, 60, 120, 180], solid, 60));\n"
-        "const holed = [{watts: [10, null, 10, 10]}];\n"
-        "console.log('holed:' + circuitRecordedSeconds([0, 60, 10000, 10060], holed, 60));\n"
-        "console.log('lone:' + circuitRecordedSeconds([0], [{watts: [10]}], 60));\n"
-        "console.log('none:' + circuitRecordedSeconds([], [], 60));\n"
-        "console.log('silent:' + circuitRecordedSeconds([0, 60], [{watts: [null, null]}], 60));",
-        marker="circuit-summary",
-    )
-    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
-    assert results["solid"] == "240", "four minute-spaced readings cover four minutes"
-    assert results["holed"] == "180", "the hole belongs to nobody, not to the reading before it"
-    assert results["lone"] == "60", "one stamp covers one poll, measured from the given cadence"
-    assert results["none"] == "0"
-    assert results["silent"] == "0", "stamps carrying nothing are not time recorded"
+def test_the_page_no_longer_measures_the_recorded_span_itself() -> None:
+    # The count that used to live here credited every non-null hourly bucket
+    # with a full 3,600 seconds, so a seven-day window holding one reading an
+    # hour reported seven whole days recorded and no window was ever found
+    # short. It is the endpoint's measurement now — taken from the coverage the
+    # rollup wrote down — and a second copy in the browser is exactly the shape
+    # this project has been bitten by before.
+    text = PAGE.read_text()
+    assert "circuitRecordedSeconds" not in text
+    assert "CIRCUIT_SPAN_ENOUGH" not in text, "the threshold moved to the endpoint with it"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -464,23 +452,26 @@ def test_the_coverage_line_says_the_right_one_of_its_four_things() -> None:
     # states, and three of them are a statement about what cannot be divided.
     #
     # The fourth is the one measured on the bench: a seven-day window in which
-    # the module had recorded for six hours returned circuits 18.392 kWh, house
-    # 254.8 kWh, fraction 0.0722. "Monitored circuits cover 7% of the house"
-    # invites the reader to conclude the house is barely monitored, when the
-    # truth is that the module was not running. The percentage is withheld there
-    # rather than re-based, because this response carries no house figure for
+    # the module had recorded for six hours returned circuits 18.392 kWh and
+    # house 254.8 kWh. "Monitored circuits cover 7% of the house" invites the
+    # reader to conclude the house is barely monitored, when the truth is that
+    # the module was not running — so the endpoint withholds the fraction there
+    # rather than re-basing it, since the response carries no house figure for
     # the recorded span and assuming the house drew evenly would be an estimate
-    # wearing a meter reading's clothes.
+    # wearing a meter reading's clothes. Every state below is read off the
+    # answer; nothing here measures anything.
     out = _run(
         "const w6 = 6 * 3600, w7 = 7 * 86400;\n"
+        "const full = (o) => Object.assign("
+        "{recorded_seconds: w6, window_seconds: w6, spans_match: true}, o);\n"
         "console.log('normal:' + circuitCoverageWords("
-        "{circuits_kwh: 8.1, house_kwh: 11.4, fraction: 0.7105}, w6, w6));\n"
+        "full({circuits_kwh: 8.1, house_kwh: 11.4, fraction: 0.7105})));\n"
         "console.log('unknown:' + circuitCoverageWords("
-        "{circuits_kwh: 8.1, house_kwh: null, fraction: null}, w6, w6));\n"
+        "full({circuits_kwh: 8.1, house_kwh: null, fraction: null})));\n"
         "console.log('over:' + circuitCoverageWords("
-        "{circuits_kwh: 12.4, house_kwh: 9.8, fraction: 1.2653}, w6, w6));\n"
-        "console.log('short:' + circuitCoverageWords("
-        "{circuits_kwh: 18.392, house_kwh: 254.8, fraction: 0.0722}, 21600, w7));",
+        "full({circuits_kwh: 12.4, house_kwh: 9.8, fraction: 1.2653})));\n"
+        "console.log('short:' + circuitCoverageWords({circuits_kwh: 18.392, house_kwh: 254.8, "
+        "fraction: null, recorded_seconds: 21600, window_seconds: w7, spans_match: false}));",
         marker="circuit-summary",
     )
     results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
@@ -592,20 +583,20 @@ def test_the_split_caption_never_claims_a_remainder_that_is_not_there() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_a_healthy_window_is_not_qualified_and_a_gappy_one_is() -> None:
-    # The threshold is 90% of the window, and it has to clear ordinary
-    # operation: a healthy installation loses at most one poll at each edge,
-    # which is two minutes of the shortest range this page offers.
+def test_the_line_qualifies_itself_from_what_the_endpoint_said() -> None:
+    # The page no longer decides whether a window is short; it reads
+    # ``spans_match``. What it must still do is say the right sentence for each
+    # answer, and in particular not report a share the endpoint withheld.
     out = _run(
         "const w6 = 6 * 3600;\n"
-        "console.log('healthy:' + circuitSpanShort(w6 - 120, w6));\n"
-        "console.log('edge:' + circuitSpanShort(w6 * 0.9, w6));\n"
-        "console.log('gappy:' + circuitSpanShort(w6 * 0.34, w6));\n"
-        "console.log('nowindow:' + circuitSpanShort(0, 0));",
+        "const cov = {circuits_kwh: 8.1, house_kwh: 11.4, fraction: null, "
+        "recorded_seconds: w6 * 0.34, window_seconds: w6, spans_match: false};\n"
+        "console.log('short:' + circuitCoverageWords(cov));\n"
+        "console.log('whole:' + circuitCoverageWords("
+        "Object.assign({}, cov, {fraction: 0.7105, recorded_seconds: w6, spans_match: true})));",
         marker="circuit-summary",
     )
     results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
-    assert results["healthy"] == "false", "one poll lost at each edge is not a qualified window"
-    assert results["edge"] == "false", "the threshold is a floor, not an exclusive bound"
-    assert results["gappy"] == "true", "a third of the window recorded must be said out loud"
-    assert results["nowindow"] == "false", "no window is not a short one"
+    assert results["short"].startswith("The circuits recorded for 2.0 h of this 6-hour window")
+    assert "%" not in results["short"], "a ratio of two different spans is not a share"
+    assert results["whole"].startswith("Monitored circuits cover 71%")

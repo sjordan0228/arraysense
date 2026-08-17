@@ -187,7 +187,9 @@ one used.
     {"id": 3, "name": "Dryer", "kind": "circuit", "watts": [4000, null],
      "kwh": 0.133, "partial": false, "offline_since": null}
   ],
-  "coverage": {"circuits_kwh": 8.1, "house_kwh": 11.4, "fraction": 0.71}
+  "coverage": {"circuits_kwh": 8.1, "house_kwh": 11.4, "fraction": 0.71,
+               "recorded_seconds": 21600, "window_seconds": 21600,
+               "spans_match": true}
 }
 ```
 
@@ -224,9 +226,31 @@ one is not a coverage figure at all but a fault reporting itself, and clamping
 it would hide a mains channel that escaped exclusion or a multiplier set for the
 wrong circuit behind a bar that looked merely full.
 
+`coverage.spans_match` is that second condition, stated rather than left to be
+inferred: `false` means the circuits recorded for materially less of the window
+than the house counter covered, so their energy is not a share of it and
+`fraction` is withheld. `coverage.recorded_seconds` and
+`coverage.window_seconds` are the two figures the comparison was made from — how
+long the module was recording for at all, against the length of the window
+asked for — so a caller can say what happened without measuring it again. The
+threshold is 90%, which clears a poll lost at each edge of the shortest range
+the Graphs page offers.
+
+`recorded_seconds` is measured, not assumed. On the hourly tier it comes from
+the coverage each bucket recorded at the moment it was rolled up, when the poll
+interval that produced its readings was still the one in force — so changing
+`emporia.interval` no longer moves the energy or the coverage of anything
+already stored. On the raw tier one reading accounts for at most one poll
+interval, and for less where the next reading came sooner; a stretch further
+apart than the interval was not recorded, and its energy is unknown rather than
+credited to the readings either side. Hours stored before this release carry no
+coverage figure and fall back to the older estimate, sample count times the
+interval currently set.
+
 A build with no Emporia module configured answers an empty history —
-`circuits: []` and `coverage` all `null` — rather than `404`, since a link to
-this page can outlive the account it was made on. A reversed range is `400`.
+`circuits: []`, every energy figure in `coverage` `null`, and nothing recorded —
+rather than `404`, since a link to this page can outlive the account it was made
+on. A reversed range is `400`.
 
 ## `GET /api/calibration`
 

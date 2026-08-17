@@ -1691,6 +1691,28 @@ class SettingsStore:
         return out
 
 
+def emporia_interval_seconds(settings: SettingsStore) -> int:
+    """How often circuits are read, as a whole number of seconds.
+
+    Three callers need this and none of them may disagree about it: the poller
+    that spaces its reads by it, the rollup that measures an hour's coverage
+    against it, and the endpoint that picks a tier and reads a raw window back.
+    A second copy of the fallback is a second answer to "what does one reading
+    cover", and that question decides an energy figure.
+
+    A stored value that is not a usable number falls back to the registered
+    default rather than propagating. Settings are decoded on read but not
+    clamped to their bounds, so a database written by another build — or edited
+    by hand — can hand this a string or a zero, and a zero divides an hour into
+    infinitely many samples.
+    """
+    value = settings.get(EMPORIA_INTERVAL_KEY)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    default = lookup_setting(EMPORIA_INTERVAL_KEY).default
+    return default if isinstance(default, int) else 60
+
+
 def _mask(value: str) -> str:
     """Show enough of a value for its owner to recognise it and no more.
 

@@ -593,7 +593,9 @@ LATE_APPEND_SECONDS = 2 * 3600
 PROMOTE_BATCH = 500
 
 
-def rebuild_circuit_hourly(conn: sqlite3.Connection, start: int, end: int) -> None:
+def rebuild_circuit_hourly(
+    conn: sqlite3.Connection, start: int, end: int, *, cadence_seconds: int
+) -> None:
     """Aggregate ``circuit_reading`` into ``circuit_hourly`` over [start, end).
 
     Simpler than the tiers above because there is nothing to consult the metric
@@ -608,6 +610,27 @@ def rebuild_circuit_hourly(conn: sqlite3.Connection, start: int, end: int) -> No
     stage that prices a circuit depends on telling those apart — coverage in
     minutes watched is not coverage in energy accounted for.
 
+    ``covered_seconds`` is that coverage measured rather than inferred, and it
+    is why ``cadence_seconds`` has no default. This runs on the hourly clock
+    over readings minutes old, so the poll interval it is handed genuinely
+    describes them; a reader arriving a month later has only the interval in
+    force *then*, which is a different number the moment the owner touches the
+    setting. Passing today's interval to yesterday's rows is what doubled the
+    energy of every stored hour when the bench interval was raised from ten
+    seconds to sixty. The caller knows the interval; an hourly row cannot be
+    asked, so it is written down here.
+
+    Each reading accounts for the distance to the next one inside its own hour,
+    capped at one poll interval, and the last reading of the hour accounts for
+    one interval. Capped because a reading covers the period it was taken for
+    and no more — the stretch after a poller stopped belongs to nobody — and
+    measured from the real stamps rather than multiplying the count, so a
+    retried poll landing five seconds after its predecessor adds five seconds
+    and not a whole interval. The total is clamped to the 3,600 seconds an hour
+    holds. An hour with no readings stores 0, never NULL: NULL is reserved for a
+    row written before the column existed, and the two must stay
+    distinguishable.
+
     An hour in which nothing was heard averages to NULL rather than to zero, and
     lands with a sample count of nought. Deleting and reinserting inside one
     transaction is what makes the rebuild idempotent, and what drops a bucket
@@ -619,12 +642,31 @@ def rebuild_circuit_hourly(conn: sqlite3.Connection, start: int, end: int) -> No
     """
     aligned_start, aligned_end = _bucket_bounds(3600, start, end)
     part = _floor_div("timestamp", 3600)
+    # The window function partitions by the bucket as well as the circuit, so
+    # each hour is measured from its own readings alone and a rebuild gives the
+    # same answer whatever range it was asked for. A reading with nothing after
+    # it in its hour takes the full interval.
+    spans = (
+        f"SELECT {part} * 3600 AS bucket, circuit_id, watts, "
+        "MIN(COALESCE("
+        f"  LEAD(timestamp) OVER (PARTITION BY circuit_id, {part} ORDER BY timestamp) - timestamp,"
+        "  ?"
+        "), ?) AS covered "
+        "FROM circuit_reading WHERE timestamp >= ? AND timestamp < ?"
+    )
     select = (
-        f"SELECT {part} * 3600 AS timestamp, circuit_id, "
+        "SELECT bucket AS timestamp, circuit_id, "
         "CAST(ROUND(AVG(watts)) AS INTEGER) AS watts, "
-        "COUNT(watts) AS sample_count "
-        "FROM circuit_reading WHERE timestamp >= ? AND timestamp < ? "
-        "GROUP BY 1, circuit_id"
+        "COUNT(watts) AS sample_count, "
+        # COALESCE, not a bare SUM: an hour holding only unanswered readings
+        # sums to NULL, and NULL here would be indistinguishable from a row
+        # written before this column existed. The outer MIN is the hour itself —
+        # at a long interval the last reading's own period can run past the end
+        # of the hour it was taken in, and an hour holds 3,600 seconds however
+        # the polls fell inside it.
+        "MIN(COALESCE(SUM(CASE WHEN watts IS NULL THEN NULL ELSE covered END), 0), 3600) "
+        "AS covered_seconds "
+        f"FROM ({spans}) GROUP BY 1, circuit_id"
     )
     with conn:
         cur = conn.cursor()
@@ -633,8 +675,9 @@ def rebuild_circuit_hourly(conn: sqlite3.Connection, start: int, end: int) -> No
             (aligned_start, aligned_end),
         )
         cur.execute(
-            "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count) " + select,
-            (aligned_start, aligned_end),
+            "INSERT INTO circuit_hourly"
+            " (timestamp, circuit_id, watts, sample_count, covered_seconds) " + select,
+            (cadence_seconds, cadence_seconds, aligned_start, aligned_end),
         )
 
 

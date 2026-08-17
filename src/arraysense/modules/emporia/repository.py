@@ -31,12 +31,10 @@ _CIRCUIT_TABLES = {"full": "circuit_reading", "hourly": "circuit_hourly"}
 
 _HOUR_SECONDS = 3600
 # What one reading is taken to cover when the caller does not say: the Emporia
-# poll interval's own default, which settings.py registers as 60 s. It is used
-# twice — as how much of an hour each of a bucket's ``sample_count`` readings
-# accounts for, and as the fallback when a window holds too few raw rows to
-# measure their spacing — and both are wrong by six times on an installation
-# polling at the ten seconds the setting permits, which is why ``history``
-# takes the figure rather than assuming this one.
+# poll interval's own default, which settings.py registers as 60 s. It is wrong
+# by six times on an installation polling at the ten seconds the setting
+# permits, which is why ``history`` takes the figure rather than assuming this
+# one.
 _POLL_SECONDS = 60
 
 # How far apart two readings have to be before the stretch between them counts
@@ -51,24 +49,41 @@ _POLL_SECONDS = 60
 _GAP_CADENCES = 2
 
 
-def _elapsed_or_default(stamps: Sequence[int], cadence_seconds: int = _POLL_SECONDS) -> int:
-    """How long one raw reading covers, taken from the window's own spacing.
+def _reading_seconds(stamps: Sequence[int], cadence_seconds: int) -> int:
+    """The most one raw reading may be credited with, in this window.
 
-    Measured rather than assumed because the spacing actually achieved need not
-    be the one configured — a poll takes as long as it takes, and the interval
-    is a floor rather than a promise. The median gap is taken rather than the
-    mean so that a poller stopped for an hour inside the window does not
-    inflate every reading's share; the hole then simply goes uncounted, which
-    is the right answer for a stretch nobody measured.
+    A reading is a sample of one poll period, so it can never account for more
+    than one poll interval: if two readings sit further apart than that, the
+    polls between them were never recorded and their energy is unknown rather
+    than attributable to the neighbours. Measured spacing can only *lower* that
+    bound, never raise it — which is the whole of the rule, ``min(median gap,
+    cadence)``, and what stops a window holding two readings three hours apart
+    from reporting six kilowatt-hours where thirty watt-hours were measured.
+
+    The median gap is what lowers it, and it is taken rather than the mean so a
+    poller stopped for an hour inside the window does not inflate every
+    reading's share. It matters for the one case the interval gets wrong in the
+    other direction: history recorded at ten seconds, read back under a setting
+    since raised to sixty, is genuinely six times denser than the setting says
+    and the measurement says so.
+
+    The residual, stated rather than hidden: the raw tier records no cadence of
+    its own, so history recorded at a *longer* interval than the one now
+    configured is under-counted — an hour of readings taken hourly, read under a
+    sixty-second setting, accounts for sixty seconds and not for the hour. That
+    is the safe direction to be wrong in by a wide margin: the alternative,
+    trusting the spacing, over-reported a sparse window by two hundred times.
+    Only the hourly tier can do better, and it does, by writing its coverage
+    down at the moment the interval was known.
 
     Fewer than two readings leaves no spacing to measure, so this falls back to
     the interval the caller says is in force: a lone reading has to be worth
     some duration or a one-sample window reports no energy at all.
     """
     if len(stamps) < 2:
-        return cadence_seconds
+        return max(1, cadence_seconds)
     gaps = sorted(b - a for a, b in pairwise(stamps))
-    return max(1, gaps[len(gaps) // 2])
+    return max(1, min(gaps[len(gaps) // 2], cadence_seconds))
 
 
 def _with_breaks(stamps: Sequence[int], cadence_seconds: int) -> list[int]:
@@ -185,11 +200,21 @@ class CircuitHistory:
     collection stopped instead of being drawn straight across the outage. See
     ``_with_breaks``; it is the same claim as any other null in the series, and
     a consumer needs no separate rule for it.
+
+    ``recorded_seconds`` is how much of the window the module was recording for
+    at all — the union across circuits, since a poll that reached one clamp
+    reached the monitor. It is here because it is measured from the same
+    coverage the energy is, and a caller that recomputed it from the timestamps
+    would be deriving in a second place the one figure that says whether these
+    circuits and the house counter describe the same span. A seven-day window
+    holding one reading an hour recorded seven hours, not seven days, and only
+    this number can say so.
     """
 
     timestamps: tuple[int, ...]
     series: tuple[CircuitSeries, ...]
     tier: str
+    recorded_seconds: int = 0
 
 
 class CircuitRepository:
@@ -339,19 +364,28 @@ class CircuitRepository:
         the energy are multiplied in one place so they cannot disagree.
 
         Energy comes from the readings rather than from the window. An hourly
-        bucket built from two of sixty samples covers two minutes, and
-        ``sample_count`` is stored precisely so that hour is not read as a
-        full one — coverage in minutes watched is not coverage in energy
+        bucket built from two of sixty samples covers two minutes, and how much
+        of the hour was recorded is stored precisely so that hour is not read as
+        a full one — coverage in minutes watched is not coverage in energy
         accounted for, and this is the figure the second question depends on.
 
-        ``cadence_seconds`` is the poll interval in force, and on the hourly
-        tier it is arithmetic rather than a hint: each of a bucket's
-        ``sample_count`` readings accounts for that many seconds of the hour.
-        The default matches the setting's own, but the owner may set it as low
-        as ten, and at ten a half-recorded hour holds 180 readings — which
-        multiplied by an assumed sixty runs past the hour, clamps back to it,
-        and reports half an hour as a whole one. The caller knows the interval;
-        an hourly row cannot be asked.
+        The hourly tier answers that from its own ``covered_seconds``, measured
+        by the rollup at a moment when the interval that produced the readings
+        was still the one in force. Nothing here guesses it, and that is the
+        point: passing today's setting to rows recorded under a different one
+        doubled the energy of every stored hour the day the bench interval was
+        raised from ten seconds to sixty. A row written before that column
+        existed holds NULL and falls back to exactly that guess —
+        ``sample_count`` times the interval now in force, clamped to the hour —
+        because its raw readings are pruned at thirty days and the measurement
+        cannot be made after the fact. An old hour read imperfectly beats an old
+        hour refused, but the fallback is written out here rather than left to
+        look like arithmetic.
+
+        ``cadence_seconds`` is the poll interval in force. It bounds the raw
+        tier, where no coverage was ever written down: one reading accounts for
+        at most one interval, and for less where the next reading came sooner.
+        See ``_reading_seconds`` for the rule and for what it costs.
 
         The timestamps are the ones that were recorded plus one per hole, so a
         stretch the module missed arrives as a null rather than as a straight
@@ -376,7 +410,7 @@ class CircuitRepository:
             ).fetchall()
             rows = self._store._conn.execute(
                 "SELECT timestamp, circuit_id, watts,"
-                f" {'sample_count' if counted else '1'}"
+                f" {'sample_count, covered_seconds' if counted else '1, NULL'}"
                 f"  FROM {table}"
                 "  WHERE timestamp >= ? AND timestamp < ?"
                 "  ORDER BY timestamp",
@@ -390,51 +424,66 @@ class CircuitRepository:
         meta = {int(row[0]): row for row in circuits if wanted is None or int(row[0]) in wanted}
         stamps = sorted({int(row[0]) for row in rows})
 
-        # What one row of the raw tier is taken to cover. Measured from the
-        # stamps the poll actually landed on rather than from the window, so a
-        # stretch nobody recorded contributes nothing instead of being smeared
-        # over the readings either side of it. Not consulted on the hourly
-        # tier, where sample_count says how much of each hour was recorded.
-        # Measured before the breaks are added, or the synthetic stamps would
-        # be counted as spacing and move the energy.
-        reading_seconds = _elapsed_or_default(stamps, cadence_seconds)
+        # The most one row of the raw tier may be credited with: one poll
+        # interval, lowered to the spacing the window achieved where that is
+        # tighter. Not consulted on the hourly tier, which stores its own
+        # coverage. Measured before the breaks are added, or the synthetic
+        # stamps would be counted as spacing and move the energy.
+        reading_seconds = _reading_seconds(stamps, cadence_seconds)
         # An hourly row covers an hour however often the module polled, so that
         # tier is judged against the hour. The raw tier is judged against the
-        # spacing it actually achieved rather than the interval in force, which
-        # is what stops an installation whose polls run long — or a stretch of
-        # history recorded at a different interval — from breaking at every
-        # ordinary reading.
+        # same bound its energy is, so a stretch nobody recorded breaks the line
+        # instead of being drawn straight across — which it was while the
+        # threshold came from the window's own spacing, since a window that is
+        # mostly hole measures the hole as its ordinary spacing.
         drawn = _with_breaks(stamps, _HOUR_SECONDS if counted else reading_seconds)
         slot = {stamp: index for index, stamp in enumerate(drawn)}
+        # The stamp after each recorded one, so a reading is credited with the
+        # distance to its successor rather than with a flat interval — a retried
+        # poll five seconds behind its predecessor is worth five seconds, not
+        # sixty. The same rule the rollup applies inside an hour.
+        following = dict(pairwise(stamps))
         watts: dict[int, list[int | None]] = {
             circuit_id: [None] * len(drawn) for circuit_id in meta
         }
         joules: dict[int, float] = dict.fromkeys(meta, 0.0)
         seen: set[int] = set()
         partial: set[int] = set()
-        for stamp, circuit_id, raw, samples in rows:
+        # How much of the window the module was recording for, per instant, as
+        # the widest coverage any one circuit had there: a poll that reached one
+        # clamp reached the monitor, and this is a fact about the module rather
+        # than about a circuit.
+        recorded_at: dict[int, int] = {}
+        for stamp, circuit_id, raw, samples, stored in rows:
             key = int(circuit_id)
             if key not in meta or raw is None:
                 continue
+            when = int(stamp)
             value = round(float(raw) * float(meta[key][5]))
-            watts[key][slot[int(stamp)]] = value
+            watts[key][slot[when]] = value
             seen.add(key)
             if counted:
                 # An hour holds 3,600 seconds however many readings landed in
-                # it. Told the interval that was actually running, a full hour's
-                # sample count multiplies back to exactly 3,600 and a
-                # half-recorded one to exactly 1,800 — but the interval is the
-                # owner's to change, and rows recorded at ten seconds read back
-                # under a setting since raised to sixty would credit an hour
-                # with six hours of energy. The clamp is what stops that, and
+                # it. ``covered_seconds`` is what the rollup measured while the
+                # interval that produced those readings was still in force, and
                 # ``partial`` is read off the same figure so the flag and the
-                # arithmetic cannot drift apart.
-                covered = min(int(samples) * cadence_seconds, _HOUR_SECONDS)
+                # arithmetic cannot drift apart. NULL is a row written before
+                # that column existed, and only there is the old guess used:
+                # the sample count times the interval running *now*, which is
+                # right until somebody changes the setting and wrong by the
+                # ratio afterwards.
+                covered = (
+                    min(int(stored), _HOUR_SECONDS)
+                    if stored is not None
+                    else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
+                )
                 if covered < _HOUR_SECONDS:
                     partial.add(key)
             else:
-                covered = reading_seconds
+                nxt = following.get(when)
+                covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
             joules[key] += value * covered
+            recorded_at[when] = max(recorded_at.get(when, 0), covered)
 
         series = [
             CircuitSeries(
@@ -453,7 +502,12 @@ class CircuitRepository:
         # Ordering a silence above a fact is what latest() already refuses to do
         # and this list is read top-down for the same reason.
         series.sort(key=lambda s: (s.kwh is None, -(s.kwh or 0.0), s.name))
-        return CircuitHistory(timestamps=tuple(drawn), series=tuple(series), tier=tier)
+        return CircuitHistory(
+            timestamps=tuple(drawn),
+            series=tuple(series),
+            tier=tier,
+            recorded_seconds=sum(recorded_at.values()),
+        )
 
 
 # Who decided a change. Two values rather than a boolean because the audit is

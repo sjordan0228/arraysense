@@ -1498,60 +1498,6 @@ function circuitEnergyRows(circuits) {
   return { ranked: all.filter(measured), unknown: all.filter((c) => !measured(c)) };
 }
 
-// How much of the window the module was actually recording for.
-//
-// Not "did any reading arrive": the repository puts a synthetic stamp carrying
-// nothing at the first instant a reading should have appeared and did not, so a
-// stretch nobody recorded is marked in the series itself. Each stamp that
-// carried a reading is credited with the distance to the next stamp, capped at
-// the spacing the window actually achieved so one stamp on the near side of a
-// three-hour hole cannot claim the hole.
-//
-// The cap is measured rather than assumed for the reason the repository
-// measures it: the achieved spacing is not the configured interval, and a
-// window answered from the hourly tier is spaced in hours rather than in polls.
-// ``cadence`` answers the one case a window cannot measure for itself, which is
-// a window holding a single stamp.
-function circuitRecordedSeconds(timestamps, circuits, cadence) {
-  const ts = timestamps || [];
-  if (!ts.length) return 0;
-  const gaps = [];
-  for (let i = 1; i < ts.length; i++) gaps.push(ts[i] - ts[i - 1]);
-  gaps.sort((a, b) => a - b);
-  const step = gaps.length ? Math.max(1, gaps[Math.floor(gaps.length / 2)]) : Math.max(1, cadence);
-  let covered = 0;
-  for (let i = 0; i < ts.length; i++) {
-    const heard = (circuits || []).some((c) => {
-      const v = c && c.watts ? c.watts[i] : null;
-      return typeof v === 'number' && isFinite(v);
-    });
-    if (!heard) continue;
-    covered += Math.min(i + 1 < ts.length ? ts[i + 1] - ts[i] : step, step);
-  }
-  return covered;
-}
-
-// Whether the circuits and the house describe the same span closely enough for
-// one to be read as a share of the other.
-//
-// Ninety per cent, and the number is the whole of this rule. A healthy
-// installation loses at most one poll at each edge of the window — two minutes
-// of the shortest range this page offers, three per cent — so this never fires
-// on ordinary operation. Below it the share is understated by more than a tenth
-// of its own value, which is more than a percentage rounded to whole numbers
-// can absorb, and the sentence stops describing what the reader thinks it does:
-// measured on the bench, a seven-day window in which the module had recorded
-// for six hours returned circuits 18.392 kWh, house 254.8 kWh, fraction 0.0722.
-// Every figure correct, and "monitored circuits cover 7% of the house" invites
-// the reader to conclude the house is barely monitored when the truth is that
-// the module was not running.
-const CIRCUIT_SPAN_ENOUGH = 0.9;
-
-function circuitSpanShort(recorded, windowSeconds) {
-  if (!(windowSeconds > 0)) return false;
-  return recorded < windowSeconds * CIRCUIT_SPAN_ENOUGH;
-}
-
 // A duration a person would say out loud. Minutes while that is the honest
 // grain, hours through the two spans this page offers in hours, days beyond.
 function circuitSpanWords(seconds) {
@@ -1610,13 +1556,34 @@ function circuitEnergyWords(kwh) {
 // carries no house figure for that span — only for the whole window — and
 // inventing one by assuming the house drew power evenly is exactly the estimate
 // this project refuses to dress as a meter reading.
-function circuitCoverageWords(coverage, recorded, windowSeconds) {
+//
+// Every one of those four decisions is the endpoint's. `spans_match` says
+// whether the two spans line up, `recorded_seconds` and `window_seconds` say by
+// how much, and the fraction is already null wherever it cannot honestly be
+// given — so this function chooses words and measures nothing. The threshold
+// that decides `spans_match` used to live here beside a browser-side count of
+// recorded time, and that count credited every hourly bucket holding anything
+// with a full hour: a week of one reading an hour read as a week recorded.
+function circuitCoverageWords(coverage) {
   const cov = coverage || {};
   const f = typeof cov.fraction === 'number' && isFinite(cov.fraction) ? cov.fraction : null;
-  const short = circuitSpanShort(recorded, windowSeconds);
+  const recorded = cov.recorded_seconds || 0;
+  const windowSeconds = cov.window_seconds || 0;
+  const short = cov.spans_match === false && windowSeconds > 0;
   const span = `The circuits recorded for ${circuitSpanWords(recorded)} of this `
     + `${circuitWindowWords(windowSeconds)} window`;
+  const known = (v) => typeof v === 'number' && isFinite(v);
   if (f === null) {
+    // Both figures present and the share still withheld means the spans are
+    // what does not line up, and that is a different sentence from a missing
+    // figure: there is nothing unknown here, only two numbers measured over
+    // different stretches of time. Said first, because the reasons below all
+    // begin from something not having been measured at all.
+    if (short && known(cov.circuits_kwh) && known(cov.house_kwh) && cov.house_kwh > 0) {
+      return `${span}, so their ${circuitEnergyWords(cov.circuits_kwh)} is not a share of the `
+        + `${circuitEnergyWords(cov.house_kwh)} the inverter's own counter recorded across the `
+        + 'whole of it. A range the module was running for will give the share.';
+    }
     // Three different facts arrive here and none of them may be said as
     // another. The endpoint leaves the share null when the circuits reported no
     // energy, when the house counter did not report, and when it reported but
@@ -1624,7 +1591,7 @@ function circuitCoverageWords(coverage, recorded, windowSeconds) {
     // the counter answered, and what it answered was nothing. Measured on the
     // bench, where a fake source holds load_energy_total_kwh at 44,721.0 across
     // every reading in the window.
-    const known = (v) => typeof v === 'number' && isFinite(v);
+    //
     // Named once, because the clause below is either a sentence of its own or
     // the tail of the span one, and "of this 6-hour window, and … across this
     // window" says it twice in a row.
@@ -1643,16 +1610,13 @@ function circuitCoverageWords(coverage, recorded, windowSeconds) {
     return short ? `${span}, and ${why}.` : why.charAt(0).toUpperCase() + why.slice(1) + '.';
   }
   if (f > 1) {
+    // No span clause here, and none is needed: the endpoint withholds the
+    // fraction outright once the spans stop lining up, so a number reaching
+    // this branch was divided from two figures covering the same window.
     return `These circuits account for ${circuitEnergyWords(cov.circuits_kwh)} against the `
       + `${circuitEnergyWords(cov.house_kwh)} on the inverter's own counter. A part cannot `
       + 'exceed the whole, so the two figures disagree rather than describing coverage — a '
-      + 'mains channel counted as a part, or a multiplier set for the wrong circuit.'
-      + (short ? ` ${span}, which is the other way two figures stop being comparable.` : '');
-  }
-  if (short) {
-    return `${span}, so their ${circuitEnergyWords(cov.circuits_kwh)} is not a share of the `
-      + `${circuitEnergyWords(cov.house_kwh)} the inverter's own counter recorded across the `
-      + 'whole of it. A range the module was running for will give the share.';
+      + 'mains channel counted as a part, or a multiplier set for the wrong circuit.';
   }
   return `Monitored circuits cover ${circuitShareWords(f)} of the house this window — `
     + `${circuitEnergyWords(cov.circuits_kwh)} of the ${circuitEnergyWords(cov.house_kwh)} the `
@@ -2354,11 +2318,10 @@ function drawCircuitSummary(body, host, view) {
   }
   const line = $('circuitCoverage');
   if (line) {
-    line.textContent = circuitCoverageWords(
-      body.coverage,
-      circuitRecordedSeconds(body.timestamps, circuits, circuitCadence),
-      range.seconds,
-    );
+    // The window is the endpoint's own figure rather than range.seconds. They
+    // agree, and that is the point: the span check was decided against the one
+    // the endpoint measured, so the sentence has to name the same one.
+    line.textContent = circuitCoverageWords(body.coverage);
   }
 }
 

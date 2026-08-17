@@ -321,7 +321,10 @@ def test_history_marks_a_partly_recorded_hour_partial(tmp_path: Path) -> None:
         repo.append_readings([Reading(100000, "1,2,3", 3000)], hour + timedelta(minutes=minute))
     # Integer epoch seconds, not datetimes.
     rebuild_circuit_hourly(
-        store._conn, int(hour.timestamp()), int((hour + timedelta(hours=1)).timestamp())
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
     )
 
     got = repo.history(hour, hour + timedelta(hours=1), tier="hourly")
@@ -343,7 +346,10 @@ def test_history_marks_a_half_recorded_hour_partial_at_a_fast_poll(tmp_path: Pat
     for tick in range(180):
         repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(seconds=10 * tick))
     rebuild_circuit_hourly(
-        store._conn, int(hour.timestamp()), int((hour + timedelta(hours=1)).timestamp())
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=10,
     )
 
     got = repo.history(hour, hour + timedelta(hours=1), tier="hourly", cadence_seconds=10)
@@ -503,7 +509,10 @@ def test_a_gap_does_not_make_a_full_hour_look_thinly_sampled(tmp_path: Path) -> 
         for tick in range(60):
             repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(minutes=tick))
     rebuild_circuit_hourly(
-        store._conn, int(first.timestamp()), int((third + timedelta(hours=1)).timestamp())
+        store._conn,
+        int(first.timestamp()),
+        int((third + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
     )
 
     got = repo.history(first, third + timedelta(hours=1), tier="hourly")
@@ -529,7 +538,10 @@ def test_the_hourly_tier_breaks_a_missing_hour_at_the_hour(tmp_path: Path) -> No
         for tick in (0, 30):
             repo.append_readings([Reading(100000, "1", 2000)], hour + timedelta(minutes=tick))
     rebuild_circuit_hourly(
-        store._conn, int(first.timestamp()), int((third + timedelta(hours=1)).timestamp())
+        store._conn,
+        int(first.timestamp()),
+        int((third + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
     )
 
     got = repo.history(first, third + timedelta(hours=1), tier="hourly")
@@ -538,6 +550,151 @@ def test_the_hourly_tier_breaks_a_missing_hour_at_the_hour(tmp_path: Path) -> No
     missing = int((first + timedelta(hours=1)).timestamp())
     assert got.timestamps == (int(first.timestamp()), missing, int(third.timestamp()))
     assert series.watts[1] is None
+
+
+def test_a_sparse_raw_window_credits_one_interval_per_reading(tmp_path: Path) -> None:
+    # The raw tier records no cadence of its own, so a reader has only the
+    # interval in force and the spacing it can measure. Trusting the spacing
+    # read two readings three hours apart as six kilowatt-hours where thirty
+    # watt-hours were measured — a reading is a sample of one poll period, and
+    # the polls that were never taken are unknown rather than the neighbours'.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Freezer", 1.0, "circuit")], start)
+    repo.append_readings([Reading(100000, "1", 1000)], start)
+    repo.append_readings([Reading(100000, "1", 1000)], start + timedelta(hours=3))
+
+    got = repo.history(start, start + timedelta(hours=4), tier="full", cadence_seconds=60)
+
+    (series,) = got.series
+    # Two readings, one minute each, at a kilowatt.
+    assert series.kwh == pytest.approx(2 * 60 * 1000 / 3_600_000)
+    assert got.recorded_seconds == 120, "two polls is two minutes recorded, not three hours"
+
+
+def test_a_window_that_is_mostly_hole_still_breaks_its_line(tmp_path: Path) -> None:
+    # The other half of the same defect. The break threshold came from the
+    # window's own spacing, and a window holding one gap measures that gap as
+    # its ordinary spacing — so the sparsest window there is, the one that most
+    # needs the break, was the one that never got it and drew a straight line
+    # across three unrecorded hours.
+    repo, store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Freezer", 1.0, "circuit")], start)
+    repo.append_readings([Reading(100000, "1", 1000)], start)
+    repo.append_readings([Reading(100000, "1", 1000)], start + timedelta(hours=3))
+
+    got = repo.history(start, start + timedelta(hours=4), tier="full", cadence_seconds=60)
+
+    (series,) = got.series
+    assert series.watts.count(None) == 1
+    assert got.timestamps[1] == int(start.timestamp()) + 60, (
+        "the break sits at the first instant a reading should have appeared"
+    )
+    store.close()
+
+
+def test_history_recorded_at_a_slower_interval_than_the_setting_is_not_inflated(
+    tmp_path: Path,
+) -> None:
+    # The residual, pinned rather than left implicit. Readings taken an hour
+    # apart and read back under a sixty-second setting account for a minute
+    # each, not an hour each. That under-reports, and it is the direction to be
+    # wrong in: the alternative over-reported a sparse window two hundredfold.
+    repo, store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Freezer", 1.0, "circuit")], start)
+    for hour in range(4):
+        repo.append_readings([Reading(100000, "1", 1000)], start + timedelta(hours=hour))
+
+    got = repo.history(start, start + timedelta(hours=4), tier="full", cadence_seconds=60)
+
+    assert got.series[0].kwh == pytest.approx(4 * 60 * 1000 / 3_600_000)
+    store.close()
+
+
+def test_a_stored_hour_does_not_move_when_the_poll_interval_changes(tmp_path: Path) -> None:
+    # The rollup writes down how much of the hour its readings account for,
+    # measured while the interval that produced them was still in force. Read
+    # back under a setting since raised from ten seconds to sixty, the same
+    # hour used to report twice the energy and call itself whole; now the
+    # setting cannot reach it at all.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], hour)
+    for tick in range(180):
+        repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(seconds=10 * tick))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=10,
+    )
+
+    at_ten = repo.history(hour, hour + timedelta(hours=1), tier="hourly", cadence_seconds=10)
+    at_sixty = repo.history(hour, hour + timedelta(hours=1), tier="hourly", cadence_seconds=60)
+
+    assert at_ten.series[0].kwh == pytest.approx(0.5)
+    assert at_sixty.series[0].kwh == pytest.approx(0.5)
+    assert at_ten.series[0].partial is True
+    assert at_sixty.series[0].partial is True
+    store.close()
+
+
+def test_an_hour_stored_before_coverage_was_recorded_falls_back_to_the_count(
+    tmp_path: Path,
+) -> None:
+    # An installation recording circuits since 1.1.0 has hours with no coverage
+    # figure, and their raw readings are pruned at thirty days so the
+    # measurement cannot be made after the fact. Those keep the old guess —
+    # sample count times the interval now in force — because an old hour read
+    # imperfectly beats an old hour refused. The fallback is deliberate and
+    # visible; what must never happen is a row like this reading as zero.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], hour)
+    for tick in range(30):
+        repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(minutes=tick))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
+    )
+    with store._conn:
+        store._conn.execute("UPDATE circuit_hourly SET covered_seconds = NULL")
+
+    got = repo.history(hour, hour + timedelta(hours=1), tier="hourly", cadence_seconds=60)
+
+    (series,) = got.series
+    assert series.kwh == pytest.approx(0.5), "thirty readings at a minute each is half an hour"
+    assert series.partial is True
+    store.close()
+
+
+def test_recorded_seconds_counts_coverage_and_not_the_buckets_that_hold_it(
+    tmp_path: Path,
+) -> None:
+    # What the span check turns on, and the figure the browser used to get
+    # wrong from the other side: it credited every hourly bucket holding
+    # anything with a full 3,600 seconds, so a week of one reading an hour read
+    # as a week recorded and no window was ever short.
+    repo, store = _repo(tmp_path)
+    first = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Oven", 1.0, "circuit")], first)
+    for hour in range(3):
+        repo.append_readings([Reading(100000, "1", 900)], first + timedelta(hours=hour))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(first.timestamp()),
+        int((first + timedelta(hours=3)).timestamp()),
+        cadence_seconds=60,
+    )
+
+    got = repo.history(first, first + timedelta(hours=3), tier="hourly", cadence_seconds=60)
+
+    assert got.recorded_seconds == 180, "three readings a minute each, not three hours"
+    store.close()
 
 
 # --- the charger audit ----------------------------------------------------

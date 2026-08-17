@@ -15,10 +15,16 @@ Emporia module has been recording since it shipped in 1.1.0, and nothing had
 ever queried.
 
 A minor version rather than a patch because a new endpoint and a new page tab
-are a feature, not a correction to an existing one. No migration is needed:
-the circuits' own raw and hourly tables already existed for the module's own
-readings, and this release only adds a way to read them. Nothing already
-stored is rewritten.
+are a feature, not a correction to an existing one.
+
+**This release adds a column, and it is applied automatically on the first
+start.** `circuit_hourly` gains `covered_seconds` — how much of each hour the
+readings behind it actually account for, measured when the hour is rolled up.
+Hours recorded before the upgrade have no figure and keep none: the raw
+readings they were built from are pruned after thirty days, so the measurement
+cannot be made after the fact, and inventing one would be worse than the
+estimate those hours already fall back to. **Nothing already stored is
+rewritten**, and hours recorded from the upgrade onwards are exact.
 
 ### Added
 
@@ -52,6 +58,16 @@ stored is rewritten.
 - **A circuit's name on the Emporia page is now a link to its own history**,
   a real link that can be copied and sent rather than a row that only means
   something inside that page.
+- **Circuit energy no longer depends on what the poll interval is set to
+  today.** How much of each hour its readings account for is measured when the
+  hour is summarised, minutes after the readings arrived, and stored with it.
+  Changing `emporia.interval` used to move the energy of every hour already
+  recorded — raising it from ten seconds to sixty doubled them, and each then
+  reported itself as a whole hour rather than the half it was. A window read at
+  full resolution is bounded the same way: one reading accounts for at most one
+  poll interval, so two readings three hours apart are worth two minutes of
+  energy rather than six kilowatt-hours, and the three hours nobody recorded
+  break the line instead of being drawn straight across.
 
 ## 1.1.0 — 16 August 2026
 

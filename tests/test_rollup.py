@@ -954,7 +954,7 @@ def test_an_hour_of_readings_becomes_one_row_per_circuit() -> None:
             "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 2, 50)",
             (hour + minute * 60,),
         )
-    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
 
     rows = dict(
         (row[0], (row[1], row[2]))
@@ -980,7 +980,7 @@ def test_an_hour_of_silence_averages_to_nothing_rather_than_zero() -> None:
             "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
             (hour + minute * 60,),
         )
-    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
 
     row = conn.execute(
         "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
@@ -1001,7 +1001,7 @@ def test_a_partly_silent_hour_averages_only_what_was_heard() -> None:
         "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
         (hour + 60,),
     )
-    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
 
     row = conn.execute(
         "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
@@ -1020,7 +1020,88 @@ def test_rebuilding_the_same_hour_twice_does_not_double_it() -> None:
     conn.execute(
         "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 80)", (hour,)
     )
-    rebuild_circuit_hourly(conn, hour, hour + 3600)
-    rebuild_circuit_hourly(conn, hour, hour + 3600)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
     assert conn.execute("SELECT COUNT(*) FROM circuit_hourly").fetchone()[0] == 1
+    conn.close()
+
+
+def test_coverage_is_measured_here_because_only_here_knows_the_interval() -> None:
+    # The whole of the fix. Thirty minutes of readings at ten seconds is 1,800
+    # seconds of the hour, and this is the only moment anything can say so: by
+    # the time a page asks, the owner may have changed the interval, and the
+    # same sample count would then mean six times as much.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for tick in range(180):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+            (hour + tick * 10,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=10)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (180, 1800)
+    conn.close()
+
+
+def test_coverage_comes_from_the_stamps_and_never_exceeds_the_hour() -> None:
+    # Measured from the real timestamps rather than multiplied out of the
+    # count, so a retried poll landing seconds behind its predecessor adds
+    # seconds and not a whole interval. And an hour holds 3,600 seconds however
+    # generously the last reading's own period runs past the end of it.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    # A poll at the top of the hour, a retry five seconds later, and one at the
+    # half hour. At a sixty-second interval that is 5 + 60 + 60 seconds.
+    for offset in (0, 5, 1800):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 700)",
+            (hour + offset,),
+        )
+    # One reading in the hour at an hourly interval claims the hour and no more.
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 2, 700)",
+        (hour + 1800,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    rebuild_circuit_hourly(conn, hour + 3600, hour + 7200, cadence_seconds=3600)
+
+    retried = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert retried == (125,), "5 + 60 + 60, not three whole intervals"
+
+    conn.execute("DELETE FROM circuit_hourly")
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=3600)
+    lone = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 2"
+    ).fetchone()
+    assert lone == (3600,), "capped at the hour it sits in"
+    conn.close()
+
+
+def test_an_hour_nobody_answered_stores_zero_coverage_rather_than_unknown() -> None:
+    # NULL in this column means one thing only: a row written before the column
+    # existed, which a reader falls back to a guess for. An hour that really
+    # recorded nothing has to say zero, or the two become the same row.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (0, 0)
     conn.close()
