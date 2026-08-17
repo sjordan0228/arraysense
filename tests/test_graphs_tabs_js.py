@@ -1,5 +1,5 @@
 """test_graphs_tabs_js.py — every section of the Graphs page has a tab, the
-weather pin round-trips, and the circuit strips are chosen by rule.
+weather pin round-trips, and the circuit strips and summary are chosen by rule.
 
 The Graphs page's tab bar, weather pin and circuit-strip selection are pure
 decisions — which tab is open, whether a section is on screen, what the pin is
@@ -321,3 +321,143 @@ def test_a_window_nobody_reported_in_is_not_worth_a_section() -> None:
     assert results["none"] == "false"
     assert results["empty"] == "false", "an enabled module with no circuits draws no section"
     assert results["nothing"] == "false", "nothing fetched is not a section either"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_summary_opens_on_energy_and_remembers_the_other() -> None:
+    # Energy is the default because it needs no hue at all: length carries the
+    # whole meaning of a ranked bar, and the palette this project validated
+    # holds five colours against a stack that wants one per band. A stored
+    # value that names no view falls back rather than blanking the panel.
+    out = _run(
+        "console.log('fresh:' + circuitViewOf(null));\n"
+        "console.log('held:' + circuitViewOf('split'));\n"
+        "console.log('back:' + circuitViewOf('energy'));\n"
+        "console.log('junk:' + circuitViewOf('sankey'));\n"
+        "console.log('default:' + DEFAULT_CIRCUIT_VIEW);",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["fresh"] == "energy", "a browser that has never chosen opens on Energy"
+    assert results["held"] == "split", "the other view survives a reload"
+    assert results["back"] == "energy"
+    assert results["junk"] == "energy", "a key naming no view must not blank the panel"
+    assert results["default"] == "energy"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_circuit_with_no_energy_figure_is_listed_rather_than_ranked() -> None:
+    # The rule this panel turns on. A null kWh is not a zero-length bar: "used
+    # no energy" and "nobody heard from it" are different claims, and drawing
+    # the second as the first puts a dead outlet at the foot of a ranking as
+    # though it were merely quiet. A measured zero is a reading and keeps its
+    # bar. The order is the endpoint's own ranking and is not sorted again.
+    out = _run(
+        "const dryer = {id: 1, name: 'Dryer', kwh: 4.2, watts: [4000]};\n"
+        "const idle = {id: 2, name: 'Porch', kwh: 0, watts: [0]};\n"
+        "const dead = {id: 3, name: 'Shed', kwh: null, watts: [null]};\n"
+        "const rows = circuitEnergyRows([dryer, idle, dead]);\n"
+        "console.log('ranked:' + rows.ranked.map(c => c.name).join(','));\n"
+        "console.log('unknown:' + rows.unknown.map(c => c.name).join(','));\n"
+        "console.log('empty:' + circuitEnergyRows(null).ranked.length);",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["ranked"] == "Dryer,Porch", "a reading of no energy is still a reading"
+    assert results["unknown"] == "Shed", "a circuit nobody heard from is not ranked at zero"
+    assert results["empty"] == "0"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_recorded_seconds_count_what_was_heard_and_not_the_holes() -> None:
+    # The measurement the coverage sentence is qualified by. A stamp that
+    # carried a reading is credited with the distance to the next one, capped at
+    # the spacing the window achieved — so the stamp on the near side of a
+    # three-hour hole cannot claim the hole. The repository's synthetic nulls
+    # are what mark the far side of it.
+    out = _run(
+        "const solid = [{watts: [10, 10, 10, 10]}];\n"
+        "console.log('solid:' + circuitRecordedSeconds([0, 60, 120, 180], solid, 60));\n"
+        "const holed = [{watts: [10, null, 10, 10]}];\n"
+        "console.log('holed:' + circuitRecordedSeconds([0, 60, 10000, 10060], holed, 60));\n"
+        "console.log('lone:' + circuitRecordedSeconds([0], [{watts: [10]}], 60));\n"
+        "console.log('none:' + circuitRecordedSeconds([], [], 60));\n"
+        "console.log('silent:' + circuitRecordedSeconds([0, 60], [{watts: [null, null]}], 60));",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["solid"] == "240", "four minute-spaced readings cover four minutes"
+    assert results["holed"] == "180", "the hole belongs to nobody, not to the reading before it"
+    assert results["lone"] == "60", "one stamp covers one poll, measured from the given cadence"
+    assert results["none"] == "0"
+    assert results["silent"] == "0", "stamps carrying nothing are not time recorded"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_coverage_line_says_the_right_one_of_its_four_things() -> None:
+    # The line that can state a falsehood with every number in it correct. Four
+    # states, and three of them are a statement about what cannot be divided.
+    #
+    # The fourth is the one measured on the bench: a seven-day window in which
+    # the module had recorded for six hours returned circuits 18.392 kWh, house
+    # 254.8 kWh, fraction 0.0722. "Monitored circuits cover 7% of the house"
+    # invites the reader to conclude the house is barely monitored, when the
+    # truth is that the module was not running. The percentage is withheld there
+    # rather than re-based, because this response carries no house figure for
+    # the recorded span and assuming the house drew evenly would be an estimate
+    # wearing a meter reading's clothes.
+    out = _run(
+        "const w6 = 6 * 3600, w7 = 7 * 86400;\n"
+        "console.log('normal:' + circuitCoverageWords("
+        "{circuits_kwh: 8.1, house_kwh: 11.4, fraction: 0.7105}, w6, w6));\n"
+        "console.log('unknown:' + circuitCoverageWords("
+        "{circuits_kwh: 8.1, house_kwh: null, fraction: null}, w6, w6));\n"
+        "console.log('over:' + circuitCoverageWords("
+        "{circuits_kwh: 12.4, house_kwh: 9.8, fraction: 1.2653}, w6, w6));\n"
+        "console.log('short:' + circuitCoverageWords("
+        "{circuits_kwh: 18.392, house_kwh: 254.8, fraction: 0.0722}, 21600, w7));",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["normal"] == (
+        "Monitored circuits cover 71% of the house this window — 8.10 kWh of 11.40 kWh."
+    )
+    assert results["unknown"] == (
+        "The house's own energy is unknown for this window, so the share these circuits "
+        "account for cannot be given."
+    ), "a null share is neither 0% nor 100%"
+    assert "0%" not in results["unknown"] and "100%" not in results["unknown"]
+    assert results["over"].startswith(
+        "These circuits account for 12.40 kWh against the house's own 9.80 kWh."
+    ), "a part above the whole is a fault reporting itself, shown as both figures"
+    assert "127%" not in results["over"] and "100%" not in results["over"], (
+        "the endpoint stopped clamping so this line could tell the truth; it must not clamp either"
+    )
+    assert results["short"] == (
+        "The circuits recorded for 6.0 h of this 7-day window, so their 18.39 kWh is not a "
+        "share of the house's 254.8 kWh across the whole of it. A range the module was "
+        "running for will give the share."
+    )
+    assert "7%" not in results["short"], (
+        "the ratio of two different spans is not a coverage figure and must not be printed"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_healthy_window_is_not_qualified_and_a_gappy_one_is() -> None:
+    # The threshold is 90% of the window, and it has to clear ordinary
+    # operation: a healthy installation loses at most one poll at each edge,
+    # which is two minutes of the shortest range this page offers.
+    out = _run(
+        "const w6 = 6 * 3600;\n"
+        "console.log('healthy:' + circuitSpanShort(w6 - 120, w6));\n"
+        "console.log('edge:' + circuitSpanShort(w6 * 0.9, w6));\n"
+        "console.log('gappy:' + circuitSpanShort(w6 * 0.34, w6));\n"
+        "console.log('nowindow:' + circuitSpanShort(0, 0));",
+        marker="circuit-summary",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["healthy"] == "false", "one poll lost at each edge is not a qualified window"
+    assert results["edge"] == "false", "the threshold is a floor, not an exclusive bound"
+    assert results["gappy"] == "true", "a third of the window recorded must be said out loud"
+    assert results["nowindow"] == "false", "no window is not a short one"

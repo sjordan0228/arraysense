@@ -61,6 +61,41 @@
     cursor:pointer;margin:10px 0 0 48px}
   .more:hover{color:var(--ink)}
   .more:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* The circuits summary: two readings of the same window with a switch between
+     them. Indented to 48px like the band labels, so the panel sits over the
+     plots below rather than over their y axis. */
+  .csum{margin:0 0 18px 48px}
+  .csumhead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin:0 0 10px}
+  /* The view switch. Not the tab bar and not the weather pin — it chooses which
+     of two pictures of one answer is drawn, so it takes the quiet tinted
+     pressed state rather than the amber that means "this is the open tab". */
+  .vsw{display:flex;gap:4px}
+  .vsw button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
+    border-radius:9px;padding:6px 13px;font:inherit;font-size:12px;line-height:1.4;cursor:pointer}
+  .vsw button:hover{color:var(--ink2)}
+  .vsw button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  .vsw button:focus-visible{outline:2px solid var(--load);outline-offset:2px}
+  /* The ranked bars. Hand-written SVG, so it scales with the panel rather than
+     being laid out in pixels the way a chart is. */
+  .cbars{display:block;width:100%;height:auto}
+  .cbars .cbar{cursor:pointer}
+  .cbars .cbar:focus-visible{outline:2px solid var(--load);outline-offset:1px}
+  .cbars .cbar .hit{fill:transparent}
+  .cbars .cbar:hover .hit,.cbars .cbar:focus-visible .hit{fill:var(--tint)}
+  /* Length carries the meaning here and hue carries nothing, so every bar is
+     the same neutral ink. --ink3 is a surface shade rather than one of the five
+     measured data hues, so no series colour is at stake. */
+  .cbars .fill{fill:var(--ink3)}
+  .cbars .nm{fill:var(--ink2);font-size:12px}
+  .cbars .fig{fill:var(--ink);font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-variant-numeric:tabular-nums}
+  .cbars .part{fill:var(--ink3);font-size:10.5px}
+  .csilent{margin-top:12px}
+  .csilent .band.silent .bandlab{margin-left:0}
+  .cnote{font-size:11px;color:var(--ink3);line-height:1.55;margin:10px 0 0;max-width:78ch}
+  /* The coverage sentence. Prose rather than a figure, because three of its
+     four shapes are a statement about what cannot be divided. */
+  .cover{font-size:11.5px;color:var(--ink2);line-height:1.6;margin:12px 0 0;max-width:78ch}
   /* Said when the selected tab has nothing to show. Every other tab hides its
      sections and leaves the bands to say "nothing recorded" themselves, but a
      tab whose whole section is withheld draws no bands at all — so without
@@ -197,6 +232,24 @@
          not this one's. -->
     <div class="chead"><h2>Circuits</h2>
       <span class="legend muted" id="circuitRes">per-circuit power from the Emporia module</span>
+    </div>
+    <!-- The window summarised, above the strips and from the same response.
+         Two readings of one answer: the energy each circuit used, ranked, and
+         the same circuits stacked under the house's own load over time. Energy
+         is the default because a ranked bar chart is the one summary form that
+         needs no colour at all. -->
+    <div class="csum" id="circuitSummary" hidden>
+      <div class="csumhead">
+        <div class="vsw" id="circuitViews" role="group" aria-label="Summary view"></div>
+        <span class="legend muted" id="circuitSummaryNote"></span>
+      </div>
+      <div id="circuitEnergy"></div>
+      <div id="circuitSplit" hidden>
+        <div class="chart" id="circSplitWrap" role="img"
+             aria-label="House load split by circuit over the selected range"></div>
+        <p class="cnote" id="circuitStackOrder"></p>
+      </div>
+      <p class="cover" id="circuitCoverage"></p>
     </div>
     <div id="circuitBands"></div>
   </section>
@@ -1338,6 +1391,201 @@ function circuitsWorthDrawing(body) {
 }
 // <<< circuit-rules
 
+// ---------------------------------------------------------------------------
+// The summary panel's rules.
+//
+// Two pictures of one window and the sentence under them, sliced apart from the
+// drawing for the same reason the strip rules are: which circuits get a bar and
+// which get a dash, and what the coverage line says in each of the four states
+// it has, are decisions a browser is not needed to check — and the coverage
+// line is the one thing on this page that can state a falsehood while every
+// number in it is arithmetically correct.
+// >>> circuit-summary
+
+// Which picture the panel is drawing. Energy is the default because it needs no
+// hue: length carries the whole meaning of a ranked bar, and the owner of this
+// installation is colour blind. The split needs one fill per band and the
+// validated palette holds five hues in total, so it is the alternative rather
+// than the opening view.
+const CIRCUIT_VIEWS = [
+  { key: 'energy', title: 'Energy this window' },
+  { key: 'split', title: 'Split by circuit' },
+];
+const DEFAULT_CIRCUIT_VIEW = 'energy';
+
+// A remembered view, or the default. Anything that does not name a view falls
+// back rather than blanking the panel — a key written by an older build, or by
+// a hand editing localStorage, must not leave the section drawing nothing.
+function circuitViewOf(stored) {
+  return CIRCUIT_VIEWS.some((v) => v.key === stored) ? stored : DEFAULT_CIRCUIT_VIEW;
+}
+
+// How many circuits the stack names one at a time. Two, and the number was
+// decided by measurement rather than by taste: the stack's fills are one hue at
+// three strengths, and validate_palette.js scores four strengths at ΔE 9.2
+// under deuteranopia with the faintest of them only 6.7 from the panel behind
+// it — a band that all but vanishes. Three separate at 12.4 and sit 10.9 clear
+// of the panel. Adding a hue instead was the other way out and is not open
+// here: every hue in the palette was measured against every other, and one
+// nobody checked is one that may be invisible to the reader. So the band count
+// gave way, and the two largest circuits are named while the rest are one band.
+const CIRCUIT_STACK_NAMED = 2;
+
+// Split the answer into the circuits that have an energy figure and the ones
+// that do not. A null kWh is not a zero-length bar: "it used no energy" and
+// "nobody heard from it" are different claims, and a bar chart that draws the
+// second as the first puts a dead outlet at the foot of a ranking as though it
+// were merely a quiet one. The order is the endpoint's own ranking by energy;
+// it is not re-sorted here, because the bars and the strips are two renderings
+// of one answer and a second sort is a second place for them to disagree.
+function circuitEnergyRows(circuits) {
+  const all = circuits || [];
+  const measured = (c) => typeof c.kwh === 'number' && isFinite(c.kwh);
+  return { ranked: all.filter(measured), unknown: all.filter((c) => !measured(c)) };
+}
+
+// How much of the window the module was actually recording for.
+//
+// Not "did any reading arrive": the repository puts a synthetic stamp carrying
+// nothing at the first instant a reading should have appeared and did not, so a
+// stretch nobody recorded is marked in the series itself. Each stamp that
+// carried a reading is credited with the distance to the next stamp, capped at
+// the spacing the window actually achieved so one stamp on the near side of a
+// three-hour hole cannot claim the hole.
+//
+// The cap is measured rather than assumed for the reason the repository
+// measures it: the achieved spacing is not the configured interval, and a
+// window answered from the hourly tier is spaced in hours rather than in polls.
+// ``cadence`` answers the one case a window cannot measure for itself, which is
+// a window holding a single stamp.
+function circuitRecordedSeconds(timestamps, circuits, cadence) {
+  const ts = timestamps || [];
+  if (!ts.length) return 0;
+  const gaps = [];
+  for (let i = 1; i < ts.length; i++) gaps.push(ts[i] - ts[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const step = gaps.length ? Math.max(1, gaps[Math.floor(gaps.length / 2)]) : Math.max(1, cadence);
+  let covered = 0;
+  for (let i = 0; i < ts.length; i++) {
+    const heard = (circuits || []).some((c) => {
+      const v = c && c.watts ? c.watts[i] : null;
+      return typeof v === 'number' && isFinite(v);
+    });
+    if (!heard) continue;
+    covered += Math.min(i + 1 < ts.length ? ts[i + 1] - ts[i] : step, step);
+  }
+  return covered;
+}
+
+// Whether the circuits and the house describe the same span closely enough for
+// one to be read as a share of the other.
+//
+// Ninety per cent, and the number is the whole of this rule. A healthy
+// installation loses at most one poll at each edge of the window — two minutes
+// of the shortest range this page offers, three per cent — so this never fires
+// on ordinary operation. Below it the share is understated by more than a tenth
+// of its own value, which is more than a percentage rounded to whole numbers
+// can absorb, and the sentence stops describing what the reader thinks it does:
+// measured on the bench, a seven-day window in which the module had recorded
+// for six hours returned circuits 18.392 kWh, house 254.8 kWh, fraction 0.0722.
+// Every figure correct, and "monitored circuits cover 7% of the house" invites
+// the reader to conclude the house is barely monitored when the truth is that
+// the module was not running.
+const CIRCUIT_SPAN_ENOUGH = 0.9;
+
+function circuitSpanShort(recorded, windowSeconds) {
+  if (!(windowSeconds > 0)) return false;
+  return recorded < windowSeconds * CIRCUIT_SPAN_ENOUGH;
+}
+
+// A duration a person would say out loud. Minutes while that is the honest
+// grain, hours through the two spans this page offers in hours, days beyond.
+function circuitSpanWords(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  if (s < 5400) return `${Math.round(s / 60)} min`;
+  const hours = s / 3600;
+  if (hours < 48) return `${hours < 10 ? hours.toFixed(1) : hours.toFixed(0)} h`;
+  return `${(s / 86400).toFixed(1)} d`;
+}
+
+// The window as an adjective — "6-hour", "7-day" — so the sentence reads as a
+// sentence rather than as a number with a unit stapled to it. A single day is
+// said in hours, because the button that asked for it says 24h and a sentence
+// naming it a "1-day window" reads as a different range from the one pressed.
+function circuitWindowWords(seconds) {
+  const s = Math.max(1, Math.round(seconds || 0));
+  return s % 86400 === 0 && s >= 2 * 86400 ? `${s / 86400}-day` : `${Math.round(s / 3600)}-hour`;
+}
+
+// A share as text. A sliver genuinely present but too small to round to a tenth
+// is written as under one rather than as 0%, which would say these circuits
+// account for none of the house — the same distinction between small and absent
+// the em dash keeps everywhere else. This deliberately repeats common.js's
+// sankeyPercent rather than calling it: this slice is extracted and run under
+// bare node, where nothing of common.js exists.
+function circuitShareWords(fraction) {
+  const pct = fraction * 100;
+  if (pct > 0 && pct < 0.05) return '<0.1%';
+  return (pct >= 9.95 ? pct.toFixed(0) : pct.toFixed(1)) + '%';
+}
+
+// An energy figure, or prose where there is none. Never a dash inside a
+// sentence: "an unknown amount" is what the sentence means, and a dash mid-line
+// reads as a typo rather than as an absence.
+function circuitEnergyWords(kwh) {
+  if (typeof kwh !== 'number' || !isFinite(kwh)) return 'an unknown amount';
+  return `${kwh < 100 ? kwh.toFixed(2) : kwh.toFixed(1)} kWh`;
+}
+
+// The sentence under the bars, in the four states it has.
+//
+// A fraction at or below one is coverage and is said as such. A null fraction
+// is not zero coverage and not full coverage: the house's own counter did not
+// answer, and a share against an unknown denominator would read as either of
+// the two things it certainly is not. A fraction above one is not a coverage
+// figure at all — a part cannot exceed the whole — so it is a fault reporting
+// itself, and the endpoint deliberately stopped clamping it so this line could
+// say so rather than draw a full bar over a mains channel that escaped the
+// exclusion.
+//
+// And the fourth, which is the one every number in it is correct for: the
+// circuits may have recorded for a fraction of the window the house counter
+// covered, in which case the ratio is arithmetic between two different spans.
+// The percentage is withheld there and both figures are shown instead. It is
+// withheld rather than re-based on the recorded span because this response
+// carries no house figure for that span — only for the whole window — and
+// inventing one by assuming the house drew power evenly is exactly the estimate
+// this project refuses to dress as a meter reading.
+function circuitCoverageWords(coverage, recorded, windowSeconds) {
+  const cov = coverage || {};
+  const f = typeof cov.fraction === 'number' && isFinite(cov.fraction) ? cov.fraction : null;
+  const short = circuitSpanShort(recorded, windowSeconds);
+  const span = `The circuits recorded for ${circuitSpanWords(recorded)} of this `
+    + `${circuitWindowWords(windowSeconds)} window`;
+  if (f === null) {
+    return short
+      ? `${span}, and the house's own energy is unknown for it, so the share these circuits `
+        + 'account for cannot be given.'
+      : "The house's own energy is unknown for this window, so the share these circuits "
+        + 'account for cannot be given.';
+  }
+  if (f > 1) {
+    return `These circuits account for ${circuitEnergyWords(cov.circuits_kwh)} against the `
+      + `house's own ${circuitEnergyWords(cov.house_kwh)}. A part cannot exceed the whole, so `
+      + 'the two figures disagree rather than describing coverage — a mains channel counted as '
+      + 'a part, or a multiplier set for the wrong circuit.'
+      + (short ? ` ${span}, which is the other way two figures stop being comparable.` : '');
+  }
+  if (short) {
+    return `${span}, so their ${circuitEnergyWords(cov.circuits_kwh)} is not a share of the `
+      + `house's ${circuitEnergyWords(cov.house_kwh)} across the whole of it. A range the `
+      + 'module was running for will give the share.';
+  }
+  return `Monitored circuits cover ${circuitShareWords(f)} of the house this window — `
+    + `${circuitEnergyWords(cov.circuits_kwh)} of ${circuitEnergyWords(cov.house_kwh)}.`;
+}
+// <<< circuit-summary
+
 // The bands currently in the DOM, rebuilt when the drawn set changes and left
 // alone when it does not — so an ordinary refresh updates five charts in place
 // and keeps the zoom on them, exactly as the pack bands do.
@@ -1396,6 +1644,10 @@ function rebuildCircuits(rows, hidden) {
     // the endpoint's `id` — but this is rebuilt whenever the drawn set changes,
     // so a positional handle cannot outlive the row it was handed to.
     sec: 'circuits', id: 'circ' + i, label: r.name, kind: 'power', ink: '--load',
+    // The endpoint's own circuit id, carried beside the DOM handle so a bar in
+    // the summary above can find the strip it belongs to. The handle cannot
+    // answer that: it is positional and changes the moment the drawn set does.
+    cid: r.id,
     // The kind, where it is one worth saying. Emporia calls an ordinary clamp a
     // circuit, which the section heading has already said.
     source: r.kind === 'circuit' ? '' : r.kind,
@@ -1461,6 +1713,422 @@ function drawCircuits(body) {
     if (b.silent) return;
     paintBand(b, xs, [rows[i].watts.map(numOrNull)], { key: 'graphs-circuits' });
   });
+  // The panel above the strips, from this same answer. It is drawn after them
+  // so a click on a bar has strips to scroll to on the very first paint.
+  drawCircuitSummary(body, $('circuitSummary'), circuitView);
+}
+
+// ---------------------------------------------------------------------------
+// The summary panel.
+//
+// Above the strips, from the same response and never a second request. Two
+// readings of one window with a switch between them, remembered per browser the
+// way the open tab is.
+// ---------------------------------------------------------------------------
+
+// The chosen view, held under the `as.` prefix every other per-browser choice
+// on this site uses — the open tab, the pin, the theme — so this is the same
+// mechanism rather than a second one.
+const CIRCUIT_VIEW_KEY = 'as.graphsCircuitView';
+let circuitView = DEFAULT_CIRCUIT_VIEW;
+
+// What the bars are currently drawn from, so an ordinary refresh leaves them
+// alone. Rebuilding the markup on every poll would take the keyboard focus off
+// a bar somebody had tabbed to, and would do it once a minute.
+let circuitBarKey = '';
+
+// The split chart's own handle. It is not one of the strips: it has its own
+// height, its own y scale over the whole house rather than one circuit's peak,
+// and it must be torn down when the panel has nothing to draw.
+const CIRCUIT_SPLIT_ID = 'circSplit';
+const SPLIT_H = 190;
+
+// The geometry of the ranked bars, in the SVG's own user units. The name column
+// is wide enough for the reference account's longest circuit name, the track is
+// what is left, and the figure is right-aligned at the far edge so a column of
+// them lines up under tabular numerals.
+const BAR_VB_W = 900;
+const BAR_ROW_H = 21;
+const BAR_TRACK_X = 250;
+const BAR_TRACK_W = 500;
+const BAR_H = 9;
+// A name longer than this is cut rather than allowed to run under the track.
+// SVG has no text overflow of its own, so the cut has to happen in the string.
+const BAR_NAME_CHARS = 34;
+
+const barName = (name) => (name.length > BAR_NAME_CHARS
+  ? name.slice(0, BAR_NAME_CHARS - 1) + '…'
+  : name);
+
+// One bar per circuit, longest first, in a single neutral ink. Length carries
+// the whole meaning here — that is exactly why this is the default view and not
+// the stack, which needs a fill per band and a palette that has been measured.
+// A circuit measured at nothing gets no bar and keeps its figure, because a
+// measured zero is a reading; a circuit nobody heard from is not on this list
+// at all and is named below it instead.
+function circuitBarsSvg(ranked) {
+  const peak = ranked.reduce((m, c) => (c.kwh > m ? c.kwh : m), 0);
+  const height = ranked.length * BAR_ROW_H + 4;
+  const rows = ranked.map((c, i) => {
+    const y = i * BAR_ROW_H;
+    const text = y + BAR_ROW_H / 2 + 4;
+    // A hair of width for a figure that is small but genuinely present, and
+    // nothing at all for a measured zero. The two are different readings and
+    // the bar must not round the first away into the second.
+    const w = peak > 0 && c.kwh > 0 ? Math.max(1.5, (c.kwh / peak) * BAR_TRACK_W) : 0;
+    const figure = circuitEnergyWords(c.kwh);
+    const label = `${c.name}, ${figure}${c.partial ? ', partial' : ''}`;
+    return `<g class="cbar" data-id="${esc(String(c.id))}" role="button" tabindex="0"
+      aria-label="${esc(label)}">`
+      + `<rect class="hit" x="0" y="${y}" width="${BAR_VB_W}" height="${BAR_ROW_H}" rx="4"/>`
+      + `<text class="nm" x="4" y="${text}">${esc(barName(c.name))}</text>`
+      + (w > 0 ? `<rect class="fill" x="${BAR_TRACK_X}" y="${y + (BAR_ROW_H - BAR_H) / 2}"
+        width="${w.toFixed(1)}" height="${BAR_H}" rx="2"/>` : '')
+      + `<text class="fig" x="${BAR_VB_W - 4}" y="${text}" text-anchor="end">${esc(figure)}`
+      // Said beside the figure rather than instead of it. The number is what was
+      // measured; `partial` says the buckets behind it were not fully recorded,
+      // which is a label on a real figure and not a doubt about it.
+      + (c.partial ? '<tspan class="part"> · partial</tspan>' : '')
+      + '</text></g>';
+  });
+  return `<svg class="cbars" viewBox="0 0 ${BAR_VB_W} ${height}" role="group"
+    aria-label="Energy by circuit over the selected range"
+    preserveAspectRatio="xMinYMin meet">${rows.join('')}</svg>`;
+}
+
+// The circuits with no energy figure, under the bars rather than among them.
+// Same row as a silent strip gets, for the same reason and in the same words:
+// a dash is what an unmeasured quantity looks like everywhere on this site, and
+// a zero-length bar would be a claim that the circuit drew nothing.
+function circuitUnknownHtml(unknown) {
+  if (!unknown.length) return '';
+  const rows = unknown.map((c) => circuitSilentHtml({
+    label: c.name,
+    why: circuitWhy(c, offlineWords(c.offline_since)),
+  })).join('');
+  return `<div class="csilent"><p class="cnote">Not ranked — no energy was measured for `
+    + `${unknown.length === 1 ? 'this circuit' : 'these circuits'} in this window.</p>`
+    + `${rows}</div>`;
+}
+
+// A bar and its strip are two renderings of one answer and are already in the
+// same order, so a click scrolls and never asks the endpoint anything. A bar
+// whose strip is behind the expander expands it first, from the answer already
+// held — the alternative is a control that does nothing for the twenty-fourth
+// circuit on the list.
+function scrollToCircuit(id) {
+  const find = () => circuitBands.findIndex((b) => String(b.cid) === String(id));
+  if (find() < 0) {
+    circuitsExpanded = true;
+    drawCircuits(lastCircuits);
+  }
+  const at = find();
+  if (at < 0) return;
+  const el = $(circuitBands[at].id + 'Wrap');
+  if (el && el.scrollIntoView) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function wireCircuitBars(host) {
+  host.querySelectorAll('.cbar').forEach((g) => {
+    const go = () => scrollToCircuit(g.dataset.id);
+    g.addEventListener('click', go);
+    g.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
+    });
+  });
+}
+
+function drawCircuitEnergy(rows) {
+  const host = $('circuitEnergy');
+  if (!host) return;
+  const key = rows.ranked.map((c) => `${c.id}:${c.kwh}:${c.partial ? 'p' : ''}`).join(' ')
+    + '|' + rows.unknown.map((c) => c.id).join(' ');
+  if (key === circuitBarKey) return;
+  circuitBarKey = key;
+  host.innerHTML = (rows.ranked.length ? circuitBarsSvg(rows.ranked) : '')
+    + circuitUnknownHtml(rows.unknown);
+  wireCircuitBars(host);
+}
+
+// The house's own load on the circuits' clock. Averaged into the circuits' own
+// buckets rather than sampled at their instants, because a circuit value on the
+// hourly tier is that hour's mean and an inverter reading at the top of the
+// hour is not — comparing the two would draw the house as noise against a
+// smooth stack. A bucket the inverter said nothing in is null, which breaks the
+// line there rather than drawing a house that briefly used nothing.
+//
+// This is a resampling of a series the page already fetched, not a second
+// calculation of a figure the endpoint gives: the coverage line's kilowatt
+// hours are read from the inverter's own counter, and this is instantaneous
+// power for a picture. The two are different quantities and neither is derived
+// from the other.
+function houseWattsOn(stamps, step) {
+  if (!lastInv || !stamps.length || !(step > 0)) return null;
+  const f = frame(lastInv.points || []);
+  const vs = f.of('load_power_w');
+  const sums = new Array(stamps.length).fill(0);
+  const counts = new Array(stamps.length).fill(0);
+  let j = 0;
+  for (let i = 0; i < f.xs.length; i++) {
+    const v = vs[i];
+    if (v === null) continue;
+    const t = f.xs[i];
+    while (j + 1 < stamps.length && stamps[j + 1] <= t) j += 1;
+    if (t < stamps[j] || t >= stamps[j] + step) continue;
+    sums[j] += v;
+    counts[j] += 1;
+  }
+  if (!counts.some((n) => n > 0)) return null;
+  return sums.map((s, k) => (counts[k] ? s / counts[k] : null));
+}
+
+// The watts a group of circuits drew at one instant, or null if any of them did
+// not answer there. Not a sum over whoever happened to report: a stack built
+// that way dips exactly where a circuit went quiet and reads as the house using
+// less, which is the one thing this page exists not to draw. drawSpreads
+// refuses the same comparison for the same reason.
+function circuitsSumAt(list, i) {
+  let total = 0;
+  for (const c of list) {
+    const v = (c.watts || [])[i];
+    if (typeof v !== 'number' || !isFinite(v)) return null;
+    total += v;
+  }
+  return total;
+}
+
+// The stack's own labels, written into each band on the canvas rather than into
+// a legend beside it. A swatch legend asks the reader to match a colour, and the
+// owner of this installation is colour blind — so the name sits in the band,
+// where telling one band from another needs no colour at all. A band too thin
+// to hold its name goes unlabelled and is named in the line under the chart
+// instead; text painted over a 6px band is unreadable whatever it says.
+const LABEL_MIN_PX = 15;
+
+function stackLabels(spec) {
+  return {
+    hooks: {
+      draw: (u) => {
+        const ratio = (typeof uPlot !== 'undefined' && uPlot.pxRatio) || 1;
+        const ctx = u.ctx;
+        const xs = u.data[0] || [];
+        ctx.save();
+        ctx.font = `${Math.round(11 * ratio)}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
+        // Both alignments are set outright rather than left to the default.
+        // ctx.save() preserves the state it finds, and what it finds here is
+        // whatever uPlot last set for its axis labels — measured on the bench
+        // as textAlign "right", which drew every band name from its x leftwards
+        // and pushed the two widest of them off the canvas entirely.
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.lineJoin = 'round';
+        // What has already been written, so a second name cannot be laid over
+        // the first. Two bands thickest at nearby instants put their labels at
+        // the same height, and overlapping text is less readable than one label
+        // and the reading order printed under the chart.
+        const placed = [];
+        for (const band of spec) {
+          let best = -1;
+          let thick = 0;
+          for (let i = 0; i < xs.length; i++) {
+            if (xs[i] < u.scales.x.min || xs[i] > u.scales.x.max) continue;
+            const lo = band.lo === null ? 0 : u.data[band.lo][i];
+            const hi = u.data[band.hi][i];
+            if (typeof lo !== 'number' || typeof hi !== 'number' || hi <= lo) continue;
+            const d = u.valToPos(lo, 'y', true) - u.valToPos(hi, 'y', true);
+            if (d > thick) { thick = d; best = i; }
+          }
+          if (best < 0 || thick < LABEL_MIN_PX * ratio) continue;
+          const width = ctx.measureText(band.name).width;
+          if (width + 10 * ratio > u.bbox.width) continue;
+          const lo = band.lo === null ? 0 : u.data[band.lo][best];
+          const y = (u.valToPos(lo, 'y', true) + u.valToPos(u.data[band.hi][best], 'y', true)) / 2;
+          const x = Math.max(
+            u.bbox.left + 4 * ratio,
+            Math.min(u.valToPos(xs[best], 'x', true) - width / 2,
+              u.bbox.left + u.bbox.width - width - 4 * ratio),
+          );
+          // Half a line of text either side of the baseline, which is what an
+          // 11px name actually occupies. A more generous box refused three of
+          // the four labels on the bench over five pixels of clearance.
+          const box = { x0: x, x1: x + width, y0: y - 7 * ratio, y1: y + 7 * ratio };
+          if (placed.some((p) => box.x0 < p.x1 && p.x0 < box.x1
+            && box.y0 < p.y1 && p.y0 < box.y1)) continue;
+          placed.push(box);
+          // A halo in the readout's own background token, so the name stays
+          // legible over a light band and a dark one alike without any new
+          // colour being introduced to do it.
+          ctx.strokeStyle = ink('--tip');
+          ctx.lineWidth = 3 * ratio;
+          ctx.strokeText(band.name, x, y);
+          ctx.fillStyle = ink('--ink');
+          ctx.fillText(band.name, x, y);
+        }
+        ctx.restore();
+      },
+    },
+  };
+}
+
+// The stack floors at zero and never below it. aroundZero pads both ends, which
+// on a stacked area lifts the whole picture off its own baseline and leaves the
+// bottom band hanging.
+const stackRange = (u, min, max) => [0, (Number.isFinite(max) ? Math.max(max, 1) : 1) * 1.08];
+
+// One fill of the stack. Three strengths of one hue, and the strengths are what
+// make the composite ladder come out where validate_palette.js was run: the
+// bands are painted largest-first and each one lays over the last, so the band
+// covered by all three reads as --load itself, the middle at 0.66 of it and the
+// top at 0.30. Those three separate at ΔE 12.4 under deuteranopia and sit 10.9
+// clear of the panel behind them, all pairs compared rather than adjacent ones.
+const STACK_ALPHAS = [0.3, 0.5143, 1];
+
+function stackFill(alpha) {
+  return {
+    scale: 'y',
+    spanGaps: false,
+    width: 1,
+    // A hairline at every boundary, so one band ends where the next begins even
+    // for a reader who cannot separate the two fills at all. Position and this
+    // line carry the division; the fill strength only reinforces it.
+    stroke: () => fade('--ink', 0.22),
+    fill: () => (alpha >= 1 ? ink('--load') : fade('--load', alpha)),
+    fillTo: () => 0,
+    points: { show: false },
+  };
+}
+
+// The house's load split by the circuits underneath it. Drawn as a stack rather
+// than as lines because the question is what makes up the total, and the space
+// left between the stack and the house's own line is the part nothing is
+// clamped to — which is why the line has to be there at all. Where the house is
+// unknown the stack is drawn alone and the panel says the remainder is unknown,
+// because a remainder of zero would be a claim that every branch is monitored.
+function drawCircuitSplit(body, rows) {
+  const stamps = body.timestamps || [];
+  const ranked = rows.ranked;
+  const named = ranked.slice(0, CIRCUIT_STACK_NAMED);
+  const rest = ranked.slice(CIRCUIT_STACK_NAMED);
+  const order = $('circuitStackOrder');
+  if (!stamps.length || !ranked.length) {
+    chartMessage(CIRCUIT_SPLIT_ID, 'nothing recorded in this range');
+    if (order) order.textContent = '';
+    return;
+  }
+  const first = stamps.map((_, i) => circuitsSumAt(named.slice(0, 1), i));
+  const both = stamps.map((_, i) => circuitsSumAt(named, i));
+  const total = stamps.map((_, i) => circuitsSumAt(ranked, i));
+  const step = stamps.length > 1 ? stamps[1] - stamps[0] : circuitCadence;
+  const house = houseWattsOn(stamps, step);
+  const cols = house ? [total, both, first, house] : [total, both, first];
+  const spec = [
+    { name: named[0].name, lo: null, hi: 3 },
+    ...(named.length > 1 ? [{ name: named[1].name, lo: 3, hi: 2 }] : []),
+    ...(rest.length ? [{ name: `${rest.length} other monitored`, lo: 2, hi: 1 }] : []),
+    ...(house ? [{ name: 'unmonitored', lo: 1, hi: 4 }] : []),
+  ];
+  const at = (hi, lo) => (u, i) => {
+    const a = u.data[hi][i];
+    const b = lo === null ? 0 : u.data[lo][i];
+    return typeof a === 'number' && typeof b === 'number' ? a - b : null;
+  };
+  const readRows = [
+    [named[0].name, at(3, null), kw],
+    ...(named.length > 1 ? [[named[1].name, at(2, 3), kw]] : []),
+    ...(rest.length ? [[`${rest.length} other monitored`, at(1, 2), kw]] : []),
+    ...(house ? [['House load', 4, kw], ['Unmonitored', at(4, 1), kw]] : []),
+  ];
+  if (!sectionVisible('circuits') && !CHARTS[CIRCUIT_SPLIT_ID]) return;
+  paint(CIRCUIT_SPLIT_ID, {
+    height: SPLIT_H + AXIS_H,
+    unit: 'W',
+    opts: chartBase({
+      // The circuits' own group. These are the strips' x array exactly, and a
+      // drag on an inverter band must not push this chart to a window its
+      // sixty-second rows have no points in.
+      sync: { key: 'graphs-circuits' },
+      scales: { x: { time: true }, y: { range: stackRange } },
+      axes: [timeAxis(), axis({ size: 46, gap: 6, values: wattTicks })],
+      series: [
+        {},
+        ...STACK_ALPHAS.map(stackFill),
+        ...(house ? [{
+          label: 'House load',
+          scale: 'y',
+          spanGaps: false,
+          width: 1.6,
+          stroke: () => ink('--ink2'),
+          points: { show: false },
+        }] : []),
+      ],
+      plugins: [readout(CIRCUIT_SPLIT_ID, readRows), stackLabels(spec)],
+    }),
+  }, [stamps, ...cols]);
+  if (order) {
+    order.textContent = 'Bottom to top: '
+      + spec.map((b) => b.name).join(', then ')
+      + (house
+        ? '. The line above the stack is the house\'s own load, and the space under it is what '
+          + 'no circuit is clamped to.'
+        : '. The house\'s own load is unknown for this window, so the unmonitored remainder '
+          + 'cannot be drawn — it is not zero.');
+  }
+}
+
+// The switch. Built once and only its pressed state updated afterwards, so the
+// listeners are bound once rather than once a minute.
+function drawCircuitViews(view) {
+  const bar = $('circuitViews');
+  if (!bar) return;
+  if (!bar.firstChild) {
+    bar.innerHTML = CIRCUIT_VIEWS.map((v) =>
+      `<button type="button" data-view="${esc(v.key)}">${esc(v.title)}</button>`).join('');
+    bar.querySelectorAll('button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        circuitView = circuitViewOf(btn.dataset.view);
+        try { localStorage.setItem(CIRCUIT_VIEW_KEY, circuitView); } catch (e) { /* private */ }
+        // Straight to the draw from the answer already held: the two views are
+        // the same window seen twice, so switching asks the endpoint nothing.
+        drawCircuitSummary(lastCircuits, $('circuitSummary'), circuitView);
+      });
+    });
+  }
+  bar.querySelectorAll('button').forEach((btn) => {
+    btn.setAttribute('aria-pressed', String(btn.dataset.view === view));
+  });
+}
+
+function drawCircuitSummary(body, host, view) {
+  if (!host) return;
+  const circuits = (body && body.circuits) || [];
+  host.hidden = !circuits.length;
+  if (!circuits.length) return;
+  const rows = circuitEnergyRows(circuits);
+  drawCircuitViews(view);
+  const energy = $('circuitEnergy');
+  const split = $('circuitSplit');
+  // Unhidden before the paint, never after. uPlot measures its container at
+  // construction, so a chart built into a hidden box lays out as an empty grid
+  // — the state issue #159 took three attempts to diagnose.
+  if (energy) energy.hidden = view !== 'energy';
+  if (split) split.hidden = view !== 'split';
+  if (view === 'split') drawCircuitSplit(body, rows);
+  else drawCircuitEnergy(rows);
+  const note = $('circuitSummaryNote');
+  if (note) {
+    note.textContent = view === 'split'
+      ? 'the same circuits stacked under the house'
+      : `${rows.ranked.length} circuit${rows.ranked.length === 1 ? '' : 's'} with a `
+        + 'measured figure, most first';
+  }
+  const line = $('circuitCoverage');
+  if (line) {
+    line.textContent = circuitCoverageWords(
+      body.coverage,
+      circuitRecordedSeconds(body.timestamps, circuits, circuitCadence),
+      range.seconds,
+    );
+  }
 }
 
 // Why the Circuits tab is empty, in terms the owner can act on. The tab is
@@ -1731,6 +2399,12 @@ async function boot() {
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
   wirePin();
+  // Which summary this browser was last looking at, read before the first paint
+  // so the panel opens on the reader's own choice rather than flashing the
+  // default and switching under them.
+  try {
+    circuitView = circuitViewOf(localStorage.getItem(CIRCUIT_VIEW_KEY));
+  } catch (e) { /* private browsing: the default stands */ }
   // Three answers shape the first paint — the two cadences decide the widths,
   // the capabilities decide the band list, and the Emporia status decides
   // whether the Circuits tab is offered at all — and none of them needs
