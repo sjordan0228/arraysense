@@ -221,9 +221,7 @@
       with no system at all. On the right, the part of it that was paid to the grid, and the
       part the array and the bank covered. The connection charge is not in either: it is
       payable whatever the roof does.
-      <span class="warn" id="sankeyShort" hidden>This month the diagram is drawn from a partial
-      measurement — energy the meter counted could not all be placed in a band, and the cards
-      above say what is missing.</span>
+      <span class="warn" id="sankeyShort" hidden></span>
     </span>
   </section>
 
@@ -253,7 +251,7 @@
 
   <section class="p">
     <div class="chead">
-      <h2>Energy this month</h2>
+      <h2 id="energyHead">Energy this month</h2>
       <span class="legend muted">the inverter's own counters, not integrated power</span>
     </div>
     <div class="egrid" id="egrid"></div>
@@ -802,8 +800,11 @@ function drawSankey(p) {
   // it carries the same qualification the cards do.
   const short = p.costShort || p.savingsShort;
   $('sankeyShort').hidden = !short;
+  $('sankeyShort').textContent = `${words.theMonth} the diagram is drawn from a partial `
+    + 'measurement — energy the meter counted could not all be placed in a band, and the '
+    + 'cards above say what is missing.';
   $('sankeyTotal').textContent =
-    `${money(p.noSolarCost, cur)} of electricity at grid rates this month`
+    `${money(p.noSolarCost, cur)} of electricity at grid rates ${words.inMonth}`
     + (short ? ' · not the whole month' : '');
 
   const total = p.noSolarCost;
@@ -895,7 +896,7 @@ function drawSankey(p) {
   // nothing more, at one steady speed for every ribbon.
   sankeyRender(svg, ribbons, out, {
     hub: 'var(--ink3)',
-    measure: 'This month',
+    measure: words.theMonth,
     total: money(total, cur),
     pace: 'steady',
   });
@@ -985,7 +986,7 @@ function renderBands(p) {
   const mark = (short) => (short
     ? ' class="part" title="Not the whole month — see the note below the table"' : '');
   const totals = `<tr>
-      <td><b>Month to date</b></td><td></td>
+      <td><b>${esc(words.total)}</b></td><td></td>
       <td${mark(p.costShort)}>${esc(uStr(importMtd, 1, 'kWh'))}</td>
       <td${mark(p.costShort)}><b>${esc(money(p.energyCost, cur))}</b></td>
       <td${mark(loadShort)}>${esc(uStr(houseMtd, 1, 'kWh'))}</td>
@@ -1040,7 +1041,7 @@ function renderBands(p) {
   }
   if (p.costShort || p.savingsShort) {
     notes.push('<span class="warn">The bars and the table draw from a partial measurement '
-      + 'this month</span> — the cards above say what is missing from it.');
+      + `${words.inMonth}</span> — the cards above say what is missing from it.`);
   }
   $('bandCap').innerHTML = notes.join(' ');
 }
@@ -1074,15 +1075,19 @@ const ENERGY_FIELDS = [
 
 // Shown whether or not a tariff exists — with none, this is the whole page.
 function renderEnergy(bucket) {
+  // renderEnergy runs before renderMonth on the path where the month's energy
+  // read succeeded and its pricing did not, so the words may not be set yet.
+  if (words !== null) $('energyHead').textContent = words.energy;
   $('egrid').innerHTML = ENERGY_FIELDS.map(([label, key]) => {
     const value = bucket ? numOrNull(bucket[key]) : null;
     const shown = value === null ? DASH : `${value.toFixed(1)}<span>kWh</span>`;
     return `<div><span class="lbl">${esc(label)}</span><b>${shown}</b></div>`;
   }).join('');
+  const w = words || monthWords(null, '');
   $('energyCap').textContent = bucket
-    ? 'Month to date, read off the inverter’s lifetime counters as end minus start, so a '
+    ? `${w.total}, read off the inverter’s lifetime counters as end minus start, so a `
       + 'gap in collection costs nothing: the counters kept counting while we were not watching.'
-    : 'Nothing has been recorded this month yet, so there is nothing to total. A missing '
+    : `Nothing was recorded ${w.inMonth}, so there is nothing to total. A missing `
       + 'reading is not a reading of zero.';
 }
 
@@ -1110,7 +1115,7 @@ function renderAssumptions(p, hasTariff, unreadable) {
       + 'one meaning, and the moment there were two implementations of it they disagreed — so '
       + 'everything above arrives already priced, and the page only draws it.');
     if (p && p.tier) {
-      bits.push(`This month was read from the ${esc(tierWord(p.tier))} tier, `
+      bits.push(`${esc(words.theMonth)} was read from the ${esc(tierWord(p.tier))} tier, `
         + (p.tier === 'hourly'
           ? 'which resolves a band boundary only to the hour: a tariff that changes rate at half '
             + 'past would put the half hour either side in the wrong band.'
