@@ -7,6 +7,102 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.2.0 — 16 August 2026
+
+The Graphs page can now show what is actually drawing the power, for an
+installation with an Emporia Vue connected — the per-circuit history the
+Emporia module has been recording since it shipped in 1.1.0, and nothing had
+ever queried.
+
+A minor version rather than a patch because a new endpoint and a new page tab
+are a feature, not a correction to an existing one.
+
+**This release adds a column, and it is applied automatically on the first
+start.** `circuit_hourly` gains `covered_seconds` — how much of each hour the
+readings behind it actually account for, measured when the hour is rolled up.
+Hours recorded before the upgrade have no figure and keep none: the raw
+readings they were built from are pruned after thirty days, so the measurement
+cannot be made after the fact, and inventing one would be worse than the
+estimate those hours already fall back to. **Nothing already stored is
+rewritten**, and hours recorded from the upgrade onwards are exact.
+
+### Added
+
+- **A Circuits tab on the Graphs page, shown only where an Emporia account is
+  connected.** The top five circuits by energy over the range on screen, each
+  drawn as its own strip scaled to its own peak with that peak printed beside
+  it — a circuit at 40 W and one at 4,000 W sharing an axis would erase the
+  smaller one. Change the range and the ranking follows it: a kettle that led
+  a one-hour window can drop out of the top five over a week. An expander
+  reveals the rest. A gap in a strip means the circuit recorded nothing there,
+  not that it drew nothing — a dead outlet and an idle one look different. A
+  circuit that has gone quiet for good, rather than for a poll or two, draws
+  no strip at all: just the reason and how long, in place of an empty box that
+  would read as a bug.
+- **A summary panel above the strips, with two readings of the same window.**
+  A ranked kWh bar chart by default — length alone carries the meaning, so it
+  needs no colour at all — and a stacked view of the same circuits under the
+  house's own load over time, behind a switch that is remembered per browser.
+- **A coverage line stating what share of the house the monitored circuits
+  account for.** Computed from energy rather than from minutes watched, which
+  is the distinction #23 was reverted twice for missing — a numerator that
+  only recorded for part of the window a house counter covers is a different
+  question from one that recorded for the whole of it, and the line answers
+  the one it can rather than dividing the two together as though they agreed.
+  It is qualified or withheld outright rather than guessed whenever an honest
+  share cannot be given, and it never reads as full or empty coverage merely
+  because the house figure is absent.
+- **`GET /api/emporia/history`.** Circuits over a range, ranked by energy, at
+  raw or hourly resolution chosen from the range and the chart's own width —
+  the same fit rule the inverter and per-module charts already use.
+- **A circuit's name on the Emporia page is now a link to its own history**,
+  a real link that can be copied and sent rather than a row that only means
+  something inside that page.
+- **Circuit energy no longer depends on what the poll interval is set to
+  today.** How much of each hour its readings account for is measured when the
+  hour is summarised, minutes after the readings arrived, and stored with it.
+  Changing `emporia.interval` used to move the energy of every hour already
+  recorded: an hour holding thirty minutes of ten-second readings accounts for
+  1,800 of its seconds, and read back at a sixty-second setting the same 180
+  readings claimed 10,800 — clamped to the hour, so the half hour doubled into a
+  whole one and took its energy with it. The rebuild reaches three hours back,
+  so a change made now still meets readings collected under the old setting; an
+  hour's coverage is therefore only ever raised by a rebuild and never lowered,
+  and lowering the interval cannot rewrite three hours of honest readings as a
+  fraction of the energy they recorded. A window read at full resolution is
+  bounded the same way: one reading accounts for at most one poll interval, so
+  two 1 kW readings three hours apart at a sixty-second interval are worth the
+  two minutes they were taken for — 33 Wh — rather than the 6 kWh that crediting
+  each of them with the whole gap would give, and the three hours nobody
+  recorded break the line instead of being drawn straight across.
+- **An hour's stored watts and its stored coverage are measured from the same
+  spans, and are written together or not at all.** Each reading holds until the
+  next one arrives, capped at one poll interval; the span is cut where it
+  crosses the hour, and both figures come from those same pieces. A plain
+  average beside a duration-weighted coverage is two different weightings of
+  one hour multiplied together by whatever reads them: 100 W held for five
+  seconds followed by 1,000 W held for two minutes stored 700 W where the hour
+  really averaged 964, and the energy came out 27% short. Cutting at the
+  boundary is the other half — a reading at 12:59:59 used to take a whole
+  interval inside the 12:00 bucket and give 13:00 nothing. And because the two
+  columns are multiplied, a rebuild replaces both or neither: keeping the larger
+  coverage while overwriting the watts left 100 W for five seconds followed by
+  1,000 W reading as 45,500 J, where those readings account for 60,500 J at a
+  sixty-second interval and 10,500 J at a ten-second one — a figure neither
+  setting produces, and so one nothing downstream could attribute to either.
+  That rule now covers an hour's removal as well as its rewriting. An hour can
+  hold nothing but the seconds a reading just before the boundary ran over into
+  it, and re-measured at a shorter interval that reading no longer reaches the
+  boundary at all — so the hour had nothing to rebuild from and was deleted
+  outright, taking real recorded energy with it: one 500 W reading at 59:50
+  books fifty seconds into the next hour, and lowering `emporia.interval` from
+  sixty seconds to ten erased that hour. A rebuild now clears an hour only where
+  the stored row accounts for nothing.
+- **The recorded-for figure describes the module rather than the circuits
+  asked for.** A poll that reached one clamp reached the monitor, so asking for
+  a single outlet that has been offline since April no longer reads as a module
+  outage and no longer withholds a share the module could honestly support.
+
 ## 1.1.0 — 16 August 2026
 
 The first optional module. An Emporia Vue's circuits, and an Emporia EV

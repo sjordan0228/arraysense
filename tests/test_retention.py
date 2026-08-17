@@ -561,7 +561,7 @@ def test_circuit_readings_are_pruned_once_the_hourly_tier_covers_them(tmp_path: 
             "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 100)",
             (hour + minute * 60,),
         )
-    rebuild_circuit_hourly(store._conn, hour, hour + 3600)
+    rebuild_circuit_hourly(store._conn, hour, hour + 3600, cadence_seconds=60)
 
     report = run_retention(store._conn, _policy(tmp_path), now=NOW)
 

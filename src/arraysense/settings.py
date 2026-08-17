@@ -1691,6 +1691,37 @@ class SettingsStore:
         return out
 
 
+def emporia_interval_seconds(settings: SettingsStore) -> int:
+    """How often circuits are read, as a whole number of seconds.
+
+    Three callers need this and none of them may disagree about it: the poller
+    that spaces its reads by it, the rollup that measures an hour's coverage
+    against it, and the endpoint that picks a tier and reads a raw window back.
+    A second copy of the fallback is a second answer to "what does one reading
+    cover", and that question decides an energy figure.
+
+    A stored value the registry would not accept falls back to the registered
+    default rather than propagating. Settings are decoded on read but not
+    checked against their bounds, so a database written by another build — or
+    edited by hand — can hand this a string, a zero, or an hour and a second.
+
+    Checked through the spec's own ``validate`` rather than against a bound
+    written out here. The registry is where a setting's limits live, and a
+    reader that hard-codes them drifts from the page and the API the moment
+    either limit moves — which is the same rule ``settings.html`` renders
+    itself by. The lower bound is what matters most: this figure is a divisor
+    and a multiplier both, and one second would credit a reading with a
+    sixtieth of what it covers.
+    """
+    spec = lookup_setting(EMPORIA_INTERVAL_KEY)
+    try:
+        value = spec.validate(settings.get(EMPORIA_INTERVAL_KEY))
+    except ValueError:
+        logger.warning("%s is out of range; falling back to the default", EMPORIA_INTERVAL_KEY)
+        value = spec.default
+    return value if isinstance(value, int) and not isinstance(value, bool) else 60
+
+
 def _mask(value: str) -> str:
     """Show enough of a value for its owner to recognise it and no more.
 

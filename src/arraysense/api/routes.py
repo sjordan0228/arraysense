@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
-from arraysense.alerts import Contributor, high_usage
+from arraysense.alerts import NOT_A_CULPRIT, Contributor, high_usage
 from arraysense.auth import (
     MIN_PASSWORD_LENGTH,
     Sessions,
@@ -78,7 +78,21 @@ from arraysense.efficiency import (
     rows_are_current,
     tilt_benefit,
 )
-from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
+from arraysense.energy import (
+    ENERGY_FIELDS,
+    MAX_EDGE_GAP,
+    Period,
+    # Private to energy.py, and imported rather than copied for the reason
+    # ``tariff._elapsed`` is below: it decides which tier a counter read over a
+    # window is answered from, and the coverage clamp has to look for the last
+    # reading in that same tier. A second copy of the rule would drift, and the
+    # symptom would be a coverage line that is silently blank.
+    _window_tier,
+    counter_kwh,
+    read_energy,
+    resolve_zone,
+    with_zone,
+)
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.modules.emporia import tokens as emporia_tokens
 from arraysense.modules.emporia.client import (
@@ -88,7 +102,7 @@ from arraysense.modules.emporia.client import (
 )
 from arraysense.modules.emporia.control import clamp_rate
 from arraysense.modules.emporia.poller import EmporiaPoller
-from arraysense.modules.emporia.repository import OWNER
+from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
@@ -109,6 +123,7 @@ from arraysense.settings import (
     check_backup_directory,
     check_serial_device,
     describe,
+    emporia_interval_seconds,
     lookup_setting,
 )
 from arraysense.setup import describe_setup
@@ -3116,6 +3131,163 @@ def _emporia(request: Request) -> EmporiaPoller | None:
     return poller if isinstance(poller, EmporiaPoller) else None
 
 
+# How far the house's own window may fall short of the circuits' before the two
+# stop describing the same span. Five minutes is the floor, and it is sized on
+# what the store can actually answer rather than chosen: the driver reads the
+# energy registers on a sixty-second clock of their own, and a window of two
+# days or under is answered from the minute tier, whose buckets are stamped at
+# the start of the minute they cover and are rebuilt once a minute. The last
+# instant the house is known for therefore sits a couple of minutes behind the
+# wall clock even on a perfectly healthy installation.
+COVERAGE_SLACK = timedelta(minutes=5)
+
+# ...and one percent of the window besides, which is what carries the long
+# ranges. Past two days a counter read is answered from the hourly tier, whose
+# newest bucket is stamped on the hour and so trails the end of a live range by
+# up to fifty-nine minutes — 0.6% of the seven-day range the Graphs page offers
+# and less of the thirty-day one. A flat five minutes would refuse both of them
+# for ever, which is not caution but a line that never works.
+#
+# What neither allowance may become is an excuse. Past it the numerator covers
+# time the denominator does not and the share reads over 100% — a partial
+# figure presented as a complete one, which is the one thing this line exists
+# to prevent — so the honest answer there is that the house total is unknown.
+COVERAGE_SHORTFALL = 0.01
+
+# How much of a window the circuits must have recorded for before their energy
+# may be read as a share of the house's own counter.
+#
+# Ninety per cent, and the number is the whole of this rule. A healthy
+# installation loses at most one poll at each edge of the window — two minutes
+# of the shortest range the Graphs page offers, three per cent — so this never
+# fires on ordinary operation. Below it the share is understated by more than a
+# tenth of its own value, which is more than a percentage rounded to whole
+# numbers can absorb, and the sentence stops describing what a reader thinks it
+# does: measured on the bench, a seven-day window in which the module had
+# recorded for six hours returned circuits 18.392 kWh, house 254.8 kWh, fraction
+# 0.0722. Every figure correct, and "monitored circuits cover 7% of the house"
+# invites the reader to conclude the house is barely monitored when the truth is
+# that the module was not running.
+#
+# Here rather than in the browser because a page draws what an endpoint tells
+# it, and because ``docs/api.md`` has promised since this endpoint shipped that
+# the fraction is null when the two do not cover closely enough the same span.
+# Only the browser checked, so the promise was not kept for any other consumer.
+CIRCUIT_SPAN_ENOUGH = 0.9
+
+# An empty coverage answer, so a module that is not running says "unknown" in
+# the same shape a running one says a number. A page that had to branch on a
+# missing key would be one refactor away from rendering "0%" for "no module".
+_NO_COVERAGE: dict[str, Any] = {
+    "circuits_kwh": None,
+    "house_kwh": None,
+    "fraction": None,
+    "recorded_seconds": 0,
+    "window_seconds": 0,
+    "spans_match": False,
+}
+
+
+def _aware(when: datetime) -> datetime:
+    """A query bound with a zone attached, reading a naive one as the server's.
+
+    The pages send instants with an offset, but a hand-typed URL need not, and
+    ``counter_kwh`` refuses a naive bound outright rather than guessing — which
+    would answer a mistyped range with a 500. ``astimezone`` on a naive value
+    assumes the machine's own zone, which is exactly the assumption
+    ``datetime.timestamp`` was already making one layer down, so nothing about
+    which instant is meant changes here; it is only said out loud.
+    """
+    return when if when.tzinfo is not None else when.astimezone()
+
+
+def _parse_circuit_ids(ids: str | None) -> list[int] | None:
+    """Turn ``ids=3,7,11`` into a list, or None for every circuit.
+
+    A malformed entry is a bad request rather than a silently narrowed answer:
+    dropping an unparseable id would return four strips where five were asked
+    for, and the page has no way to notice.
+    """
+    if ids is None or not ids.strip():
+        return None
+    try:
+        return [int(part) for part in ids.split(",") if part.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"bad circuit ids: {ids!r}") from exc
+
+
+def _emporia_cadence_seconds(request: Request) -> int:
+    """The Emporia poll interval, which is the circuit raw tier's resolution.
+
+    Not the inverter's. Scored at eleven seconds a seven-day circuit range comes
+    out at 55,000 points and picks the raw tier, which holds ten thousand rows
+    for it — the tier choice would be made against a cadence that does not
+    describe this data at all. It is also the bound on what one raw reading may
+    account for, since the raw tier records no cadence of its own.
+
+    It is *not* the hourly tier's arithmetic any more. That tier stores the
+    coverage the rollup measured while the interval that produced the readings
+    was still in force, and handing this figure to rows recorded under another
+    one is the defect that doubled every stored hour's energy the day the bench
+    interval was raised.
+    """
+    return emporia_interval_seconds(SettingsStore(request.app.state.store))
+
+
+def _coverage_end(
+    store: SqliteStore, start: datetime, end: datetime, span: timedelta, field: str = "load_kwh"
+) -> datetime | None:
+    """The last instant the house's own counter is known for, or None.
+
+    The house figure is read to the last instant the inverter actually
+    reported, not to the wall clock. ``counter_kwh`` is right to refuse a bound
+    it cannot bracket — that refusal is what stops an outage being billed to
+    the day collection came back in — but every range the Graphs page offers
+    ends at "now", and there is never a reading after now. Asked as written,
+    the coverage line would be blank on every live request, permanently.
+
+    The circuits' own energy is deliberately not re-cut to this instant. There
+    is nothing in the tail to cut: the shortfall is a poll or two of the
+    inverter's, and the two windows describe the same span for every purpose
+    this percentage has. What keeps that true is the allowance below — past it
+    the numerator would cover hours the denominator does not, and None is
+    returned so the page can say the house total is unknown instead.
+
+    The search runs against the tier ``counter_kwh`` will read and falls back
+    the same way, because a clamp landing on an instant that tier has no row
+    for is no better than no clamp at all. A minute bucket is stamped at the
+    start of the minute it covers rather than at the reading inside it, so the
+    newest raw reading is later than the newest minute row on all but the one
+    second they can share — measured here as a raw counter at 17:59:18 against
+    a minute bucket at 17:59:00, where clamping to the raw instant returned
+    None and clamping to the bucket returned the figure. Where the mirror is
+    imperfect the answer is None and the page says "unknown", which is the safe
+    direction to be wrong in.
+
+    Reading forward as far as ``MAX_EDGE_GAP`` is what keeps a historical
+    window unclamped: if any reading lands at or after ``end`` then the window
+    is bracketed as asked and nothing needs pulling back.
+
+    ``span`` is handed in rather than measured from the two bounds, because
+    subtracting two aware datetimes ignores the zone they share: a window
+    running midnight to midnight across the November clock change is 49 hours
+    long and reads as 48. The caller has already measured it through
+    ``tariff._elapsed``, and one request must not measure one window twice.
+    """
+    metric = ENERGY_FIELDS[field]
+    allowance = max(COVERAGE_SLACK, span * COVERAGE_SHORTFALL)
+    floor, ceiling = end - allowance, end + MAX_EDGE_GAP
+    rows = store.query([metric], floor, ceiling, tier=_window_tier(start, end))
+    if not rows:
+        rows = store.query([metric], floor, ceiling, tier="full")
+    moments = [
+        when for row in rows if row.get(metric) is not None and (when := _row_time(row)) is not None
+    ]
+    if not moments:
+        return None
+    return end if moments[-1] >= end else moments[-1]
+
+
 @router.get("/emporia/status")
 async def emporia_status(request: Request) -> dict[str, Any]:
     """What the module is doing, and whether it needs the owner.
@@ -3155,6 +3327,11 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     since April and August, and without these a page can only render them the
     same as a circuit that happened to be idle. They belong to the device rather
     than the channel, so every circuit on a dead monitor carries the same answer.
+
+    ``id`` is what lets a row on this page link to that circuit's own chart on
+    ``/graphs#circuits=<id>``. It is the same surrogate ``/api/emporia/history``
+    reports for the same circuit — the two must agree, since a link is only as
+    good as the id it names being the id the other endpoint answers to.
     """
     poller = _emporia(request)
     if poller is None:
@@ -3163,6 +3340,7 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     return {
         "circuits": [
             {
+                "id": circuit.circuit_id,
                 "name": circuit.name,
                 "kind": circuit.kind,
                 "watts": circuit.watts,
@@ -3188,6 +3366,158 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
             }
             for circuit in poller.repository.latest()
         ]
+    }
+
+
+@router.get("/emporia/history")
+def emporia_history(
+    request: Request,
+    store: _ReadStore,
+    start: datetime,
+    end: datetime,
+    ids: str | None = None,
+    width: int = Query(default=1000, ge=1, le=10000),
+) -> dict[str, Any]:
+    """Circuits over a range, ranked by energy, at a resolution that suits the chart.
+
+    ``ids`` narrows the answer to named circuits; omitted, every circuit is
+    returned and the page decides how many strips to draw. The narrowing is
+    here rather than in the browser because the reference account has
+    thirty-nine circuits and fetching all of them to draw five is the query
+    this argument exists to avoid.
+
+    ``coverage`` is the one figure on this endpoint that can mislead. The
+    monitored circuits are not the house — unmonitored branches are real, and
+    two of the reference account's outlets have been offline since April and
+    August — so a page drawing five bars without it invites the reader to
+    believe those five are the house. It is computed from energy rather than
+    from minutes watched, which is the distinction #23 was reverted twice for
+    missing, and it is None rather than 1.0 when the house's own figure is
+    absent: a fraction taken against an unknown denominator would read as full
+    coverage, which inverts the truth exactly. The circuits' own total is None
+    on the same terms, since a monitor nobody has heard from did not measure
+    nothing.
+
+    Both sides of that comparison are bounded here. ``_coverage_end`` pulls the
+    house figure back to the last instant the inverter's own counter is known
+    for; ``spans_match`` is the other half, and it was missing — the circuits
+    could have recorded for six hours of a seven-day window and the share was
+    still divided out and reported. It is null past that point, with
+    ``recorded_seconds`` and ``window_seconds`` alongside it so a page can say
+    what happened rather than measure it again.
+
+    A build with no poller answers an empty history rather than 404ing. The tab
+    is gated on the module, but a bookmark outlives the account it was made on.
+    """
+    start, end = _aware(start), _aware(end)
+    _check_range(start, end)
+    poller = _emporia(request)
+    # Through ``_elapsed``, not by subtraction, and measured once for the whole
+    # request. A range that spans a clock change is 23 or 25 hours long and the
+    # naive difference says 24, which would put a fully recorded autumn window
+    # under the span threshold and withhold a share that was perfectly good —
+    # and would have this one request answer "how long is this window" three
+    # different ways, for the tier, for the coverage allowance, and here.
+    window_seconds = int(_elapsed(start, end))
+    span = timedelta(seconds=window_seconds)
+    if poller is None:
+        return {
+            "tier": "full",
+            "timestamps": [],
+            "circuits": [],
+            "coverage": {**_NO_COVERAGE, "window_seconds": window_seconds},
+        }
+
+    wanted = _parse_circuit_ids(ids)
+    cadence = _emporia_cadence_seconds(request)
+    tier = select_tier(span, width_px=width, cadence_seconds=cadence, circuit=True)
+    with _inside_the_calendar():
+        # Read through the injected view, not through ``poller.repository``.
+        # The poller's repository holds the primary connection — the one the
+        # collector writes through — and this is the heaviest read the module
+        # makes: thirty days across thirty-nine circuits is tens of thousands
+        # of rows. Running it there is the shape ``_read_store`` was written to
+        # end, and its own docstring names the cost, measured at 1.6 to 3.2
+        # seconds a response while issue #63 was chased through the rollup.
+        # ``latest()`` stays on the poller's connection because it reads one row
+        # per circuit and is not worth a second handle.
+        history = CircuitRepository(store).history(
+            start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
+        )
+        coverage_end = _coverage_end(store, start, end, span)
+        house_kwh = (
+            counter_kwh(store, start, coverage_end)
+            if coverage_end is not None and coverage_end > start
+            else None
+        )
+
+    # The poller holds this, not the repository: it is what the last status call
+    # said, refreshed on the module's own clock. emporia_circuits already reads
+    # it from the same place.
+    connections = poller.connections
+    parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+    measured = [s.kwh for s in parts if s.kwh is not None]
+    circuits_kwh = sum(measured) if measured else None
+    # Whether the two figures describe the same stretch of time closely enough
+    # for one to be read as a share of the other. ``_check_range`` has already
+    # refused anything that does not run forwards, so the guard is for a range
+    # whose seconds round to nothing: there is no shortfall to find in a window
+    # of no length, and the house figure over one is zero anyway.
+    recorded_seconds = history.recorded_seconds
+    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
+    return {
+        "tier": history.tier,
+        "timestamps": list(history.timestamps),
+        "circuits": [
+            {
+                "id": s.circuit_id,
+                "name": s.name,
+                "kind": s.kind,
+                "watts": list(s.watts),
+                "kwh": None if s.kwh is None else round(s.kwh, 3),
+                "partial": s.partial,
+                "offline_since": (
+                    connections[s.device_gid].offline_since if s.device_gid in connections else None
+                ),
+            }
+            for s in parts
+        ],
+        "coverage": {
+            "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
+            "house_kwh": None if house_kwh is None else round(house_kwh, 3),
+            "fraction": (
+                None
+                if circuits_kwh is None
+                or house_kwh is None
+                or house_kwh <= 0
+                # A numerator that recorded for a fraction of the window its
+                # denominator covers is arithmetic between two different spans,
+                # not a share. Withheld rather than re-based on the recorded
+                # span, because this response carries no house figure for that
+                # span — only for the whole window — and inventing one by
+                # assuming the house drew power evenly is exactly the estimate
+                # this project refuses to dress as a meter reading.
+                or not spans_match
+                # Reported uncapped, deliberately. A part cannot exceed the
+                # whole, so a fraction above one is not a coverage figure at
+                # all — it is a fault saying so: a mains channel that escaped
+                # the exclusion, a multiplier set for the wrong circuit, or two
+                # windows that stopped being comparable. Clamping it to 1.0
+                # would render every one of those as perfect coverage, which is
+                # the one reading guaranteed to be wrong, and would hide the
+                # fault for as long as it lasted. The page renders anything
+                # above one as a disagreement rather than as a full bar.
+                else round(circuits_kwh / house_kwh, 4)
+            ),
+            # What the span check was decided on, so the page can say it
+            # without measuring it again. The old browser-side count credited
+            # every hourly bucket that held anything with a full 3,600 seconds,
+            # which reported a seven-day window holding one reading an hour as
+            # seven days recorded and defeated the check from the other side.
+            "recorded_seconds": recorded_seconds,
+            "window_seconds": window_seconds,
+            "spans_match": spans_match,
+        },
     }
 
 

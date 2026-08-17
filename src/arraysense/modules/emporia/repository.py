@@ -17,11 +17,108 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 
 from arraysense.modules.emporia.parse import Circuit, Reading
 from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
+
+# The tier names this module answers to, mapped to the tables that hold them. A
+# name is validated against this map before it reaches a query string, so the
+# table name interpolated into the SQL below is never a caller's string.
+_CIRCUIT_TABLES = {"full": "circuit_reading", "hourly": "circuit_hourly"}
+
+_HOUR_SECONDS = 3600
+# What one reading is taken to cover when the caller does not say: the Emporia
+# poll interval's own default, which settings.py registers as 60 s. It is wrong
+# by six times on an installation polling at the ten seconds the setting
+# permits, which is why ``history`` takes the figure rather than assuming this
+# one.
+_POLL_SECONDS = 60
+
+# How far apart two readings have to be before the stretch between them counts
+# as unrecorded rather than as an ordinary late poll: two cadences, the first
+# spacing that leaves a whole period with nothing written in it. Two is the
+# allowance ``store.tiers.select_tier_for_range`` already spends on the same
+# question of whether a tier holds a stretch, so it is this project's figure
+# rather than a new one. The comparison is inclusive where that one is
+# exclusive, and the hourly tier is why: its stamps are aligned to the hour, so
+# an hour nobody recorded puts its neighbours at exactly two cadences and an
+# exclusive test would draw a straight line through every one of them.
+_GAP_CADENCES = 2
+
+
+def _reading_seconds(stamps: Sequence[int], cadence_seconds: int) -> int:
+    """The most one raw reading may be credited with, in this window.
+
+    A reading is a sample of one poll period, so it can never account for more
+    than one poll interval: if two readings sit further apart than that, the
+    polls between them were never recorded and their energy is unknown rather
+    than attributable to the neighbours. Measured spacing can only *lower* that
+    bound, never raise it — which is the whole of the rule, ``min(median gap,
+    cadence)``, and what stops a window holding two 1 kW readings three hours
+    apart at a sixty-second interval from reporting the 6 kWh the gap would carry
+    where the two minutes of poll period actually sampled are worth 33 Wh.
+
+    The median gap is what lowers it, and it is taken rather than the mean so a
+    poller stopped for an hour inside the window does not inflate every
+    reading's share. It matters for the one case the interval gets wrong in the
+    other direction: history recorded at ten seconds, read back under a setting
+    since raised to sixty, is genuinely six times denser than the setting says
+    and the measurement says so.
+
+    The residual, stated rather than hidden: the raw tier records no cadence of
+    its own, so history recorded at a *longer* interval than the one now
+    configured is under-counted — an hour of readings taken hourly, read under a
+    sixty-second setting, accounts for sixty seconds and not for the hour. That
+    is the safe direction to be wrong in by a wide margin: the alternative,
+    trusting the spacing, over-reported a sparse window by two hundred times.
+    Only the hourly tier can do better, and it does, by writing its coverage
+    down at the moment the interval was known.
+
+    Fewer than two readings leaves no spacing to measure, so this falls back to
+    the interval the caller says is in force: a lone reading has to be worth
+    some duration or a one-sample window reports no energy at all.
+    """
+    if len(stamps) < 2:
+        return max(1, cadence_seconds)
+    gaps = sorted(b - a for a, b in pairwise(stamps))
+    return max(1, min(gaps[len(gaps) // 2], cadence_seconds))
+
+
+def _with_breaks(stamps: Sequence[int], cadence_seconds: int) -> list[int]:
+    """The window's stamps, plus one carrying nothing at the start of each hole.
+
+    A series is built from the rows that exist, so a poller stopped for three
+    hours leaves two readings three hours apart sitting *adjacent* in the
+    array — and a chart that breaks a line only where a null sits joins them,
+    drawing an air conditioner ramping gently down and back up across three
+    hours nobody measured. The inverter path never had this to deal with
+    because the collector writes a row even when a poll fails, and that row
+    enters the series as a null; the Emporia poller writes nothing at all while
+    the module is off, so there is no row to become one and it has to be made
+    here.
+
+    Here rather than in the browser because a page draws what an endpoint tells
+    it. A series a consumer has to know to distrust has only pushed the problem
+    outward, and there is more than one consumer.
+
+    One stamp per hole is all a break needs — measured on the bench against
+    uPlot itself, which leaves 1,035 pixels of a strip unpainted on the
+    strength of a single null. Filling the hole would say the same thing in the
+    hundred and seventy-six points a three-hour hole takes at a minute's
+    cadence. It sits at ``previous + cadence``, the first instant that should
+    have carried a reading and did not; at the midpoint the break would float
+    away from the moment collection stopped.
+    """
+    out: list[int] = []
+    for previous, current in pairwise(stamps):
+        out.append(previous)
+        if current - previous >= _GAP_CADENCES * cadence_seconds:
+            out.append(previous + cadence_seconds)
+    out.extend(stamps[-1:])
+    return out
 
 
 @dataclass(frozen=True)
@@ -31,8 +128,16 @@ class CircuitLatest:
     ``watts`` is None both when the circuit has never been read and when its
     last reading was absent. A page must say "no reading" for either, so they do
     not need separating here — but neither may be drawn as a zero.
+
+    ``circuit_id`` is the surrogate ``history()`` already keys its own series
+    on. A page linking a live row to that circuit's chart has to name the same
+    circuit both endpoints agree on, and identity here is ``(device_gid,
+    channel_num)`` with this id as its handle — never the name, which
+    ``sync_circuits`` updates in place the moment an owner renames a circuit in
+    Emporia's app.
     """
 
+    circuit_id: int
     device_gid: int
     channel_num: str
     name: str
@@ -42,6 +147,78 @@ class CircuitLatest:
     # What the owner said this circuit is, in Emporia's own numbering. The page
     # picks an icon from it; None means nobody has categorised the clamp.
     type_gid: int | None = None
+
+
+@dataclass(frozen=True)
+class CircuitSeries:
+    """One circuit's readings over a window, with the energy they add up to.
+
+    ``kwh`` is None rather than 0.0 for a circuit that reported nothing at all
+    across the window. The two are different claims — "it used no energy" and
+    "nobody heard from it" — and a bar chart that renders the second as the
+    first puts a dead outlet at the bottom of a ranking as though it were a
+    quiet one.
+
+    ``partial`` says the energy figure was built from buckets that were not
+    fully recorded. It is not a doubt about the number; the number is what was
+    measured. It is what lets the page label a figure rather than present a
+    part as a whole. Only the hourly tier can raise it, because only the hourly
+    tier stores a sample count — a raw row is one reading, and how much of the
+    window those readings between them cover is already in the energy.
+
+    A hole in the window does not raise it. "Thinly sampled bucket" and "the
+    module was off for three hours" are different facts, and an hour recorded
+    end to end is whole however long the silence either side of it ran.
+
+    ``watts`` therefore holds two kinds of null and deliberately does not
+    separate them: a circuit that was listed and did not answer, and an instant
+    nothing was recorded at. Both are absences, and neither may be drawn as a
+    number.
+    """
+
+    circuit_id: int
+    device_gid: int
+    channel_num: str
+    name: str
+    kind: str
+    watts: tuple[int | None, ...]
+    kwh: float | None
+    partial: bool
+
+
+@dataclass(frozen=True)
+class CircuitHistory:
+    """Every requested circuit over one window, on one shared clock.
+
+    One timestamp array for all of them rather than one each. The circuits are
+    polled together and stored under a single instant — ``append_readings``
+    takes one ``now`` for the whole batch — so they genuinely share sample
+    times, and a chart drawing five strips against five near-identical x arrays
+    pays five times for one fact.
+
+    Not every instant here was polled. Where the module went quiet, one stamp
+    is added carrying nothing for any circuit, so a line breaks at the moment
+    collection stopped instead of being drawn straight across the outage. See
+    ``_with_breaks``; it is the same claim as any other null in the series, and
+    a consumer needs no separate rule for it.
+
+    ``recorded_seconds`` is how much of the window the module was recording for
+    at all — the union across every circuit the window holds, since a poll that
+    reached one clamp reached the monitor. Across every circuit and not only
+    the requested ones: narrowing to a single outlet that has been offline
+    since April would otherwise report a module outage and withhold a share the
+    module could honestly support. It is here because it is measured from the
+    same coverage the energy is, and a caller that recomputed it from the
+    timestamps would be deriving in a second place the one figure that says
+    whether these circuits and the house counter describe the same span. A
+    seven-day window holding one reading an hour recorded seven hours, not
+    seven days, and only this number can say so.
+    """
+
+    timestamps: tuple[int, ...]
+    series: tuple[CircuitSeries, ...]
+    tier: str
+    recorded_seconds: int = 0
 
 
 class CircuitRepository:
@@ -143,7 +320,7 @@ class CircuitRepository:
         try:
             rows = self._store._conn.execute(
                 "SELECT c.device_gid, c.channel_num, c.name, c.kind, c.multiplier,"
-                "       r.watts, r.timestamp, c.type_gid"
+                "       r.watts, r.timestamp, c.type_gid, c.id"
                 "  FROM circuit c"
                 "  LEFT JOIN circuit_reading r"
                 "    ON r.circuit_id = c.id"
@@ -156,6 +333,7 @@ class CircuitRepository:
             return []
         out = [
             CircuitLatest(
+                circuit_id=int(row[8]),
                 device_gid=int(row[0]),
                 channel_num=str(row[1]),
                 name=str(row[2]),
@@ -168,6 +346,180 @@ class CircuitRepository:
         ]
         out.sort(key=lambda c: (c.watts is None, -(c.watts or 0), c.name))
         return out
+
+    def history(
+        self,
+        start: datetime,
+        end: datetime,
+        tier: str,
+        circuit_ids: Sequence[int] | None = None,
+        cadence_seconds: int = _POLL_SECONDS,
+    ) -> CircuitHistory:
+        """Circuits over a window, ranked by the energy each one used.
+
+        Ranked by energy rather than by the newest reading, because the live
+        list already answers "what is drawing that" and this answers "what ate
+        the power" — a kettle at 5 kW for a minute is not the day's biggest
+        load and sorting on watts would say it was.
+
+        The multiplier is applied here, as it is in ``latest()`` and for the
+        same reason: both tiers store one leg of a 240 V circuit, so the dryer,
+        the oven and both air conditioners read half without it. The series and
+        the energy are multiplied in one place so they cannot disagree.
+
+        Energy comes from the readings rather than from the window. An hourly
+        bucket built from two of sixty samples covers two minutes, and how much
+        of the hour was recorded is stored precisely so that hour is not read as
+        a full one — coverage in minutes watched is not coverage in energy
+        accounted for, and this is the figure the second question depends on.
+
+        The hourly tier answers that from its own ``covered_seconds``, measured
+        by the rollup at a moment when the interval that produced the readings
+        was still the one in force. Nothing here guesses it, and that is the
+        point: passing today's setting to rows recorded under a different one
+        doubled the energy of every stored hour the day the bench interval was
+        raised from ten seconds to sixty. A row written before that column
+        existed holds NULL and falls back to exactly that guess —
+        ``sample_count`` times the interval now in force, clamped to the hour —
+        because its raw readings are pruned at thirty days and the measurement
+        cannot be made after the fact. An old hour read imperfectly beats an old
+        hour refused, but the fallback is written out here rather than left to
+        look like arithmetic.
+
+        ``cadence_seconds`` is the poll interval in force. It bounds the raw
+        tier, where no coverage was ever written down: one reading accounts for
+        at most one interval, and for less where the next reading came sooner.
+        See ``_reading_seconds`` for the rule and for what it costs.
+
+        The timestamps are the ones that were recorded plus one per hole, so a
+        stretch the module missed arrives as a null rather than as a straight
+        line drawn across it — ``_with_breaks`` says why that is this
+        endpoint's job and not the page's. The energy is untouched by it: a
+        synthetic stamp carries no reading, so it is worth nothing and cannot
+        move a kWh figure or mark an hour partial.
+
+        A database error yields an empty history rather than raising. This runs
+        unattended on someone's inverter and a page saying it has no circuits
+        tells the owner more than a page returning 500.
+        """
+        if tier not in _CIRCUIT_TABLES:
+            raise ValueError(f"unknown circuit tier {tier!r}")
+        table = _CIRCUIT_TABLES[tier]
+        counted = tier == "hourly"
+        first = int(start.timestamp())
+        last = int(end.timestamp())
+        try:
+            circuits = self._store._conn.execute(
+                "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
+            ).fetchall()
+            rows = self._store._conn.execute(
+                "SELECT timestamp, circuit_id, watts,"
+                f" {'sample_count, covered_seconds' if counted else '1, NULL'}"
+                f"  FROM {table}"
+                "  WHERE timestamp >= ? AND timestamp < ?"
+                "  ORDER BY timestamp",
+                (first, last),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("could not read circuit history: %s", exc)
+            return CircuitHistory(timestamps=(), series=(), tier=tier)
+
+        wanted = None if circuit_ids is None else set(circuit_ids)
+        meta = {int(row[0]): row for row in circuits if wanted is None or int(row[0]) in wanted}
+        stamps = sorted({int(row[0]) for row in rows})
+
+        # The most one row of the raw tier may be credited with: one poll
+        # interval, lowered to the spacing the window achieved where that is
+        # tighter. Not consulted on the hourly tier, which stores its own
+        # coverage. Measured before the breaks are added, or the synthetic
+        # stamps would be counted as spacing and move the energy.
+        reading_seconds = _reading_seconds(stamps, cadence_seconds)
+        # An hourly row covers an hour however often the module polled, so that
+        # tier is judged against the hour. The raw tier is judged against the
+        # same bound its energy is, so a stretch nobody recorded breaks the line
+        # instead of being drawn straight across — which it was while the
+        # threshold came from the window's own spacing, since a window that is
+        # mostly hole measures the hole as its ordinary spacing.
+        drawn = _with_breaks(stamps, _HOUR_SECONDS if counted else reading_seconds)
+        slot = {stamp: index for index, stamp in enumerate(drawn)}
+        # The stamp after each recorded one, so a reading is credited with the
+        # distance to its successor rather than with a flat interval — a retried
+        # poll five seconds behind its predecessor is worth five seconds, not
+        # sixty. The same rule the rollup applies inside an hour.
+        following = dict(pairwise(stamps))
+        watts: dict[int, list[int | None]] = {
+            circuit_id: [None] * len(drawn) for circuit_id in meta
+        }
+        joules: dict[int, float] = dict.fromkeys(meta, 0.0)
+        seen: set[int] = set()
+        partial: set[int] = set()
+        # How much of the window the module was recording for, per instant, as
+        # the widest coverage any one circuit had there: a poll that reached one
+        # clamp reached the monitor, and this is a fact about the module rather
+        # than about a circuit.
+        recorded_at: dict[int, int] = {}
+        for stamp, circuit_id, raw, samples, stored in rows:
+            if raw is None:
+                continue
+            key = int(circuit_id)
+            when = int(stamp)
+            if counted:
+                # An hour holds 3,600 seconds however many readings landed in
+                # it. ``covered_seconds`` is what the rollup measured while the
+                # interval that produced those readings was still in force, and
+                # ``partial`` is read off the same figure so the flag and the
+                # arithmetic cannot drift apart. NULL is a row written before
+                # that column existed, and only there is the old guess used:
+                # the sample count times the interval running *now*, which is
+                # right until somebody changes the setting and wrong by the
+                # ratio afterwards.
+                covered = (
+                    min(int(stored), _HOUR_SECONDS)
+                    if stored is not None
+                    else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
+                )
+            else:
+                nxt = following.get(when)
+                covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
+            # Taken from every circuit the window returned, before the narrowing
+            # below. This is a fact about the module, not about a circuit: a
+            # poll that reached one clamp reached the monitor. Measured after
+            # the narrowing, a request for one circuit read that circuit's
+            # silence as a module outage and withheld a share the module could
+            # honestly support.
+            recorded_at[when] = max(recorded_at.get(when, 0), covered)
+            if key not in meta:
+                continue
+            value = round(float(raw) * float(meta[key][5]))
+            watts[key][slot[when]] = value
+            seen.add(key)
+            if counted and covered < _HOUR_SECONDS:
+                partial.add(key)
+            joules[key] += value * covered
+
+        series = [
+            CircuitSeries(
+                circuit_id=circuit_id,
+                device_gid=int(row[1]),
+                channel_num=str(row[2]),
+                name=str(row[3]),
+                kind=str(row[4]),
+                watts=tuple(watts[circuit_id]),
+                kwh=(joules[circuit_id] / 3_600_000) if circuit_id in seen else None,
+                partial=circuit_id in partial,
+            )
+            for circuit_id, row in meta.items()
+        ]
+        # A circuit nobody heard from sorts last, below one measured at nothing.
+        # Ordering a silence above a fact is what latest() already refuses to do
+        # and this list is read top-down for the same reason.
+        series.sort(key=lambda s: (s.kwh is None, -(s.kwh or 0.0), s.name))
+        return CircuitHistory(
+            timestamps=tuple(drawn),
+            series=tuple(series),
+            tier=tier,
+            recorded_seconds=sum(recorded_at.values()),
+        )
 
 
 # Who decided a change. Two values rather than a boolean because the audit is

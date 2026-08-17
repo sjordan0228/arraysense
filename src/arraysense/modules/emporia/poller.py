@@ -61,8 +61,8 @@ from arraysense.settings import (
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
-    EMPORIA_INTERVAL_KEY,
     SettingsStore,
+    emporia_interval_seconds,
 )
 from arraysense.store.sqlite_store import SqliteStore
 
@@ -200,8 +200,7 @@ class EmporiaPoller:
         return self._state
 
     def _interval(self) -> float:
-        value = self._settings.get(EMPORIA_INTERVAL_KEY)
-        return float(value) if isinstance(value, int | float) else 60.0
+        return float(emporia_interval_seconds(self._settings))
 
     def _override_until(self) -> datetime | None:
         """When the owner's hand stops holding the charger, or None if it is not.

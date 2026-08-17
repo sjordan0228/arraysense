@@ -117,6 +117,21 @@ MODULE_TIERS: tuple[Tier, ...] = (
     Tier("hourly", "module_hourly", None),
 )
 
+# The optional Emporia module's tiers. Raw and hourly only, for the reason the
+# module tiers have no minute tier and the opposite reason besides: a circuit
+# is polled once a minute already, so a minute tier would be a copy of the raw
+# one under another name. Named here with the other two so tier selection reads
+# one list rather than keeping a third copy of the table names in step by hand.
+#
+# ``keep_days`` describes the retention that is already running — the raw tier
+# is pruned into the hourly one by store.retention, and the hourly tier appears
+# in no prune table of its own, which is what None means here and why a
+# thirteen-month circuit history is readable.
+CIRCUIT_TIERS: tuple[Tier, ...] = (
+    Tier("full", "circuit_reading", 30),
+    Tier("hourly", "circuit_hourly", None),
+)
+
 SERIALS_TABLE = "serials"
 INVALID_TABLE = "invalid_readings"
 SETTINGS_TABLE = "settings"
@@ -364,6 +379,23 @@ def _circuit_hourly_ddl(as_name: str) -> str:
     stage that prices a circuit has to be able to tell them apart. That differs
     deliberately from the module tier, which counts rows because a failed poll
     writes none there.
+
+    ``covered_seconds`` is how much of the hour those readings actually account
+    for, and it is the one figure a reader cannot derive. A sample count means
+    nothing until something says what one sample covers, and the only moment
+    anything knows that is the rollup — which runs on the hourly clock, minutes
+    after the readings it summarises, while the poll interval that produced them
+    is still the one in force. Read back later under an interval the owner has
+    since changed, the same count says something else entirely: 180 samples is
+    half an hour at ten seconds and a whole one at sixty, so raising the setting
+    doubled the energy of every hour already stored. Measuring once, here, is
+    what stops a setting from rewriting history.
+
+    Nullable, and NULL means one specific thing: a row written before this
+    column existed. Those cannot be repaired — their raw readings are pruned
+    after thirty days, so for most of them the evidence is gone — and a reader
+    falls back to the old guess for them, visibly. An hour genuinely holding no
+    readings stores 0 rather than NULL, so the two are never confused.
     """
     return (
         f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
@@ -371,6 +403,7 @@ def _circuit_hourly_ddl(as_name: str) -> str:
         "    circuit_id INTEGER NOT NULL,\n"
         "    watts INTEGER,\n"
         "    sample_count INTEGER NOT NULL,\n"
+        "    covered_seconds INTEGER,\n"
         "    PRIMARY KEY (timestamp, circuit_id)\n"
         f") {_TABLE_OPTIONS}"
     )
@@ -736,6 +769,12 @@ def migration_ddl(
 # NULL column to a table that already has rows.
 LATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     CHARGER_CHANGE_TABLE: (("source", "TEXT"),),
+    # How much of each hour the readings behind it account for. Added after the
+    # tier shipped, so an installation that has been recording circuits since
+    # 1.1.0 has hours without one; those keep NULL and are read with the old
+    # guess, because their raw readings are pruned at thirty days and the
+    # measurement cannot be made after the fact.
+    CIRCUIT_HOURLY_TABLE: (("covered_seconds", "INTEGER"),),
 }
 
 

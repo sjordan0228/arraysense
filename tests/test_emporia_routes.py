@@ -11,7 +11,7 @@ screenshot.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +172,343 @@ def client_with_password(tmp_path: Path) -> Any:
     with TestClient(app) as c:
         yield c
     store.close()
+
+
+@pytest.fixture
+def client_without_emporia(tmp_path: Path) -> Any:
+    app, store, _ = _app(tmp_path, with_poller=False)
+    with TestClient(app) as c:
+        yield c
+    store.close()
+
+
+# --- circuit history ------------------------------------------------------
+
+# The instant every history window below ends at. Fixed rather than read from
+# the clock because the route reads no clock either: every bound it works from
+# arrives in the request or comes out of the store, so a fixed END makes the
+# arithmetic checkable instead of approximate.
+END = datetime(2026, 8, 16, 18, 0, tzinfo=UTC)
+
+# How far behind END the newest inverter counter reading sits on a live-shaped
+# request. The dongle read takes 12-17 s and the range on screen ends at the
+# wall clock, so the house is never known quite up to the end of the window.
+INVERTER_LAG = timedelta(seconds=12)
+
+LOAD_COUNTER = "load_energy_total_kwh"
+
+
+def _seed_counters(store: SqliteStore, newest: datetime, hours: float = 7.0) -> None:
+    """Write the house's lifetime counter back from ``newest``, 0.1 kWh a minute.
+
+    A minute apart because that is the clock the driver reads the energy
+    registers on, and 0.1 kWh is the finest step the metric's scale of ten can
+    hold — anything smaller would not survive the round trip through storage.
+
+    Seven hours because the longest window asked for below is six, and a
+    counter read is only knowable where readings bracket both of its bounds:
+    three hours of history answers a one-hour question and blanks a six-hour
+    one, which looks exactly like the endpoint being broken.
+    """
+    steps = int(hours * 60)
+    for step in range(steps + 1):
+        store.append(
+            Sample(
+                timestamp=newest - timedelta(minutes=step),
+                readings={LOAD_COUNTER: 1000.0 + 0.1 * (steps - step)},
+            )
+        )
+
+
+def _seed_circuits(app: Any, newest: datetime, minutes: int = 60) -> None:
+    """A dryer and a mains channel, both reporting every minute back from ``newest``.
+
+    Counted in whole minutes rather than in hours because the span check turns
+    on exactly how many readings landed, and a fraction of an hour multiplied
+    back out lands one reading either side of what was asked for.
+    """
+    repo = app.state.emporia.repository
+    repo.sync_circuits(
+        [
+            Circuit(100000, "5", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "1", "Main panel", 1.0, "mains"),
+        ],
+        newest,
+    )
+    for step in range(minutes):
+        when = newest - timedelta(minutes=step)
+        repo.append_readings([Reading(100000, "5", 1000), Reading(100000, "1", 4000)], when)
+
+
+def _app_with_history(
+    tmp_path: Path, *, counters_newest: datetime | None = END - INVERTER_LAG
+) -> tuple[Any, SqliteStore]:
+    """An app whose circuits report to just before END, with the house behind them.
+
+    ``counters_newest`` is what each test varies: a poll behind END is the live
+    shape, hours behind it is an inverter that went silent, and None is one that
+    has never reported an energy counter at all.
+    """
+    app, store, _ = _app(tmp_path)
+    _seed_circuits(app, END - timedelta(seconds=30))
+    if counters_newest is not None:
+        _seed_counters(store, counters_newest)
+    return app, store
+
+
+def _history(client: TestClient, hours: float, **params: Any) -> dict[str, Any]:
+    """Ask for the circuit history of the ``hours`` before END, as the page does."""
+    response = client.get(
+        "/api/emporia/history",
+        params={
+            "start": (END - timedelta(hours=hours)).isoformat(),
+            "end": END.isoformat(),
+            **params,
+        },
+    )
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def test_history_excludes_mains_from_the_ranking_and_the_coverage(tmp_path: Path) -> None:
+    # A monitor's mains channel is the sum of the circuits beside it. Counting
+    # it as a part doubles every house — alerts.NOT_A_CULPRIT already names it
+    # and this reads that set rather than keeping a second copy.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert "mains" not in {circuit["kind"] for circuit in body["circuits"]}
+    # The dryer alone: 1 kW held across sixty one-minute readings is 1 kWh. The
+    # mains channel was reading 4 kW at the same instants and contributes none
+    # of it.
+    assert body["coverage"]["circuits_kwh"] == pytest.approx(1.0)
+
+
+def test_history_reports_the_tier_it_answered_from(tmp_path: Path) -> None:
+    # An hourly average of a pump that runs four minutes an hour is a true
+    # number and a misleading shape. The page names the tier so the reader is
+    # not told a shape it did not draw.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        day = _history(c, hours=24)
+        week = _history(c, hours=24 * 7)
+    store.close()
+
+    assert day["tier"] == "full"
+    assert week["tier"] == "hourly"
+
+
+def test_history_says_what_fraction_of_the_house_the_circuits_cover(tmp_path: Path) -> None:
+    # Five bars read as the whole house without this. The fraction is computed
+    # from energy, never from minutes watched — coverage in minutes is a
+    # different question and money depends on the second (#23).
+    #
+    # Asserted as a real number, not "None or in range". A tolerant assertion
+    # here is what would have let a permanently null coverage pass as though the
+    # feature worked.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    coverage = body["coverage"]
+    # The counter climbs 0.1 kWh a minute, so the hour before END holds 6 kWh —
+    # measured to the last reading the inverter actually sent, twelve seconds
+    # before the end of the window.
+    assert coverage["house_kwh"] == pytest.approx(6.0)
+    assert coverage["circuits_kwh"] == pytest.approx(1.0)
+    assert coverage["fraction"] == pytest.approx(1.0 / 6.0, abs=0.01)
+
+
+def test_coverage_is_reported_for_a_window_ending_now(tmp_path: Path) -> None:
+    # The regression this guards is silent and total: _covered cannot bracket a
+    # bound with no reading after it, so an unclamped window ending at the wall
+    # clock blanks this line on every live request, for ever.
+    #
+    # The circuits are seeded across the whole window on purpose. This is about
+    # the *house* side of the clamp, and a window the module only recorded part
+    # of withholds the share for its own reason — which would leave this passing
+    # or failing for something other than what it is here to watch.
+    app, store, _ = _app(tmp_path)
+    _seed_circuits(app, END - timedelta(seconds=30), minutes=6 * 60)
+    _seed_counters(store, END - INVERTER_LAG)
+    with TestClient(app) as c:
+        body = _history(c, hours=6)
+    store.close()
+
+    assert body["coverage"]["fraction"] is not None
+
+
+def test_coverage_goes_unknown_when_the_inverter_has_been_silent(tmp_path: Path) -> None:
+    # The last inverter reading is hours old while circuits kept reporting.
+    # Clamping to it would divide a full window of circuits by a partial window
+    # of house and read well over 100%. Unknown is the truthful answer.
+    app, store = _app_with_history(tmp_path, counters_newest=END - timedelta(hours=3))
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["house_kwh"] is None
+    assert body["coverage"]["fraction"] is None
+
+
+def test_history_reports_a_fraction_above_one_rather_than_capping_it(tmp_path: Path) -> None:
+    # A part cannot exceed the whole, so a fraction above one is not a coverage
+    # figure at all — it is a fault saying so: a mains channel that escaped the
+    # exclusion, or a multiplier set for the wrong circuit. Capping it to 1.0
+    # would render every one of those as perfect coverage, which is the single
+    # reading guaranteed to be wrong, and would hide the fault for as long as it
+    # lasted. The page decides how to draw a disagreement; the endpoint's job is
+    # to report the arithmetic it actually did.
+    app, store, _ = _app(tmp_path)
+    newest = END - timedelta(seconds=30)
+    repo = app.state.emporia.repository
+    repo.sync_circuits([Circuit(100000, "5", "Dryer", 1.0, "circuit")], newest)
+    # 30 kW held for an hour is 30 kWh, against a house counter climbing 6.0 over
+    # the same hour — the arithmetic of a multiplier set an order of magnitude
+    # too high, which is exactly what this figure should expose.
+    for step in range(60):
+        repo.append_readings([Reading(100000, "5", 30000)], newest - timedelta(minutes=step))
+    _seed_counters(store, END - INVERTER_LAG)
+
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["house_kwh"] == pytest.approx(6.0)
+    assert body["coverage"]["fraction"] > 1.0
+
+
+def test_history_withholds_the_share_when_the_circuits_recorded_part_of_the_window(
+    tmp_path: Path,
+) -> None:
+    # The check docs/api.md has promised since this endpoint shipped and only
+    # the browser was making. _coverage_end bounds the house side; nothing
+    # bounded the circuits', so an hour of circuit readings inside a six-hour
+    # window was divided by six hours of house counter and reported as a share.
+    # Every figure in it correct, and the sentence it produced — "monitored
+    # circuits cover 3% of the house" — invites the reader to conclude the house
+    # is barely monitored when the truth is the module was not running.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=6)
+    store.close()
+
+    coverage = body["coverage"]
+    assert coverage["circuits_kwh"] == pytest.approx(1.0), "an hour of dryer really was recorded"
+    assert coverage["house_kwh"] is not None, "and the house counter really did report"
+    assert coverage["fraction"] is None, "but the two do not describe the same span"
+    assert coverage["spans_match"] is False
+    assert coverage["recorded_seconds"] == 60 * 60
+    assert coverage["window_seconds"] == 6 * 3600
+
+
+@pytest.mark.parametrize(
+    ("minutes", "matches"),
+    [
+        (60, True),
+        # One poll lost at each edge of the shortest range the page offers.
+        (58, True),
+        # Exactly ninety per cent: the threshold is a floor, not an exclusive bound.
+        (54, True),
+        (53, False),
+        (20, False),
+    ],
+)
+def test_the_span_threshold_clears_ordinary_operation_and_catches_a_gappy_window(
+    tmp_path: Path, minutes: int, matches: bool
+) -> None:
+    # Ninety per cent of the window, and the number has to clear ordinary
+    # operation or the qualification fires on every healthy installation and so
+    # means nothing. A healthy one loses at most one poll at each edge, which is
+    # two minutes of the shortest range the page offers. Below the threshold the
+    # share would be understated by more than a tenth of its own value, which is
+    # more than a percentage rounded to whole numbers can absorb.
+    app, store, _ = _app(tmp_path)
+    _seed_circuits(app, END - timedelta(seconds=30), minutes=minutes)
+    _seed_counters(store, END - INVERTER_LAG)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["spans_match"] is matches
+    assert (body["coverage"]["fraction"] is not None) is matches
+
+
+def test_history_reports_the_span_it_measured_the_check_against(tmp_path: Path) -> None:
+    # The page says how long the circuits recorded for, and it has to be the
+    # figure the endpoint decided on rather than one measured again in the
+    # browser — the browser's own count credited every hourly bucket holding
+    # anything with a full 3,600 seconds and so could never find a window short.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    coverage = body["coverage"]
+    assert coverage["window_seconds"] == 3600
+    assert coverage["recorded_seconds"] == 3600
+    assert coverage["spans_match"] is True
+    assert coverage["fraction"] is not None
+
+
+def test_history_leaves_the_fraction_null_when_the_house_is_unknown(tmp_path: Path) -> None:
+    # A house figure the inverter did not report is not a house drawing nothing.
+    # A fraction computed against zero would read as full coverage, which is the
+    # exact inversion of the truth.
+    app, store = _app_with_history(tmp_path, counters_newest=None)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["circuits_kwh"] == pytest.approx(1.0)
+    assert body["coverage"]["house_kwh"] is None
+    assert body["coverage"]["fraction"] is None
+
+
+def test_history_can_be_narrowed_to_named_circuits(tmp_path: Path) -> None:
+    # The reference account has thirty-nine circuits and the page draws five.
+    # Fetching all of them to discard thirty-four is what this argument avoids.
+    app, store = _app_with_history(tmp_path)
+    ids = app.state.emporia.repository._ids()
+    with TestClient(app) as c:
+        body = _history(c, hours=1, ids=str(ids[(100000, "5")]))
+    store.close()
+
+    assert [circuit["name"] for circuit in body["circuits"]] == ["Dryer"]
+
+
+def test_history_refuses_an_unparseable_circuit_id(client: TestClient) -> None:
+    # Dropping the bad entry would return four strips where five were asked for,
+    # and the page has no way to notice it was given a narrower answer.
+    response = client.get(
+        "/api/emporia/history",
+        params={"start": "2026-08-16T00:00:00Z", "end": "2026-08-16T06:00:00Z", "ids": "3,oops"},
+    )
+    assert response.status_code == 400
+
+
+def test_history_with_the_module_off_answers_empty_rather_than_erroring(
+    client_without_emporia: TestClient,
+) -> None:
+    # The tab is gated on the module, but a stale bookmark must not 500.
+    response = client_without_emporia.get(
+        "/api/emporia/history",
+        params={"start": "2026-08-16T00:00:00Z", "end": "2026-08-16T06:00:00Z"},
+    )
+    assert response.status_code == 200
+    assert response.json()["circuits"] == []
+
+
+def test_history_rejects_a_backwards_range(client: TestClient) -> None:
+    response = client.get(
+        "/api/emporia/history",
+        params={"start": "2026-08-16T06:00:00Z", "end": "2026-08-16T00:00:00Z"},
+    )
+    assert response.status_code == 400
 
 
 def test_status_says_off_before_anybody_enables_it(client: TestClient) -> None:
@@ -345,6 +682,27 @@ def test_the_circuits_endpoint_says_which_devices_stopped_answering(tmp_path: Pa
     assert rows["Shed outlet"]["connected"] is False
     assert rows["Shed outlet"]["offline_since"] == "since Apr 2, 2026, 5:06 PM"
     store.close()
+
+
+def test_the_live_list_and_the_history_endpoint_agree_on_circuit_ids(tmp_path: Path) -> None:
+    # The whole reason an id was added to the live list: a row on /emporia
+    # links to /graphs#circuits=<id>, and the link is worthless unless the
+    # circuits endpoint answers to the same id for the same circuit. Every row
+    # carries an id, and it is the surrogate history() already keys its series
+    # on — never a name, which sync_circuits updates in place on a rename.
+    app, store = _app_with_history(tmp_path)
+    with TestClient(app) as c:
+        live = c.get("/api/emporia/circuits").json()["circuits"]
+        history = _history(c, hours=1)
+    store.close()
+
+    assert live, "the seeded circuits should be listed"
+    assert all(isinstance(row["id"], int) for row in live), "every circuit carries an id"
+    live_ids = {row["name"]: row["id"] for row in live}
+    history_ids = {row["name"]: row["id"] for row in history["circuits"]}
+    assert history_ids, "the history endpoint should report the dryer circuit"
+    for name, circuit_id in history_ids.items():
+        assert live_ids[name] == circuit_id, f"the live list and history disagree about {name}'s id"
 
 
 def test_a_circuit_emporia_said_nothing_about_is_not_reported_as_online(tmp_path: Path) -> None:

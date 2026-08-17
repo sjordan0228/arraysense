@@ -2206,3 +2206,32 @@ def test_opening_a_database_written_before_the_source_column_repairs_it(tmp_path
     assert row[1] is None, (
         "and it says nothing about who moved the rate, because nobody recorded it"
     )
+
+
+def test_opening_a_database_written_before_covered_seconds_repairs_it(tmp_path: Path) -> None:
+    # The same shape for the circuit tier, and with more at stake: without the
+    # repair every rollup after the upgrade fails with "no such column", so the
+    # hourly tier stops advancing and retention stops being able to prune raw
+    # readings that grow by 56,000 rows a day. The hours already stored keep
+    # NULL — the raw readings behind them are pruned at thirty days, so their
+    # coverage cannot be measured now, and rewriting them would be inventing it.
+    path = str(tmp_path / "old.db")
+    store = SqliteStore(path, device=TEST_DEVICE)
+    with store._conn:
+        store._conn.execute("ALTER TABLE circuit_hourly DROP COLUMN covered_seconds")
+        store._conn.execute(
+            "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count)"
+            " VALUES (1786896000, 1, 900, 30)"
+        )
+    store.close()
+
+    reopened = SqliteStore(path, device=TEST_DEVICE)
+    columns = {r[1] for r in reopened._conn.execute("PRAGMA table_info(circuit_hourly)")}
+    row = reopened._conn.execute(
+        "SELECT watts, sample_count, covered_seconds FROM circuit_hourly"
+    ).fetchone()
+    reopened.close()
+
+    assert "covered_seconds" in columns
+    assert row[:2] == (900, 30), "the hour that was there is untouched"
+    assert row[2] is None, "and it says nothing about its own coverage, because nobody measured it"

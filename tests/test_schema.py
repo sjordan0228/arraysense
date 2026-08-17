@@ -326,6 +326,33 @@ def test_a_hand_shaped_table_gains_a_column_it_is_missing() -> None:
     conn.close()
 
 
+def test_the_hourly_circuit_tier_gains_its_coverage_column_on_open() -> None:
+    # An installation that has been recording circuits since 1.1.0 has this
+    # table without the column, and every rollup after the upgrade would fail
+    # with "no such column" — on precisely the installations with the most
+    # history. The rows already there keep NULL: their raw readings are pruned
+    # at thirty days, so the coverage cannot be measured after the fact, and a
+    # zero written here would claim those hours recorded nothing at all.
+    conn = _open()
+    conn.execute("ALTER TABLE circuit_hourly DROP COLUMN covered_seconds")
+    conn.execute(
+        "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count)"
+        " VALUES (3600, 1, 900, 30)"
+    )
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+
+    stmts = late_column_ddl(existing)
+
+    assert "ALTER TABLE circuit_hourly ADD COLUMN covered_seconds INTEGER" in stmts
+    for stmt in stmts:
+        conn.execute(stmt)
+    row = conn.execute("SELECT sample_count, covered_seconds FROM circuit_hourly").fetchone()
+    assert row == (30, None), "an hour written by the older build says nothing about its coverage"
+    conn.close()
+
+
 def test_a_hand_shaped_table_that_is_current_needs_no_migration() -> None:
     conn = _open()
     existing = {
