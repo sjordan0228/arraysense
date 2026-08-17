@@ -95,9 +95,38 @@ def _multiplier_for(raw: object, device_gid: int, channel_num: str) -> float:
     return 1.0
 
 
-def _label_for(name: object, device_gid: int, channel_num: str) -> str:
+def _device_name(node: dict[str, object]) -> str | None:
+    """What the owner called this device in Emporia's app, if they called it anything.
+
+    It sits in ``locationProperties`` rather than on the channel, which is why
+    it went unused: an outlet, a charger and a monitor all report themselves on
+    the mains channel and none of them name it, so the whole device read as
+    "Device 402097 ch 1,2,3" while Emporia had held "EVSE" all along.
+    """
+    properties = node.get("locationProperties")
+    if not isinstance(properties, dict):
+        return None
+    name = properties.get("deviceName")
+    return name.strip() if isinstance(name, str) and name.strip() else None
+
+
+def _label_for(
+    name: object, device_gid: int, channel_num: str, device_name: str | None = None
+) -> str:
+    """What to call a channel: its own name, then its device's, then an identifier.
+
+    ``device_name`` is offered only for a device's own mains channel, and the
+    restriction is the point rather than an optimisation. A name describes the
+    device, so lending it to every unnamed clamp on a monitor renders four
+    separate circuits as four rows all reading "Subpanel Vue" — which is worse
+    than the identifier it replaced, since the identifier at least tells them
+    apart. An unnamed clamp is a clamp nobody has named, and saying so is the
+    honest answer.
+    """
     if isinstance(name, str) and name.strip():
         return name.strip()
+    if device_name:
+        return device_name
     return f"Device {device_gid} ch {channel_num}"
 
 
@@ -108,6 +137,7 @@ def _walk(node: object, out: list[Circuit]) -> None:
     model = str(node.get("model", ""))
     if isinstance(gid, int):
         channels = node.get("channels")
+        named = _device_name(node)
         if isinstance(channels, list):
             for channel in channels:
                 if not isinstance(channel, dict):
@@ -121,7 +151,12 @@ def _walk(node: object, out: list[Circuit]) -> None:
                     Circuit(
                         device_gid=gid,
                         channel_num=number,
-                        name=_label_for(channel.get("name"), gid, number),
+                        name=_label_for(
+                            channel.get("name"),
+                            gid,
+                            number,
+                            named if number == MAINS_CHANNEL else None,
+                        ),
                         multiplier=multiplier,
                         kind=_kind_for(model, number),
                         type_gid=(

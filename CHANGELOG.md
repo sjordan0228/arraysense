@@ -7,6 +7,28 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.2 — 17 August 2026
+
+Six circuits stop being called by their serial numbers.
+
+### Fixed
+
+- **A device that Emporia has a name for is called by it.** An outlet, a
+  charger and a monitor all report themselves on the mains channel, and none of
+  them name that channel — so the Circuits page and the Circuits tab showed
+  "Device 402097 ch 1,2,3" for six of the reference account's thirty-nine
+  rows while Emporia had held "EVSE", "Dishwasher", "Washer", "Garage fridge",
+  "Garage Freezer" and "Subpanel Vue" for them the whole time. The name was
+  never on the channel; it is one level up, in the device's own
+  `locationProperties`, which is why nothing had read it. Rename a device in
+  Emporia's app and the page follows.
+
+  **An unnamed clamp is still called by its number, deliberately.** The name
+  belongs to the device, so lending it to every unnamed channel would render a
+  monitor's four unconfigured clamps as four separate rows all reading
+  "Subpanel Vue" — worse than the identifier it replaced, which at least tells
+  them apart. Only a device's own mains channel takes the device's name.
+
 ## 1.1.1 — 16 August 2026
 
 The Graphs page can now show what is actually drawing the power, for an

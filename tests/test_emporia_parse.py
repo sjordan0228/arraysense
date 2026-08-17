@@ -289,6 +289,74 @@ def test_a_name_that_is_only_whitespace_gets_the_stable_label() -> None:
     assert circuits[0].name == "Device 100010 ch 1"
 
 
+# A device whose mains channel carries no name of its own, which is every
+# outlet, charger and monitor on the reference account. The name the owner gave
+# it in Emporia's app is in ``locationProperties``, one level up from the
+# channel — taken from the real reply on 17 August 2026, where six of the
+# thirty-nine circuits were reading as "Device 402097 ch 1,2,3" while Emporia
+# held "EVSE", "Dishwasher", "Washer" and three more for them all along.
+NAMED_DEVICES = {
+    "devices": [
+        {
+            "deviceGid": 100020,
+            "model": "VUE003",
+            "locationProperties": {"deviceName": "Subpanel Vue"},
+            "channels": [
+                {"channelNum": "1,2,3", "name": None, "channelMultiplier": 1.0},
+                {"channelNum": "1", "name": "Entry", "channelMultiplier": 1.0},
+                {"channelNum": "7", "name": None, "channelMultiplier": 1.0},
+                {"channelNum": "8", "name": None, "channelMultiplier": 1.0},
+            ],
+            "devices": [
+                {
+                    "deviceGid": 100021,
+                    "model": "VVDN01",
+                    "locationProperties": {"deviceName": "EVSE"},
+                    "channels": [{"channelNum": "1,2,3", "name": None, "channelMultiplier": 1.0}],
+                }
+            ],
+        }
+    ]
+}
+
+
+def test_a_device_names_its_own_mains_channel() -> None:
+    # The charger read as "Device 100021 ch 1,2,3" on every page while Emporia
+    # had a name for it the whole time.
+    got = {(c.device_gid, c.channel_num): c for c in circuits_from_devices(NAMED_DEVICES)}
+    assert got[(100021, "1,2,3")].name == "EVSE"
+    assert got[(100020, "1,2,3")].name == "Subpanel Vue"
+
+
+def test_an_unnamed_clamp_does_not_take_the_devices_name() -> None:
+    # The half of this that is easy to get wrong. A device's name belongs to the
+    # device, so lending it to every unnamed clamp would render four separate
+    # circuits as four rows all called "Subpanel Vue" — worse than the stable
+    # label, because the stable label at least tells them apart.
+    got = {(c.device_gid, c.channel_num): c for c in circuits_from_devices(NAMED_DEVICES)}
+    assert got[(100020, "7")].name == "Device 100020 ch 7"
+    assert got[(100020, "8")].name == "Device 100020 ch 8"
+
+
+def test_a_channels_own_name_outranks_the_devices() -> None:
+    got = {(c.device_gid, c.channel_num): c for c in circuits_from_devices(NAMED_DEVICES)}
+    assert got[(100020, "1")].name == "Entry"
+
+
+def test_a_device_with_no_name_of_its_own_keeps_the_stable_label() -> None:
+    payload = {
+        "devices": [
+            {
+                "deviceGid": 100022,
+                "model": "SSO001",
+                "locationProperties": {"deviceName": "   "},
+                "channels": [{"channelNum": "1,2,3", "name": None, "channelMultiplier": 1.0}],
+            }
+        ]
+    }
+    assert circuits_from_devices(payload)[0].name == "Device 100022 ch 1,2,3"
+
+
 def test_an_outlet_on_the_mains_channel_is_an_outlet_not_a_mains_total() -> None:
     # A smart outlet reports itself on the same channel a monitor uses for its
     # mains. Typed as mains it would be excluded from the circuit list, and the
