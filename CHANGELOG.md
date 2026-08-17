@@ -7,6 +7,40 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.4 — 17 August 2026
+
+The Costs page can be pointed at a month other than the one in progress.
+
+### Added
+
+- **A month picker on the Costs page.** Every figure follows it — the three
+  money cards, the diagram, the rate-band table and the energy grid — so a
+  finished month can be read the way the current one always could. The control
+  is the one the Efficiency page already carries, in the strip that already
+  named the billing month.
+
+  **Forward stops at the month in progress.** Asked about next month the
+  service answers rather than refuses, partially and with its elapsed fraction
+  clamped, so a month that has not happened would have arrived on the page
+  looking like an ordinary part month.
+
+### Fixed
+
+- **A month that is over no longer describes itself as an estimate.** Eleven
+  strings on the page assumed the month was still running: "Cost so far",
+  "Estimated bill", "Month to date", "it assumes the rest of the month uses
+  each rate band at the rate this one has so far". Each now has a finished-month
+  form, decided in one place from the same elapsed threshold the month strip
+  already used, because a page that relabelled some of them and not the others
+  would mislead more than one that relabelled none.
+
+- **The five-minute refresh no longer returns the reader to today.** It rebuilt
+  its window from the clock on every pass, so a reader looking at July would
+  have been moved to August five minutes after arriving, with nothing on screen
+  to say why. It now leaves a finished month alone entirely — a month that is
+  over cannot change, and re-reading it is a month of counter history read for
+  nothing.
+
 ## 1.1.3 — 17 August 2026
 
 The Circuits tab can be given the months your Vue recorded before ArraySense
