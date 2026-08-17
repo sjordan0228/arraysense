@@ -426,6 +426,14 @@ const shouldAutoRefresh = (cursor, today) =>
   cursor === null || (cursor.year === today.year && cursor.month === today.month);
 // <<< costs-month-cursor
 
+// What this refresh calls the month, set by renderMonth and read by every
+// renderer below it. renderMonth runs first on every path through refresh(),
+// including the one where pricing fails, so nothing downstream can read a
+// stale set — and the fallback is the running month's wording, which is the
+// safe direction: a finished month labelled "so far" is clumsy, a running one
+// labelled as a finished bill is the mistake this page exists to avoid.
+let words = null;
+
 async function monthEnergy(win) {
   const zone = browserZone();
   const url = `/api/energy?start=${encodeURIComponent(win.startParam)}`
@@ -504,6 +512,38 @@ function shortNote(entry, what) {
   return `<span class="warn">Not the whole story:</span> ${parts.join('; and ')}.`;
 }
 
+// >>> costs-month-words
+// The page's words for a month that is over, against one still running. One
+// helper rather than eleven scattered ternaries: "Cost so far", "Month to date"
+// and "Estimated bill" are the same claim said three ways, and a page that
+// relabelled some of them and not the others would mislead more than one that
+// relabelled none.
+//
+// ``fraction`` is the service's own fraction_elapsed where it has one and the
+// page's own day count where it does not; ``name`` is the month written out.
+// 0.999 is renderMonth's own threshold and is deliberately the same number —
+// within three-quarters of an hour of a month's end, calling it unfinished is
+// pedantry rather than honesty, and the strip and the labels disagreeing about
+// which month it is would be worse than either answer.
+//
+// An absent fraction keeps every qualifier. Absent is not complete, and a month
+// whose elapsed share could not be read is the last thing to relabel as a bill.
+function monthWords(fraction, name) {
+  const running = fraction === null || fraction === undefined || fraction < 0.999;
+  return {
+    running,
+    cost: running ? 'Cost so far' : 'Cost',
+    bill: running ? 'Estimated bill' : 'Bill',
+    total: running ? 'Month to date' : 'Month total',
+    energy: running ? 'Energy this month' : `Energy in ${name}`,
+    // "this month" reads as the current one wherever it lands in a sentence, so
+    // a finished month is named rather than pointed at.
+    inMonth: running ? 'this month' : `in ${name}`,
+    theMonth: running ? 'This month' : name,
+  };
+}
+// <<< costs-month-words
+
 // The picker's own state. Called on every refresh rather than only on a click,
 // because the month in progress becomes a finished one at midnight on the first
 // and the forward button has to open at that moment without a reload.
@@ -529,6 +569,7 @@ function renderMonth(win, priced) {
   // point — a mid-month figure read as the finished bill is this page's
   // easiest way to mislead.
   const partial = fraction !== null && fraction < 0.999;
+  words = monthWords(fraction, win.start.toLocaleDateString(undefined, MONTH_FMT));
   const parts = [
     partial
       ? `<b>${done.toFixed(1)}</b> of ${days} days — this is a part month, not a bill`
@@ -565,6 +606,11 @@ function renderNoTariff(unreadable) {
 function renderCards(p) {
   const cur = p.currency;
   $('cards').hidden = false;
+  // The three card labels are markup, not data, so they are set here rather
+  // than left static in the HTML: which of the two forms is right changes with
+  // the month the reader picked.
+  $('costV').previousElementSibling.textContent = words.cost;
+  $('billV').previousElementSibling.textContent = words.bill;
   $('costV').innerHTML = bigMoney(p.costSoFar, cur);
   const costBits = [`Grid energy <b>${esc(money(p.energyCost, cur))}</b>`];
   // Three cases, not two. A charge of nothing is a tariff that has none; a
@@ -587,9 +633,11 @@ function renderCards(p) {
     // or none, and projecting a month from nothing is the invented number this
     // page most has to avoid.
     $('billSub').innerHTML = p.energyCost === null
-      ? 'Not enough has been recorded this month to price it, let alone project it.'
+      ? `Not enough was recorded ${words.inMonth} to price it, let alone project it.`
       : 'Every rate band has to have been measured at least once before a month can be '
-        + 'projected from it. Come back after the first full day.';
+        + (words.running
+          ? 'projected from it. Come back after the first full day.'
+          : 'priced from it, and one of them never was.');
   } else {
     const bits = [`Energy <b>${esc(money(p.projectedCost, cur))}</b>`];
     if (p.fixedMonthly) bits.push(`connection charge <b>${esc(money(p.fixedMonthly, cur))}</b>`);
@@ -597,12 +645,14 @@ function renderCards(p) {
     // A month that changes season breaks the projection's own premise: the
     // remaining days are priced by a different set of bands than the measured
     // ones, so scaling one to the other is arithmetic across two tariffs.
-    const caveat = p.seasonChanges
-      ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
-        + 'different bands than the part measured — treat the projection as the roughest of '
-        + 'guides.'
-      : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
-        + 'one has so far.';
+    const caveat = !words.running
+      ? 'The month is over, so this is what it came to rather than a projection.'
+      : p.seasonChanges
+        ? '<span class="warn">This month changes season</span>, so the rest of it is priced by '
+          + 'different bands than the part measured — treat the projection as the roughest of '
+          + 'guides.'
+        : 'An estimate: it assumes the rest of the month uses each rate band at the rate this '
+          + 'one has so far.';
     $('billSub').innerHTML = `${bits.join(' · ')}. ${caveat}${billCoverage(p)}`;
   }
 
