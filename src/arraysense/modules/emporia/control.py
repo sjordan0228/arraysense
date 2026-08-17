@@ -129,14 +129,21 @@ def decide(
     if authority == APP or authority not in CONTROL_LEVELS:
         rate = None if requested_a is None else clamp_rate(requested_a, limits)[0]
         return Decision(rate, False, "the Emporia app manages this charger")
+
+    rate, refused = (None, None) if requested_a is None else clamp_rate(requested_a, limits)
+    # Above the stop branch, not below it. The override was checked only on the
+    # path that sets a rate, so under full authority a request to *stop* the
+    # charger — the heavier of the two powers — went straight through a hold
+    # that was in force. No automatic caller stops a charger yet, which is the
+    # only reason this never fired; a rule that holds for the smaller power and
+    # not the larger is one waiting for its first caller.
+    if override_until is not None and override_until > now:
+        return Decision(rate, False, f"override holds until {override_until.isoformat()}", refused)
     if requested_a is None:
         # Stopping the charger. Clamping does not apply; authority does.
         stop = Decision(None, authority == FULL, "stop the charger")
         return stop if authority == FULL else Decision(None, False, "stopping needs full authority")
 
-    rate, refused = clamp_rate(requested_a, limits)
-    if override_until is not None and override_until > now:
-        return Decision(rate, False, f"override holds until {override_until.isoformat()}", refused)
     # An allowlist, not a denylist. This read `if authority == ADVISORY` and
     # applied everything else, so a typo in the setting — or a database written
     # by a newer build that knows an authority this one does not — was granted
@@ -153,7 +160,6 @@ def restore_target(
     charger_rate_a: int | None,
     last_set_a: int | None,
     default_a: int,
-    holding: bool,
 ) -> int | None:
     """The rate to put the charger back to on startup, or None to leave it.
 
@@ -167,8 +173,15 @@ def restore_target(
     front of the charger, which is the opposite of the rule above. And a service
     that has never set anything has nothing to put back, so a fresh install
     walks in and changes nothing at all.
+
+    Ownership is the whole of what this answers. It once took a ``holding`` flag
+    as well, and that was a second place for the manual override to be checked —
+    fed by the same setting ``decide`` already reads, so the two could disagree
+    and one of them would be dead whichever way a caller wired it. Whether this
+    module may act *right now* is ``decide``'s question, and a caller that skips
+    it gets no restore at all rather than an unguarded one.
     """
-    if holding or last_set_a is None or charger_rate_a is None:
+    if last_set_a is None or charger_rate_a is None:
         return None
     if charger_rate_a != last_set_a:
         return None

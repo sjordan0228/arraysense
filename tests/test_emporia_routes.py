@@ -445,9 +445,9 @@ def test_setting_a_rate_needs_write_permission(client_with_password: TestClient)
 def test_setting_a_rate_clamps_it_audits_it_and_starts_the_override(tmp_path: Path) -> None:
     app, store, _ = _app(tmp_path)
     settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGE_CEILING_KEY, 32)
     settings.set(CHARGER_AUTHORITY_KEY, "full")
-    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger()
     poller.charger = ChargerState(
@@ -484,7 +484,9 @@ def test_a_write_that_emporia_refuses_is_audited_as_not_applied(tmp_path: Path) 
     # The worst thing this could do is record a change that never happened: the
     # restore then believes the charger is at a rate it is not, and leaves it.
     app, store, _ = _app(tmp_path)
-    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger(fail=EmporiaUnreachableError("no route"))
     poller.charger = ChargerState(
@@ -517,7 +519,9 @@ def test_stopping_and_starting_the_charger_is_audited(tmp_path: Path) -> None:
     # switched off charges it not at all. "Why is the car not charged" has to
     # have an answer, and this is where it comes from.
     app, store, _ = _app(tmp_path)
-    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     poller.client = _StubCharger()
     poller.charger = ChargerState(
@@ -554,7 +558,9 @@ def test_a_rate_the_charger_does_not_take_is_not_audited_as_applied(tmp_path: Pa
     # the change is recorded as not applied, so restore never trusts a rate the
     # charger is not actually at.
     app, store, _ = _app(tmp_path)
-    SettingsStore(store).set(CHARGER_AUTHORITY_KEY, "full")
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
     poller = app.state.emporia
     stub = _StubCharger()
     stub.rate = 6  # whatever is written, it keeps reporting 6 A
@@ -617,6 +623,174 @@ def test_the_charger_tab_appears_only_where_there_is_a_charger() -> None:
     assert entry is not None, "the charger nav entry is missing"
     assert "/api/emporia/charger" in entry.group(0)
     assert "body.charger" in entry.group(0), "it must gate on a charger existing, not on a setting"
+    assert "body.enabled" in entry.group(0), "and on the module actually being switched on"
+
+
+def _plugged_in_charger(app: Any) -> Any:
+    """A poller holding a charger, ready for a route to be pointed at it."""
+    poller = app.state.emporia
+    poller.client = _StubCharger()
+    poller.charger = ChargerState(
+        device_gid=900001,
+        rate_a=6,
+        max_rate_a=48,
+        on=True,
+        status="Standby",
+        message="Ready",
+        conflicts=(),
+        plugged_in=True,
+        connected=True,
+        offline_since=None,
+        fault=None,
+    )
+    poller._charger_record = {"deviceGid": 900001, "chargingRate": 6}
+    poller._id_token = "id-1"
+    return poller
+
+
+def test_a_rate_set_by_hand_is_recorded_as_the_owners(tmp_path: Path) -> None:
+    # The load-bearing half of #202. The owner's write is applied — it really
+    # did reach the charger — so ``applied`` alone cannot separate it from this
+    # module's own work, and restore-on-startup undid a hand-set rate on the
+    # strength of that equality.
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        assert c.post("/api/emporia/charger/rate", json={"amps": 16}).status_code == 200
+
+    change = poller.audit.recent_changes()[0]
+    assert change.applied is True, "it reached the charger"
+    assert change.source == "owner", "but it was not this module's decision"
+    assert poller.audit.last_applied_rate(900001) is None, "so restore has nothing of its own"
+    store.close()
+
+
+def test_the_override_opens_when_the_owner_presses_not_when_emporia_answers(
+    tmp_path: Path,
+) -> None:
+    # The write is a round trip to a cloud service and the restore runs on the
+    # poller's own clock, so opening the window afterwards left a gap in which
+    # an automatic decision could find no hold and write over a rate the owner
+    # was in the middle of setting. A write that fails holds too: they reached
+    # for the charger either way.
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _plugged_in_charger(app)
+    poller.client = _StubCharger(fail=EmporiaUnreachableError("no route"))
+
+    with TestClient(app) as c:
+        assert c.post("/api/emporia/charger/rate", json={"amps": 16}).status_code == 503
+
+    held_until = settings.get(CHARGE_OVERRIDE_UNTIL_KEY)
+    assert isinstance(held_until, int) and held_until > 0
+    store.close()
+
+
+def test_stopping_the_charger_by_hand_is_recorded_as_the_owners(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        assert c.post("/api/emporia/charger/power", json={"on": False}).status_code == 200
+
+    assert poller.audit.recent_changes()[0].source == "owner"
+    store.close()
+
+
+def test_the_history_says_who_made_each_change(tmp_path: Path) -> None:
+    # The page shows this list to answer "what has this service done to my car".
+    # Without the source it cannot separate its own work from the owner's, which
+    # is the same question restore-on-startup gets wrong without it.
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        c.post("/api/emporia/charger/rate", json={"amps": 16})
+        body = c.get("/api/emporia/charger").json()
+
+    assert body["changes"][0]["source"] == "owner"
+    store.close()
+
+
+# --- a module that is switched off ----------------------------------------
+#
+# "Off" has to mean off. The poller kept the last charger it read for the life
+# of the process, so a disabled module went on reporting a charger at a rate and
+# the page drew live controls over it — controls whose press would have reached
+# a real charger, because neither write route consults the enable either.
+
+
+def test_a_disabled_module_serves_no_charger(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(EMPORIA_ENABLED_KEY, False)
+    _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        body = c.get("/api/emporia/charger").json()
+
+    assert body["charger"] is None
+    assert body["changes"] == []
+    assert body["enabled"] is False
+    store.close()
+
+
+def test_a_disabled_module_refuses_to_set_a_rate(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, False)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/rate", json={"amps": 16})
+
+    assert response.status_code == 409
+    assert "switched off" in response.json()["detail"]
+    assert poller.client.writes == [], "nothing reached the charger"
+    store.close()
+
+
+def test_a_disabled_module_says_why_rather_than_that_it_has_no_charger(tmp_path: Path) -> None:
+    # A tick clears the cached charger the moment the module goes off, so by
+    # the time most presses land there is no charger to find and the honest
+    # answer — "no Emporia charger is being read" — is the unhelpful one.
+    # Somebody who has just switched the module off is owed the reason.
+    app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(EMPORIA_ENABLED_KEY, False)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/rate", json={"amps": 16})
+
+    assert response.status_code == 409
+    assert "switched off" in response.json()["detail"]
+    store.close()
+
+
+def test_a_disabled_module_refuses_to_stop_the_charger(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, False)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _plugged_in_charger(app)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/power", json={"on": False})
+
+    assert response.status_code == 409
+    assert poller.audit.recent_changes() == [], "nothing reached the charger"
+    store.close()
 
 
 def test_a_charger_the_app_manages_refuses_a_rate_rather_than_ignoring_it(
@@ -626,6 +800,7 @@ def test_a_charger_the_app_manages_refuses_a_rate_rather_than_ignoring_it(
     # it is worse than one that says why it will not — and the page hides the
     # control entirely, so this is the belt behind the braces.
     app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(EMPORIA_ENABLED_KEY, True)
     poller = app.state.emporia
     poller.client = _StubCharger()
     poller.charger = ChargerState(

@@ -170,6 +170,17 @@ class CircuitRepository:
         return out
 
 
+# Who decided a change. Two values rather than a boolean because the audit is
+# read by a person: "module" and "owner" say what they mean in a table cell,
+# where a `by_module` column would have to be decoded.
+#
+# This module decided it — a restore, or anything the control rules chose.
+MODULE = "module"
+# The person did, through a route: the slider on the charger page, or the stop
+# and start buttons. Their rate is theirs, and this module never puts it back.
+OWNER = "owner"
+
+
 @dataclass(frozen=True)
 class ChargerChange:
     """One decision about a charge rate, applied or not.
@@ -177,8 +188,14 @@ class ChargerChange:
     ``applied`` separates what reached the charger from what was only decided.
     Both are worth keeping — a module that proposed twenty things and did none
     of them looks identical to one nobody asked, unless the refusals are
-    recorded — but only an applied change is this service's own work, and
-    restore-on-startup depends on telling those apart.
+    recorded.
+
+    ``source`` separates *whose* decision it was, and it is not a refinement of
+    ``applied``: the owner moving the slider is applied too, because it really
+    did reach the charger. Reading provenance out of ``applied`` alone is the
+    defect that let restore-on-startup claim a hand-set rate as its own work and
+    undo it. None on a row written before this was recorded — unknown is not a
+    showing that the change was this module's, so restore leaves those alone.
     """
 
     timestamp: int
@@ -187,9 +204,16 @@ class ChargerChange:
     to_a: int | None
     reason: str
     applied: bool
+    source: str | None = None
 
     def same_decision(
-        self, *, from_a: int | None, to_a: int | None, reason: str, applied: bool
+        self,
+        *,
+        from_a: int | None,
+        to_a: int | None,
+        reason: str,
+        applied: bool,
+        source: str | None,
     ) -> bool:
         """Whether a decision being made now is the one already written here.
 
@@ -197,15 +221,16 @@ class ChargerChange:
         decisions can never share a second, so counting it would make every
         comparison false and the check pointless.
 
-        ``applied`` is the sharpest of the four. A rate proposed and the same
-        rate actually reaching the charger are different events, and a caller
+        ``applied`` is the sharpest of them. A rate proposed and the same rate
+        actually reaching the charger are different events, and a caller
         suppressing the second because it matched the first would hide a write.
         """
-        return (self.from_a, self.to_a, self.reason, self.applied) == (
+        return (self.from_a, self.to_a, self.reason, self.applied, self.source) == (
             from_a,
             to_a,
             reason,
             applied,
+            source,
         )
 
 
@@ -230,9 +255,15 @@ class ChargerAudit:
         to_a: int | None,
         reason: str,
         applied: bool,
+        source: str,
         now: datetime,
     ) -> None:
-        """Write one decision down, whether or not it reached the charger."""
+        """Write one decision down, whether or not it reached the charger.
+
+        ``source`` has no default on purpose. Every caller has to say whether it
+        is the module deciding or the owner asking, because the one that forgot
+        is the one whose rate gets undone on the next restart.
+        """
         conn = self._store._conn
         with conn:
             conn.execute(
@@ -241,9 +272,17 @@ class ChargerAudit:
                 # decisions — which is how stopping and starting a charger
                 # within one second lost a row when this had a composite key.
                 "INSERT INTO charger_change"
-                " (timestamp, device_gid, from_a, to_a, reason, applied)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (int(now.timestamp()), device_gid, from_a, to_a, reason, 1 if applied else 0),
+                " (timestamp, device_gid, from_a, to_a, reason, applied, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(now.timestamp()),
+                    device_gid,
+                    from_a,
+                    to_a,
+                    reason,
+                    1 if applied else 0,
+                    source,
+                ),
             )
 
     def last_applied_rate(self, device_gid: int) -> int | None:
@@ -252,18 +291,53 @@ class ChargerAudit:
         What restore-on-startup compares the charger against: it puts back only
         a rate it can show was its own. A decision that was never applied never
         reached the charger, so it is not evidence of anything.
+
+        **Its own** is the whole of the question, and ``applied`` does not
+        answer it. The owner moving the slider is applied too, so without the
+        source this returned the owner's rate, the charger was sitting at
+        exactly that rate, and the restore concluded it had set it — then undid
+        a rate somebody chose deliberately, inside the window meant to protect
+        it.
+
+        It is the *newest* rate that reached the charger that has to be asked,
+        not the newest one this module set. Filtering the owner's rows out of
+        the query instead would find an older row of the module's own and claim
+        the rate on the strength of it: the module set 6 A months ago, the owner
+        has since chosen 6 A deliberately, and a rate that agrees with an old
+        one of ours is not thereby ours. So the last applied decision decides,
+        and it answers None unless it was this module's.
+
+        Only decisions about a rate count, which is what ``to_a IS NOT NULL``
+        selects: stopping and starting the charger decides nothing about the
+        rate, and reading those as the owner claiming it would retire
+        restore-on-startup the first time anybody pressed stop. A row from
+        before the source was recorded answers None for the reason at the top:
+        unknown is not a showing.
+
+        An owner's write counts whether or not it was confirmed, and this is
+        the one place the two sides of ``applied`` are deliberately not
+        symmetric. A write is audited as applied only when the charger is read
+        back at the new rate, so a request Emporia accepted and then went quiet
+        on records as *not* applied while having changed the rate anyway. For
+        this module's own proposals that is exactly right — an unconfirmed one
+        is not evidence of anything. For the owner it is not: they reached for
+        the charger, and a rate that may be theirs is not one this module can
+        show is its own.
         """
         try:
             row = self._store._conn.execute(
-                "SELECT to_a FROM charger_change"
-                " WHERE device_gid = ? AND applied = 1 AND to_a IS NOT NULL"
+                "SELECT to_a, source, applied FROM charger_change"
+                " WHERE device_gid = ? AND to_a IS NOT NULL"
+                "   AND (applied = 1 OR source = ?)"
                 " ORDER BY timestamp DESC, id DESC LIMIT 1",
-                (device_gid,),
+                (device_gid, OWNER),
             ).fetchone()
         except sqlite3.Error as exc:
             logger.warning("could not read the charger audit: %s", exc)
             return None
-        return None if row is None else int(row[0])
+        if row is None or row[1] != MODULE or not row[2]:
+            return None
+        return int(row[0])
 
     def last_change(self, device_gid: int) -> ChargerChange | None:
         """The newest decision about this charger, applied or not.
@@ -283,7 +357,7 @@ class ChargerAudit:
         """One SELECT over the audit, so the row-to-object mapping exists once."""
         try:
             rows = self._store._conn.execute(
-                "SELECT timestamp, device_gid, from_a, to_a, reason, applied"
+                "SELECT timestamp, device_gid, from_a, to_a, reason, applied, source"
                 f" FROM charger_change {tail}",
                 params,
             ).fetchall()
@@ -298,6 +372,7 @@ class ChargerAudit:
                 to_a=None if row[3] is None else int(row[3]),
                 reason=str(row[4]),
                 applied=bool(row[5]),
+                source=None if row[6] is None else str(row[6]),
             )
             for row in rows
         ]

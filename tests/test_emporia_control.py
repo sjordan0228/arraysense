@@ -116,27 +116,57 @@ def test_stopping_the_charger_needs_the_authority_to_stop_it() -> None:
 
 
 def test_a_rate_this_service_set_is_restored_when_there_is_no_reason_to_hold() -> None:
-    assert restore_target(charger_rate_a=6, last_set_a=6, default_a=32, holding=False) == 32
+    assert restore_target(charger_rate_a=6, last_set_a=6, default_a=32) == 32
 
 
-def test_a_rate_this_service_set_is_left_alone_while_it_still_has_a_reason() -> None:
-    assert restore_target(charger_rate_a=6, last_set_a=6, default_a=32, holding=True) is None
+def test_a_rate_this_service_set_is_left_alone_while_the_owners_hand_is_on_it() -> None:
+    # restore_target answers ownership and nothing else. Whether this module may
+    # act right now is decide's question, and it is asked with the same override
+    # every other automatic decision is measured against — which is the whole
+    # point of there being one gate rather than two that can disagree.
+    target = restore_target(charger_rate_a=6, last_set_a=6, default_a=32)
+    assert target == 32, "the rate is ours to put back"
+    held = decide(
+        target,
+        authority=FULL,
+        limits=LIMITS,
+        now=NOW,
+        override_until=NOW + timedelta(hours=1),
+    )
+    assert held.apply is False
+    assert "override holds" in held.reason
+
+
+def test_the_override_holds_a_stop_as_well_as_a_rate() -> None:
+    # Stopping the charger is the heavier of the two powers — a low rate charges
+    # a car slowly, a charger switched off charges it not at all — and the
+    # override was checked only on the path that sets a rate. Nothing automatic
+    # stops a charger yet, which is the only reason it never fired.
+    held = decide(
+        None,
+        authority=FULL,
+        limits=LIMITS,
+        now=NOW,
+        override_until=NOW + timedelta(hours=1),
+    )
+    assert held.apply is False
+    assert "override holds" in held.reason
 
 
 def test_a_rate_somebody_else_set_is_never_touched() -> None:
     # The owner moved the slider to 10 A. That is theirs, not ours to undo,
     # even though we happen to have set 6 A at some point in the past.
-    assert restore_target(charger_rate_a=10, last_set_a=6, default_a=32, holding=False) is None
+    assert restore_target(charger_rate_a=10, last_set_a=6, default_a=32) is None
 
 
 def test_a_service_that_has_never_set_anything_restores_nothing() -> None:
     # A fresh install must not walk in and change a charge rate it has no
     # history with. Nothing was ours, so nothing is ours to put back.
-    assert restore_target(charger_rate_a=6, last_set_a=None, default_a=32, holding=False) is None
+    assert restore_target(charger_rate_a=6, last_set_a=None, default_a=32) is None
 
 
 def test_a_rate_already_at_the_default_needs_no_restoring() -> None:
-    assert restore_target(charger_rate_a=32, last_set_a=32, default_a=32, holding=False) is None
+    assert restore_target(charger_rate_a=32, last_set_a=32, default_a=32) is None
 
 
 # --- the edges, and two rules that were silently open -----------------------
@@ -190,7 +220,7 @@ def test_zero_and_negative_requests_are_lifted_to_the_floor() -> None:
 
 
 def test_a_charger_that_did_not_report_its_rate_is_not_restored() -> None:
-    assert restore_target(charger_rate_a=None, last_set_a=6, default_a=32, holding=False) is None
+    assert restore_target(charger_rate_a=None, last_set_a=6, default_a=32) is None
 
 
 def test_an_override_outranks_advisory_in_the_reason_it_gives() -> None:
@@ -265,7 +295,7 @@ def test_a_restore_target_outside_the_limits_is_clamped_before_it_is_sent() -> N
     # about limits, so on its own it can name a rate the module may not set.
     # Everything that acts on it goes through decide() first, and this is the
     # test that keeps it that way.
-    target = restore_target(charger_rate_a=6, last_set_a=6, default_a=10, holding=False)
+    target = restore_target(charger_rate_a=6, last_set_a=6, default_a=10)
     assert target == 10, "the raw answer is unclamped by design"
     limits = Limits(floor_a=32, ceiling_a=48)
     got = decide(target, authority=LIMITED, limits=limits, now=NOW)

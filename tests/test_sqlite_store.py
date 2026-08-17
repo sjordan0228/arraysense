@@ -2178,3 +2178,31 @@ def test_site_only_rows_do_not_stretch_the_claimed_span(tmp_path: Path) -> None:
     store.close()
     assert spans["full"] == (inverter_at, inverter_at)
     assert spans["hourly"] == (inverter_at, inverter_at)
+
+
+def test_opening_a_database_written_before_the_source_column_repairs_it(tmp_path: Path) -> None:
+    # The two installations this had to be right for. Both already hold a
+    # charger_change table with rows in it, and CREATE TABLE IF NOT EXISTS does
+    # nothing at all to a table that already exists — so without the repair the
+    # first audit write after the upgrade would fail with "no such column", on
+    # the boxes with the most history rather than the least.
+    path = str(tmp_path / "old.db")
+    store = SqliteStore(path, device=TEST_DEVICE)
+    with store._conn:
+        store._conn.execute("ALTER TABLE charger_change DROP COLUMN source")
+        store._conn.execute(
+            "INSERT INTO charger_change (timestamp, device_gid, from_a, to_a, reason, applied)"
+            " VALUES (1786900000, 900001, 32, 6, 'restored on startup', 1)"
+        )
+    store.close()
+
+    reopened = SqliteStore(path, device=TEST_DEVICE)
+    columns = {r[1] for r in reopened._conn.execute("PRAGMA table_info(charger_change)")}
+    row = reopened._conn.execute("SELECT reason, source FROM charger_change").fetchone()
+    reopened.close()
+
+    assert "source" in columns
+    assert row[0] == "restored on startup", "the history that was there is untouched"
+    assert row[1] is None, (
+        "and it says nothing about who moved the rate, because nobody recorded it"
+    )

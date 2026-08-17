@@ -7,13 +7,59 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
-## 1.0.11 — 16 August 2026
+## 1.1.0 — 16 August 2026
 
-An adjustable mount stops costing you the performance history every time you
-adjust it.
+The first optional module. An Emporia Vue's circuits, and an Emporia EV
+charger, sit beside the inverter rather than inside it — and an adjustable
+mount stops costing you the performance history every time you adjust it.
+
+A minor version rather than a patch because modules are a new shape for this
+service to have, not a new reading. The module adds its own tables, which are
+created when the database is next opened; nothing already stored is rewritten,
+and an installation that never switches the module on gets the tables and
+nothing else.
 
 ### Added
 
+- **An Emporia module, off by default, that costs nothing while it is off.** No
+  poller, no HTTP, no rows: an installation that never enables it behaves
+  exactly as it did before this existed. Switching it on reads the circuits an
+  Emporia Vue measures and stores them on their own fifteen-second clock,
+  entirely separately from the inverter — Emporia's cloud being down, slow, or
+  refusing the credential costs solar collection nothing, which is the point of
+  a module rather than a feature. Circuits are keyed on the monitor and the
+  channel rather than the name, so renaming one in Emporia's app moves a label
+  instead of stranding a year of history. The login is one JSON POST to Cognito
+  using the standard library alone, and the refresh token lives in a 0600 file
+  outside the database, so a database shared while diagnosing a problem does
+  not carry account access with it.
+- **A warning when the house is drawing more than it usually does, and what is
+  drawing it.** Whether to warn comes from the inverter's own load figure every
+  eleven seconds, so it fires on an installation that has never heard of
+  Emporia. What is responsible comes from Emporia and only from Emporia, and a
+  set of circuits accounting for a fraction of the draw says so rather than
+  being presented as the whole explanation.
+- **Control of an Emporia EV charger, on the accounts that have one.** A page
+  of its own rather than a card, because a charger is a thing you act on and
+  circuits are a thing you read, and the tab appears only where there is a
+  charger to reach. How much say the service has is one setting with four
+  positions — the Emporia app keeps it, propose only, may set a rate, may also
+  stop and start — each strictly more powerful than the last, defaulting to the
+  Emporia app keeping it, and an unrecognised value means the charger is not
+  ours. Permission to drive somebody's car charger fails closed at every level.
+  The rate is a slider from 6 to 48 A that starts wherever the charger actually
+  is, because amps are a quantity you feel your way to rather than type.
+- **A record of every change to the charge rate, and every one refused.** A
+  charge rate persists for ever once set — it does not time out or revert, and
+  nothing at Emporia's end will put it back — so a car found at 6 A in the
+  morning is a number with no history attached. The page lists what moved, who
+  moved it, and why, refusals included: a module that proposed twenty things
+  and did none of them otherwise looks identical to one nobody asked.
+- **A warning when Emporia is driving the same charger.** Emporia ships four
+  controllers of its own, and on the reference account the one the design
+  expected to find was off while two others were on — one of which moved the
+  rate from 16 A to 7 A during testing. All four are now checked and named. It
+  warns and never refuses: it is the owner's charger and their account.
 - **Tilt can be a schedule rather than a single angle.** An array on a
   seasonally adjustable mount is moved twice a year, and until now the owner
   had to choose between a model that matched the array today and one that
@@ -34,6 +80,42 @@ adjust it.
 
 ### Fixed
 
+- **Restore on startup no longer overrules a rate you set by hand.** The
+  service puts a rate back after a restart so that dying mid-throttle does not
+  leave a car at 6 A all night — but it decided a rate was its own to put back
+  by asking only what was last applied, and your own change reaches the charger
+  the same way its does. So a rate somebody set deliberately was undone by the
+  next restart, inside the two-hour window meant to protect it, and the window
+  itself was never consulted. The record now says who decided each change, and
+  the restore puts back only what it can show is its own work and only when
+  nobody's hand is on the charger. A change recorded before this was tracked
+  says nothing about who made it, and is left alone rather than assumed.
+- **Switching the module off now switches the charger off with it.** The
+  Charger tab stayed in the nav, the page behind it reported a charger at a
+  rate, and both controls would have attempted a real write — the last charger
+  read was kept for the life of the process, and neither write route asked
+  whether the module was still on. It is now forgotten when a tick finds the
+  module disabled, the endpoint answers with no charger, and both writes are
+  refused with a reason rather than accepted and dropped.
+- **The per-pack views ask the device whether it has packs.** On a machine
+  whose driver declares no per-module battery, the dashboard drew a Battery
+  modules card over an empty grid, advising the owner to check that the packs
+  are in closed loop — a CAN link that cannot be down because it does not
+  exist. The Graphs page had the same hole one level up: a Packs tab, a Packs
+  section, and two spread bands, none of them gated. Only an explicit "no"
+  suppresses them, because absent capability is not absent data, and the
+  advisory stays for the case it was written for: a device that declares packs
+  and has none reporting, which is a real fault.
+- **A circuit that is blank says which kind of blank it is.** A clamp measuring
+  nothing and a monitor that has been dead since April rendered identically.
+  Every device's connection is now read, and the page says why a row is empty
+  and since when.
+- **A restore that cannot be applied is not written down again every restart.**
+  Under an authority that may only propose, nothing about the charger moves, so
+  the identical sentence was recorded on every restart for ever — and the
+  history is read to answer "what has this service done to my car", which a
+  hundred copies of one line answers less well than none. A change that was
+  actually applied is never suppressed: it did something, and it happened again.
 - **Adding a future adjustment no longer discards the scored history.** Editing
   the array bumps the efficiency config version, which marks every stored day
   stale and rescores it. That was right when any edit could change what the

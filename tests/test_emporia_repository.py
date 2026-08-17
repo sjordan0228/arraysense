@@ -13,7 +13,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from arraysense.modules.emporia.parse import Circuit, Reading
-from arraysense.modules.emporia.repository import ChargerAudit, ChargerChange, CircuitRepository
+from arraysense.modules.emporia.repository import (
+    MODULE,
+    OWNER,
+    ChargerAudit,
+    ChargerChange,
+    CircuitRepository,
+)
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -251,7 +257,9 @@ def test_a_recategorised_circuit_takes_the_new_category(tmp_path: Path) -> None:
 
 def test_a_change_is_recorded_with_what_it_moved_and_why(tmp_path: Path) -> None:
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=32, to_a=16, reason="peak band opened", applied=True, now=NOW)
+    repo.record_change(
+        900001, from_a=32, to_a=16, reason="peak band opened", applied=True, source=MODULE, now=NOW
+    )
     rows = repo.recent_changes()
     assert len(rows) == 1
     assert (rows[0].from_a, rows[0].to_a, rows[0].applied) == (32, 16, True)
@@ -265,7 +273,13 @@ def test_a_refused_change_is_recorded_too(tmp_path: Path) -> None:
     # see the decisions that went the other way.
     repo, store = _audit(tmp_path)
     repo.record_change(
-        900001, from_a=32, to_a=16, reason="advisory: proposed, not applied", applied=False, now=NOW
+        900001,
+        from_a=32,
+        to_a=16,
+        reason="advisory: proposed, not applied",
+        applied=False,
+        source=MODULE,
+        now=NOW,
     )
     assert repo.recent_changes()[0].applied is False
     store.close()
@@ -275,13 +289,16 @@ def test_the_last_rate_this_service_set_is_what_restore_compares_against(tmp_pat
     # Restore only ever undoes its own work, so it has to know which rate was
     # its own. A refused change never reached the charger and must not count.
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=None, to_a=16, reason="set", applied=True, now=NOW)
+    repo.record_change(
+        900001, from_a=None, to_a=16, reason="set", applied=True, source=MODULE, now=NOW
+    )
     repo.record_change(
         900001,
         from_a=16,
         to_a=6,
         reason="would have",
         applied=False,
+        source=MODULE,
         now=NOW + timedelta(minutes=1),
     )
     assert repo.last_applied_rate(900001) == 16
@@ -294,11 +311,156 @@ def test_a_charger_this_service_never_touched_has_no_last_rate(tmp_path: Path) -
     store.close()
 
 
+def test_a_rate_the_owner_set_is_not_a_rate_this_service_set(tmp_path: Path) -> None:
+    # The defect this column exists for. The owner moving the slider is audited
+    # as applied — it did reach the charger — so a query asking only "what was
+    # last applied" answered with the owner's own number, restore concluded the
+    # rate was its own work, and undid it inside the override window.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=7, to_a=6, reason="set by hand", applied=True, source=OWNER, now=NOW
+    )
+    assert repo.last_applied_rate(900001) is None
+    store.close()
+
+
+def test_the_owners_change_is_still_the_newest_thing_that_happened(tmp_path: Path) -> None:
+    # Filtering it out of last_applied_rate must not hide it from the history:
+    # "what has this service done to my car" is answered by every line, and the
+    # owner's own is often the one that explains the rest.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=7, to_a=6, reason="set by hand", applied=True, source=OWNER, now=NOW
+    )
+    newest = repo.last_change(900001)
+    assert newest is not None
+    assert (newest.reason, newest.source) == ("set by hand", OWNER)
+    assert repo.recent_changes()[0].source == OWNER
+    store.close()
+
+
+def test_the_owner_choosing_a_rate_this_service_once_set_is_still_theirs(tmp_path: Path) -> None:
+    # Filtering the owner's rows out of the query is not enough on its own. The
+    # module set 6 A months ago; the owner has since chosen 6 A deliberately. A
+    # query that skips their row finds the module's, sees the charger sitting at
+    # exactly that rate, and concludes it may put it back — undoing a choice
+    # somebody made on purpose because it happened to agree with an old one.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=32, to_a=6, reason="throttled", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=6,
+        to_a=6,
+        reason="set by hand",
+        applied=True,
+        source=OWNER,
+        now=NOW + timedelta(hours=1),
+    )
+    assert repo.last_applied_rate(900001) is None
+    store.close()
+
+
+def test_stopping_the_charger_by_hand_does_not_retire_the_restore(tmp_path: Path) -> None:
+    # Stopping and starting is audited, because "why is the car not charged" has
+    # to have an answer — but it decides nothing about the rate, and it carries
+    # no rate for that reason. Reading it as the owner claiming the rate would
+    # retire restore-on-startup the first time anybody pressed stop, which is
+    # the behaviour the whole control stage exists for.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=32, to_a=6, reason="throttled", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=6,
+        to_a=None,
+        reason="stopped charging",
+        applied=True,
+        source=OWNER,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert repo.last_applied_rate(900001) == 6
+    store.close()
+
+
+def test_an_owners_write_that_could_not_be_confirmed_still_claims_the_rate(
+    tmp_path: Path,
+) -> None:
+    # A write is audited as applied only when the charger reads back at the new
+    # rate, so a request Emporia accepted and then went quiet on records as not
+    # applied while having changed the rate anyway. This module's own proposals
+    # are right to be discounted that way; the owner's are not — they reached
+    # for the charger, and a rate that may be theirs is not one this module can
+    # show is its own.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=32, to_a=6, reason="throttled", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=6,
+        to_a=20,
+        reason="failed: no route",
+        applied=False,
+        source=OWNER,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert repo.last_applied_rate(900001) is None
+    store.close()
+
+
+def test_an_unapplied_proposal_of_this_modules_own_still_claims_nothing(tmp_path: Path) -> None:
+    # The other side of the same asymmetry. A proposal this module never sent
+    # changed nothing, so the rate it last really did set is still its own.
+    repo, store = _audit(tmp_path)
+    repo.record_change(
+        900001, from_a=32, to_a=6, reason="throttled", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=6,
+        to_a=32,
+        reason="advisory: proposed, not applied",
+        applied=False,
+        source=MODULE,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert repo.last_applied_rate(900001) == 6
+    store.close()
+
+
+def test_a_change_written_before_the_source_was_recorded_is_never_claimed(tmp_path: Path) -> None:
+    # An audit written by an earlier build says who moved the rate no more than
+    # it says why. Unknown provenance is not a showing that the rate was ours,
+    # and restore puts back only what it can show is its own — so the old rows
+    # are left alone rather than assumed.
+    repo, store = _audit(tmp_path)
+    with store._conn:
+        store._conn.execute(
+            "INSERT INTO charger_change (timestamp, device_gid, from_a, to_a, reason, applied)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (int(NOW.timestamp()), 900001, 32, 6, "restored on startup", 1),
+        )
+    assert repo.last_applied_rate(900001) is None
+    assert repo.recent_changes()[0].source is None
+    store.close()
+
+
 def test_the_newest_changes_come_first(tmp_path: Path) -> None:
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=None, to_a=10, reason="first", applied=True, now=NOW)
     repo.record_change(
-        900001, from_a=10, to_a=20, reason="second", applied=True, now=NOW + timedelta(minutes=5)
+        900001, from_a=None, to_a=10, reason="first", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=10,
+        to_a=20,
+        reason="second",
+        applied=True,
+        source=MODULE,
+        now=NOW + timedelta(minutes=5),
     )
     assert [row.reason for row in repo.recent_changes()] == ["second", "first"]
     store.close()
@@ -309,8 +471,12 @@ def test_two_decisions_in_the_same_second_are_both_kept(tmp_path: Path) -> None:
     # loses one of the two is worse than none: it shows a charger that was
     # stopped and never started, or started and never stopped.
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=16, to_a=16, reason="stopped charging", applied=True, now=NOW)
-    repo.record_change(900001, from_a=16, to_a=16, reason="started charging", applied=True, now=NOW)
+    repo.record_change(
+        900001, from_a=16, to_a=16, reason="stopped charging", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001, from_a=16, to_a=16, reason="started charging", applied=True, source=MODULE, now=NOW
+    )
     assert [row.reason for row in repo.recent_changes()] == [
         "started charging",
         "stopped charging",
@@ -325,9 +491,17 @@ def test_the_newest_decision_is_readable_whether_or_not_it_was_applied(tmp_path:
     # about to repeat itself has to see the refusals too, because a proposal
     # that repeats is a proposal that was never applied.
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=None, to_a=16, reason="set", applied=True, now=NOW)
     repo.record_change(
-        900001, from_a=16, to_a=32, reason="proposed", applied=False, now=NOW + timedelta(minutes=1)
+        900001, from_a=None, to_a=16, reason="set", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900001,
+        from_a=16,
+        to_a=32,
+        reason="proposed",
+        applied=False,
+        source=MODULE,
+        now=NOW + timedelta(minutes=1),
     )
     newest = repo.last_change(900001)
     assert newest is not None
@@ -337,9 +511,17 @@ def test_the_newest_decision_is_readable_whether_or_not_it_was_applied(tmp_path:
 
 def test_the_newest_decision_is_the_one_for_that_charger(tmp_path: Path) -> None:
     repo, store = _audit(tmp_path)
-    repo.record_change(900001, from_a=None, to_a=16, reason="mine", applied=True, now=NOW)
     repo.record_change(
-        900002, from_a=None, to_a=24, reason="theirs", applied=True, now=NOW + timedelta(minutes=1)
+        900001, from_a=None, to_a=16, reason="mine", applied=True, source=MODULE, now=NOW
+    )
+    repo.record_change(
+        900002,
+        from_a=None,
+        to_a=24,
+        reason="theirs",
+        applied=True,
+        source=MODULE,
+        now=NOW + timedelta(minutes=1),
     )
     newest = repo.last_change(900001)
     assert newest is not None and newest.reason == "mine"
@@ -357,29 +539,59 @@ def test_a_decision_matches_an_earlier_one_only_when_every_part_of_it_does() -> 
         to_a=32,
         reason="restored to 32 A on startup: advisory: proposed, not applied",
         applied=False,
+        source=MODULE,
     )
-    assert earlier.same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=False)
+    assert earlier.same_decision(
+        from_a=6, to_a=32, reason=earlier.reason, applied=False, source=MODULE
+    )
     # The timestamp is the one field that must not count. Two identical
     # proposals are one proposal made twice, and they can never share a second.
     assert ChargerChange(
-        timestamp=999, device_gid=900001, from_a=6, to_a=32, reason=earlier.reason, applied=False
-    ).same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=False)
+        timestamp=999,
+        device_gid=900001,
+        from_a=6,
+        to_a=32,
+        reason=earlier.reason,
+        applied=False,
+        source=MODULE,
+    ).same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=False, source=MODULE)
 
-    assert not earlier.same_decision(from_a=6, to_a=24, reason=earlier.reason, applied=False)
-    assert not earlier.same_decision(from_a=10, to_a=32, reason=earlier.reason, applied=False)
-    assert not earlier.same_decision(from_a=6, to_a=32, reason="set by hand", applied=False)
-    # Applied is the sharpest of the four. A proposal and the same figure
-    # actually reaching the charger are not the same event, and treating them
-    # as one would hide the write.
-    assert not earlier.same_decision(from_a=6, to_a=32, reason=earlier.reason, applied=True)
+    assert not earlier.same_decision(
+        from_a=6, to_a=24, reason=earlier.reason, applied=False, source=MODULE
+    )
+    assert not earlier.same_decision(
+        from_a=10, to_a=32, reason=earlier.reason, applied=False, source=MODULE
+    )
+    assert not earlier.same_decision(
+        from_a=6, to_a=32, reason="set by hand", applied=False, source=MODULE
+    )
+    # Applied is the sharpest of them. A proposal and the same figure actually
+    # reaching the charger are not the same event, and treating them as one
+    # would hide the write.
+    assert not earlier.same_decision(
+        from_a=6, to_a=32, reason=earlier.reason, applied=True, source=MODULE
+    )
+    # And who decided is part of the decision. The same numbers chosen by the
+    # owner and chosen by this module are two different things happening.
+    assert not earlier.same_decision(
+        from_a=6, to_a=32, reason=earlier.reason, applied=False, source=OWNER
+    )
 
     # An absent rate and a rate are different decisions in both directions. A
     # charger that never said what it was at is not one sitting at 6 A, and a
     # comparison that let those match would suppress a genuinely new proposal.
     unknown = ChargerChange(
-        timestamp=1, device_gid=900001, from_a=None, to_a=None, reason="r", applied=False
+        timestamp=1,
+        device_gid=900001,
+        from_a=None,
+        to_a=None,
+        reason="r",
+        applied=False,
+        source=MODULE,
     )
-    assert unknown.same_decision(from_a=None, to_a=None, reason="r", applied=False)
-    assert not unknown.same_decision(from_a=6, to_a=None, reason="r", applied=False)
-    assert not unknown.same_decision(from_a=None, to_a=32, reason="r", applied=False)
-    assert not earlier.same_decision(from_a=None, to_a=32, reason=earlier.reason, applied=False)
+    assert unknown.same_decision(from_a=None, to_a=None, reason="r", applied=False, source=MODULE)
+    assert not unknown.same_decision(from_a=6, to_a=None, reason="r", applied=False, source=MODULE)
+    assert not unknown.same_decision(from_a=None, to_a=32, reason="r", applied=False, source=MODULE)
+    assert not earlier.same_decision(
+        from_a=None, to_a=32, reason=earlier.reason, applied=False, source=MODULE
+    )

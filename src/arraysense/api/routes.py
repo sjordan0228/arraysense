@@ -88,6 +88,7 @@ from arraysense.modules.emporia.client import (
 )
 from arraysense.modules.emporia.control import clamp_rate
 from arraysense.modules.emporia.poller import EmporiaPoller
+from arraysense.modules.emporia.repository import OWNER
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
@@ -3224,6 +3225,24 @@ class ChargeRate(BaseModel):
     amps: int
 
 
+def _refuse_while_disabled(settings: SettingsStore) -> None:
+    """Stop a write to the charger while the module is switched off.
+
+    The enable is not the authority setting and neither implies the other, so
+    both write routes checked ``charger_authority`` and neither checked this —
+    which left a disabled module holding a stale charger, a live token, and two
+    endpoints that would have reached a real car. Refused with a 409 in the
+    manner of the app-authority refusal rather than accepted and dropped,
+    because a control that takes a number and does nothing with it is worse than
+    one that is not there.
+    """
+    if not bool(settings.get(EMPORIA_ENABLED_KEY)):
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia module is switched off; switch it on in Settings first",
+        )
+
+
 @router.get("/emporia/charger")
 async def emporia_charger(request: Request) -> dict[str, Any]:
     """The charger, who else is driving it, and what this service has done to it.
@@ -3232,13 +3251,20 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
     charger. It is a warning and never a refusal — it is the owner's charger and
     their account — but it has to be said, because two controllers moving one
     rate will undo each other and neither will look broken.
+
+    A switched-off module answers with no charger at all, and that is the rule
+    stated in one place so nothing downstream has to remember it: the nav draws
+    the Charger tab from this answer, and it kept drawing it — over a page of
+    live controls — for a module the owner had turned off.
     """
-    poller = _emporia(request)
-    if poller is None or poller.charger is None:
-        return {"charger": None, "changes": []}
-    state = poller.charger
     settings = SettingsStore(request.app.state.store)
+    enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
+    poller = _emporia(request)
+    if poller is None or poller.charger is None or not enabled:
+        return {"charger": None, "changes": [], "enabled": enabled}
+    state = poller.charger
     return {
+        "enabled": enabled,
         "charger": {
             "device_gid": state.device_gid,
             "rate_a": state.rate_a,
@@ -3262,6 +3288,9 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
                 "to_a": change.to_a,
                 "reason": change.reason,
                 "applied": change.applied,
+                # Who decided it. Null on a line written before this was
+                # recorded, which the page must not render as either party.
+                "source": change.source,
             }
             for change in poller.audit.recent_changes()
         ],
@@ -3281,10 +3310,16 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
     It also starts the override window. Somebody who has just set a rate by hand
     should not have it moved out from under them by the next automatic decision.
     """
+    # The enable is asked first, and before the charger is looked for. A tick
+    # clears the cached charger the moment the module is switched off, so asking
+    # about the charger first answers "no Emporia charger is being read" — true,
+    # but not the reason, and the reason is the thing somebody who has just
+    # turned the module off needs to be told.
+    settings = SettingsStore(request.app.state.store)
+    _refuse_while_disabled(settings)
     poller = _emporia(request)
     if poller is None or poller.charger is None:
         raise HTTPException(status_code=404, detail="no Emporia charger is being read")
-    settings = SettingsStore(request.app.state.store)
     if settings.get(CHARGER_AUTHORITY_KEY) == "app":
         # Refused rather than quietly ignored. The owner said the Emporia app
         # has this charger, and a control that accepts a number and does
@@ -3296,6 +3331,16 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
     charger = poller.charger
     rate, refused = clamp_rate(body.amps, poller.limits())
     now = datetime.now(tz=UTC)
+    # The window opens when the owner presses, not when Emporia answers. The
+    # write below is a round trip to a cloud service, and the restore runs on
+    # the poller's own clock — so opening it afterwards left a gap in which an
+    # automatic decision could look at a charger the owner was in the middle of
+    # changing, find no hold, and write over it. A failed write holds too: they
+    # reached for the charger either way, and the conservative reading of that
+    # is the one this module owes them.
+    minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
+    hold = int(minutes) if isinstance(minutes, int) else 120
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
     try:
         confirmed = await asyncio.to_thread(poller.write_rate, rate)
     except EmporiaAuthExpiredError as exc:
@@ -3307,6 +3352,7 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
             to_a=rate,
             reason=f"failed: {exc}",
             applied=False,
+            source=OWNER,
             now=now,
         )
         raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
@@ -3323,11 +3369,9 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
         reason=("set by hand" if took else "set by hand, but the charger still reads differently")
         + (f" ({refused})" if refused else ""),
         applied=took,
+        source=OWNER,
         now=now,
     )
-    minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
-    hold = int(minutes) if isinstance(minutes, int) else 120
-    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
     return {"ok": True, "rate_a": rate, "refused": refused, "confirmed": took}
 
 
@@ -3347,10 +3391,17 @@ async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, A
     route is the owner asking, so it acts either way — but it is audited like
     everything else, because "why is the car not charged" has to have an answer.
     """
+    # The enable is asked first, and before the charger is looked for. A tick
+    # clears the cached charger the moment the module is switched off, so asking
+    # about the charger first answers "no Emporia charger is being read" — true,
+    # but not the reason, and the reason is the thing somebody who has just
+    # turned the module off needs to be told.
+    settings = SettingsStore(request.app.state.store)
+    _refuse_while_disabled(settings)
     poller = _emporia(request)
     if poller is None or poller.charger is None:
         raise HTTPException(status_code=404, detail="no Emporia charger is being read")
-    if SettingsStore(request.app.state.store).get(CHARGER_AUTHORITY_KEY) == "app":
+    if settings.get(CHARGER_AUTHORITY_KEY) == "app":
         raise HTTPException(
             status_code=409,
             detail="the Emporia app manages this charger; change that in Settings first",
@@ -3365,9 +3416,14 @@ async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, A
         poller.audit.record_change(
             charger.device_gid,
             from_a=charger.rate_a,
-            to_a=charger.rate_a,
+            # No rate was decided. Recording the current one here made a power
+            # press look like a decision about the rate, and the audit is what
+            # restore-on-startup reads to work out whose rate the charger is
+            # sitting at — so pressing stop once retired the restore for good.
+            to_a=None,
             reason=f"failed to {'start' if body.on else 'stop'} charging: {exc}",
             applied=False,
+            source=OWNER,
             now=now,
         )
         raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
@@ -3375,10 +3431,14 @@ async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, A
     poller.audit.record_change(
         charger.device_gid,
         from_a=charger.rate_a,
-        to_a=charger.rate_a,
+        # See the failure path above: a power press decides nothing about the
+        # rate, and an absent rate is absent rather than a repeat of the one
+        # that happened to be set.
+        to_a=None,
         reason=("started charging" if body.on else "stopped charging")
         + ("" if took else ", but the charger still reads otherwise"),
         applied=took,
+        source=OWNER,
         now=now,
     )
     return {"ok": True, "on": body.on, "confirmed": took}

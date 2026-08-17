@@ -71,10 +71,12 @@ from arraysense.store.rollup import LATE_APPEND_SECONDS
 from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
+    LATE_COLUMNS,
     MODULE_TIERS,
     PENDING_TABLE,
     expected_columns,
     inverter_metric_columns,
+    late_column_ddl,
     migration_ddl,
     module_metric_columns,
     schema_ddl,
@@ -265,6 +267,17 @@ class SqliteStore:
             for table in expected_columns(declared)
         }
         for statement in migration_ddl(existing, declared):
+            self._conn.execute(statement)
+        # The same repair for the tables whose shape is written out by hand.
+        # Their columns do not come from the metric registry, so nothing above
+        # would ever notice one missing — and the first write would fail with
+        # "no such column" on exactly the installations that have been running
+        # longest.
+        late = {
+            table: tuple(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
+            for table in LATE_COLUMNS
+        }
+        for statement in late_column_ddl(late):
             self._conn.execute(statement)
         # What each tier actually has, read back after the migrations so a
         # column just added is counted. Reads answer from this rather than from

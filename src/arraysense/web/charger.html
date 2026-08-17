@@ -112,7 +112,7 @@
     </form>
     <div class="tablewrap">
       <table id="changes">
-        <thead><tr><th>When</th><th>Change</th><th>Why</th></tr></thead>
+        <thead><tr><th>When</th><th>Who</th><th>Change</th><th>Why</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -215,13 +215,24 @@ async function loadCharger() {
   $('changes').querySelector('tbody').innerHTML = (body.changes || []).map((ch) => {
     const when = new Date(ch.timestamp * 1000).toLocaleString();
     const from = ch.from_a === null ? DASH : ch.from_a + ' A';
-    const to = ch.to_a === null ? 'stop' : ch.to_a + ' A';
+    // No rate decided is a dash, the way an absent reading is everywhere else.
+    // It read 'stop', which was right for the one decision that means stopping
+    // and wrong for the press that started the charger again — and the reason
+    // beside it already says which of the two happened.
+    const to = ch.to_a === null ? DASH : ch.to_a + ' A';
+    // Who decided, which is a separate fact from whether it was applied — a
+    // rate you set by hand reaches the charger exactly the way one this service
+    // chose does. A line written before the source was recorded says nothing,
+    // and a dash is the honest answer rather than a guess at either party.
+    const who = ch.source === 'owner' ? 'You'
+      : ch.source === 'module' ? 'This service' : DASH;
     // A refused decision is shown, not hidden. A log of successes only makes a
     // module that never acted look exactly like one nobody asked.
     return `<tr class="${ch.applied ? '' : 'absent'}">`
-      + `<td>${esc(when)}</td><td>${esc(from)} → ${esc(to)}${ch.applied ? '' : ' (not applied)'}</td>`
+      + `<td>${esc(when)}</td><td>${esc(who)}</td>`
+      + `<td>${esc(from)} → ${esc(to)}${ch.applied ? '' : ' (not applied)'}</td>`
       + `<td>${esc(ch.reason)}</td></tr>`;
-  }).join('') || '<tr><td colspan="3" class="muted">Nothing has changed the rate yet.</td></tr>';
+  }).join('') || '<tr><td colspan="4" class="muted">Nothing has changed the rate yet.</td></tr>';
 }
 
 $('amps').addEventListener('input', () => {
