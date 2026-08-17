@@ -766,6 +766,31 @@ def _fill_hour(
     )
 
 
+def _null_hour(
+    repo: CircuitRepository,
+    store: SqliteStore,
+    device_gid: int,
+    channel: str,
+    hour: datetime,
+    *,
+    cadence_seconds: int = 60,
+) -> None:
+    # An hour where the circuit was listed and never answered once -- every
+    # reading it saw that hour carries no watts, so the real rollup writes a
+    # row with a NULL average and a sample count of nought rather than no row
+    # at all (rebuild_circuit_hourly's own docstring: "An hour in which
+    # nothing was heard averages to NULL rather than to zero"). That is the
+    # row band_kwh has to notice and label, not a gap in the timestamps.
+    for minute in range(60):
+        repo.append_readings([Reading(device_gid, channel, None)], hour + timedelta(minutes=minute))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=cadence_seconds,
+    )
+
+
 def test_band_kwh_splits_a_circuits_energy_between_the_bands_it_ran_in(tmp_path: Path) -> None:
     # The arithmetic the whole panel rests on: one circuit, two bands, and the
     # energy landing where the clock says it did.
@@ -963,6 +988,101 @@ def test_band_kwh_yields_nothing_rather_than_raising_on_a_database_error(tmp_pat
     day = datetime(2026, 7, 1, tzinfo=UTC)
 
     assert repo.band_kwh(day, day + timedelta(days=1), []) == ()
+    store.close()
+
+
+def test_band_kwh_does_not_over_credit_a_fully_recorded_hour_the_window_cuts_into(
+    tmp_path: Path,
+) -> None:
+    # The critical defect, reproduced exactly: a fully-recorded hour queried
+    # through a window that starts and ends inside it. The old guard,
+    # ``hour_end > last``, only asks whether the query ends before the hour's
+    # nominal end -- true here even though nothing about this row is actually
+    # partial -- and shrank span to ``last - when`` anyway, crediting three
+    # quarters of the hour's energy (0.75 kWh) to a query that asked about
+    # exactly half of it.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    hour = day + timedelta(hours=12)
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000)  # a full, fully-recorded hour
+    window_start = hour + timedelta(minutes=10)
+    window_end = hour + timedelta(minutes=40)
+    intervals = [(window_start, window_end, "off-peak")]
+
+    result = repo.band_kwh(window_start, window_end, intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # 1000 W held for the 30 minutes the window actually covers is 0.5 kWh --
+    # not the 0.75 kWh the old formula returned.
+    assert energy.by_band["off-peak"] == pytest.approx(0.5)
+    store.close()
+
+
+def test_band_kwh_does_not_over_credit_a_fully_recorded_final_hour_cut_by_last(
+    tmp_path: Path,
+) -> None:
+    # The reachable shape behind the critical defect: for a site whose local
+    # UTC offset is not a whole number of hours (Asia/Kolkata, +5:30), a
+    # calendar month's boundary does not land on a UTC hour, so the last hour
+    # of every month is a fully-recorded hour whose nominal end merely exceeds
+    # the query's own ``last`` -- exactly the test a genuinely in-progress
+    # hour passes, and the old code had no way to tell a fully recorded hour
+    # cut short by an arbitrary ``last`` from one still being written.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    hour = day + timedelta(hours=12)
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000)  # a full, fully-recorded hour
+    window_end = hour + timedelta(minutes=15)
+    intervals = [(day, window_end, "off-peak")]
+
+    result = repo.band_kwh(day, window_end, intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # Only the first 15 of the hour's 60 minutes lie inside the window: 0.25
+    # kWh -- not the full hour's 1.0 kWh the old formula returned once
+    # ``overlap / span`` came out to exactly 1.
+    assert energy.by_band["off-peak"] == pytest.approx(0.25)
+    store.close()
+
+
+def test_band_kwh_marks_a_band_partial_when_one_of_its_hours_reported_nothing(
+    tmp_path: Path,
+) -> None:
+    # A NULL-watts hourly row -- a circuit listed and never answered for a
+    # whole hour, evidenced by the row itself rather than inferred from a
+    # gap in the timestamps -- was silently skipped before anything recorded
+    # that its band lost an hour. A circuit with one valid 1 kW hour and one
+    # such silent hour in the same band must not report a complete-looking
+    # 1 kWh with nothing marking it otherwise.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits(
+        [
+            Circuit(100000, "1", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "2", "Shed outlet", 1.0, "circuit"),
+        ],
+        day,
+    )
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    _null_hour(repo, store, 100000, "1", day + timedelta(hours=11))  # same band, no answer
+    _null_hour(repo, store, 100000, "2", day + timedelta(hours=10))  # never answers at all
+    intervals = [(day, day + timedelta(days=1), "off-peak")]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+    by_name = {c.name: c for c in result}
+
+    dryer = by_name["Dryer"]
+    assert dryer.by_band["off-peak"] == pytest.approx(1.0), "only the valid hour's energy"
+    assert dryer.partial_bands == frozenset({"off-peak"})
+
+    # "Shed outlet" reported nothing at all, anywhere in the window -- already
+    # a dash (``by_band`` empty, ``cost`` None downstream). Flagging it
+    # partial too would hatch a row with nothing behind it to hatch.
+    outlet = by_name["Shed outlet"]
+    assert outlet.by_band == {}
+    assert outlet.partial_bands == frozenset()
     store.close()
 
 

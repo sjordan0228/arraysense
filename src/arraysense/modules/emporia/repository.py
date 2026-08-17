@@ -554,7 +554,24 @@ class CircuitRepository:
         evenly through it — bounded by one hour on one circuit at one boundary
         a day, which is the same kind and size of tolerance ``bucket_totals``
         already accepts at a bucket edge. The alternative is inventing a
-        distribution the stored row does not carry.
+        distribution the stored row does not carry. A stored hour is only ever
+        spread over less than the full hour when it is genuinely still being
+        written — measured by ``covered_seconds`` itself, not by whether the
+        query's own end happens to fall before the hour's nominal one, which is
+        also true of a complete past hour on the last hour of a month whose
+        UTC offset is not a whole number of hours.
+
+        A circuit's band figure also carries a flag for the hours it is known
+        to be missing rather than merely thin. ``rebuild_circuit_hourly``
+        writes a NULL-watts row for an hour a circuit was listed for but never
+        answered once, and that row contributes no energy here — but every
+        band its hour overlaps is marked partial for that circuit, the same
+        completeness rule ``spend.missing_band`` already applies to a band
+        that came back empty, at the scale of one hour of it rather than the
+        whole thing. A circuit that reported nothing at all, anywhere in the
+        window, is left unflagged: it is already a dash through its empty
+        ``by_band``, and marking it partial too would label a row with
+        nothing on it to label.
 
         Everything is compared as epoch seconds, never as datetimes: two aware
         datetimes sharing a tzinfo subtract as though they were naive, and a
@@ -612,13 +629,40 @@ class CircuitRepository:
 
         joules: dict[int, dict[str, float]] = {cid: {} for cid in meta}
         thin: dict[int, set[str]] = {cid: set() for cid in meta}
+        # Circuits actually heard from somewhere in the window, at least
+        # once. A circuit that never answered at all is already a dash —
+        # ``by_band`` stays empty and a page reads that as ``cost is None`` —
+        # and flagging it partial too would hatch a row with nothing behind
+        # it to hatch.
+        seen: set[int] = set()
         for stamp, circuit_id, raw, samples, stored in rows:
-            if raw is None:
-                continue
             key = int(circuit_id)
             if key not in meta:
                 continue
             when = int(stamp)
+            if raw is None:
+                # A NULL-watts hourly row is a circuit that was listed and did
+                # not answer once in the whole hour — rebuild_circuit_hourly
+                # writes exactly this row, with a NULL average and a sample
+                # count of nought, when every reading it saw that hour came
+                # back with no watts. That is a fact evidenced by the row
+                # itself, not a hole inferred from a gap in the timestamps —
+                # a different question from the one CircuitSeries's own
+                # docstring answers, which is only that a hole *elsewhere*
+                # must not demote an hour that was itself recorded end to
+                # end. A multi-hour sum known to be missing this specific
+                # hour is the same defect spend.missing_band already guards
+                # at the scale of a whole band gone rather than one hour of
+                # it, so every band this hour overlaps is marked partial for
+                # this circuit — contributing no energy, since none was
+                # measured.
+                if counted:
+                    hour_end = when + _HOUR_SECONDS
+                    for iv_start, iv_end, band in windows:
+                        if min(hour_end, iv_end, last) - max(when, iv_start, first) > 0:
+                            thin[key].add(band)
+                continue
+            seen.add(key)
             if counted:
                 covered = (
                     min(int(stored), _HOUR_SECONDS)
@@ -628,17 +672,32 @@ class CircuitRepository:
                 # The span the energy is spread across is the hour, not the
                 # part of it that was recorded — where in the hour those
                 # seconds fell is precisely what the row does not say — except
-                # at the trailing edge, where it is not a guess at all. The
-                # current month always ends mid-hour, and there the rollup's
-                # own covered_seconds already IS the part of the hour that
-                # existed by ``last``, because the rest of it has not happened
-                # yet. Smearing that already-exact figure across a remainder
-                # that does not exist applied the same fraction twice: a 1 kW
-                # row covering 12:00-12:30, asked about a window ending 12:30,
-                # returned 0.25 kWh instead of the 0.5 it actually measured.
-                # Shrinking span to match is what stops the second reduction.
+                # at the trailing edge of a row that is genuinely still being
+                # written, where it is not a guess at all. The current month
+                # always ends mid-hour, and there the rollup's own
+                # covered_seconds already IS the part of the hour that existed
+                # by the time it was measured, because the rest of it had not
+                # happened yet. Smearing that already-exact figure across a
+                # remainder that does not exist applies the same fraction
+                # twice: a 1 kW row covering 12:00-12:30, asked about a window
+                # ending 12:30, returned 0.25 kWh instead of the 0.5 it
+                # actually measured. Shrinking span to match is what stops the
+                # second reduction — but only for a row that is actually
+                # short. ``hour_end > last`` alone is not enough to tell that:
+                # it is also true of a fully recorded *past* hour whose
+                # nominal end merely falls after the window's own end, which
+                # is every month's last hour on a site whose UTC offset is not
+                # a whole number of hours — that hour was booked at three
+                # quarters of its energy for a query that asked about half of
+                # it. ``covered < _HOUR_SECONDS`` is what tells the two apart,
+                # since only a row that is actually partial can measure less
+                # than the whole hour. And the shrunk span is ``covered``
+                # itself rather than ``last - when``: the two agree only when
+                # the row was measured up to exactly ``last``, which is not
+                # guaranteed when the caller's ``last`` is earlier than the
+                # real "now" a still-forming row was recorded up to.
                 hour_end = when + _HOUR_SECONDS
-                span = last - when if hour_end > last else _HOUR_SECONDS
+                span = covered if hour_end > last and covered < _HOUR_SECONDS else _HOUR_SECONDS
             else:
                 nxt = following.get(when)
                 covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
@@ -653,8 +712,13 @@ class CircuitRepository:
                 # landing mid-hour (a Kolkata month, half an hour off UTC) is
                 # an ordinary clip on the smear, not a claim that the row's
                 # own recorded seconds are known to sit exactly at the
-                # window's edge the way the trailing one is.
-                overlap = min(when + span, iv_end) - max(when, iv_start, first)
+                # window's edge the way the trailing one is. ``last`` is
+                # intersected too, and it has to be now that it is no longer
+                # always folded into ``span``: a fully recorded hour is never
+                # shrunk any more, so without this clip a query ending
+                # mid-hour would count that hour's energy past the window's
+                # own end — exactly the over-credit this fixes.
+                overlap = min(when + span, iv_end, last) - max(when, iv_start, first)
                 if overlap <= 0:
                     continue
                 joules[key][band] = joules[key].get(band, 0.0) + energy * (overlap / span)
@@ -666,7 +730,7 @@ class CircuitRepository:
                 name=str(row[3]),
                 kind=str(row[4]),
                 by_band={band: value / 3_600_000 for band, value in joules[circuit_id].items()},
-                partial_bands=frozenset(thin[circuit_id]),
+                partial_bands=frozenset(thin[circuit_id]) if circuit_id in seen else frozenset(),
             )
             for circuit_id, row in meta.items()
         )
