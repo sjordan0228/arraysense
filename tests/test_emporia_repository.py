@@ -849,6 +849,45 @@ def test_band_kwh_marks_the_band_whose_hour_was_thinly_covered(tmp_path: Path) -
     store.close()
 
 
+def test_band_kwh_spreads_a_half_covered_hour_evenly_across_a_boundary_inside_it(
+    tmp_path: Path,
+) -> None:
+    # Pins the choice of span in band_kwh's proportioning, not just the total.
+    # A stored hour's covered_seconds says *how much* of the hour was
+    # measured, never *where* -- the row does not carry that. Anchoring the
+    # split at the reading's own covered duration (span = covered) looks like
+    # a tightening of the real span = _HOUR_SECONDS, and it would pass every
+    # other case in this file, because the other cases keep a partial hour
+    # entirely inside one band, where the two choices agree. Here a boundary
+    # sits at the hour's midpoint, and the two choices diverge hard: span =
+    # covered would book the whole 0.5 kWh into the first half and nothing
+    # into the second (its 1,800-second span ends exactly at the boundary and
+    # never reaches the far side). The real code assumes the measured energy
+    # was spread evenly across the *hour*, so the boundary at the midpoint
+    # splits it down the middle instead: 0.25 kWh on each side.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    hour = day + timedelta(hours=10)
+    # Thirty one-minute-apart readings cover half the hour -- 1,800 of 3,600
+    # seconds, through the real rollup rather than a hand-written
+    # covered_seconds.
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000, minutes=30)
+    intervals = [
+        (hour, hour + timedelta(minutes=30), "off-peak"),
+        (hour + timedelta(minutes=30), hour + timedelta(hours=1), "peak"),
+    ]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # Not 0.5 / 0.0, which is the answer span = covered would give.
+    assert energy.by_band["off-peak"] == pytest.approx(0.25)
+    assert energy.by_band["peak"] == pytest.approx(0.25)
+    assert energy.partial_bands == frozenset({"off-peak", "peak"})
+    store.close()
+
+
 def test_band_kwh_ignores_a_stretch_no_band_covers(tmp_path: Path) -> None:
     # A gap in the schedule is unpriced energy, not energy in a band named
     # None -- the Costs page already warns about unpriced minutes separately.
