@@ -1,11 +1,12 @@
-"""test_graphs_tabs_js.py — every section of the Graphs page has a tab, and the
-weather pin round-trips.
+"""test_graphs_tabs_js.py — every section of the Graphs page has a tab, the
+weather pin round-trips, and the circuit strips are chosen by rule.
 
-The Graphs page's tab bar and weather pin are pure decisions — which tab is
-open, whether a section is on screen, what the pin is stored as — sliced
-between the graph-tabs markers and run under node, the same way the settings
-page's tab-defs slice is (tests/test_settings_tabs_js.py). Two invariants a
-band table can drift from sit here:
+The Graphs page's tab bar, weather pin and circuit-strip selection are pure
+decisions — which tab is open, whether a section is on screen, what the pin is
+stored as, which circuits are drawn and what the expander says — sliced between
+markers and run under node, the same way the settings page's tab-defs slice is
+(tests/test_settings_tabs_js.py). Two invariants a band table can drift from sit
+here:
 
 * every `sec:` the band table names has a tab, and every tab other than All
   names a section — so a new section cannot be added without a tab, and a tab
@@ -17,8 +18,10 @@ Skipped where node is not installed; loud if the extraction markers move.
 What this cannot catch: it does not render a chart, so the deferred-paint rule
 — a chart is only built the first time its section becomes visible, because
 constructing a uPlot into a hidden container lays out an empty grid — is not
-checked here. That needs a browser. The rule lives in paintBand() and is
-verified by measurement on the LXC.
+checked here. Neither is anything about how a null draws: that a gap breaks the
+line rather than being bridged is uPlot's `spanGaps`, and only a canvas can show
+it. Both need a browser. The rules live in paintBand() and in common.js's
+trace(), and are verified by measurement on the LXC.
 """
 
 from __future__ import annotations
@@ -33,21 +36,18 @@ import pytest
 NODE = shutil.which("node")
 PAGE = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web" / "graphs.html"
 
-_START = "// >>> graph-tabs"
-_END = "// <<< graph-tabs"
 
-
-def _slice() -> str:
+def _slice(marker: str = "graph-tabs") -> str:
     text = PAGE.read_text()
-    start = text.index(_START)
-    end = text.index(_END)
-    assert start < end, f"graph-tabs markers are out of order in graphs.html: {_START}"
+    start = text.index(f"// >>> {marker}")
+    end = text.index(f"// <<< {marker}")
+    assert start < end, f"{marker} markers are out of order in graphs.html"
     return text[start:end]
 
 
-def _run(body: str) -> str:
+def _run(body: str, marker: str = "graph-tabs") -> str:
     assert NODE is not None
-    script = _slice() + "\n" + body
+    script = _slice(marker) + "\n" + body
     out = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=True)
     return out.stdout.strip()
 
@@ -215,3 +215,109 @@ def test_a_link_to_the_circuits_tab_lands_on_all_where_there_are_none() -> None:
         "console.log(wantedGraphTab('circuits', null, tabs));"
     )
     assert out == "all"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_circuits_section_hides_until_something_has_been_read() -> None:
+    # Enabled is not the same fact as having data. The tab is offered on the
+    # owner's switch, so a module turned on a minute ago — or one whose saved
+    # login Emporia has rejected — reaches this page with an enabled module and
+    # no readings, and a bare heading over nothing is what that used to draw.
+    # Unknown hides it, which is the opposite of the packs default and matches
+    # the tab rule: circuits have never been shown to be present.
+    out = _run(
+        "console.log('with:' + graphSectionVisible('circuits', 'all', false, true, true, true));\n"
+        "console.log('without:' "
+        "+ graphSectionVisible('circuits', 'all', false, true, true, false));\n"
+        "console.log('undeclared:' + graphSectionVisible('circuits', 'all', false, true, true));\n"
+        "console.log('own_tab_empty:' "
+        "+ graphSectionVisible('circuits', 'circuits', false, true, true, false));\n"
+        "console.log('other_section:' "
+        "+ graphSectionVisible('solar', 'all', false, true, true, false));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["with"] == "true"
+    assert results["without"] == "false", "an enabled module with no readings draws no section"
+    assert results["undeclared"] == "false", "unknown hides it — the opposite of the packs rule"
+    assert results["own_tab_empty"] == "false", "the tab says why instead of opening an empty box"
+    assert results["other_section"] == "true", "the gate is the circuits section alone"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_five_strips_are_drawn_and_the_expander_counts_the_rest() -> None:
+    # Five is alerts.DEFAULT_TOP's answer to "which loads matter", and the
+    # reference account has thirty-nine circuits: drawing them all is thousands
+    # of pixels of scrolling before the reader learns anything. The order is the
+    # endpoint's ranking by energy, so the five drawn are the five that used the
+    # most and the expander holds the tail of the same list.
+    out = _run(
+        "const list = Array.from({length: 39}, (_, i) => ({name: 'c' + i}));\n"
+        "console.log('folded:' + circuitsDrawn(list, false).map(c => c.name).join(','));\n"
+        "console.log('expanded:' + circuitsDrawn(list, true).length);\n"
+        "console.log('short:' + circuitsDrawn(list.slice(0, 3), false).length);\n"
+        "console.log('words:' + circuitsMoreWords(34, false));\n"
+        "console.log('one:' + circuitsMoreWords(1, false));\n"
+        "console.log('back:' + circuitsMoreWords(34, true));",
+        marker="circuit-rules",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["folded"] == "c0,c1,c2,c3,c4", "the top five, in the endpoint's own order"
+    assert results["expanded"] == "39", "expanding draws the rest of the same answer"
+    assert results["short"] == "3", "fewer than five is not padded out"
+    assert results["words"] == "show the other 34", "the count is the offer"
+    assert results["one"] == "show the other one"
+    assert results["back"] == "show fewer"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_circuit_that_reported_nothing_gets_a_row_and_no_chart() -> None:
+    # The rule the whole page turns on. A circuit heard from nowhere in the
+    # window did not draw 0 W, and an empty plot reads as a fault while a
+    # dropped row reads as a circuit that no longer exists — so it gets a row
+    # saying why and no chart at all. A circuit measured at zero is a reading
+    # and keeps its strip.
+    out = _run(
+        "const since = '2026-04-02T13:45:00.000Z';\n"
+        "const dead = {watts: [null, null], kwh: null, offline_since: since};\n"
+        "const quiet = {watts: [null, null], kwh: null, offline_since: null};\n"
+        "const zero = {watts: [0, 0], kwh: 0, offline_since: null};\n"
+        "const live = {watts: [null, 40], kwh: 0.01, offline_since: null};\n"
+        "console.log('dead:' + circuitSilent(dead));\n"
+        "console.log('quiet:' + circuitSilent(quiet));\n"
+        "console.log('zero:' + circuitSilent(zero));\n"
+        "console.log('live:' + circuitSilent(live));\n"
+        "console.log('why_dead:' + circuitWhy(dead, '2 Apr 2026'));\n"
+        "console.log('why_quiet:' + circuitWhy(quiet, ''));",
+        marker="circuit-rules",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["dead"] == "true"
+    assert results["quiet"] == "true"
+    assert results["zero"] == "false", "a reading of no power is a reading"
+    assert results["live"] == "false", "one reading among nulls is still a series"
+    assert results["why_dead"] == "offline since 2 Apr 2026"
+    assert results["why_quiet"] == "nothing recorded in this range", (
+        "silence Emporia has not explained must not be reported as a fault"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_window_nobody_reported_in_is_not_worth_a_section() -> None:
+    # What decides whether the section appears at all. One circuit that reported
+    # is enough, because the offline rows are worth reading beside a strip. A
+    # window in which nothing reported is a sentence, not thirty-nine rows all
+    # saying the same thing.
+    out = _run(
+        "const dead = {watts: [null, null], kwh: null};\n"
+        "const live = {watts: [null, 40], kwh: 0.01};\n"
+        "console.log('some:' + circuitsWorthDrawing({circuits: [dead, live]}));\n"
+        "console.log('none:' + circuitsWorthDrawing({circuits: [dead, dead]}));\n"
+        "console.log('empty:' + circuitsWorthDrawing({circuits: []}));\n"
+        "console.log('nothing:' + circuitsWorthDrawing(null));",
+        marker="circuit-rules",
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n") if ":" in ln)
+    assert results["some"] == "true"
+    assert results["none"] == "false"
+    assert results["empty"] == "false", "an enabled module with no circuits draws no section"
+    assert results["nothing"] == "false", "nothing fetched is not a section either"
