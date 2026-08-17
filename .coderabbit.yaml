@@ -1,0 +1,173 @@
+# CodeRabbit configuration for Solar ArraySense
+# Open-source solar and battery monitoring for EG4 and LuxPower inverters.
+# Python 3.12, FastAPI, SQLite, vanilla JS pages with vendored uPlot charts.
+#
+# Validated against https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+# Review guidance goes in `reviews.path_instructions`. A bare `reviews.instructions`
+# key is not in the schema and is ignored.
+
+language: "en-US"
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: true
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+      - "dev"
+
+  path_filters:
+    - "!src/arraysense/web/uPlot.*"
+    - "!src/arraysense/web/*.woff2"
+    - "!src/arraysense/web/*.LICENSE"
+    - "!src/arraysense/web/phosphor-2.svg"
+    - "!uv.lock"
+    - "!docs/superpowers/issues/**"
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        Solar ArraySense reads an EG4/LuxPower inverter, stores samples in
+        SQLite, and serves dashboard pages from FastAPI. It runs unattended on
+        a Raspberry Pi against the owner's live inverter. Source:
+        src/arraysense/. Tests: tests/, mirroring the module layout as
+        test_<module>.py. Specs and plans: docs/superpowers/{specs,plans}/.
+        CLAUDE.md holds the full contract.
+
+        **Absent data is never zero.**
+        - A missing reading is `None` and stores as `NULL`. Flag any code that
+          defaults a missing value to 0, or that treats 0 as "no reading".
+        - A battery block that is empty because CAN is down must never render
+          as 0% SOC. This has already shipped as a bug here: a zero-filled read
+          wrote eighteen battery readings as 0.0.
+        - Never present a partial figure as a complete one. A labelled partial
+          is fine. A dash is right only when nothing was measured. Coverage
+          measured in minutes watched is NOT coverage in energy accounted for,
+          and money depends on the second.
+
+        **One direction of data flow: driver -> collector -> store -> api.**
+        - Nothing in api/ may talk to the inverter.
+        - Nothing in store/ may import from collector/.
+        - Nothing in collector/ may import the inverter library. Only a driver
+          knows what speaks to the wire.
+        - Adding an inverter family means a new directory under drivers/ plus
+          one line of registration, never an edit to the collector.
+
+        **Single sources of truth. Flag duplication of these.**
+        - metrics.py defines every metric: name, unit, integer scale, plausible
+          bounds. Schema, validation and the API derive from it. Adding a
+          metric should be a one-line change there, not a change in four files.
+        - settings.py holds settings defaults; defaults live in the registry,
+          never in the database. settings.html renders itself from describe(),
+          so a page that hard-codes a label or a bound is a bug — it drifts
+          from validation the moment either moves.
+        - panels.py is the only place the per-string array grammar is parsed.
+        - Nothing is computed in two places. A page draws what an endpoint
+          tells it. The Costs page once held its own tariff parser beside the
+          Python one and the two disagreed within a day. Money is the wrong
+          thing to derive twice.
+
+        **The store has two writers.** A weather poller writes site readings
+        into the same raw tier the inverter writes. `metrics.SITE_METRICS`
+        keeps them apart, and three things read it: the store's writable set,
+        `latest()`, and the staleness witness. Any new site-level source must
+        join that set.
+
+        **Time and timezones. Both traps below have already cost real money.**
+        - `with_zone` attaches a zone to a naive datetime and does nothing at
+          all to an aware one. An aware bound must be `.astimezone(zone)`d, or
+          tariff bands match against the UTC clock.
+        - Subtracting two datetimes that share a tzinfo ignores the zone;
+          Python treats them as naive. Durations must go through
+          `tariff._elapsed` or `costs._real_minutes`, both of which convert to
+          UTC first. Flag any raw datetime subtraction used as a duration.
+
+        **Dependencies.** Runtime dependencies are pylxpweb, fastapi and
+        uvicorn, and nothing else. Flag any new runtime dependency. pvlib is a
+        development dependency only and must never be imported from src/.
+
+        **Secrets.** This repository is public. Real serials, keys and MAC
+        addresses belong in config/config.toml, which is gitignored.
+        Documentation and tests use placeholders (CE12345678, BA12345678).
+        Flag any real-looking serial, key or MAC address in a tracked file. A
+        dongle serial has reached two test files before.
+
+        **No AI attribution anywhere.** No `Co-Authored-By` trailers, no
+        "generated with" or "created by" lines, in commit messages, pull
+        requests, issues, code comments or documentation.
+
+        **Workflow.** Branch from `dev`, never from `main`. PRs target `dev`.
+        `main` moves only after `dev` has run on the Pi without trouble. Every
+        dev -> main promotion needs a CHANGELOG.md entry and a version bump in
+        both `pyproject.toml` and `src/arraysense/__init__.py`. There is no
+        "Unreleased" changelog section — iterate the patch number instead.
+
+    - path: "src/arraysense/**/*.py"
+      instructions: |
+        **Typing.** Every function gets full annotations, including `-> None`.
+        mypy runs in strict mode and must pass with zero errors.
+        `from __future__ import annotations` at the top of every module.
+
+        **Style.** Ruff enforces it: line length 100, import sorting, pyupgrade.
+
+        **Docstrings.** Prose, not structured sections. Every module, class and
+        public function needs one, and it should explain why the thing exists
+        and what breaks without it. Do not add `Args:` blocks — the signature
+        already says what the arguments are. Reserve `Raises:` for a genuinely
+        surprising exception. Module docstrings open with the filename and a
+        one-line purpose, then the reasoning.
+
+        **Error handling.** Catch specific exceptions. Flag any bare `except:`
+        or `except Exception`. Connection failures against the inverter are
+        expected, not exceptional: record them as gaps and retry with backoff.
+        Never swallow an error silently — either handle it or let it propagate.
+
+        **Logging.** `logger = logging.getLogger(__name__)` at module level.
+        This runs unattended on someone's inverter, so a failure that leaves no
+        trace is a failure nobody can diagnose.
+
+    - path: "tests/**/*.py"
+      instructions: |
+        pytest with `asyncio_mode = "auto"`, so async tests need no decorator.
+        Full type annotations apply to tests too, including `-> None`; mypy
+        runs strict over tests as well as src.
+
+        Test behaviour, not implementation. Use `FakeSource` rather than
+        touching real hardware. Never put a real serial, key or MAC address in
+        a test — use placeholders (CE12345678, BA12345678).
+
+    - path: "src/arraysense/web/**"
+      instructions: |
+        Vanilla JS and HTML, no build step. Shared helpers, palette and the
+        uPlot chart factory live in common.js.
+
+        **The palette is CVD-validated and must not be changed by eye — the
+        owner is colour blind.** Flag any new or altered chart colour. The
+        palette is --pv:#cf7b26 --load:#4678cc --batt:#2aa198 --grid:#b0486e
+        --batt-dis:#d1495b. Prefer fewer hues plus a second encoding: fill
+        versus line versus dash, position, or facets. Charge is green and
+        discharge red, still one series with a sign separated by the zero line,
+        so position carries the sign and hue only reinforces it.
+
+        **No CDN, ever.** uPlot, the fonts and the icons are vendored under
+        web/ and served from /vendor/. The service runs on home networks that
+        may have no route to the internet. Flag any external URL.
+
+        **A page draws what an endpoint tells it.** Flag any calculation in the
+        browser that duplicates one in Python — tariffs, costs, energy totals
+        and the array grammar all belong on the server side.
+
+        **Absent data is not zero here either.** A missing reading renders as a
+        dash, never as 0.
+
+knowledge_base:
+  opt_out: false
+
+code_generation:
+  docstrings:
+    enabled: false
