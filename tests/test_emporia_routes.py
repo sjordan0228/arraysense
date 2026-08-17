@@ -343,6 +343,33 @@ def test_coverage_goes_unknown_when_the_inverter_has_been_silent(tmp_path: Path)
     assert body["coverage"]["fraction"] is None
 
 
+def test_history_reports_a_fraction_above_one_rather_than_capping_it(tmp_path: Path) -> None:
+    # A part cannot exceed the whole, so a fraction above one is not a coverage
+    # figure at all — it is a fault saying so: a mains channel that escaped the
+    # exclusion, or a multiplier set for the wrong circuit. Capping it to 1.0
+    # would render every one of those as perfect coverage, which is the single
+    # reading guaranteed to be wrong, and would hide the fault for as long as it
+    # lasted. The page decides how to draw a disagreement; the endpoint's job is
+    # to report the arithmetic it actually did.
+    app, store, _ = _app(tmp_path)
+    newest = END - timedelta(seconds=30)
+    repo = app.state.emporia.repository
+    repo.sync_circuits([Circuit(100000, "5", "Dryer", 1.0, "circuit")], newest)
+    # 30 kW held for an hour is 30 kWh, against a house counter climbing 6.0 over
+    # the same hour — the arithmetic of a multiplier set an order of magnitude
+    # too high, which is exactly what this figure should expose.
+    for step in range(60):
+        repo.append_readings([Reading(100000, "5", 30000)], newest - timedelta(minutes=step))
+    _seed_counters(store, END - INVERTER_LAG)
+
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert body["coverage"]["house_kwh"] == pytest.approx(6.0)
+    assert body["coverage"]["fraction"] > 1.0
+
+
 def test_history_leaves_the_fraction_null_when_the_house_is_unknown(tmp_path: Path) -> None:
     # A house figure the inverter did not report is not a house drawing nothing.
     # A fraction computed against zero would read as full coverage, which is the

@@ -102,7 +102,7 @@ from arraysense.modules.emporia.client import (
 )
 from arraysense.modules.emporia.control import clamp_rate
 from arraysense.modules.emporia.poller import EmporiaPoller
-from arraysense.modules.emporia.repository import OWNER
+from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
@@ -3371,7 +3371,16 @@ def emporia_history(
     cadence = _emporia_cadence_seconds(request)
     tier = select_tier(end - start, width_px=width, cadence_seconds=cadence, circuit=True)
     with _inside_the_calendar():
-        history = poller.repository.history(
+        # Read through the injected view, not through ``poller.repository``.
+        # The poller's repository holds the primary connection — the one the
+        # collector writes through — and this is the heaviest read the module
+        # makes: thirty days across thirty-nine circuits is tens of thousands
+        # of rows. Running it there is the shape ``_read_store`` was written to
+        # end, and its own docstring names the cost, measured at 1.6 to 3.2
+        # seconds a response while issue #63 was chased through the rollup.
+        # ``latest()`` stays on the poller's connection because it reads one row
+        # per circuit and is not worth a second handle.
+        history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
         coverage_end = _coverage_end(store, start, end)
@@ -3411,12 +3420,16 @@ def emporia_history(
             "fraction": (
                 None
                 if circuits_kwh is None or house_kwh is None or house_kwh <= 0
-                # Capped at one because a part cannot exceed the whole it is a
-                # part of. The allowance in _coverage_end is what keeps the two
-                # windows comparable; this only stops a clamp's last few
-                # seconds, or a multiplier the owner has set slightly high,
-                # printing as more of the house than the house.
-                else round(min(1.0, circuits_kwh / house_kwh), 4)
+                # Reported uncapped, deliberately. A part cannot exceed the
+                # whole, so a fraction above one is not a coverage figure at
+                # all — it is a fault saying so: a mains channel that escaped
+                # the exclusion, a multiplier set for the wrong circuit, or two
+                # windows that stopped being comparable. Clamping it to 1.0
+                # would render every one of those as perfect coverage, which is
+                # the one reading guaranteed to be wrong, and would hide the
+                # fault for as long as it lasted. The page renders anything
+                # above one as a disagreement rather than as a full bar.
+                else round(circuits_kwh / house_kwh, 4)
             ),
         },
     }
