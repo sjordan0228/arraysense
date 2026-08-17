@@ -1360,21 +1360,37 @@ def costs(
     # days — found nothing and priced August 2025 as unknown, while the History
     # page read the same month out of the hourly tier and showed $87.65.
     #
-    # A candidate is only taken if its earliest row actually reaches back to
-    # ``lead`` — merely being non-empty is not enough. Retention prunes the
-    # minute tier from its oldest end, so a month straddling that cutoff still
-    # gets *some* minute rows back: the stretch after the cutoff. The old
+    # A candidate is only taken outright if its earliest row actually reaches
+    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
+    # the minute tier from its oldest end, so a month straddling that cutoff
+    # still gets *some* minute rows back: the stretch after the cutoff. The old
     # "if rows: break" took them anyway, and the stretch before the cutoff,
     # having no rows at all, priced as though it had never happened rather
     # than falling to the hourly tier, which is kept indefinitely and always
     # reaches back this far.
+    #
+    # A month whose collection genuinely began after ``lead`` — a fresh
+    # install, or one old enough that even the tier which does hold it starts
+    # partway through — fails that bracket check on *every* candidate, and
+    # nothing ever breaks the loop. The last candidate tried is "full", kept
+    # only thirty days, so once raw and minute retention have both moved past
+    # the month its query comes back empty; unconditionally assigning ``rows``
+    # on every pass then let that empty last resort overwrite the nonempty,
+    # correctly-partial rows an earlier candidate (typically hourly) had
+    # already found. ``rows`` is only ever reassigned here when a candidate is
+    # itself nonempty, so a bracket-less fallthrough still prices whatever the
+    # least-coarse candidate actually returned instead of the emptiest thing
+    # tried last. ``period_energy`` still flags the gap before ``lead`` as
+    # unmeasured — this only stops a labelled partial from being thrown away
+    # in favour of a dash nothing justified.
     rows: list[dict[str, Any]] = []
     tier = "minute"
     for candidate in ("minute", "hourly", "full"):
-        tier = candidate
-        rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if rows and cast(datetime, rows[0]["timestamp"]) - lead <= MAX_EDGE_GAP:
-            break
+        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
+        if candidate_rows:
+            rows, tier = candidate_rows, candidate
+            if cast(datetime, candidate_rows[0]["timestamp"]) - lead <= MAX_EDGE_GAP:
+                break
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 

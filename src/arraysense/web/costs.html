@@ -449,6 +449,21 @@ const monthRolledOver = (cursor, today, seen) =>
   cursor !== null &&
   cursor.year === seen.year &&
   cursor.month === seen.month;
+
+// One tick of the five-minute timer: whether it should refresh, and what it
+// should remember having seen for next time. Pulled out of boot() so the
+// seeding bug that shipped beside it (#216) has something to test directly —
+// boot() used to hand this ``seen === null``, which reads exactly like "the
+// timer has never run" and cannot be told apart from a tab that booted in the
+// last few minutes before midnight on the first. On that tab's very first
+// tick, ``today`` has already rolled over but ``seen`` has no baseline to
+// compare it against, so neither the bonus refresh nor the forward button
+// (only re-enabled inside refresh()'s own renderPicker) ever fires — both sit
+// stuck on the month that just finished until the reader reloads the page.
+const rolloverTick = (cursor, today, seen) => ({
+  seen: { year: today.year, month: today.month },
+  shouldRefresh: shouldAutoRefresh(cursor, today) || monthRolledOver(cursor, today, seen),
+});
 // <<< costs-month-cursor
 
 // What this refresh calls the month, set by renderMonth and read by every
@@ -597,39 +612,58 @@ function shortNote(entry, what) {
 }
 
 // >>> costs-month-words
-// The page's words for a month that is over, against one still running. One
-// helper rather than eleven scattered ternaries: "Cost so far", "Month to date"
-// and "Estimated bill" are the same claim said three ways, and a page that
-// relabelled some of them and not the others would mislead more than one that
-// relabelled none.
+// The page's words for a month that is over, against one still running — and,
+// answering a separate question, for a figure whose own inputs were actually
+// measured, against one that was not. The original signature took only the
+// calendar's own fraction and let it answer both, which is the bug #216 found
+// four times over: the energy grid captioned a bucket "Month total" with
+// `complete:false` sitting right there unread; a bill whose internal dropped
+// span was restored at a blended rate still read "Bill" because only the
+// *time* axis had reached 1.0, not the energy one; and the last forty-five
+// minutes of a real month — past the 0.999 slop that makes "This month" versus
+// the month's name a reasonable place to round early — still had "Cost",
+// "Bill" and "Month total" sitting over figures that excluded exactly that
+// stretch. One helper rather than eleven scattered ternaries: "Cost so far",
+// "Month to date" and "Estimated bill" are the same claim said three ways, and
+// relabelling some of them and not the others would mislead more than
+// relabelling none.
 //
 // ``fraction`` is the service's own fraction_elapsed where it has one and the
 // page's own day count where it does not; ``name`` is the month written out.
-// 0.999 is renderMonth's own threshold and is deliberately the same number —
-// within three-quarters of an hour of a month's end, calling it unfinished is
-// pedantry rather than honesty, and the strip and the labels disagreeing about
-// which month it is would be worse than either answer.
+// ``complete`` is the second, independent verdict — whether every counter
+// behind the figures these words are about to label was actually measured —
+// and it is the caller's job to answer it from whichever reply said so
+// (`bucket.complete`, `p.isProjected`, ...), never assumed from the calendar.
+// It defaults to `true` so a caller with nothing more specific to say gets the
+// calendar's own answer and no existing call site has to change.
 //
-// An absent fraction keeps every qualifier. Absent is not complete, and a month
-// whose elapsed share could not be read is the last thing to relabel as a bill.
+// The two questions use different thresholds on purpose. ``running`` keeps the
+// 0.999 slop and answers only which *tense* to write the month's name in —
+// "This month" three-quarters of an hour early is a grammar choice, not a
+// claim any number is finished, unlike "Bill" or "Month total". ``whole``
+// answers the completeness question and needs the *true* boundary
+// (`fraction >= 1`): a bracket gap or a scaled-up bill is exactly as untrue at
+// 99.9% as it is at noon, and rounding it away early is what finding 5 was.
 //
-// renderMonth's own `partial` disagrees with `running` on a null fraction —
-// `partial` treats it as NOT partial (a null reads as the finished "all N
-// days" case), while `running` here treats it as still running. That
-// divergence is unreachable today: every `fraction` that reaches either place
-// is either `Math.min(1, done / days)`, never null, or `priced.fractionElapsed`,
-// which the service always computes numerically whenever a tariff is
-// configured — an unconfigured tariff returns before either function runs. If
-// a future caller ever does produce a null fraction here, `renderMonth` is the
-// one that has to change to match `running`, not the other way round: absent
-// rendering as complete is exactly the mistake this project exists to catch.
-function monthWords(fraction, name) {
+// An absent fraction keeps every qualifier on both questions. Absent is not
+// complete, and a month whose elapsed share could not be read is the last
+// thing to relabel as a bill.
+//
+// renderMonth's own day-count text disagrees with `running` on a null
+// fraction only in the sense that it, too, now reads `running` directly
+// rather than keeping a second copy of the threshold — the two used to be
+// duplicated on the promise they would always agree, and a duplicate is
+// exactly the kind of thing that stops.
+function monthWords(fraction, name, complete = true) {
   const running = fraction === null || fraction === undefined || fraction < 0.999;
+  const calendarOver = fraction !== null && fraction !== undefined && fraction >= 1;
+  const whole = calendarOver && complete;
   return {
     running,
-    cost: running ? 'Cost so far' : 'Cost',
-    bill: running ? 'Estimated bill' : 'Bill',
-    total: running ? 'Month to date' : 'Month total',
+    whole,
+    cost: whole ? 'Cost' : 'Cost so far',
+    bill: whole ? 'Bill' : 'Estimated bill',
+    total: whole ? 'Month total' : 'Month to date',
     energy: running ? 'Energy this month' : `Energy in ${name}`,
     // "this month" reads as the current one wherever it lands in a sentence, so
     // a finished month is named rather than pointed at.
@@ -682,19 +716,20 @@ function renderPicker(today) {
   forward.title = allowed ? 'Next month' : 'This is the month in progress';
 }
 
-function renderMonth(win, priced) {
+// ``complete`` is passed straight through to monthWords — the calendar day
+// count below reads `words.running`, the 0.999-slop grammar question, on
+// purpose: "3.9 of 31 days" is a fact about the clock regardless of whether
+// the energy or the bill behind it has been fully measured, so it stays on
+// the looser threshold rather than borrowing the stricter one meant for
+// figures that claim to be whole.
+function renderMonth(win, priced, complete = true) {
   $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
   const days = win.days;
   const done = win.done;
   const fraction = priced ? priced.fractionElapsed : Math.min(1, done / days);
-  // Within the last three-quarters of an hour of a month, calling it a part
-  // month is pedantry rather than honesty; before that, saying so is the whole
-  // point — a mid-month figure read as the finished bill is this page's
-  // easiest way to mislead.
-  const partial = fraction !== null && fraction < 0.999;
-  words = monthWords(fraction, win.start.toLocaleDateString(undefined, MONTH_FMT));
+  words = monthWords(fraction, win.start.toLocaleDateString(undefined, MONTH_FMT), complete);
   const parts = [
-    partial
+    words.running
       ? `<b>${done.toFixed(1)}</b> of ${days} days — this is a part month, not a bill`
       : `all ${days} days`,
   ];
@@ -1411,7 +1446,12 @@ async function refresh() {
     trouble.push(`The month’s energy could not be read: ${e.message}.`);
   }
   if (isStale(gen)) return;
-  renderMonth(win, null);
+  // The service's own verdict on this bucket's bracket, not the calendar's —
+  // see costs-month-words. A missing bucket has no energy total for the
+  // completeness word to qualify in the first place, so it defaults true and
+  // is simply never read by that branch of renderEnergy.
+  const bucketComplete = bucket ? bucket.complete === true : true;
+  renderMonth(win, null, bucketComplete);
   renderEnergy(bucket);
 
   let quote = null;
@@ -1444,7 +1484,10 @@ async function refresh() {
   $('notariff').hidden = true;
 
   const priced = fromQuote(quote);
-  renderMonth(win, priced);
+  // Both verdicts are known now: the energy bucket's own bracket, and whether
+  // the bill had to be scaled up for a dropped span. Either one being false
+  // is enough to keep every "so far" qualifier — see costs-month-words.
+  renderMonth(win, priced, bucketComplete && !priced.isProjected);
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
@@ -1486,12 +1529,18 @@ async function boot() {
   // rollover — the clock has turned over since the previous tick — from
   // cursor simply naming a month the reader picked on purpose. Local to
   // boot() because nothing outside this interval needs it.
-  let lastPolled = null;
+  //
+  // Seeded from the month refresh() just displayed, not left null: a tab
+  // that boots less than one interval before midnight on the first would
+  // otherwise reach its first tick with today already rolled over and no
+  // baseline to compare it against — see rolloverTick's own comment for what
+  // that silently breaks.
+  let lastPolled = { year: cursor.year, month: cursor.month };
   setInterval(async () => {
     const today = civilNow(await siteZone());
-    const justRolledOver = monthRolledOver(cursor, today, lastPolled);
-    lastPolled = { year: today.year, month: today.month };
-    if (!shouldAutoRefresh(cursor, today) && !justRolledOver) return;
+    const tick = rolloverTick(cursor, today, lastPolled);
+    lastPolled = tick.seen;
+    if (!tick.shouldRefresh) return;
     await refresh();
   }, 5 * 60 * 1000);
 }

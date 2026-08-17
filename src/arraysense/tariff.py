@@ -604,6 +604,15 @@ class BillEstimate:
     was recording for all of it, while ``is_projected`` is false only once the
     counted span itself reaches the whole month — a collector that started on
     the tenth still scales its estimate up on the thirty-first.
+
+    A counted span reaching the whole month is not the same question either:
+    a month whose counters bracket its start and end can still have an
+    internal dropped span, and the total then prices the energy that
+    *was* measured while restoring the rest at its blended rate — a genuine
+    projection with nothing left to scale. Reading only the time-based
+    ``scale`` there said "what it came to" beside a total that was still
+    assuming a rate for kilowatt-hours nobody measured. ``is_projected`` has
+    to be true whenever either kind of scaling touched the total.
     """
 
     currency: str
@@ -1279,17 +1288,6 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     # counter kept counting through every gap between those minutes.
     accounted = covered if energy.counted_minutes is None else energy.counted_minutes * 60
     scale = max(month_seconds / accounted, 1.0) if accounted > 0 else None
-    # Whether the total below is a genuine projection or the month priced as
-    # it stands. ``fraction_elapsed`` answers a different question — it is 1.0
-    # for any finished calendar month regardless of what was actually
-    # recorded in it — so an installation whose collection began mid-month
-    # still has ``scale`` above 1.0 once the month is over: ``estimated_total``
-    # is still being scaled up from the part that was measured, and calling
-    # that "what it came to rather than a projection" would be false. Only a
-    # ``scale`` of exactly 1.0 means the counted span already reaches the
-    # whole month, which needs both the month to be over and the collector to
-    # have covered all of it.
-    is_projected = scale is not None and scale > 1.0
 
     # Then by the energy the bands account for, which is a different question
     # from the time: a counter can sit silent for a day while polls keep
@@ -1309,6 +1307,21 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     ):
         correction = (imported_kwh + import_entry.unattributed_kwh) / imported_kwh
         assumed = import_entry.unattributed_kwh
+
+    # Whether the total below is a genuine projection or the month priced as
+    # it stands. ``fraction_elapsed`` answers a different question — it is 1.0
+    # for any finished calendar month regardless of what was actually
+    # recorded in it — so an installation whose collection began mid-month
+    # still has ``scale`` above 1.0 once the month is over: ``estimated_total``
+    # is still being scaled up from the part that was measured, and calling
+    # that "what it came to rather than a projection" would be false. A
+    # ``scale`` of exactly 1.0 means the counted span reaches the whole month,
+    # but that alone is not "nothing was assumed": the counted span can still
+    # hold an internal dropped stretch that ``correction`` restored at a
+    # blended rate, which is a projection on the energy axis even when the
+    # time axis needed no scaling at all. Both have to be clean for the total
+    # to be what the month actually came to.
+    is_projected = scale is not None and (scale > 1.0 or correction > 1.0)
 
     projected = None if so_far is None or scale is None else so_far * scale * correction
 

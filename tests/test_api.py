@@ -1965,6 +1965,56 @@ def test_costs_picks_the_minute_tier_for_a_well_covered_month(client: Any) -> No
     assert body["cost"]["energy_cost"] == pytest.approx(744 * 0.12, rel=1e-3)
 
 
+def test_costs_keeps_a_partial_tier_when_none_of_them_reaches_lead(client: Any) -> None:
+    # Collection genuinely began five hours into the month — past the two-hour
+    # lead every candidate is checked against — so no tier's earliest row ever
+    # brackets it: minute and raw both stand for the retention that has since
+    # expired and hold nothing at all, and hourly's own earliest row is still
+    # five hours short. The old "if rows and brackets: break" loop falls
+    # through every candidate and lands on the last one tried, "full", whose
+    # query is empty — overwriting the nonempty hourly rows that were sitting
+    # right there and turning a labelled partial month into dashes.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2024, 6, 1, tzinfo=UTC)
+    month_end = datetime(2024, 7, 1, tzinfo=UTC)
+    began = month_start + timedelta(hours=5)
+    for hour in range(24):
+        store.append(
+            Sample(
+                timestamp=began + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 100.0 + hour,
+                    "load_energy_total_kwh": 200.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(began.timestamp()) - 3600, int(month_end.timestamp()) + 3600)
+    conn.commit()
+    # Stand in for the tiers whose retention has already pruned this month away.
+    conn.execute("DELETE FROM inverter_raw")
+    conn.execute("DELETE FROM inverter_minute")
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={
+            "start": "2024-06-01T00:00:00Z",
+            "end": "2024-07-01T00:00:00Z",
+            "tz": "UTC",
+        },
+    ).json()
+    assert body["tier"] == "hourly"
+    assert body["cost"] is not None
+    assert body["cost"]["energy_cost"] is not None
+    # Genuinely short — the five hours before collection began were never
+    # measured by anything, so the figure has to say so rather than read whole.
+    assert body["cost"]["cost_is_short"] is True
+
+
 def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:
     # The History page shows saving beside cost. It is the counterfactual — the
     # same house load bought entirely from the grid, less what the grid actually
