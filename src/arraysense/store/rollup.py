@@ -672,11 +672,25 @@ def rebuild_circuit_hourly(
     alternative is trading a correction nobody asked for against energy that was
     really recorded.
 
+    **Measuring nothing at all is the smallest measurement of all, so the delete
+    carries the same guard as the upsert.** A reading a few seconds before the
+    hour spills the rest of its period into the next bucket, and that spill can
+    be the only thing the bucket holds — nothing is stamped inside it, so its
+    sample count is nought. Re-capped at a shorter interval the span no longer
+    reaches the boundary, the bucket produces no row for this pass, and a delete
+    that only asked whether a row had been rebuilt erased it: one 500 W reading
+    at 59:50 books fifty seconds into the next hour at a sixty-second interval,
+    and lowering the interval to ten deleted that hour outright, 25 kJ measured
+    honestly and thrown away by a setting. So a bucket is deleted only where the
+    stored row accounts for nothing — a measured coverage of zero, or the NULL a
+    row predating the column carries with no samples behind it. A stale row that
+    claims nothing still goes; one that claims energy is left for a pass that can
+    support it.
+
     An hour in which nothing was heard averages to NULL rather than to zero, and
     lands with a sample count of nought. An hour with no readings stores 0
     coverage, never NULL: NULL is reserved for a row written before the column
-    existed, and the two must stay distinguishable. A bucket whose source rows
-    have since gone is deleted rather than left behind.
+    existed, and the two must stay distinguishable.
 
     The readings are read one interval either side of the aligned range, so a
     bucket's figures depend only on the readings around it and never on the
@@ -743,6 +757,11 @@ def rebuild_circuit_hourly(
         cur = conn.cursor()
         cur.execute(
             cte + "DELETE FROM circuit_hourly WHERE timestamp >= ? AND timestamp < ?"
+            # The only-grows guard, in the form the delete needs it: a pass that
+            # measured nothing may clear a row that claims nothing and no other.
+            # COALESCE on sample_count rather than on 0, because a row written
+            # before the coverage column existed reads its energy from the count.
+            " AND COALESCE(circuit_hourly.covered_seconds, circuit_hourly.sample_count) = 0"
             " AND NOT EXISTS (SELECT 1 FROM measured m WHERE m.timestamp = circuit_hourly.timestamp"
             " AND m.circuit_id = circuit_hourly.circuit_id)",
             (*reach, aligned_start, aligned_end),

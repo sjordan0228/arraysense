@@ -90,6 +90,14 @@ rewritten**, and hours recorded from the upgrade onwards are exact.
   1,000 W reading as 45,500 J, where those readings account for 60,500 J at a
   sixty-second interval and 10,500 J at a ten-second one — a figure neither
   setting produces, and so one nothing downstream could attribute to either.
+  That rule now covers an hour's removal as well as its rewriting. An hour can
+  hold nothing but the seconds a reading just before the boundary ran over into
+  it, and re-measured at a shorter interval that reading no longer reaches the
+  boundary at all — so the hour had nothing to rebuild from and was deleted
+  outright, taking real recorded energy with it: one 500 W reading at 59:50
+  books fifty seconds into the next hour, and lowering `emporia.interval` from
+  sixty seconds to ten erased that hour. A rebuild now clears an hour only where
+  the stored row accounts for nothing.
 - **The recorded-for figure describes the module rather than the circuits
   asked for.** A poll that reached one clamp reached the monitor, so asking for
   a single outlet that has been offline since April no longer reads as a module
