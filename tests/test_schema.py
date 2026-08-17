@@ -19,11 +19,13 @@ from arraysense.store.schema import (
     FORECAST_TABLE,
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
+    LATE_COLUMNS,
     MODULE_TIERS,
     PENDING_TABLE,
     SETTINGS_TABLE,
     expected_columns,
     inverter_metric_columns,
+    late_column_ddl,
     migration_ddl,
     module_metric_columns,
     schema_ddl,
@@ -291,6 +293,58 @@ def test_migration_adds_sample_count_to_a_rollup_table() -> None:
         conn.execute(stmt)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(inverter_minute)")}
     assert "sample_count" in cols
+    conn.close()
+
+
+# --- the tables whose shape is written out by hand --------------------------
+#
+# migration_ddl only knows the metric tiers, because those derive their columns
+# from the registry. A column added to charger_change or circuit is invisible to
+# it, so the installations that have been running longest are exactly the ones
+# that would fail on the first write with "no such column".
+
+
+def test_a_hand_shaped_table_gains_a_column_it_is_missing() -> None:
+    conn = _open()
+    conn.execute("ALTER TABLE charger_change DROP COLUMN source")
+    conn.execute(
+        "INSERT INTO charger_change (timestamp, device_gid, from_a, to_a, reason, applied)"
+        " VALUES (1, 900001, 32, 6, 'written by the older build', 1)"
+    )
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+
+    stmts = late_column_ddl(existing)
+
+    assert stmts == ("ALTER TABLE charger_change ADD COLUMN source TEXT",)
+    for stmt in stmts:
+        conn.execute(stmt)
+    row = conn.execute("SELECT reason, source FROM charger_change").fetchone()
+    assert row[0] == "written by the older build"
+    assert row[1] is None, "the rows that were already there say nothing about who moved the rate"
+    conn.close()
+
+
+def test_a_hand_shaped_table_that_is_current_needs_no_migration() -> None:
+    conn = _open()
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+    assert late_column_ddl(existing) == ()
+    conn.close()
+
+
+def test_every_late_column_is_addable_to_a_table_that_already_has_rows() -> None:
+    # SQLite refuses a NOT NULL column added to a non-empty table unless it
+    # carries a default, and a migration that raises on open bricks the service
+    # for exactly the installations with the most history in them. Asserted over
+    # the whole mapping so a column added later cannot skip the rule.
+    conn = _open()
+    for table, columns in LATE_COLUMNS.items():
+        for name, sql_type in columns:
+            declared = f"{name} {sql_type}".upper()
+            assert "NOT NULL" not in declared or "DEFAULT" in declared, f"{table}.{name}"
     conn.close()
 
 

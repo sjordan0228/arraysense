@@ -1224,7 +1224,13 @@ const MODULE_NAV = [
     label: 'Charger',
     href: '/charger',
     status: '/api/emporia/charger',
-    shows: (body) => !!body.charger,
+    // Two facts, and the tab needs both. "Does this account have a charger",
+    // because most people who switch the module on have no EV charger at all —
+    // and "is the module actually on", which this asked for a long time by
+    // asking neither: the poller kept the last charger it read for the life of
+    // the process, so switching the module off left the tab in place over a
+    // page of live controls.
+    shows: (body) => body.enabled === true && !!body.charger,
   },
 ];
 

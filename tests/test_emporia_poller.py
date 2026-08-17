@@ -19,9 +19,10 @@ from pathlib import Path
 from arraysense.modules.emporia import tokens
 from arraysense.modules.emporia.client import EmporiaAuthExpiredError, EmporiaUnreachableError
 from arraysense.modules.emporia.poller import EmporiaPoller
-from arraysense.modules.emporia.repository import ChargerAudit
+from arraysense.modules.emporia.repository import MODULE, OWNER, ChargerAudit
 from arraysense.settings import (
     CHARGE_DEFAULT_KEY,
+    CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
     SettingsStore,
@@ -311,7 +312,9 @@ async def test_advisory_authority_never_writes_to_the_charger(tmp_path: Path) ->
     poller, store, _ = _poller(tmp_path, client)
     settings = SettingsStore(store)
     settings.set(EMPORIA_ENABLED_KEY, True)
-    poller.audit.record_change(900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW)
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
 
     await poller.tick(NOW)
 
@@ -327,7 +330,9 @@ async def test_a_rate_this_service_set_is_put_back_when_it_may_write(tmp_path: P
     settings = SettingsStore(store)
     settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGER_AUTHORITY_KEY, "limited")
-    poller.audit.record_change(900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW)
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
 
     await poller.tick(NOW)
 
@@ -344,11 +349,177 @@ async def test_a_rate_somebody_else_set_is_left_where_they_put_it(tmp_path: Path
     settings.set(CHARGER_AUTHORITY_KEY, "limited")
     # This service last set 20 A; the charger is sitting at 6 A, so somebody
     # moved it by hand.
-    poller.audit.record_change(900001, from_a=32, to_a=20, reason="test", applied=True, now=NOW)
+    poller.audit.record_change(
+        900001, from_a=32, to_a=20, reason="test", applied=True, source=MODULE, now=NOW
+    )
 
     await poller.tick(NOW)
 
     assert client.writes == []
+    store.close()
+
+
+async def test_a_hand_set_rate_the_charger_is_still_at_is_not_restored_over(
+    tmp_path: Path,
+) -> None:
+    # The half the older test did not cover, and the one that fired against the
+    # real account. The owner set 6 A by hand, the charger is sitting at exactly
+    # 6 A, and a restore that asks only "was 6 A the last rate applied" gets yes
+    # — because the owner's write is applied too — and undoes it.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    poller.audit.record_change(
+        900001, from_a=7, to_a=6, reason="set by hand", applied=True, source=OWNER, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert client.writes == [], "the person standing at the car wins"
+    store.close()
+
+
+async def test_the_override_window_holds_the_restore_off(tmp_path: Path) -> None:
+    # The second guard, and the one the audit shows was never asked. Even a rate
+    # this service really did set is left alone while the owner's hand is still
+    # on the charger.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int((NOW + timedelta(hours=2)).timestamp()))
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert client.writes == []
+    store.close()
+
+
+async def test_a_lapsed_override_no_longer_holds_the_restore_off(tmp_path: Path) -> None:
+    # The window is a window. Once it has passed, a rate this service set is
+    # still its own to put back — otherwise one manual change would freeze the
+    # restore for the life of the installation.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int((NOW - timedelta(hours=2)).timestamp()))
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert client.writes == [32]
+    store.close()
+
+
+async def test_an_override_that_is_not_a_time_holds_rather_than_crashing(tmp_path: Path) -> None:
+    # Settings are decoded on read but never clamped to their registered bounds,
+    # so a number no clock can represent can reach this — and it would have
+    # raised out of the poller's own task, which catches store errors and
+    # nothing else, stopping the module for the life of the process. Reading it
+    # as "no override" would fail the other way, towards writing to a car on the
+    # strength of a value nobody can interpret.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    store._conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)"
+        " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (CHARGE_OVERRIDE_UNTIL_KEY, "999999999999999999"),
+    )
+    store._conn.commit()
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert poller.state.status == "ok", "the tick finished rather than dying"
+    assert client.writes == []
+    store.close()
+
+
+async def test_a_restore_records_itself_as_the_modules_own_work(tmp_path: Path) -> None:
+    # Otherwise the next restart reads this line as the owner's and refuses to
+    # act, which is the same defect the other way round.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert poller.audit.recent_changes()[0].source == MODULE
+    store.close()
+
+
+async def test_switching_the_module_off_mid_poll_stops_the_restore(tmp_path: Path) -> None:
+    # A tick awaits a token refresh and two HTTP calls between checking the
+    # enable and deciding what to do, and the setting is written from the web
+    # server's threadpool. Somebody switching the module off during that window
+    # had their charger written to afterwards, by a decision taken while it was
+    # still on.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+    # The owner reaches Settings while the poll is in flight.
+    real_get = client.get
+
+    def get(path: str, id_token: str) -> object:
+        settings.set(EMPORIA_ENABLED_KEY, False)
+        return real_get(path, id_token)
+
+    client.get = get  # type: ignore[method-assign]
+
+    await poller.tick(NOW)
+
+    assert client.writes == []
+    # And it is still owed a restore when the module comes back, rather than
+    # having spent its one consideration on a tick that did nothing.
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    client.get = real_get  # type: ignore[method-assign]
+    await poller.tick(NOW + timedelta(minutes=1))
+    assert client.writes == [32]
+    store.close()
+
+
+async def test_a_disabled_tick_forgets_the_charger_it_last_saw(tmp_path: Path) -> None:
+    # "Off" has to mean off. The charger was assigned on every successful read
+    # and never cleared, so a module switched off went on serving the last
+    # charger it saw — at a rate — for the life of the process, and the page
+    # drew live controls over it.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    await poller.tick(NOW)
+    assert poller.charger is not None and poller.connections != {}
+
+    settings.set(EMPORIA_ENABLED_KEY, False)
+    await poller.tick(NOW + timedelta(minutes=1))
+
+    assert poller.charger is None
+    assert poller.connections == {}
     store.close()
 
 
@@ -360,7 +531,9 @@ async def test_the_restore_is_attempted_once_and_not_every_minute(tmp_path: Path
     settings = SettingsStore(store)
     settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGER_AUTHORITY_KEY, "limited")
-    poller.audit.record_change(900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW)
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
 
     await poller.tick(NOW)
     await poller.tick(NOW)
@@ -382,7 +555,7 @@ async def test_a_restart_does_not_write_the_same_proposal_down_again(tmp_path: P
     settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGER_AUTHORITY_KEY, "advisory")
     ChargerAudit(store).record_change(
-        900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
     )
 
     first = EmporiaPoller(store, token_path, client=client)
@@ -408,7 +581,7 @@ async def test_a_proposal_that_has_changed_is_written_down(tmp_path: Path) -> No
     settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGER_AUTHORITY_KEY, "advisory")
     ChargerAudit(store).record_change(
-        900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
     )
 
     first = EmporiaPoller(store, token_path, client=client)
@@ -431,7 +604,9 @@ async def test_the_charger_is_the_apps_until_the_owner_says_otherwise(tmp_path: 
     settings = SettingsStore(store)
     settings.set(EMPORIA_ENABLED_KEY, True)
     settings.set(CHARGER_AUTHORITY_KEY, "app")
-    poller.audit.record_change(900001, from_a=32, to_a=6, reason="test", applied=True, now=NOW)
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
 
     await poller.tick(NOW)
 

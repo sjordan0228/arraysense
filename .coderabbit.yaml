@@ -21,6 +21,20 @@ reviews:
       - "main"
       - "dev"
 
+  pre_merge_checks:
+    docstrings:
+      # Off, because the check counts tests and this project deliberately does
+      # not put docstrings on them — the reasoning for a test goes in a comment
+      # above it, which is the house style in every test file here. The check
+      # measures only the functions a PR adds, so a change that adds tests is
+      # scored almost entirely on them: the charger-safety PR came out at 26%
+      # having documented 6 of 6 new functions in src/ and 1 of 37 in tests/.
+      # There is no way to scope it to a path, and no threshold survives that
+      # mix, so a warning that fires on every PR that adds tests would train
+      # everybody to ignore the whole pre-merge block. Docstrings in src/ stay
+      # required, by the path instructions below and by review.
+      mode: "off"
+
   path_filters:
     - "!src/arraysense/web/uPlot.*"
     - "!src/arraysense/web/*.woff2"

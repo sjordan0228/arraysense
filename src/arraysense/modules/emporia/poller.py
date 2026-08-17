@@ -53,11 +53,12 @@ from arraysense.modules.emporia.parse import (
     device_gids,
     readings_from_usage,
 )
-from arraysense.modules.emporia.repository import ChargerAudit, CircuitRepository
+from arraysense.modules.emporia.repository import MODULE, ChargerAudit, CircuitRepository
 from arraysense.settings import (
     CHARGE_CEILING_KEY,
     CHARGE_DEFAULT_KEY,
     CHARGE_FLOOR_KEY,
+    CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
     EMPORIA_INTERVAL_KEY,
@@ -202,6 +203,37 @@ class EmporiaPoller:
         value = self._settings.get(EMPORIA_INTERVAL_KEY)
         return float(value) if isinstance(value, int | float) else 60.0
 
+    def _override_until(self) -> datetime | None:
+        """When the owner's hand stops holding the charger, or None if it is not.
+
+        Stored as a Unix second by the route that sets a rate, and read back
+        here as an aware UTC instant because everything it is compared against
+        is one. A naive datetime would compare against the wall clock of
+        whichever machine this is, which is the class of mistake this project
+        has already paid for once in the tariff bands.
+
+        A second no clock can represent is held rather than ignored. Settings
+        are decoded on read but not clamped to their registered bounds, so a
+        database written by another build — or edited by hand — can hand this a
+        number ``fromtimestamp`` refuses; and reading that as "no override"
+        would fail open, towards writing to somebody's car. It would also have
+        raised out of the poller's own task, which catches store errors and
+        nothing else, and stopped the module for the life of the process with
+        no symptom anywhere.
+        """
+        value = self._settings.get(CHARGE_OVERRIDE_UNTIL_KEY)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            logger.warning(
+                "%s holds %r, which is not a time; holding the charger rather than acting",
+                CHARGE_OVERRIDE_UNTIL_KEY,
+                value,
+            )
+            return datetime.max.replace(tzinfo=UTC)
+
     def limits(self) -> Limits:
         """The owner's floor and ceiling, and what the charger admits."""
         floor = self._settings.get(CHARGE_FLOOR_KEY)
@@ -258,9 +290,30 @@ class EmporiaPoller:
         A proposal identical to the newest audit line is not written down again.
         Under an authority that may not write nothing about the charger moves,
         so the same sentence was recorded on every restart for ever.
+
+        **The override window was the argument nobody passed.** ``decide``
+        accepts it and implements the hold correctly, and this call left it out,
+        so a service that restarted inside the window put back a rate the owner
+        had set by hand an hour earlier. The window is read here rather than
+        remembered from the write that opened it, because a restart is exactly
+        what loses anything remembered.
+
+        A held restore is still written down. Under an authority that may write,
+        "restored to 32 A on startup: override holds until 18:29" is the module
+        saying out loud that it saw a rate of its own and left it alone — which
+        is what somebody reading the history after a restart wants to know.
         """
+        # The enable is read again here, not only at the top of the tick. A tick
+        # awaits a token refresh and two HTTP calls between the two points, and
+        # the setting is written from the web server's threadpool — so somebody
+        # switching the module off mid-poll had their charger written to
+        # afterwards by a decision taken while it was still on. Checked before
+        # ``_restore_considered`` is set, so a restore skipped for this reason
+        # is still considered once the module comes back.
         charger = self.charger
         if charger is None or self._restore_considered:
+            return
+        if not bool(self._settings.get(EMPORIA_ENABLED_KEY)):
             return
         self._restore_considered = True
         default = self._settings.get(CHARGE_DEFAULT_KEY)
@@ -269,7 +322,6 @@ class EmporiaPoller:
             charger_rate_a=charger.rate_a,
             last_set_a=self.audit.last_applied_rate(charger.device_gid),
             default_a=default_a,
-            holding=False,
         )
         if target is None:
             return
@@ -279,6 +331,7 @@ class EmporiaPoller:
             authority=authority if isinstance(authority, str) else APP,
             limits=self.limits(),
             now=now,
+            override_until=self._override_until(),
         )
         reason = f"restored to {verdict.rate_a} A on startup: {verdict.reason}"
         # A proposal that has not changed is not news. Under an authority that
@@ -292,7 +345,11 @@ class EmporiaPoller:
             not verdict.apply
             and previous is not None
             and previous.same_decision(
-                from_a=charger.rate_a, to_a=verdict.rate_a, reason=reason, applied=verdict.apply
+                from_a=charger.rate_a,
+                to_a=verdict.rate_a,
+                reason=reason,
+                applied=verdict.apply,
+                source=MODULE,
             )
         ):
             return
@@ -304,6 +361,10 @@ class EmporiaPoller:
             to_a=verdict.rate_a,
             reason=reason,
             applied=verdict.apply,
+            # This one is the module's, and saying so is what lets the *next*
+            # restart tell it from a rate the owner chose. A line recorded
+            # without it would be read as nobody's, and never put back.
+            source=MODULE,
             now=now,
         )
 
@@ -343,6 +404,16 @@ class EmporiaPoller:
     async def tick(self, now: datetime) -> None:
         """One cycle. Never raises: every expected failure becomes a state."""
         if not bool(self._settings.get(EMPORIA_ENABLED_KEY)):
+            # Forget the charger and the connection list, not just stop reading
+            # them. They were assigned on every successful read and never
+            # cleared, so a module switched off went on reporting the last
+            # charger it saw — at a rate, with a live-looking slider over it —
+            # for the whole life of the process. "Off" has to mean off. The raw
+            # record goes with them: it carries the breaker PIN, and holding it
+            # for a module nobody is running buys nothing.
+            self.charger = None
+            self.connections = {}
+            self._charger_record = None
             self._state = PollerState("off", "", self._state.last_success)
             return
 

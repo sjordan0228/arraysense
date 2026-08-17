@@ -398,6 +398,14 @@ def _charger_change_ddl(as_name: str) -> str:
     did: stopping and starting a charger within the same second left one line
     where there had been two, which is precisely the record somebody would be
     reading to find out what happened.
+
+    ``source`` is who decided, and it is not a refinement of ``applied``. The
+    owner moving the slider is applied — it really did reach the charger — so a
+    query asking only what was last applied answered with the owner's own
+    number, and restore-on-startup concluded the rate was its own work and undid
+    it. Nullable, because a row written before the column existed says who moved
+    the rate no more than it says why, and an unknown provenance is not a
+    showing that the rate was this service's.
     """
     return (
         f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
@@ -407,7 +415,8 @@ def _charger_change_ddl(as_name: str) -> str:
         "    from_a INTEGER,\n"
         "    to_a INTEGER,\n"
         "    reason TEXT NOT NULL,\n"
-        "    applied INTEGER NOT NULL\n"
+        "    applied INTEGER NOT NULL,\n"
+        "    source TEXT\n"
         f") {_TABLE_OPTIONS_ROWID}"
     )
 
@@ -713,6 +722,38 @@ def migration_ddl(
                 )
             else:
                 statements.append(f"ALTER TABLE {table} ADD COLUMN {name} INTEGER")
+    return tuple(statements)
+
+
+# Columns added to a fixed-shape table after that table first shipped, in the
+# order they were added. ``CREATE TABLE IF NOT EXISTS`` is idempotent only while
+# the shape is unchanged, so against a database that already has the table it
+# does nothing at all and the first write fails with "no such column" — the same
+# gap ``migration_ddl`` closes for the metric tiers, which cannot be listed here
+# because their columns come from the registry rather than from a literal.
+#
+# Every one has to be nullable or carry a default: SQLite refuses to add a NOT
+# NULL column to a table that already has rows.
+LATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    CHARGER_CHANGE_TABLE: (("source", "TEXT"),),
+}
+
+
+def late_column_ddl(existing: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
+    """Return ALTER statements giving a live database the columns it is missing.
+
+    The counterpart to ``migration_ddl`` for the tables whose shape is written
+    out by hand rather than derived from the metric registry. A database already
+    current yields nothing to run.
+    """
+    statements: list[str] = []
+    for table, columns in LATE_COLUMNS.items():
+        have = set(existing.get(table, ()))
+        statements.extend(
+            f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+            for name, sql_type in columns
+            if name not in have
+        )
     return tuple(statements)
 
 
