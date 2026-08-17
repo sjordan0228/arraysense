@@ -25,6 +25,20 @@
      for an unknown, never an empty bar that would read as "nothing yet". */
   .mprog.none{background:repeating-linear-gradient(45deg,var(--tint-2) 0 4px,transparent 4px 9px);
     box-shadow:inset 0 0 0 1px var(--tint-2)}
+  /* The month picker, in the strip this page already had. The same control the
+     Efficiency page carries and deliberately the same measurements, so a reader
+     who has learned one has learned both. Forward is disabled rather than
+     hidden on the month in progress: a control that vanishes reads as a bug,
+     and one greyed out says there is nowhere further to go. */
+  .mnav{display:flex;align-items:center;gap:8px;margin-top:2px}
+  .mnav button{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink2);border-radius:7px;padding:4px 10px;font-size:13px;cursor:pointer;
+    font-family:inherit;line-height:1}
+  .mnav button:hover:not(:disabled){background:var(--tint-2);color:var(--ink)}
+  .mnav button:disabled{opacity:.35;cursor:default}
+  /* Wide enough that the strip does not reflow as the name changes length —
+     "May 2026" against "September 2026". */
+  .mnav h2{min-width:184px;margin:0}
   .pn{margin-bottom:12px;font-size:12px;color:var(--warn);border-left:3px solid var(--warn)}
   .pn[hidden]{display:none}
   /* No tariff. This is not an error state and must not look like one: nothing
@@ -146,7 +160,11 @@
     <div class="monthbar">
       <div>
         <span class="lbl">Billing month</span>
-        <h2 id="monthName">—</h2>
+        <div class="mnav">
+          <button id="prevMonth" type="button" aria-label="Previous month">←</button>
+          <h2 id="monthName">—</h2>
+          <button id="nextMonth" type="button" aria-label="Next month">→</button>
+        </div>
       </div>
       <div class="mstat" id="monthStat"></div>
     </div>
@@ -371,6 +389,38 @@ function monthWindow(month, today) {
   };
 }
 // <<< costs-month-window
+
+// >>> costs-month-cursor
+// Which month the page is pricing, as {year, month} with month 1-based, on the
+// installation's own calendar. Page state rather than a value derived per
+// render: refresh() runs again every five minutes, and rebuilding the month from
+// the clock each time puts a reader looking at July back on August without them
+// touching anything — invisible in any manual test shorter than the interval,
+// and indistinguishable afterwards from "the picker does not work".
+let cursor = null;
+
+// One month either way, asked of the calendar rather than of arithmetic on a
+// month number. December plus one is January of the next year; 12 + 1 = 13 is a
+// month no calendar has.
+function shiftMonth(month, delta) {
+  const d = civilDay(month.year, month.month + delta, 1);
+  return { year: d.getFullYear(), month: d.getMonth() + 1 };
+}
+
+// Forward stops at the month in progress. The service answers a request for next
+// month rather than refusing it — partially, with its elapsed fraction clamped —
+// so a month that has not happened yet would arrive on the page labelled exactly
+// like an ordinary part month. The Efficiency page's picker shifts its cursor
+// unconditionally and can be paged into next year; that is a gap in it, not a
+// pattern to copy across.
+const canGoForward = (month, today) =>
+  month.year < today.year || (month.year === today.year && month.month < today.month);
+
+// Whether the five-minute poll should run at all. A month that is over cannot
+// change, so re-reading it is a month of counter history read for nothing.
+const shouldAutoRefresh = (cursor, today) =>
+  cursor === null || (cursor.year === today.year && cursor.month === today.month);
+// <<< costs-month-cursor
 
 async function monthEnergy(win) {
   const zone = browserZone();
