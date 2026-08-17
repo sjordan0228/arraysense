@@ -94,6 +94,17 @@ def test_no_coverage_at_all_says_nothing_rather_than_nothing_measured() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_remainder_is_not_all_called_unclamped() -> None:
+    """Finding 7. A monitored circuit gone quiet is part of the remainder too
+    -- the reference account has had two outlets offline since April and
+    August -- and a sentence that names only "branches nobody has clamped"
+    claims more than coverage, measured in energy, can actually tell apart."""
+    said = _words(_MATCHED)
+    assert "nobody has clamped" not in said
+    assert "unrecorded" in said or "unmonitored" in said
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_the_share_is_attributed_to_every_monitored_circuit_not_the_five_shown() -> None:
     """The sentence renders beside a panel titled "The five circuits that cost
     the most", and the coverage figure it states is computed server-side over
@@ -166,6 +177,7 @@ def _circuit(
     kwh: float | None,
     bands: list[dict[str, Any]],
     partial: bool = False,
+    rider: float | None = None,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -173,6 +185,7 @@ def _circuit(
         "cost": cost,
         "kwh": kwh,
         "partial": partial,
+        "rider": rider,
         "bands": bands,
     }
 
@@ -221,6 +234,90 @@ def test_a_zero_cost_partial_band_stays_in_the_bar() -> None:
         "the zero-cost band was dropped and the row read as unmeasured"
     )
     assert 'class="part"' in html, "the partial band itself disappeared from the bar"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_wholly_missing_band_marks_the_row_total_not_just_the_bar() -> None:
+    """Finding 2. A band this circuit reported in another in-effect band but
+    not in at all arrives ``cost: null, partial: false`` and is filtered out
+    of the bar entirely -- there is no segment to hatch, since cost is null
+    rather than merely thin. Before this, the row carried c.partial=true from
+    the backend with nothing on screen showing it: no hatch (nothing to
+    hatch), and the caption's "a hatched segment" explanation pointed at
+    nothing on this row. The total itself needs its own mark."""
+    circuits = [
+        _circuit(
+            "Fridge",
+            2.0,
+            5.0,
+            [
+                {"band": "peak", "kwh": None, "cost": None, "partial": False},
+                {"band": "off-peak", "kwh": 5.0, "cost": 2.0, "partial": False},
+            ],
+            partial=True,
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert 'class="cv part"' in html, "the row total carries no mark for the missing band"
+    assert "did not report in" in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_fully_known_row_is_not_marked_missing() -> None:
+    """The negative case for the marker above: a circuit that reported in
+    every in-effect band gets no dot on its total."""
+    circuits = [
+        _circuit(
+            "Dryer",
+            4.5,
+            15.0,
+            [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}],
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert 'class="cv part"' not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_nonzero_rider_is_named_in_the_totals_title() -> None:
+    """Finding 5. The PCRF/SCRF rider rides on ``cost`` but on no band beside
+    it, so the bands below a row would sum to less than the total shown --
+    $4.50 of segments beside a $4.65 total -- with nothing on screen saying
+    where the other $0.15 came from until the total explains itself."""
+    circuits = [
+        _circuit(
+            "Dryer",
+            4.65,
+            15.0,
+            [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}],
+            rider=0.15,
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert "rate rider" in html
+    assert "$0.15" in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_zero_rider_says_nothing_about_a_rider_at_all() -> None:
+    """No adjustment configured reads back as rider 0.0 from spend.py -- a
+    known, real zero -- and a row whose bill genuinely carries no rider must
+    not be told it does."""
+    circuits = [
+        _circuit(
+            "Dryer",
+            4.5,
+            15.0,
+            [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}],
+            rider=0.0,
+        )
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert "rider" not in html
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

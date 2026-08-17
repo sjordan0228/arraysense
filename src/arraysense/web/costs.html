@@ -156,6 +156,13 @@
   .spendrow .cn{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
     white-space:nowrap}
   .spendrow .cv{font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
+  /* The row-total marker for a band this circuit is entirely missing rather
+     than merely thin in (#31 again, at the scale of a whole band with no
+     width of its own to hatch). Same dot, same colour, same reasoning as
+     td.part above — reused rather than a second convention for one more
+     shape of "this figure is not the whole of it". */
+  .spendrow .cv.part{position:relative;padding-right:9px}
+  .spendrow .cv.part::after{content:'·';position:absolute;right:1px;top:1px;color:var(--warn)}
   .spendrow .ck{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
     color:var(--ink3)}
   /* The same height as the band split above it, and for the same reason that bar
@@ -1071,7 +1078,9 @@ function coverageWords(coverage) {
       + 'not to be read as a share of the bill until they agree.';
   }
   return `The circuits this system monitors account for ${pctStr(share)} of this period’s `
-    + 'energy. The rest is branches nobody has clamped, which no page here measures.';
+    + 'energy. The rest is unmonitored or unrecorded — real branches with no clamp on them, '
+    + 'and any monitored circuit that went quiet during this period — and no page here '
+    + 'measures which.';
 }
 // <<< costs-coverage-words
 
@@ -1132,9 +1141,30 @@ function renderSpenders(body, cur) {
             + `${share > 0.18 ? `<i>${esc(b.band)}</i>` : ''}</span>`;
         }).join('')}</div>`
       : '<div class="splitbar none"></div>';
+    // A band this circuit is short a whole hour of, or never reported in at
+    // all over an in-effect band, has no width to hatch — cost is null, so
+    // it never reaches `priced` and no segment above can carry the mark. The
+    // row's own total is still qualified by it (c.partial says so), so the
+    // total needs its own marker or the row reads as unqualified with the
+    // caption below still claiming a hatch explains every qualified figure.
+    const missingBand = c.bands.some((b) => b.cost === null);
+    const cvNotes = [];
+    if (missingBand) {
+      cvNotes.push('A band this circuit did not report in over this period is left out of '
+        + 'this total, so it is not the whole of it.');
+    }
+    // The PCRF/SCRF rider rides on the total but on no band below it — the
+    // bands alone would sum to less than this figure with nothing saying
+    // why, which is a different question from missingBand above and gets
+    // its own sentence rather than being folded into it.
+    if (c.rider !== null && c.rider !== undefined && c.rider !== 0) {
+      cvNotes.push(`Includes ${money(c.rider, cur)} of rate rider (PCRF/SCRF), which is not `
+        + 'split out in the bar below.');
+    }
+    const cvTitle = cvNotes.length ? ` title="${esc(cvNotes.join(' '))}"` : '';
     return `<div class="spendrow">
       <span class="cn" title="${esc(c.name)}">${esc(c.name)}</span>
-      <span class="cv">${esc(money(c.cost, cur))}</span>
+      <span class="cv${missingBand ? ' part' : ''}"${cvTitle}>${esc(money(c.cost, cur))}</span>
       <span class="ck">${esc(uStr(c.kwh, 1, 'kWh'))}</span>
       ${bar}
     </div>`;

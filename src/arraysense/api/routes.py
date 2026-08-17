@@ -1586,7 +1586,12 @@ def costs_circuits(
             start, end, tier="hourly", cadence_seconds=cadence
         )
         energies = CircuitRepository(store).band_kwh(
-            start, end, intervals, tier="hourly", cadence_seconds=cadence
+            start,
+            end,
+            intervals,
+            tier="hourly",
+            cadence_seconds=cadence,
+            now=datetime.now(tz=UTC),
         )
         parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
         measured = [s.kwh for s in parts if s.kwh is not None]
@@ -1599,11 +1604,26 @@ def costs_circuits(
             window_seconds=window_seconds,
         )
 
-    # The bands in effect over the period, not every band the tariff holds —
-    # the same set estimate_bill prices against. Pricing all of a seasonal
-    # tariff's bands instead leaves an out-of-season one permanently
-    # unmeasured, which makes every total permanently absent.
-    bands = tariff.bands_in_effect(start, end) or tariff.bands
+    # The bands actually present in the interval walk, not every band the
+    # period's season admits — bands_in_effect only excludes an out-of-season
+    # band, so a current-month request ending before the first peak window
+    # still got peak back, top_spenders treated it as unmeasured rather than
+    # not-yet-occurred, and every circuit's total came back partial for a
+    # band the clock had not reached. Narrowed from ``intervals`` the same
+    # way price_period already narrows a whole tariff to the bands a split
+    # period's own energy names (costs.py's own ``entered``/``narrowed``),
+    # because band_intervals has already applied the season filter internally
+    # by the time it names them — matching that safeguard rather than a
+    # second one answers the season question and the not-yet-occurred one at
+    # once. The season-only fallback stays for the edge a window carries no
+    # named interval at all — a wholly unpriced stretch — so bands is never
+    # emptied outright.
+    entered = {name.strip().casefold() for _, _, name in intervals if name is not None}
+    bands = (
+        tuple(band for band in tariff.bands if band.key in entered)
+        or tariff.bands_in_effect(start, end)
+        or tariff.bands
+    )
     # The same PCRF/SCRF rider compute_cost charges the house's own total —
     # resolved once here, the way bands is, rather than inside top_spenders,
     # which has no business knowing what a tariff's adjustment table is.
@@ -1618,6 +1638,10 @@ def costs_circuits(
                 "cost": None if c.cost is None else round(c.cost, 2),
                 "kwh": None if c.kwh is None else round(c.kwh, 3),
                 "partial": c.partial,
+                # The PCRF/SCRF rider already folded into cost but not into
+                # any band below it — a page summing the bands alone would
+                # come up short of cost with nothing explaining the gap.
+                "rider": None if c.rider is None else round(c.rider, 2),
                 "bands": [
                     {
                         "band": b.band,

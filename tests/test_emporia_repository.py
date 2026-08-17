@@ -9,6 +9,7 @@ offline since April must not be drawn as one using no power.
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -857,6 +858,16 @@ def test_band_kwh_marks_the_band_whose_hour_was_thinly_covered(tmp_path: Path) -
     day = datetime(2026, 7, 1, tzinfo=UTC)
     repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
     _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    # Hours 11-14 are filled too, fully, so off-peak has no hole in its own
+    # story -- an unfilled stretch there would also be a bucket with no row
+    # at all, which is its own case with its own test
+    # (test_band_kwh_marks_a_band_partial_when_an_hour_is_missing_entirely)
+    # and would mark off-peak partial for a reason this test is not about.
+    # Hour 15 is left unfilled: it falls in "peak", the band already expected
+    # to come back partial from hour 16's thin coverage, and it contributes
+    # no energy either way, so it does not disturb the 0.25 kWh below.
+    for hour in range(11, 15):
+        _fill_hour(repo, store, 100000, "1", day + timedelta(hours=hour), watts=1000)
     # Fifteen one-minute-apart readings cover fifteen of the hour's sixty
     # minutes -- 900 of 3,600 seconds.
     _fill_hour(repo, store, 100000, "1", day + timedelta(hours=16), watts=1000, minutes=15)
@@ -929,7 +940,10 @@ def test_band_kwh_does_not_double_apportion_the_in_progress_hour(tmp_path: Path)
     window_end = hour + timedelta(minutes=30)
     intervals = [(hour, window_end, "off-peak")]
 
-    result = repo.band_kwh(day, window_end, intervals, tier="hourly")
+    # ``now`` is pinned to the window's own end, matching the current month
+    # this test is about: the hour genuinely has not finished yet, which is
+    # what makes covered_seconds a real prefix rather than a guess.
+    result = repo.band_kwh(day, window_end, intervals, tier="hourly", now=window_end)
 
     energy = {c.name: c for c in result}["Dryer"]
     # Not 0.25, which is what applying the 30-of-60-minute fraction twice gives.
@@ -1084,6 +1098,224 @@ def test_band_kwh_marks_a_band_partial_when_one_of_its_hours_reported_nothing(
     assert outlet.by_band == {}
     assert outlet.partial_bands == frozenset()
     store.close()
+
+
+def test_band_kwh_marks_a_band_partial_when_an_hour_is_missing_entirely(
+    tmp_path: Path,
+) -> None:
+    """The absent-row half of the case above. A poller outage or an archive
+    reply that omitted an hour leaves no row at all -- not even the NULL-watts
+    one rebuild_circuit_hourly writes for a circuit that was listed and never
+    answered -- so neither branch that marks a band partial ever runs, and a
+    circuit recorded either side of the gap summed as though nothing were
+    missing."""
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    # Hour 11 never rolled up at all -- no row, not even a NULL one -- and
+    # hour 12 resumes reporting.
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=12), watts=1000)
+    intervals = [(day, day + timedelta(days=1), "off-peak")]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    assert energy.by_band["off-peak"] == pytest.approx(2.0), "only the two recorded hours' energy"
+    assert energy.partial_bands == frozenset({"off-peak"})
+    store.close()
+
+
+def test_band_kwh_does_not_treat_a_finished_historical_hour_as_a_live_prefix(
+    tmp_path: Path,
+) -> None:
+    """Finding 3. A query ending mid-hour is not always the current, still-
+    forming moment -- a finished month whose UTC offset is not a whole number
+    of hours ends mid-hour too, and a collection gap can leave that
+    already-elapsed hour thin on its own. ``covered_seconds`` says only how
+    much of the hour was sampled, never where, so treating it as a prefix
+    here would book all thirty covered minutes before the 20-minute boundary
+    instead of spreading them the way an ordinary thin hour already is.
+    """
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    hour = day + timedelta(hours=10)
+    # Thirty one-minute-apart readings from the top of the hour -- the real
+    # rollup's own covered_seconds for a thin hour -- but "now" is ten days
+    # past it, so nothing about this gap is still forming.
+    _fill_hour(repo, store, 100000, "1", hour, watts=1000, minutes=30)
+    window_end = hour + timedelta(minutes=20)
+    intervals = [(day, window_end, "off-peak")]
+
+    result = repo.band_kwh(day, window_end, intervals, tier="hourly", now=hour + timedelta(days=10))
+
+    energy = {c.name: c for c in result}["Dryer"]
+    # The row holds 0.5 kWh over its thirty covered minutes. Spread evenly
+    # across the hour and clipped to the twenty minutes the window reaches,
+    # that is 0.5 kWh * (20/60) = 1/6 kWh -- not the 1/3 kWh span=covered
+    # gives by assuming the thirty covered minutes sat inside those first
+    # twenty.
+    assert energy.by_band["off-peak"] == pytest.approx(1 / 6)
+    store.close()
+
+
+def _oracle_band_kwh(
+    rows: list[tuple[int, int, int]],
+    bands: list[tuple[int, int, str]],
+    first: int,
+    last: int,
+    now_ts: int,
+) -> dict[str, float]:
+    """An independent reference for ``band_kwh``'s span/overlap arithmetic.
+
+    Built from the rule this project has already settled on -- an hour's
+    energy is spread evenly across the hour it was measured in, unless the
+    hour genuinely has not finished happening yet, in which case the only
+    seconds it could hold are the ones already recorded and they are a real
+    prefix rather than a guess -- and not from ``band_kwh``'s own code. A
+    formula copied from the function under test would reproduce whatever bug
+    that function has; this is a second, independently written implementation
+    of the same specification, so a disagreement between the two says one of
+    them has drifted from it.
+
+    ``rows`` are ``(when, watts, covered_seconds)`` for one circuit's hourly
+    buckets, ``when`` aligned to the hour. ``bands`` are ``(start, end,
+    name)`` in epoch seconds, expected to partition ``[first, last)`` exactly
+    -- the property below relies on that so summing every band recovers the
+    whole window's energy with nothing left over and nothing double-counted.
+    """
+    hour_seconds = 3600
+    out: dict[str, float] = {}
+    for when, watts, covered in rows:
+        hour_end = when + hour_seconds
+        live = hour_end > last and covered < hour_seconds and hour_end > now_ts
+        span = covered if live else hour_seconds
+        if span <= 0 or covered <= 0:
+            continue
+        energy = float(watts) * covered
+        for band_start, band_end, name in bands:
+            overlap = min(when + span, band_end, last) - max(when, band_start, first)
+            if overlap <= 0:
+                continue
+            out[name] = out.get(name, 0.0) + energy * (overlap / span) / 3_600_000
+    return out
+
+
+def _random_band_kwh_case(
+    rng: random.Random,
+) -> tuple[list[tuple[int, int, int]], list[tuple[int, int, str]], int, int, int]:
+    """One random scenario for the energy-conservation property below.
+
+    Aimed at the axes that have produced a defect before: a window that
+    starts inside an hour, ends inside an hour, or both inside one hour
+    shorter than 3,600 seconds; a run of one to four stored hours, some fully
+    covered and some only partly; and a band boundary falling inside an hour,
+    exactly on one, or outside the window altogether. ``now_ts`` decides
+    whether the final hour -- the only one ``band_kwh`` may ever treat as a
+    still-forming prefix -- genuinely has not finished yet or is a fully
+    elapsed hour that merely happens to be thin, which is the distinction
+    finding 3 was about.
+
+    Returns ``(rows, bands, first, last, now_ts)`` rather than a dataclass:
+    nothing downstream needs to name the pieces, and a tuple keeps the caller
+    and this generator agreeing on shape by construction.
+    """
+    hour_seconds = 3600
+    h0 = hour_seconds * rng.randint(472_000, 500_000)  # an aligned hour, varied across runs
+    num_hours = rng.randint(1, 4)
+    first_offset = rng.randrange(0, hour_seconds)
+    last_offset = rng.randrange(first_offset + 1, num_hours * hour_seconds + 1)
+    first = h0 + first_offset
+    last = h0 + last_offset
+
+    rows: list[tuple[int, int, int]] = []
+    for i in range(num_hours):
+        when = h0 + i * hour_seconds
+        watts = rng.randint(1, 4000)
+        covered = hour_seconds if rng.random() < 0.5 else rng.randint(1, hour_seconds - 1)
+        rows.append((when, watts, covered))
+
+    boundary_when = h0 + ((last_offset - 1) // hour_seconds) * hour_seconds
+    boundary_hour_end = boundary_when + hour_seconds
+    live = rng.random() < 0.5
+    now_ts = last if live else boundary_hour_end + rng.randint(0, 10_000_000)
+
+    candidates: set[int] = set()
+    if last - first > 1:
+        candidates |= {rng.randrange(first + 1, last) for _ in range(6)}
+    hour_grid = (h0 + k * hour_seconds for k in range(1, num_hours))
+    candidates |= {edge for edge in hour_grid if first < edge < last}
+    pool = sorted(candidates)
+    cuts = sorted(rng.sample(pool, min(len(pool), rng.randint(0, 2))))
+    edges = [first, *cuts, last]
+    bands = [(edges[i], edges[i + 1], f"band{i}") for i in range(len(edges) - 1)]
+    return rows, bands, first, last, now_ts
+
+
+def test_band_kwh_conserves_energy_across_bands(tmp_path: Path) -> None:
+    """The invariant, once and for all, rather than a fourth review of the
+    same span/overlap arithmetic: for any circuit, any run of hourly rows and
+    any request window, the energy ``band_kwh`` attributes across bands must
+    equal what the independent oracle above -- built from the specification,
+    not from this function's own formula -- says the window actually holds.
+
+    Cases are generated rather than hand-picked, from a fixed seed printed in
+    every failure message so one can be reproduced exactly rather than chased
+    through a re-run that draws different numbers.
+
+    Rows are inserted directly into ``circuit_hourly`` rather than replayed
+    through ``append_readings``/``rebuild_circuit_hourly``: a few hundred
+    cases spanning up to four hours apiece would be tens of thousands of
+    per-minute inserts through the real rollup, and what is under test here
+    is ``band_kwh``'s own arithmetic over an already-stored row -- the
+    rollup's own arithmetic already has its own tests elsewhere in this file.
+    """
+    seed = 20260817
+    rng = random.Random(seed)
+    repo, store = _repo(tmp_path)
+    try:
+        for case_index in range(400):
+            rows, bands, first, last, now_ts = _random_band_kwh_case(rng)
+            name = f"circuit{case_index}"
+            ids = repo.sync_circuits([Circuit(100000, str(case_index), name, 1.0, "circuit")], NOW)
+            circuit_id = ids[(100000, str(case_index))]
+            conn = store._conn
+            with conn:
+                conn.executemany(
+                    "INSERT INTO circuit_hourly"
+                    " (timestamp, circuit_id, watts, sample_count, covered_seconds)"
+                    " VALUES (?, ?, ?, 1, ?)",
+                    [(when, circuit_id, watts, covered) for when, watts, covered in rows],
+                )
+            intervals = [
+                (
+                    datetime.fromtimestamp(band_start, UTC),
+                    datetime.fromtimestamp(band_end, UTC),
+                    band_name,
+                )
+                for band_start, band_end, band_name in bands
+            ]
+            actual = repo.band_kwh(
+                datetime.fromtimestamp(first, UTC),
+                datetime.fromtimestamp(last, UTC),
+                intervals,
+                tier="hourly",
+                circuit_ids=[circuit_id],
+                now=datetime.fromtimestamp(now_ts, UTC),
+            )
+            energy = next(c for c in actual if c.name == name)
+            expected = _oracle_band_kwh(rows, bands, first, last, now_ts)
+            for band_name in {*expected, *energy.by_band}:
+                exp = expected.get(band_name, 0.0)
+                got = energy.by_band.get(band_name, 0.0)
+                assert got == pytest.approx(exp, abs=1e-6), (
+                    f"seed={seed} case={case_index} band={band_name!r} rows={rows} "
+                    f"bands={bands} first={first} last={last} now_ts={now_ts} "
+                    f"expected={exp} got={got}"
+                )
+    finally:
+        store.close()
 
 
 # --- the charger audit ----------------------------------------------------

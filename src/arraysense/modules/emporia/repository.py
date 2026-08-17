@@ -16,7 +16,7 @@ import logging
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from itertools import pairwise
 
 from arraysense.modules.emporia.parse import Circuit, Reading
@@ -86,6 +86,29 @@ def _reading_seconds(stamps: Sequence[int], cadence_seconds: int) -> int:
         return max(1, cadence_seconds)
     gaps = sorted(b - a for a, b in pairwise(stamps))
     return max(1, min(gaps[len(gaps) // 2], cadence_seconds))
+
+
+def _mark_missing_hour(
+    thin: set[str],
+    windows: Sequence[tuple[int, int, str]],
+    hour_start: int,
+    first: int,
+    last: int,
+) -> None:
+    """Flag every band an hour with no measured energy overlaps, for one circuit.
+
+    ``band_kwh`` calls this from two places for what is the same fact told two
+    ways: a row that exists but carries no watts (the circuit was listed and
+    never answered once that hour) and an hour with no row for it at all
+    (the poller was down, or an archive reply omitted it). Both mean this
+    circuit's energy for that hour is unknown rather than zero, and both feed
+    the same set through the same overlap arithmetic rather than keeping two
+    copies of it that could drift apart.
+    """
+    hour_end = hour_start + _HOUR_SECONDS
+    for iv_start, iv_end, band in windows:
+        if min(hour_end, iv_end, last) - max(hour_start, iv_start, first) > 0:
+            thin.add(band)
 
 
 def _with_breaks(stamps: Sequence[int], cadence_seconds: int) -> list[int]:
@@ -531,6 +554,7 @@ class CircuitRepository:
         tier: str = "hourly",
         circuit_ids: Sequence[int] | None = None,
         cadence_seconds: int = _POLL_SECONDS,
+        now: datetime | None = None,
     ) -> tuple[CircuitEnergy, ...]:
         """Each circuit's energy over a window, split into the bands it ran in.
 
@@ -556,22 +580,41 @@ class CircuitRepository:
         already accepts at a bucket edge. The alternative is inventing a
         distribution the stored row does not carry. A stored hour is only ever
         spread over less than the full hour when it is genuinely still being
-        written — measured by ``covered_seconds`` itself, not by whether the
-        query's own end happens to fall before the hour's nominal one, which is
+        written, which is a fact about the clock rather than about the query:
+        ``now`` — the real instant, unless a caller pins it for a test — says
+        whether the hour has actually finished, and ``covered_seconds`` says
+        how much of it was sampled. A hole where a caller's ``last`` merely
+        falls before the hour's nominal end is not the same claim: that is
         also true of a complete past hour on the last hour of a month whose
-        UTC offset is not a whole number of hours.
+        UTC offset is not a whole number of hours, and of a thin hour with an
+        ordinary collection gap that finished happening well before today —
+        neither is still being written, so neither may be treated as a prefix
+        starting at the top of the hour. Trusting ``last`` alone for that
+        question is the mistake three rounds of review found in this
+        function; ``now`` is what tells a bucket that has not finished
+        forming from one that is complete but thin, and
+        ``test_band_kwh_conserves_energy_across_bands`` asserts the
+        conservation this whole function rests on directly, across many
+        generated cases, rather than leaving it to be re-broken a fourth
+        time.
 
         A circuit's band figure also carries a flag for the hours it is known
-        to be missing rather than merely thin. ``rebuild_circuit_hourly``
-        writes a NULL-watts row for an hour a circuit was listed for but never
-        answered once, and that row contributes no energy here — but every
-        band its hour overlaps is marked partial for that circuit, the same
-        completeness rule ``spend.missing_band`` already applies to a band
-        that came back empty, at the scale of one hour of it rather than the
-        whole thing. A circuit that reported nothing at all, anywhere in the
-        window, is left unflagged: it is already a dash through its empty
-        ``by_band``, and marking it partial too would label a row with
-        nothing on it to label.
+        to be missing rather than merely thin, in two shapes that are the
+        same fact. ``rebuild_circuit_hourly`` writes a NULL-watts row for an
+        hour a circuit was listed for but never answered once, and that row
+        contributes no energy here — but every band its hour overlaps is
+        marked partial for that circuit, the same completeness rule
+        ``spend.missing_band`` already applies to a band that came back
+        empty, at the scale of one hour of it rather than the whole thing.
+        The other shape is a bucket with no row at all — the poller was down,
+        or an archive reply omitted that hour — which is told from one this
+        circuit was never asked about by sitting strictly between two hours
+        it did report: every aligned hour in such a gap is marked partial the
+        same way a NULL-watts row is, through the shared
+        ``_mark_missing_hour``. A circuit that reported nothing at all,
+        anywhere in the window, is left unflagged either way: it is already a
+        dash through its empty ``by_band``, and marking it partial too would
+        label a row with nothing on it to label.
 
         Everything is compared as epoch seconds, never as datetimes: two aware
         datetimes sharing a tzinfo subtract as though they were naive, and a
@@ -586,6 +629,7 @@ class CircuitRepository:
         counted = tier == "hourly"
         first = int(start.timestamp())
         last = int(end.timestamp())
+        now_ts = int((now if now is not None else datetime.now(UTC)).timestamp())
         # circuit_hourly's own timestamp is the floor of the hour it covers
         # (rebuild_circuit_hourly), so the bucket straddling ``first`` is
         # stamped *before* it whenever the boundary does not land on the
@@ -629,6 +673,12 @@ class CircuitRepository:
 
         joules: dict[int, dict[str, float]] = {cid: {} for cid in meta}
         thin: dict[int, set[str]] = {cid: set() for cid in meta}
+        # Every hour this circuit has any row for, whether or not it carries
+        # watts — the anchors a gap between two of them is measured from,
+        # below. Only the hourly tier has aligned buckets to look for a gap
+        # between; the raw tier's own holes are a different question,
+        # already ``history()``'s to answer via ``_with_breaks``.
+        reported_hours: dict[int, list[int]] = {cid: [] for cid in meta}
         # Circuits actually heard from somewhere in the window, at least
         # once. A circuit that never answered at all is already a dash —
         # ``by_band`` stays empty and a page reads that as ``cost is None`` —
@@ -640,6 +690,8 @@ class CircuitRepository:
             if key not in meta:
                 continue
             when = int(stamp)
+            if counted:
+                reported_hours[key].append(when)
             if raw is None:
                 # A NULL-watts hourly row is a circuit that was listed and did
                 # not answer once in the whole hour — rebuild_circuit_hourly
@@ -657,10 +709,7 @@ class CircuitRepository:
                 # this circuit — contributing no energy, since none was
                 # measured.
                 if counted:
-                    hour_end = when + _HOUR_SECONDS
-                    for iv_start, iv_end, band in windows:
-                        if min(hour_end, iv_end, last) - max(when, iv_start, first) > 0:
-                            thin[key].add(band)
+                    _mark_missing_hour(thin[key], windows, when, first, last)
                 continue
             seen.add(key)
             if counted:
@@ -696,8 +745,27 @@ class CircuitRepository:
                 # the row was measured up to exactly ``last``, which is not
                 # guaranteed when the caller's ``last`` is earlier than the
                 # real "now" a still-forming row was recorded up to.
+                #
+                # ``hour_end > last`` alone finds the boundary row, but it
+                # cannot tell a bucket still being written from one that
+                # finished long ago and merely happens to end after the
+                # window's own close — a finished month's last hour on a site
+                # off a whole UTC offset is exactly that shape, and if a
+                # collection gap also left that hour thin, ``covered_seconds``
+                # records only how much of it was sampled, never where. Book
+                # the whole thin figure as a top-of-hour prefix there and it
+                # can claim energy that was actually measured on the far side
+                # of ``last``, past the boundary rather than proportional to
+                # it — the defect three rounds of review kept finding in this
+                # line. ``hour_end > now_ts`` is what a fully elapsed hour can
+                # never satisfy, live or not, so it is what actually tells
+                # the two apart; ``last`` alone was only ever a proxy for it.
                 hour_end = when + _HOUR_SECONDS
-                span = covered if hour_end > last and covered < _HOUR_SECONDS else _HOUR_SECONDS
+                span = (
+                    covered
+                    if hour_end > last and covered < _HOUR_SECONDS and hour_end > now_ts
+                    else _HOUR_SECONDS
+                )
             else:
                 nxt = following.get(when)
                 covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
@@ -724,6 +792,25 @@ class CircuitRepository:
                 joules[key][band] = joules[key].get(band, 0.0) + energy * (overlap / span)
                 if counted and covered < _HOUR_SECONDS:
                     thin[key].add(band)
+
+        # A bucket with no row at all, sitting strictly between two hours
+        # this circuit did report — the NULL-watts row's own case above
+        # covers a circuit that was asked and stayed silent; this is the
+        # other way an hour can be unaccounted for, when nothing asked it
+        # anything because the poller itself was down, or an archive reply
+        # simply omitted that hour. Bounded to strictly between two rows this
+        # circuit actually has, rather than from the edges of the query
+        # window inward, because that is the only span in which a gap is
+        # evidenced: a circuit with no row before its first appearance in the
+        # window may just not have existed yet, and guessing past its last
+        # row would flag hours nobody was ever going to hear from again.
+        if counted:
+            for key, hours in reported_hours.items():
+                for previous, following_hour in pairwise(sorted(hours)):
+                    missing = previous + _HOUR_SECONDS
+                    while missing < following_hour:
+                        _mark_missing_hour(thin[key], windows, missing, first, last)
+                        missing += _HOUR_SECONDS
 
         return tuple(
             CircuitEnergy(

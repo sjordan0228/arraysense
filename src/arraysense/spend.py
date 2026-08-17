@@ -83,6 +83,15 @@ class CircuitSpend:
     distinction between the two ways a sum can fall short. Which band is
     thin, or absent, is in ``bands``, because that is the fact a reader needs
     and a row-level flag cannot carry.
+
+    ``rider`` is the PCRF/SCRF addition folded into ``cost`` but not into any
+    ``BandSpend.cost`` — the rider is charged on the whole total rather than
+    per band, so there is no band figure to add it to. Carried separately
+    rather than silently absorbed, because a page that only shows the bands
+    and the total would otherwise present a total the bands do not sum to
+    with nothing explaining the gap: $4.50 of segments beside a $4.65 total.
+    None when ``cost`` is None too — an unpublished month's rider is exactly
+    as unknown as the total it would have ridden on.
     """
 
     name: str
@@ -91,6 +100,7 @@ class CircuitSpend:
     kwh: float | None
     bands: tuple[BandSpend, ...]
     partial: bool
+    rider: float | None = None
 
 
 def top_spenders(
@@ -120,7 +130,14 @@ def top_spenders(
     house's cost unstatable, so ``status == "unknown"`` poisons a circuit's
     ``cost`` the same way it poisons ``CostResult.cost`` — leaving ``kwh``
     alone, since the energy figure does not depend on a price nobody has
-    entered.
+    entered. The rider itself comes back on ``CircuitSpend.rider`` rather than
+    only inside ``cost``, because it never lands in any ``BandSpend`` either —
+    a page that drew a circuit's cost breakdown from its bands alone would sum
+    to less than the total shown beside it, with nothing on screen saying why.
+
+    ``rider`` on the return value is 0.0 rather than None when no adjustment
+    is configured at all: that is a fact about the tariff, known and zero,
+    which is a different claim from a published month's rider being unstated.
 
     Ranked by cost rather than by energy because the page is about money, and a
     circuit that only ever runs at peak outranking one that used twice the
@@ -147,11 +164,15 @@ def top_spenders(
         # to hatch.
         present = reported or {}
         missing_band = any(band.key not in present for band in bands)
+        rider: float | None = None
         if cost is not None:
             if unknown_rider:
                 cost = None
             elif rider_per_kwh is not None and kwh is not None:
-                cost += kwh * rider_per_kwh
+                rider = kwh * rider_per_kwh
+                cost += rider
+            else:
+                rider = 0.0
         thin = {name.strip().casefold() for name in circuit.partial_bands}
         split = tuple(
             BandSpend(
@@ -172,6 +193,7 @@ def top_spenders(
                 kwh=kwh,
                 bands=split,
                 partial=any(b.partial for b in split) or (cost is not None and missing_band),
+                rider=rider,
             )
         )
     # A circuit nobody heard from sorts last, below one measured at nothing.

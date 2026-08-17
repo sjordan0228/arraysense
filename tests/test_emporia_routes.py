@@ -960,6 +960,47 @@ def test_costs_circuits_converts_an_aware_bound_to_the_owners_zone(tmp_path: Pat
     assert dryer["cost"] == pytest.approx(3.0 * 0.30)
 
 
+def test_costs_circuits_does_not_flag_partial_for_a_band_the_window_never_reached(
+    tmp_path: Path,
+) -> None:
+    """Finding 6. ``bands_in_effect`` only excludes a band that is out of
+    season -- it says nothing about whether the requested window's clock ever
+    reached the band's hours -- so a current-month request ending at 11:00,
+    asked against a tariff with a 15:00-20:00 peak, used to get peak back
+    anyway. ``top_spenders`` then read "never reported in peak" as a band
+    that went unmeasured rather than one that had not happened yet, and
+    marked every circuit's total partial for it. Selecting from the band
+    names ``band_intervals`` actually named for this window -- the same
+    narrowing ``costs.price_period`` already does from a split period's own
+    energy -- answers the season question band_intervals already applied
+    internally and the not-yet-occurred one together.
+    """
+    app, store = _spend_app(tmp_path)
+    with TestClient(app) as c:
+        c.put(
+            "/api/settings",
+            json={
+                "tariff.bands": (
+                    "Peak | 0.40 | 15:00-20:00; Off-peak | 0.10 | 00:00-15:00,20:00-24:00"
+                )
+            },
+        )
+        # _spend_window is the one recorded hour, 10:00-11:00 -- entirely
+        # before the peak band's 15:00 start.
+        body = c.get("/api/costs/circuits", params=_spend_window()).json()
+    store.close()
+
+    dryer = next(entry for entry in body["circuits"] if entry["name"] == "Dryer")
+    assert {b["band"] for b in dryer["bands"]} == {"Off-peak"}, (
+        "peak was never in this window at all -- it should not appear as a band "
+        "the circuit was expected to report in"
+    )
+    assert dryer["partial"] is False, (
+        "a band that has not happened yet is not the same claim as one that "
+        "went unmeasured, and only the second should mark the row partial"
+    )
+
+
 def test_a_rounding_noise_house_reading_is_treated_as_no_reading(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

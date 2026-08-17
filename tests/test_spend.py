@@ -150,6 +150,13 @@ def test_the_monthly_adjustment_rides_on_the_circuits_total_too() -> None:
     # Band price alone is 10*0.40 + 5*0.10 = 4.5; the rider adds 15 kWh * 0.01.
     assert ranked[0].cost == pytest.approx(4.65)
     assert ranked[0].kwh == pytest.approx(15.0)
+    # Finding 5: the rider comes back on its own rather than only folded into
+    # cost, since it is not in any BandSpend either -- $4.50 of band cost
+    # beside a $4.65 total, with nothing on screen saying where the other
+    # $0.15 came from, until this is read.
+    assert ranked[0].rider == pytest.approx(0.15)
+    band_costs = [b.cost for b in ranked[0].bands if b.cost is not None]
+    assert sum(band_costs) == pytest.approx(4.5)
 
 
 def test_an_unpublished_months_adjustment_poisons_the_circuits_cost() -> None:
@@ -161,3 +168,12 @@ def test_an_unpublished_months_adjustment_poisons_the_circuits_cost() -> None:
     )
     assert ranked[0].cost is None
     assert ranked[0].kwh == pytest.approx(15.0)
+    assert ranked[0].rider is None, "as unknown as the total it would have ridden on"
+
+
+def test_no_configured_adjustment_reads_as_a_zero_rider_not_an_absent_one() -> None:
+    """No PCRF/SCRF table at all is a known fact about the tariff -- there is
+    no rider -- not the same claim as a published month whose factors have
+    not arrived yet."""
+    ranked = top_spenders([circuit("Dryer", peak=10.0, off=5.0)], BANDS)
+    assert ranked[0].rider == 0.0
