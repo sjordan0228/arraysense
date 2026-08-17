@@ -20,6 +20,7 @@ from datetime import datetime
 from itertools import pairwise
 
 from arraysense.modules.emporia.parse import Circuit, Reading
+from arraysense.spend import CircuitEnergy
 from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
@@ -519,6 +520,128 @@ class CircuitRepository:
             series=tuple(series),
             tier=tier,
             recorded_seconds=sum(recorded_at.values()),
+        )
+
+    def band_kwh(
+        self,
+        start: datetime,
+        end: datetime,
+        intervals: Sequence[tuple[datetime, datetime, str | None]],
+        *,
+        tier: str = "hourly",
+        circuit_ids: Sequence[int] | None = None,
+        cadence_seconds: int = _POLL_SECONDS,
+    ) -> tuple[CircuitEnergy, ...]:
+        """Each circuit's energy over a window, split into the bands it ran in.
+
+        ``history()`` with one accumulator per band instead of one per circuit,
+        and deliberately the same query, the same coverage rule and the same
+        multiplier: two readers of the same rows that disagree about how much
+        energy is in them is how a page comes to price a month two ways.
+
+        ``intervals`` are the band windows ``costs.band_intervals`` cut, as
+        (start, end, band name) with the name None for a stretch no band covers.
+        A stretch nobody priced contributes to nothing here — the energy in it
+        is real and unpriced, and the Costs page already warns about unpriced
+        minutes separately rather than inventing a band to hold them.
+
+        The hourly tier is the one this is asked for, and the tolerance it
+        carries is stated rather than hidden. A stored hour's energy is split
+        across the intervals the *hour* overlaps, in proportion to that overlap.
+        Every tariff this project has seen changes rate on the hour, so each
+        hour lies in one band and the split is exact. A band edge at half past
+        makes it an assumption that the hour's recorded seconds were spread
+        evenly through it — bounded by one hour on one circuit at one boundary
+        a day, which is the same kind and size of tolerance ``bucket_totals``
+        already accepts at a bucket edge. The alternative is inventing a
+        distribution the stored row does not carry.
+
+        Everything is compared as epoch seconds, never as datetimes: two aware
+        datetimes sharing a tzinfo subtract as though they were naive, and a
+        month with a clock change in it is where that surfaces.
+
+        A database error yields nothing rather than raising, for the reason
+        ``history()`` gives.
+        """
+        if tier not in _CIRCUIT_TABLES:
+            raise ValueError(f"unknown circuit tier {tier!r}")
+        table = _CIRCUIT_TABLES[tier]
+        counted = tier == "hourly"
+        first = int(start.timestamp())
+        last = int(end.timestamp())
+        try:
+            circuits = self._store._conn.execute(
+                "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
+            ).fetchall()
+            rows = self._store._conn.execute(
+                "SELECT timestamp, circuit_id, watts,"
+                f" {'sample_count, covered_seconds' if counted else '1, NULL'}"
+                f"  FROM {table}"
+                "  WHERE timestamp >= ? AND timestamp < ?"
+                "  ORDER BY timestamp",
+                (first, last),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("could not read circuit band energy: %s", exc)
+            return ()
+
+        wanted = None if circuit_ids is None else set(circuit_ids)
+        meta = {int(row[0]): row for row in circuits if wanted is None or int(row[0]) in wanted}
+        stamps = sorted({int(row[0]) for row in rows})
+        reading_seconds = _reading_seconds(stamps, cadence_seconds)
+        following = dict(pairwise(stamps))
+        # Named bands only, as epoch seconds. An unpriced stretch is dropped
+        # here rather than carried as a None key, so nothing downstream has to
+        # remember that one of its bands is not a band.
+        windows = [
+            (int(iv_start.timestamp()), int(iv_end.timestamp()), band)
+            for iv_start, iv_end, band in intervals
+            if band is not None
+        ]
+
+        joules: dict[int, dict[str, float]] = {cid: {} for cid in meta}
+        thin: dict[int, set[str]] = {cid: set() for cid in meta}
+        for stamp, circuit_id, raw, samples, stored in rows:
+            if raw is None:
+                continue
+            key = int(circuit_id)
+            if key not in meta:
+                continue
+            when = int(stamp)
+            if counted:
+                covered = (
+                    min(int(stored), _HOUR_SECONDS)
+                    if stored is not None
+                    else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
+                )
+                # The span the energy is spread across is the hour, not the part
+                # of it that was recorded: where in the hour those seconds fell
+                # is precisely what the row does not say.
+                span = _HOUR_SECONDS
+            else:
+                nxt = following.get(when)
+                covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
+                span = covered
+            if span <= 0 or covered <= 0:
+                continue
+            value = round(float(raw) * float(meta[key][5]))
+            energy = float(value) * covered
+            for iv_start, iv_end, band in windows:
+                overlap = min(when + span, iv_end) - max(when, iv_start)
+                if overlap <= 0:
+                    continue
+                joules[key][band] = joules[key].get(band, 0.0) + energy * (overlap / span)
+                if counted and covered < _HOUR_SECONDS:
+                    thin[key].add(band)
+
+        return tuple(
+            CircuitEnergy(
+                name=str(row[3]),
+                kind=str(row[4]),
+                by_band={band: value / 3_600_000 for band, value in joules[circuit_id].items()},
+                partial_bands=frozenset(thin[circuit_id]),
+            )
+            for circuit_id, row in meta.items()
         )
 
 

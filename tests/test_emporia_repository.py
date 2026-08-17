@@ -735,6 +735,149 @@ def test_recorded_seconds_describes_the_module_even_when_one_circuit_is_asked_fo
     store.close()
 
 
+# --- circuit energy split by rate band ------------------------------------
+
+
+def _fill_hour(
+    repo: CircuitRepository,
+    store: SqliteStore,
+    device_gid: int,
+    channel: str,
+    hour: datetime,
+    *,
+    watts: int,
+    minutes: int = 60,
+    cadence_seconds: int = 60,
+) -> None:
+    # One reading a minute for `minutes` minutes from the top of `hour`, then
+    # the real rollup over it -- so band_kwh is tested against a circuit_hourly
+    # row built the way a production one is, not one typed into the table by
+    # hand. `minutes < 60` is how the thinly-covered-hour case is built: the
+    # rollup measures real coverage from the spacing between real readings.
+    for minute in range(minutes):
+        repo.append_readings(
+            [Reading(device_gid, channel, watts)], hour + timedelta(minutes=minute)
+        )
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=cadence_seconds,
+    )
+
+
+def test_band_kwh_splits_a_circuits_energy_between_the_bands_it_ran_in(tmp_path: Path) -> None:
+    # The arithmetic the whole panel rests on: one circuit, two bands, and the
+    # energy landing where the clock says it did.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    # Two whole hours at 1000 W: 1 kWh each, one in each band.
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=16), watts=1000)
+    intervals = [
+        (day, day + timedelta(hours=15), "off-peak"),
+        (day + timedelta(hours=15), day + timedelta(hours=20), "peak"),
+        (day + timedelta(hours=20), day + timedelta(days=1), "off-peak"),
+    ]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    assert energy.by_band["off-peak"] == pytest.approx(1.0)
+    assert energy.by_band["peak"] == pytest.approx(1.0)
+    store.close()
+
+
+def test_band_kwh_applies_the_multiplier(tmp_path: Path) -> None:
+    # circuit_hourly.watts is stored unmultiplied. A 240 V circuit reads half
+    # without this, which under-prices the dryer, the oven and both air
+    # conditioners by exactly half.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Oven", 2.0, "circuit")], day)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    intervals = [(day, day + timedelta(days=1), "off-peak")]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+
+    assert {c.name: c for c in result}["Oven"].by_band["off-peak"] == pytest.approx(2.0)
+    store.close()
+
+
+def test_band_kwh_reports_no_entry_for_a_band_a_circuit_never_touched(tmp_path: Path) -> None:
+    # Not 0.0. The band occurred and this circuit was never heard from in it.
+    # spend.CircuitEnergy's own contract treats an absent key and a None value
+    # as the same claim, so this checks membership rather than `is None` --
+    # asserting `is None` would raise KeyError instead of failing cleanly.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    intervals = [
+        (day, day + timedelta(hours=15), "off-peak"),
+        (day + timedelta(hours=15), day + timedelta(hours=20), "peak"),
+    ]
+
+    result = repo.band_kwh(day, day + timedelta(hours=20), intervals, tier="hourly")
+
+    assert "peak" not in {c.name: c for c in result}["Dryer"].by_band
+    store.close()
+
+
+def test_band_kwh_marks_the_band_whose_hour_was_thinly_covered(tmp_path: Path) -> None:
+    # The flag the page labels a figure from, and it belongs to the band
+    # rather than to the circuit.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    # Fifteen one-minute-apart readings cover fifteen of the hour's sixty
+    # minutes -- 900 of 3,600 seconds.
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=16), watts=1000, minutes=15)
+    intervals = [
+        (day, day + timedelta(hours=15), "off-peak"),
+        (day + timedelta(hours=15), day + timedelta(hours=20), "peak"),
+    ]
+
+    result = repo.band_kwh(day, day + timedelta(hours=20), intervals, tier="hourly")
+
+    energy = {c.name: c for c in result}["Dryer"]
+    assert energy.partial_bands == frozenset({"peak"})
+    # 1 kW held for 900 of the hour's 3,600 seconds is a quarter of a kWh.
+    assert energy.by_band["peak"] == pytest.approx(0.25)
+    store.close()
+
+
+def test_band_kwh_ignores_a_stretch_no_band_covers(tmp_path: Path) -> None:
+    # A gap in the schedule is unpriced energy, not energy in a band named
+    # None -- the Costs page already warns about unpriced minutes separately.
+    repo, store = _repo(tmp_path)
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], day)
+    _fill_hour(repo, store, 100000, "1", day + timedelta(hours=10), watts=1000)
+    intervals = [(day, day + timedelta(days=1), None)]
+
+    result = repo.band_kwh(day, day + timedelta(days=1), intervals, tier="hourly")
+
+    assert {c.name: c for c in result}["Dryer"].by_band == {}
+    store.close()
+
+
+def test_band_kwh_yields_nothing_rather_than_raising_on_a_database_error(tmp_path: Path) -> None:
+    # The same rule history() follows: this runs unattended on someone's
+    # inverter, and a page with no circuits tells the owner more than a 500.
+    # sqlite3.Connection.execute is a read-only slot -- it cannot be
+    # monkeypatched onto an instance -- so this forces the same real error
+    # history()'s own database-error test does: drop a table the query needs.
+    repo, store = _repo(tmp_path)
+    store._conn.execute("DROP TABLE circuit")
+    day = datetime(2026, 7, 1, tzinfo=UTC)
+
+    assert repo.band_kwh(day, day + timedelta(days=1), []) == ()
+    store.close()
+
+
 # --- the charger audit ----------------------------------------------------
 
 
