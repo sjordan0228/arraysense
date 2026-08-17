@@ -1041,7 +1041,7 @@ function renderBands(p) {
   }
   if (p.costShort || p.savingsShort) {
     notes.push('<span class="warn">The bars and the table draw from a partial measurement '
-      + `${words.inMonth}</span> — the cards above say what is missing from it.`);
+      + `${esc(words.inMonth)}</span> — the cards above say what is missing from it.`);
   }
   $('bandCap').innerHTML = notes.join(' ');
 }
@@ -1075,8 +1075,12 @@ const ENERGY_FIELDS = [
 
 // Shown whether or not a tariff exists — with none, this is the whole page.
 function renderEnergy(bucket) {
-  // renderEnergy runs before renderMonth on the path where the month's energy
-  // read succeeded and its pricing did not, so the words may not be set yet.
+  // words is set by renderMonth, which now runs immediately before this call
+  // in refresh() — so words is never actually null by the time execution
+  // reaches here. The guard (and the monthWords(null, '') fallback below)
+  // stay anyway: this is the only renderer that ever ran ahead of
+  // renderMonth, and a future edit that reintroduces that ordering should
+  // get a blank first paint rather than a thrown exception.
   if (words !== null) $('energyHead').textContent = words.energy;
   $('egrid').innerHTML = ENERGY_FIELDS.map(([label, key]) => {
     const value = bucket ? numOrNull(bucket[key]) : null;
@@ -1255,8 +1259,8 @@ async function refresh() {
   } catch (e) {
     trouble.push(`The month’s energy could not be read: ${e.message}.`);
   }
-  renderEnergy(bucket);
   renderMonth(win, null);
+  renderEnergy(bucket);
 
   let quote = null;
   try {
