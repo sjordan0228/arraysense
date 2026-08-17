@@ -309,44 +309,68 @@ async function getJSON(url) {
   return response.json();
 }
 
+// >>> costs-month-window
 // The owner's month, on the calendar the service answers on: local midnight on
 // the first, to local midnight on the first of the next. Never now minus thirty
 // days, and never an epoch divided by 86400 — one month a year is 23 hours short
 // of that and one is an hour long, and both look like a data bug.
 //
-// ``today`` is the date in the *installation's* zone, from
-// civilNow(siteZone()), and not this browser's. Built from the browser's the
+// ``month`` is which month to price, as {year, month} with month 1-based, on the
+// installation's own calendar. ``today`` is the date in the same zone, from
+// civilNow(siteZone()), and not this browser's. Built from the browser's, the
 // page asked about an instant that is not the site's midnight on the first, and
 // the whole month turned on it: the connection charge falls due whole and was
 // apportioned instead ($3.44 of $15.00 on an install five hours west of the
 // reader), the month-to-date cost was short by the hours either side, and the
 // estimated bill came back for the previous calendar month, complete, in the
 // first week of this one.
-function monthWindow(today) {
-  const start = civilDay(today.year, today.month, 1);
-  const end = civilDay(today.year, today.month + 1, 1);
+//
+// The two used to be one argument and could not stay one. Everything below that
+// says "now" is right for the month in progress and wrong for every other: a
+// finished month asked about with Date.now() as its end is read by the service
+// as the span from that month's first to this instant, which prices September
+// as five weeks.
+function monthWindow(month, today) {
+  const start = civilDay(month.year, month.month, 1);
+  const end = civilDay(month.year, month.month + 1, 1);
+  const days = Math.round(elapsed(start, end) / 86400000);
+  const current = month.year === today.year && month.month === today.month;
+  const ahead = elapsed(civilDay(today.year, today.month, 1), start) > 0;
   // How far into the month the site's own clock is, in its own days. Calendar
   // fields rather than an interval, so it needs no instant to measure from; it
   // is a day out of thirty-one at worst and only stands in until the service's
-  // own fraction_elapsed arrives with the pricing.
-  const done = today.day - 1
-    + (today.hour * 3600 + today.minute * 60 + today.second) / 86400;
+  // own fraction_elapsed arrives with the pricing. A month already over has
+  // elapsed whole; one the clock has not reached has elapsed nothing, which the
+  // picker prevents a reader from ever seeing and which is still not allowed to
+  // render as a finished bill if some other path reaches it.
+  const done = ahead
+    ? 0
+    : current
+      ? today.day - 1 + (today.hour * 3600 + today.minute * 60 + today.second) / 86400
+      : days;
   return {
     start,
     end,
-    days: Math.round(elapsed(start, end) / 86400000),
+    days,
     done,
+    // Read by the picker, by the auto-refresh and by every label on the page.
+    current,
     // A bare wall-clock date, read by the service as midnight in the zone it
     // resolved — which is what makes this the site's first of the month rather
     // than the reader's.
     startParam: naiveStamp(start),
-    // A true instant, needing no zone at all, and it has to stay one: it is
-    // also what tells the service how much of the month has actually happened.
-    // A page opened in the first second of the month still has to ask for a
-    // range the API will accept, hence the nudge.
-    endParam: new Date(Date.now() + (done === 0 ? 1000 : 0)).toISOString(),
+    // For the month in progress this is a true instant, needing no zone at all,
+    // and it has to stay one: it is also what tells the service how much of the
+    // month has actually happened. A page opened in the first second of the
+    // month still has to ask for a range the API will accept, hence the nudge.
+    // A finished month is asked about in the site's own words instead, so the
+    // window is the month rather than the stretch from its first until now.
+    endParam: current
+      ? new Date(Date.now() + (done === 0 ? 1000 : 0)).toISOString()
+      : naiveStamp(end),
   };
 }
+// <<< costs-month-window
 
 async function monthEnergy(win) {
   const zone = browserZone();
