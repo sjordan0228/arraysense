@@ -500,6 +500,16 @@ function shortNote(entry, what) {
   return `<span class="warn">Not the whole story:</span> ${parts.join('; and ')}.`;
 }
 
+// The picker's own state. Called on every refresh rather than only on a click,
+// because the month in progress becomes a finished one at midnight on the first
+// and the forward button has to open at that moment without a reload.
+function renderPicker(today) {
+  const forward = $('nextMonth');
+  const allowed = canGoForward(cursor, today);
+  forward.disabled = !allowed;
+  forward.title = allowed ? 'Next month' : 'This is the month in progress';
+}
+
 function renderMonth(win, priced) {
   $('monthName').textContent = win.start.toLocaleDateString(undefined, MONTH_FMT);
   const days = win.days;
@@ -1153,8 +1163,12 @@ function monthNames(list) {
 async function refresh() {
   // The month the *installation* is in, which is not always the month the
   // browser is in, and is never the browser's month measured from the browser's
-  // midnight. Everything below hangs off this.
-  const win = monthWindow(civilNow(await siteZone()));
+  // midnight. The cursor hangs off this on the first pass and is left alone
+  // afterwards, so the reader's choice survives every later refresh.
+  const today = civilNow(await siteZone());
+  if (cursor === null) cursor = { year: today.year, month: today.month };
+  const win = monthWindow(cursor, today);
+  renderPicker(today);
   // Collected rather than set as they happen: two reads can fail in one pass,
   // and a second failure overwriting the first would leave the page explaining
   // only half of what went wrong.
@@ -1217,8 +1231,25 @@ function stamp() {
 async function boot() {
   await syncDisplayDefaults();
   drawNav('costs');
+  $('prevMonth').onclick = async () => {
+    cursor = shiftMonth(cursor, -1);
+    await refresh();
+  };
+  $('nextMonth').onclick = async () => {
+    const today = civilNow(await siteZone());
+    // Checked here as well as on the button's disabled state: a disabled button
+    // is a rendering, and the rule is that the page never asks about a month
+    // that has not happened.
+    if (!canGoForward(cursor, today)) return;
+    cursor = shiftMonth(cursor, 1);
+    await refresh();
+  };
   await refresh();
-  setInterval(refresh, 5 * 60 * 1000);
+  setInterval(async () => {
+    const today = civilNow(await siteZone());
+    if (!shouldAutoRefresh(cursor, today)) return;
+    await refresh();
+  }, 5 * 60 * 1000);
 }
 
 boot();
