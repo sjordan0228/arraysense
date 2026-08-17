@@ -7,6 +7,39 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.3 — 17 August 2026
+
+The Circuits tab can be given the months your Vue recorded before ArraySense
+was ever pointed at it.
+
+### Added
+
+- **`tools/backfill_emporia_history.py`, a one-off import of Emporia's own
+  archive.** The Circuits tab offers thirty days and thirteen months, and a
+  fresh installation has hours — every reading before the module was connected
+  is sitting in Emporia's cloud and nothing had asked for it. One run per
+  installation fills the hourly tier from it; on the reference account that was
+  21,723 rows across thirty-nine circuits and thirty days, in about a minute.
+  See [docs/backfilling-emporia-history.md](docs/backfilling-emporia-history.md).
+
+  **It never overwrites an hour ArraySense measured itself.** Our rollup is
+  built from readings taken here; Emporia's figure is taken on trust, so where
+  both exist ours stands. An hour the cloud has no figure for gets no row at
+  all rather than a row claiming the circuit drew nothing, and the hour still
+  running is skipped — Emporia will answer for it, but that answer covers only
+  the minutes so far and nothing later would correct it.
+
+  Safe against a live installation, and running it twice writes nothing the
+  second time.
+
+### Notes
+
+- **A backfilled hour is not labelled "partial" and a polled one is.** That is
+  not backwards. An Emporia hourly bucket is the device's own aggregate of its
+  own continuous record, so it covers the whole hour; polling that device once
+  a minute covers around 3,540 seconds of it. The label says how an hour was
+  measured, not how good it is.
+
 ## 1.1.2 — 17 August 2026
 
 Six circuits stop being called by their serial numbers.
