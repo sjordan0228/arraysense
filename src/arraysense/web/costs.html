@@ -115,6 +115,22 @@
   .splitbar span.part{min-width:7px;position:relative}
   .splitbar span.part::after{content:'';position:absolute;inset:0;pointer-events:none;
     background:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 5px)}
+  /* One row per circuit: the name, what it cost, what it used, and where the
+     money went inside it. The band bar is renderSplit's bar at row height —
+     same hue, same shades, same hatch for a partly-unmeasured segment — because
+     a second way of drawing a band split on one page is a second thing to learn
+     for no new information. */
+  .spend{display:flex;flex-direction:column;gap:9px;margin-top:4px}
+  .spendrow{display:grid;grid-template-columns:minmax(0,1.4fr) 78px 82px minmax(120px,1fr);
+    align-items:center;gap:10px}
+  @media(max-width:700px){.spendrow{grid-template-columns:minmax(0,1fr) 78px 82px}
+    .spendrow .splitbar{grid-column:1/-1}}
+  .spendrow .cn{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+  .spendrow .cv{font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
+  .spendrow .ck{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
+    color:var(--ink3)}
+  .spendrow .splitbar{height:14px}
   /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
      it — uppercase at .17em tracking turns an explanation into shouting. */
   .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
@@ -247,6 +263,15 @@
       </table>
     </div>
     <span class="cap" id="bandCap"></span>
+  </section>
+
+  <section class="p" id="spendSec" hidden>
+    <div class="chead">
+      <h2>The five circuits that cost the most</h2>
+      <span class="legend muted" id="spendCoverage"></span>
+    </div>
+    <div class="spend" id="spendList"></div>
+    <span class="cap" id="spendCap"></span>
   </section>
 
   <section class="p">
@@ -635,6 +660,7 @@ function renderNoTariff(unreadable) {
   $('cards').hidden = true;
   $('sankeySec').hidden = true;
   $('bandSec').hidden = true;
+  $('spendSec').hidden = true;
 }
 
 function renderCards(p) {
@@ -973,6 +999,89 @@ function renderSplit(p) {
     + bar('Cost', p.rows.map((r) => ({ name: r.band.name, v: r.cost })), importShort);
 }
 
+// >>> costs-coverage-words
+// What the list is allowed to claim. The monitored circuits are not the house —
+// the reference account runs thirty-nine channels against a whole-home load, and
+// two of its outlets have been offline since April and August — so a panel
+// naming five circuits over a month's bill without this invites the reader to
+// believe those five are the bill.
+//
+// Measured in energy and said in those words. The strip above already carries a
+// minutes-watched figure, and the two answering different questions is the
+// distinction #23 was reverted twice for losing; a reader comparing them has to
+// be able to see which is which without being told.
+//
+// Three refusals, each of which would otherwise read as full coverage:
+// no denominator, two spans that do not describe the same stretch, and a share
+// above one — which is not coverage at all but a fault announcing itself, since
+// a part cannot exceed the whole.
+function coverageWords(coverage) {
+  if (!coverage) return '';
+  const share = coverage.fraction;
+  if (share === null || share === undefined || !isFinite(share)) {
+    return coverage.spans_match === false
+      ? 'These circuits and the house counter do not cover the same stretch of this period, '
+        + 'so what share of it they account for cannot be said.'
+      : 'What share of this period’s energy these circuits account for could not be measured, '
+        + 'so treat the list as a part of the bill rather than as the whole of it.';
+  }
+  if (share > 1) {
+    return `These circuits add up to ${pctStr(share)} of the house’s own measured energy, `
+      + 'which cannot be right — the two figures disagree, and the list is not to be read as '
+      + 'a share of the bill until they agree.';
+  }
+  return `These circuits account for ${pctStr(share)} of this period’s energy. `
+    + 'The rest is branches nobody has clamped, and is not in this list.';
+}
+// <<< costs-coverage-words
+
+// One row per circuit. Ranked by cost, both figures shown, and the band split
+// beside them — a circuit that only ever runs at peak outranking one that used
+// twice the energy is the useful thing here and a baffling one to meet without
+// the split to explain it.
+function renderSpenders(body, cur) {
+  const list = Array.isArray(body && body.circuits) ? body.circuits : [];
+  if (!list.length) { $('spendSec').hidden = true; return; }
+  $('spendSec').hidden = false;
+  $('spendCoverage').textContent = coverageWords(body.coverage);
+  const shades = [0.9, 0.62, 0.42, 0.28];
+  $('spendList').innerHTML = list.map((c) => {
+    const priced = c.bands.filter((b) => b.cost !== null && b.cost > 0);
+    const total = priced.reduce((a, b) => a + b.cost, 0);
+    // A circuit whose bands were all unmeasured gets the hatch the rest of the
+    // page gives an unknown, never an empty bar reading as "spent nothing".
+    const bar = total > 0
+      ? `<div class="splitbar">${priced.map((b, i) => {
+          const share = b.cost / total;
+          const shade = shades[Math.min(i, shades.length - 1)];
+          const why = b.partial ? ' — part of this band’s window was not measured' : '';
+          return `<span${b.partial ? ' class="part"' : ''}`
+            + ` style="flex:${(share * 1000).toFixed(2)};background:rgba(176,72,110,${shade})"`
+            + ` title="${esc(b.band)} ${esc(money(b.cost, cur))}${esc(why)}">`
+            + `${share > 0.18 ? esc(b.band) : ''}</span>`;
+        }).join('')}</div>`
+      : '<div class="splitbar none"></div>';
+    return `<div class="spendrow">
+      <span class="cn" title="${esc(c.name)}">${esc(c.name)}</span>
+      <span class="cv">${esc(money(c.cost, cur))}</span>
+      <span class="ck">${esc(uStr(c.kwh, 1, 'kWh'))}</span>
+      ${bar}
+    </div>`;
+  }).join('');
+  const anyPartial = list.some((c) => c.partial);
+  const anySilent = list.some((c) => c.cost === null);
+  const notes = [];
+  if (anyPartial) {
+    notes.push('A hatched segment is a band whose window was only partly recorded, so that '
+      + 'part of the figure is what was measured rather than the whole of it.');
+  }
+  if (anySilent) {
+    notes.push('A circuit showing ' + DASH + ' reported nothing at all over this period. That '
+      + 'is not a circuit that used nothing.');
+  }
+  $('spendCap').innerHTML = notes.join(' ');
+}
+
 function renderBands(p) {
   $('bandSec').hidden = false;
   const cur = p.currency;
@@ -1200,6 +1309,17 @@ async function monthCost(win) {
     + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
 }
 
+// Which circuits cost the most over the same window, and what share of the
+// month's energy they account for. A separate endpoint from monthCost — see
+// the try/catch around its call in refresh() for why a failure here must not
+// take the month's money off the page with it.
+async function monthSpenders(win) {
+  const zone = browserZone();
+  return getJSON(`/api/costs/circuits?start=${encodeURIComponent(win.startParam)}`
+    + `&end=${encodeURIComponent(win.endParam)}`
+    + (zone ? `&tz=${encodeURIComponent(zone)}` : ''));
+}
+
 // The service's answer in the shape the drawing below reads. A mapping, not a
 // calculation: every figure here was computed server-side, and the only
 // arithmetic is adding a band's cost to the counterfactual it is subtracted
@@ -1331,6 +1451,7 @@ async function refresh() {
 
   if (quote && !quote.configured) {
     renderNoTariff(quote.unreadable === true);
+    $('spendSec').hidden = true;
     renderAssumptions(null, false, quote.unreadable === true);
     pageNote(trouble.join(' '));
     stamp();
@@ -1339,6 +1460,7 @@ async function refresh() {
   if (!quote || !quote.cost) {
     // Configured but unpriceable: the service has a tariff and could not apply
     // it to this month. Nothing is invented to fill the gap.
+    $('spendSec').hidden = true;
     renderAssumptions(null, Boolean(quote), !quote);
     pageNote(trouble.join(' '));
     stamp();
@@ -1351,6 +1473,23 @@ async function refresh() {
   renderCards(priced);
   drawSankey(priced);
   renderBands(priced);
+
+  // Its own read and its own failure. A circuit list that could not be fetched
+  // must not take the month's money off the page with it — that money came from
+  // a different endpoint and is unaffected.
+  let spend = null;
+  try {
+    spend = await monthSpenders(win);
+  } catch (e) {
+    trouble.push(`The circuit spending could not be read: ${e.message}.`);
+  }
+  if (isStale(gen)) return;
+  if (spend) {
+    renderSpenders(spend, priced.currency);
+  } else {
+    $('spendSec').hidden = true;
+  }
+
   renderAssumptions(priced, true, false);
   pageNote(trouble.join(' '));
   stamp();
