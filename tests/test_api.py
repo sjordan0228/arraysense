@@ -2015,6 +2015,74 @@ def test_costs_keeps_a_partial_tier_when_none_of_them_reaches_lead(client: Any) 
     assert body["cost"]["cost_is_short"] is True
 
 
+def test_costs_picks_the_furthest_reaching_tier_when_none_of_them_brackets(
+    client: Any,
+) -> None:
+    # The other partial-tier test above leaves "full" genuinely empty, which
+    # the old loop happened to get right by accident — an empty candidate
+    # never overwrites ``rows``. This is the case that accident does not
+    # cover: collection began four days into the month, so nothing brackets
+    # ``lead`` on any tier, but the month is now old enough that thirty-day
+    # retention has pruned the raw tier down to its last eleven days —
+    # "full" is not empty, just worse than what came before it. The old
+    # "keep the last nonempty candidate" loop tried minute, then hourly,
+    # then full, and full — reaching back the least of the three — was
+    # tried last and so overwrote the better hourly rows sitting right
+    # there. The fix has to choose by how far back a candidate's earliest
+    # row actually reaches, not by which one happened to be asked last.
+    client.put("/api/settings", json={"tariff.bands": "Flat | 0.12 | 00:00-24:00"})
+    store = client.app.state.store
+    month_start = datetime(2025, 7, 1, tzinfo=UTC)
+    month_end = datetime(2025, 8, 1, tzinfo=UTC)
+    tail = month_end + timedelta(hours=3)
+    # What the collector actually recorded, before any retention pruned it:
+    # every tier starts here, four days into the month.
+    collection_began = month_start + timedelta(days=4)
+    # The minute tier's own retention has already pruned three of those four
+    # days away, in the same shape the straddling test above exercises.
+    minute_survives_from = collection_began + timedelta(days=3)
+    # The raw tier's thirty-day retention has pruned it far harder still —
+    # down to its last eleven days — which is what makes it nonempty rather
+    # than the empty last resort the other partial-tier test relies on.
+    raw_survives_from = month_end - timedelta(days=11)
+
+    hours = int((tail - collection_began).total_seconds() // 3600) + 1
+    for hour in range(hours):
+        store.append(
+            Sample(
+                timestamp=collection_began + timedelta(hours=hour),
+                readings={
+                    "grid_import_energy_total_kwh": 1000.0 + hour,
+                    "load_energy_total_kwh": 2000.0 + hour * 2,
+                },
+                battery_modules=(),
+            )
+        )
+    conn = sqlite3.connect(client.app.state.config.database_path)
+    rebuild_inverter_hourly(conn, int(collection_began.timestamp()), int(tail.timestamp()))
+    rebuild_inverter_minute(conn, int(minute_survives_from.timestamp()), int(tail.timestamp()))
+    conn.commit()
+    conn.execute(
+        "DELETE FROM inverter_raw WHERE timestamp < ?", (int(raw_survives_from.timestamp()),)
+    )
+    conn.commit()
+    conn.close()
+
+    body = client.get(
+        "/api/costs",
+        params={"start": "2025-07-01T00:00:00Z", "end": "2025-08-01T00:00:00Z", "tz": "UTC"},
+    ).json()
+    # Hourly reaches back to collection_began, four days further than minute
+    # and over a week further than the pruned raw tier — it is the one
+    # candidate that actually holds the most complete answer.
+    assert body["tier"] == "hourly"
+    assert body["cost"] is not None
+    assert body["cost"]["energy_cost"] is not None
+    # Genuinely short — the four days before collection began were never
+    # measured by anything, so the figure has to say so rather than read whole.
+    assert body["cost"]["cost_is_short"] is True
+
+
 def test_a_priced_bucket_carries_what_the_system_saved(client: Any) -> None:
     # The History page shows saving beside cost. It is the counterfactual — the
     # same house load bought entirely from the grid, less what the grid actually

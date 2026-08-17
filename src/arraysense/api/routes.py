@@ -1372,25 +1372,37 @@ def costs(
     # A month whose collection genuinely began after ``lead`` — a fresh
     # install, or one old enough that even the tier which does hold it starts
     # partway through — fails that bracket check on *every* candidate, and
-    # nothing ever breaks the loop. The last candidate tried is "full", kept
-    # only thirty days, so once raw and minute retention have both moved past
-    # the month its query comes back empty; unconditionally assigning ``rows``
-    # on every pass then let that empty last resort overwrite the nonempty,
-    # correctly-partial rows an earlier candidate (typically hourly) had
-    # already found. ``rows`` is only ever reassigned here when a candidate is
-    # itself nonempty, so a bracket-less fallthrough still prices whatever the
-    # least-coarse candidate actually returned instead of the emptiest thing
-    # tried last. ``period_energy`` still flags the gap before ``lead`` as
-    # unmeasured — this only stops a labelled partial from being thrown away
-    # in favour of a dash nothing justified.
+    # nothing ever breaks the loop. Every remaining candidate then has to be
+    # judged on how far back its own earliest row reaches, because the loop
+    # order (minute, hourly, full) is not an order of coverage — it is the
+    # order resolution gets coarser. Each tier is pruned from its own oldest
+    # end on its own schedule, so "full" is not reliably empty by the time the
+    # loop reaches it: thirty days of retention can still leave it holding the
+    # tail of an old month, later and worse than what hourly already found.
+    # Keeping whichever candidate merely happened to be nonempty and tried
+    # last picked exactly that tail once, silently discarding the earlier,
+    # more complete rows hourly was already holding — the same loss the
+    # bracket check exists to prevent, reached by a different door. So
+    # ``rows`` is only replaced here when a candidate both has rows and
+    # reaches further back than whatever is already kept, never merely for
+    # being nonempty and later in the loop; the first candidate to bracket
+    # ``lead`` is by definition as good as this gets, so it still stops the
+    # search rather than being compared against tiers coarser than it needs.
+    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
+    # this only stops a labelled partial from being thrown away in favour of
+    # a worse one that happened to be tried last.
     rows: list[dict[str, Any]] = []
     tier = "minute"
+    earliest: datetime | None = None
     for candidate in ("minute", "hourly", "full"):
         candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if candidate_rows:
-            rows, tier = candidate_rows, candidate
-            if cast(datetime, candidate_rows[0]["timestamp"]) - lead <= MAX_EDGE_GAP:
-                break
+        if not candidate_rows:
+            continue
+        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
+        if earliest is None or candidate_earliest < earliest:
+            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
+        if candidate_earliest - lead <= MAX_EDGE_GAP:
+            break
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 
