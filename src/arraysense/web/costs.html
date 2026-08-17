@@ -432,6 +432,31 @@ const shouldAutoRefresh = (cursor, today) =>
 // labelled as a finished bill is the mistake this page exists to avoid.
 let words = null;
 
+// >>> costs-refresh-generation
+// Which refresh() call is the current one. refresh() awaits two network reads
+// — the month's energy and its cost — and nothing waits for an earlier call to
+// land before starting another: a double-click on the picker, paging through
+// several months quickly, or the five-minute timer landing mid-click all start
+// a second refresh() while the first is still in flight. Without a way to tell
+// them apart, whichever call's fetches resolve last wins the page — not
+// whichever the reader asked for last — and the page can show one month's
+// numbers under another month's heading with nothing on screen saying so.
+//
+// refresh() takes a ticket from this counter on entry and checks isStale after
+// every await it makes, including the ones inside its own try blocks. A stale
+// response arriving late is not an error to report — it is a result to
+// discard, the same way a slow tab losing a race to a faster one is not a
+// bug — and a superseded refresh has to paint nothing at all: not a partial
+// render, not the picker, not an error note.
+let refreshGen = 0;
+
+// The one comparison every checkpoint in refresh() makes, named rather than
+// repeated as `gen !== refreshGen` at each of the three awaits: three copies
+// of the same comparison are three chances for one of them to drift, and a
+// missed checkpoint is the whole bug surviving.
+const isStale = (gen) => gen !== refreshGen;
+// <<< costs-refresh-generation
+
 async function monthEnergy(win) {
   const zone = browserZone();
   const url = `/api/energy?start=${encodeURIComponent(win.startParam)}`
@@ -784,12 +809,18 @@ function drawSankey(p) {
     return;
   }
   if (p.noSolarCost <= 0) {
-    hold('nothing has been used this month yet');
+    // "Yet" is right while the month still has time left to be used in, and
+    // wrong the moment it is named: nothing was left "yet" to happen in July
+    // once July is over, so a finished month drops it rather than pairing it
+    // with a month that has already closed.
+    hold(words.running
+      ? 'nothing has been used this month yet'
+      : `nothing was used ${esc(words.inMonth)}`);
     return;
   }
   if (p.savings < 0) {
-    hold('The grid supplied more than the house used this month, so there is no saving to '
-      + `draw: <b>${esc(money(p.energyCost, cur))}</b> was paid against `
+    hold(`The grid supplied more than the house used ${esc(words.inMonth)}, so there is no `
+      + `saving to draw: <b>${esc(money(p.energyCost, cur))}</b> was paid against `
       + `<b>${esc(money(p.noSolarCost, cur))}</b> the house would have cost. The bank was `
       + 'charged from the grid.');
     return;
@@ -1030,9 +1061,15 @@ function renderBands(p) {
     }
   }
   if (p.unpricedMinutes > 0) {
-    notes.push(`<span class="warn">The bands leave ${p.unpricedMinutes} minutes of this month `
-      + 'unpriced</span> — energy used in those hours belongs to no band, and is missing from '
-      + 'every figure here. Widen a band, or add one covering the rest of the day.');
+    // This one fires from a configuration gap — bands that do not cover all
+    // 24 hours — rather than a data gap, so on such an installation it would
+    // otherwise say "this month" on every past month the reader ever opens.
+    // "of this month unpriced" also does not take words.inMonth's own "in"
+    // prefix without doubling the preposition, hence the reorder rather than
+    // a straight substitution.
+    notes.push(`<span class="warn">The bands leave ${p.unpricedMinutes} minutes unpriced `
+      + `${esc(words.inMonth)}</span> — energy used in those hours belongs to no band, and is `
+      + 'missing from every figure here. Widen a band, or add one covering the rest of the day.');
   }
   if (p.rows.some((r) => r.importKwh === null)) {
     notes.push('A band showing ' + DASH + ' occurred and was never measured. Nothing of it is '
@@ -1240,11 +1277,17 @@ function monthNames(list) {
 }
 
 async function refresh() {
+  // This call's own ticket. Checked after every await below; see
+  // costs-refresh-generation for why a call that loses the race has to walk
+  // away rather than paint what it fetched.
+  const gen = ++refreshGen;
+
   // The month the *installation* is in, which is not always the month the
   // browser is in, and is never the browser's month measured from the browser's
   // midnight. The cursor hangs off this on the first pass and is left alone
   // afterwards, so the reader's choice survives every later refresh.
   const today = civilNow(await siteZone());
+  if (isStale(gen)) return;
   if (cursor === null) cursor = { year: today.year, month: today.month };
   const win = monthWindow(cursor, today);
   renderPicker(today);
@@ -1259,6 +1302,7 @@ async function refresh() {
   } catch (e) {
     trouble.push(`The month’s energy could not be read: ${e.message}.`);
   }
+  if (isStale(gen)) return;
   renderMonth(win, null);
   renderEnergy(bucket);
 
@@ -1272,6 +1316,7 @@ async function refresh() {
     trouble.push(`The month’s cost could not be read: ${e.message}. Any money still on screen `
       + 'is from the last successful read.');
   }
+  if (isStale(gen)) return;
 
   if (quote && !quote.configured) {
     renderNoTariff(quote.unreadable === true);
