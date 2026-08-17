@@ -113,8 +113,31 @@
      second encoding the palette rule asks for, and it is already this file's
      word for absent data: .splitbar.none hatches the whole bar the same way. */
   .splitbar span.part{min-width:7px;position:relative}
-  .splitbar span.part::after{content:'';position:absolute;inset:0;pointer-events:none;
+  /* The hatch runs along the top and bottom edges and leaves the middle clear.
+     Drawn across the whole segment it struck the label out — and raising the
+     label above it did not help, because the hatch is --ink and the label is
+     near-white, so on a dark theme the text was white on white however the
+     stacking resolved. A clear channel is the only fix that keeps both, and the
+     texture reads as well from two edges as from a full fill. */
+  .splitbar span.part::before,
+  .splitbar span.part::after{content:'';position:absolute;left:0;right:0;height:4px;
+    pointer-events:none;z-index:0;
     background:repeating-linear-gradient(45deg,var(--ink) 0 1px,transparent 1px 5px)}
+  .splitbar span.part::before{top:0}
+  .splitbar span.part::after{bottom:0}
+  /* The label rides above the hatch rather than under it. With ``inset:0`` the
+     overlay covered the whole segment including its text, and at row height with
+     a band's name in it — rather than a percentage — that struck every character
+     through and left the bar unreadable. The owner reported it from a screenshot;
+     no test could have. The <i> exists only to carry a stacking context, since a
+     bare text node cannot take one. */
+  .splitbar span i{position:relative;z-index:1;font-style:normal}
+  /* A hard edge between neighbouring bands. The segments are one hue separated by
+     lightness, which is the palette rule — but lightness alone is what the hatch
+     washes out, and a reader who cannot see hue then has nothing left telling them
+     where peak ends. Carved in the panel's own colour so it reads as a gap in both
+     themes rather than as a line of its own. */
+  .splitbar span + span{box-shadow:inset 2px 0 0 var(--panel)}
   /* One row per circuit: the name, what it cost, what it used, and where the
      money went inside it. The band bar is renderSplit's bar at row height —
      same hue, same shades, same hatch for a partly-unmeasured segment — because
@@ -130,7 +153,11 @@
   .spendrow .cv{font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
   .spendrow .ck{font-size:12px;text-align:right;font-variant-numeric:tabular-nums;
     color:var(--ink3)}
-  .spendrow .splitbar{height:14px}
+  /* The same height as the band split above it, and for the same reason that bar
+     is that height: a 10px label needs the room. Squeezed to 14 for compactness,
+     the hatch's edge strips ate the ascenders and descenders of the band name and
+     the row became the thing it exists to explain. */
+  .spendrow .splitbar{height:19px}
   /* Captions are sentences, so they borrow .lbl's colour and undo the rest of
      it — uppercase at .17em tracking turns an explanation into shouting. */
   .cap{display:block;margin-top:11px;font-size:11px;line-height:1.6;color:var(--ink3);letter-spacing:0}
@@ -1058,6 +1085,20 @@ function renderSpenders(body, cur) {
   $('spendSec').hidden = false;
   $('spendCoverage').textContent = coverageWords(body.coverage);
   const shades = [0.9, 0.62, 0.42, 0.28];
+  // >>> costs-hatch-earns-its-place
+  // Whether a hatched segment would distinguish anything. A marker every segment
+  // carries marks nothing: on an installation whose circuit history is younger
+  // than the month being priced, every band of every circuit is partial, and the
+  // bars came back solid diagonal — the labels struck through, and the lightness
+  // difference between peak and off-peak washed out, which is the encoding a
+  // colour-blind reader has instead of hue. The fact is not dropped; it moves to
+  // the caption, which can say it once in words rather than five times in texture.
+  const everyBandPartial = (rows) => {
+    const bands = rows.flatMap((c) => c.bands.filter((b) => b.cost !== null));
+    return bands.length > 0 && bands.every((b) => b.partial);
+  };
+  // <<< costs-hatch-earns-its-place
+  const blanket = everyBandPartial(list);
   $('spendList').innerHTML = list.map((c) => {
     // A band this circuit never reported in is absent, not zero — dropped
     // here as it is everywhere else. A band it reported at exactly $0 is a
@@ -1077,10 +1118,13 @@ function renderSpenders(body, cur) {
           const share = total > 0 ? b.cost / total : 1 / priced.length;
           const shade = shades[Math.min(i, shades.length - 1)];
           const why = b.partial ? ' — part of this band’s window was not measured' : '';
-          return `<span${b.partial ? ' class="part"' : ''}`
+          // The title still tells the truth about every segment; only the
+          // texture is withheld when it would cover the whole panel.
+          const hatch = b.partial && !blanket;
+          return `<span${hatch ? ' class="part"' : ''}`
             + ` style="flex:${Math.max(2, share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
             + ` title="${esc(b.band)} ${esc(money(b.cost, cur))}${esc(why)}">`
-            + `${share > 0.18 ? esc(b.band) : ''}</span>`;
+            + `${share > 0.18 ? `<i>${esc(b.band)}</i>` : ''}</span>`;
         }).join('')}</div>`
       : '<div class="splitbar none"></div>';
     return `<div class="spendrow">
@@ -1093,7 +1137,13 @@ function renderSpenders(body, cur) {
   const anyPartial = list.some((c) => c.partial);
   const anySilent = list.some((c) => c.cost === null);
   const notes = [];
-  if (anyPartial) {
+  if (blanket) {
+    // Said once, in words, because saying it five times in texture said nothing
+    // and cost the bars their labels. Same claim, and it still qualifies every
+    // figure in the panel — it simply names them all at once.
+    notes.push('Every band above was only partly recorded, so each figure is what was '
+      + 'measured rather than the whole of it.');
+  } else if (anyPartial) {
     notes.push('A hatched segment is a band whose window was only partly recorded, so that '
       + 'part of the figure is what was measured rather than the whole of it.');
   }
