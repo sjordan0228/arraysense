@@ -132,9 +132,11 @@ def select_tier(
 def _family(*, module: bool, circuit: bool) -> tuple[Tier, ...]:
     """The tier tuple a request names, so the choice is spelled in one place.
 
-    Three call sites picked between two families with the same inline
-    conditional; a third family turns that into three copies of a rule that has
-    to agree. Callers validate the combination before asking.
+    Two call sites picked between two families with the same inline
+    conditional, and a third family would have made that two copies of a rule
+    that has to agree — with the circuit case reachable from only one of them,
+    which is the shape a selection silently scored against the wrong tables.
+    Callers validate the combination before asking.
     """
     if circuit:
         return CIRCUIT_TIERS
