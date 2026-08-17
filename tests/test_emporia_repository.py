@@ -12,6 +12,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from arraysense.modules.emporia.parse import Circuit, Reading
 from arraysense.modules.emporia.repository import (
     MODULE,
@@ -20,6 +22,7 @@ from arraysense.modules.emporia.repository import (
     ChargerChange,
     CircuitRepository,
 )
+from arraysense.store.rollup import rebuild_circuit_hourly
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -250,6 +253,142 @@ def test_a_recategorised_circuit_takes_the_new_category(tmp_path: Path) -> None:
     repo.sync_circuits([Circuit(100000, "8", "AC", 2.0, "circuit", type_gid=11)], NOW)
     assert repo.latest()[0].type_gid == 11
     store.close()
+
+
+# --- reading a circuit's history ------------------------------------------
+
+
+def test_history_applies_the_multiplier_to_watts_and_kwh(tmp_path: Path) -> None:
+    # Both tiers store one leg of a 240 V circuit. A dryer stored at 2,000 W
+    # with a multiplier of 2.0 really drew 4,000 W, and an endpoint that
+    # forgot would halve every large appliance on the page — quietly, and in a
+    # direction that looks plausible.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    ids = repo.sync_circuits([Circuit(100000, "1,2,3", "Dryer", 2.0, "circuit")], start)
+    for minute in range(4):
+        repo.append_readings([Reading(100000, "1,2,3", 2000)], start + timedelta(minutes=minute))
+
+    got = repo.history(start, start + timedelta(minutes=5), tier="full")
+
+    (series,) = got.series
+    assert series.circuit_id == ids[(100000, "1,2,3")]
+    assert series.watts == (4000, 4000, 4000, 4000)
+    # 4,000 W held across four one-minute readings is 4000 * (4/60) / 1000 kWh.
+    assert series.kwh == pytest.approx(4000 * (4 / 60) / 1000)
+
+
+def test_history_keeps_a_silent_reading_as_none(tmp_path: Path) -> None:
+    # A circuit that was listed but did not answer stores NULL. Rendering that
+    # as zero is the defect this whole project exists to avoid: a dead outlet
+    # and an idle one are different facts.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "4", "Porch", 1.0, "circuit")], start)
+    repo.append_readings([Reading(100000, "4", 40)], start)
+    repo.append_readings([Reading(100000, "4", None)], start + timedelta(minutes=1))
+    repo.append_readings([Reading(100000, "4", 41)], start + timedelta(minutes=2))
+
+    got = repo.history(start, start + timedelta(minutes=3), tier="full")
+
+    (series,) = got.series
+    assert series.watts == (40, None, 41)
+
+
+def test_history_gives_a_circuit_with_no_readings_a_null_kwh(tmp_path: Path) -> None:
+    # Not zero kWh. A circuit offline since April used no measured energy and
+    # also used an unknown amount; zero would assert the first and hide the
+    # second, and the page has to be able to say "offline" rather than "0.0".
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "9", "Shed outlet", 1.0, "circuit")], start)
+
+    got = repo.history(start, start + timedelta(hours=1), tier="full")
+
+    (series,) = got.series
+    assert series.kwh is None
+    assert set(series.watts) <= {None}
+
+
+def test_history_marks_a_partly_recorded_hour_partial(tmp_path: Path) -> None:
+    # circuit_hourly carries sample_count precisely so an hour built from two
+    # readings does not claim the coverage of one built from sixty. Energy read
+    # off the average without it overstates a partly recorded hour.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1,2,3", "Dryer", 1.0, "circuit")], hour)
+    for minute in (0, 1):
+        repo.append_readings([Reading(100000, "1,2,3", 3000)], hour + timedelta(minutes=minute))
+    # Integer epoch seconds, not datetimes.
+    rebuild_circuit_hourly(
+        store._conn, int(hour.timestamp()), int((hour + timedelta(hours=1)).timestamp())
+    )
+
+    got = repo.history(hour, hour + timedelta(hours=1), tier="hourly")
+
+    (series,) = got.series
+    assert series.partial is True
+    # Two readings a minute apart is two minutes of coverage, not sixty.
+    assert series.kwh == pytest.approx(3000 * (2 / 60) / 1000)
+
+
+def test_history_can_be_narrowed_to_named_circuits(tmp_path: Path) -> None:
+    # The page draws five strips out of thirty-nine. Fetching all of them and
+    # discarding thirty-four is the query this argument exists to avoid.
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    ids = repo.sync_circuits(
+        [
+            Circuit(100000, "1", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "2", "Porch", 1.0, "circuit"),
+        ],
+        start,
+    )
+    repo.append_readings([Reading(100000, "1", 3000), Reading(100000, "2", 40)], start)
+
+    got = repo.history(
+        start, start + timedelta(minutes=1), tier="full", circuit_ids=[ids[(100000, "1")]]
+    )
+
+    assert [s.name for s in got.series] == ["Dryer"]
+
+
+def test_history_ranks_by_energy_not_by_the_last_reading(tmp_path: Path) -> None:
+    # A circuit at 5 kW for one minute used less than one at 1 kW for half an
+    # hour. Ranking on the latest watts would answer "what is on now", which the
+    # live list already answers, rather than "what ate the power".
+    repo, _store = _repo(tmp_path)
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+    repo.sync_circuits(
+        [
+            Circuit(100000, "1", "Kettle", 1.0, "circuit"),
+            Circuit(100000, "2", "Heat pump", 1.0, "circuit"),
+        ],
+        start,
+    )
+    repo.append_readings([Reading(100000, "1", 5000)], start)
+    for minute in range(30):
+        repo.append_readings([Reading(100000, "2", 1000)], start + timedelta(minutes=minute))
+
+    got = repo.history(start, start + timedelta(hours=1), tier="full")
+
+    assert [s.name for s in got.series] == ["Heat pump", "Kettle"]
+
+
+def test_history_returns_nothing_rather_than_raising_on_a_database_error(
+    tmp_path: Path,
+) -> None:
+    # latest() already swallows sqlite3.Error into a warning and an empty list:
+    # this runs unattended and a page that 500s tells the owner less than a page
+    # that says it has no circuits. history() matches it rather than inventing a
+    # second policy for the same failure.
+    repo, store = _repo(tmp_path)
+    store._conn.execute("DROP TABLE circuit_reading")
+    start = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+
+    got = repo.history(start, start + timedelta(hours=1), tier="full")
+
+    assert got.series == ()
 
 
 # --- the charger audit ----------------------------------------------------

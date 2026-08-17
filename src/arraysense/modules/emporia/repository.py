@@ -17,11 +17,44 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import pairwise
 
 from arraysense.modules.emporia.parse import Circuit, Reading
 from arraysense.store.sqlite_store import SqliteStore
 
 logger = logging.getLogger(__name__)
+
+# The tier names this module answers to, mapped to the tables that hold them. A
+# name is validated against this map before it reaches a query string, so the
+# table name interpolated into the SQL below is never a caller's string.
+_CIRCUIT_TABLES = {"full": "circuit_reading", "hourly": "circuit_hourly"}
+
+_HOUR_SECONDS = 3600
+# What one reading is taken to cover: the Emporia poll interval's own default,
+# which settings.py sets to 60 s. Used twice — as how much of an hour each of a
+# bucket's ``sample_count`` readings accounts for, and as the fallback when a
+# window holds too few raw rows to measure their spacing.
+_POLL_SECONDS = 60
+
+
+def _elapsed_or_default(stamps: Sequence[int]) -> int:
+    """How long one raw reading covers, taken from the window's own spacing.
+
+    Measured rather than assumed because the repository is not told the poll
+    interval, and because the spacing actually achieved need not be the one
+    configured. The median gap is taken rather than the mean so that a poller
+    stopped for an hour inside the window does not inflate every reading's
+    share — the hole then simply goes uncounted, which is the right answer for
+    a stretch nobody measured.
+
+    Fewer than two readings leaves no spacing to measure, so this falls back to
+    the module's default interval: a lone reading has to be worth some duration
+    or a one-sample window reports no energy at all.
+    """
+    if len(stamps) < 2:
+        return _POLL_SECONDS
+    gaps = sorted(b - a for a, b in pairwise(stamps))
+    return max(1, gaps[len(gaps) // 2])
 
 
 @dataclass(frozen=True)
@@ -42,6 +75,50 @@ class CircuitLatest:
     # What the owner said this circuit is, in Emporia's own numbering. The page
     # picks an icon from it; None means nobody has categorised the clamp.
     type_gid: int | None = None
+
+
+@dataclass(frozen=True)
+class CircuitSeries:
+    """One circuit's readings over a window, with the energy they add up to.
+
+    ``kwh`` is None rather than 0.0 for a circuit that reported nothing at all
+    across the window. The two are different claims — "it used no energy" and
+    "nobody heard from it" — and a bar chart that renders the second as the
+    first puts a dead outlet at the bottom of a ranking as though it were a
+    quiet one.
+
+    ``partial`` says the energy figure was built from buckets that were not
+    fully recorded. It is not a doubt about the number; the number is what was
+    measured. It is what lets the page label a figure rather than present a
+    part as a whole. Only the hourly tier can raise it, because only the hourly
+    tier stores a sample count — a raw row is one reading, and how much of the
+    window those readings between them cover is already in the energy.
+    """
+
+    circuit_id: int
+    device_gid: int
+    channel_num: str
+    name: str
+    kind: str
+    watts: tuple[int | None, ...]
+    kwh: float | None
+    partial: bool
+
+
+@dataclass(frozen=True)
+class CircuitHistory:
+    """Every requested circuit over one window, on one shared clock.
+
+    One timestamp array for all of them rather than one each. The circuits are
+    polled together and stored under a single instant — ``append_readings``
+    takes one ``now`` for the whole batch — so they genuinely share sample
+    times, and a chart drawing five strips against five near-identical x arrays
+    pays five times for one fact.
+    """
+
+    timestamps: tuple[int, ...]
+    series: tuple[CircuitSeries, ...]
+    tier: str
 
 
 class CircuitRepository:
@@ -168,6 +245,112 @@ class CircuitRepository:
         ]
         out.sort(key=lambda c: (c.watts is None, -(c.watts or 0), c.name))
         return out
+
+    def history(
+        self,
+        start: datetime,
+        end: datetime,
+        tier: str,
+        circuit_ids: Sequence[int] | None = None,
+    ) -> CircuitHistory:
+        """Circuits over a window, ranked by the energy each one used.
+
+        Ranked by energy rather than by the newest reading, because the live
+        list already answers "what is drawing that" and this answers "what ate
+        the power" — a kettle at 5 kW for a minute is not the day's biggest
+        load and sorting on watts would say it was.
+
+        The multiplier is applied here, as it is in ``latest()`` and for the
+        same reason: both tiers store one leg of a 240 V circuit, so the dryer,
+        the oven and both air conditioners read half without it. The series and
+        the energy are multiplied in one place so they cannot disagree.
+
+        Energy comes from the readings rather than from the window. An hourly
+        bucket built from two of sixty samples covers two minutes, and
+        ``sample_count`` is stored precisely so that hour is not read as a
+        full one — coverage in minutes watched is not coverage in energy
+        accounted for, and this is the figure the second question depends on.
+
+        A database error yields an empty history rather than raising. This runs
+        unattended on someone's inverter and a page saying it has no circuits
+        tells the owner more than a page returning 500.
+        """
+        if tier not in _CIRCUIT_TABLES:
+            raise ValueError(f"unknown circuit tier {tier!r}")
+        table = _CIRCUIT_TABLES[tier]
+        counted = tier == "hourly"
+        first = int(start.timestamp())
+        last = int(end.timestamp())
+        try:
+            circuits = self._store._conn.execute(
+                "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
+            ).fetchall()
+            rows = self._store._conn.execute(
+                "SELECT timestamp, circuit_id, watts,"
+                f" {'sample_count' if counted else '1'}"
+                f"  FROM {table}"
+                "  WHERE timestamp >= ? AND timestamp < ?"
+                "  ORDER BY timestamp",
+                (first, last),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("could not read circuit history: %s", exc)
+            return CircuitHistory(timestamps=(), series=(), tier=tier)
+
+        wanted = None if circuit_ids is None else set(circuit_ids)
+        meta = {int(row[0]): row for row in circuits if wanted is None or int(row[0]) in wanted}
+        stamps = sorted({int(row[0]) for row in rows})
+        slot = {stamp: index for index, stamp in enumerate(stamps)}
+
+        # What one row of the raw tier is taken to cover. Measured from the
+        # stamps the poll actually landed on rather than from the window, so a
+        # stretch nobody recorded contributes nothing instead of being smeared
+        # over the readings either side of it. Not consulted on the hourly
+        # tier, where sample_count says how much of each hour was recorded.
+        reading_seconds = _elapsed_or_default(stamps)
+        watts: dict[int, list[int | None]] = {
+            circuit_id: [None] * len(stamps) for circuit_id in meta
+        }
+        joules: dict[int, float] = dict.fromkeys(meta, 0.0)
+        seen: set[int] = set()
+        partial: set[int] = set()
+        for stamp, circuit_id, raw, samples in rows:
+            key = int(circuit_id)
+            if key not in meta or raw is None:
+                continue
+            value = round(float(raw) * float(meta[key][5]))
+            watts[key][slot[int(stamp)]] = value
+            seen.add(key)
+            if counted:
+                # An hour holds 3,600 seconds however many readings landed in
+                # it, and the poll interval is the owner's to set as low as ten
+                # seconds. Without the clamp a faster poller than the one
+                # assumed here would credit an hour with six hours of energy.
+                covered = min(int(samples) * _POLL_SECONDS, _HOUR_SECONDS)
+                if covered < _HOUR_SECONDS:
+                    partial.add(key)
+            else:
+                covered = reading_seconds
+            joules[key] += value * covered
+
+        series = [
+            CircuitSeries(
+                circuit_id=circuit_id,
+                device_gid=int(row[1]),
+                channel_num=str(row[2]),
+                name=str(row[3]),
+                kind=str(row[4]),
+                watts=tuple(watts[circuit_id]),
+                kwh=(joules[circuit_id] / 3_600_000) if circuit_id in seen else None,
+                partial=circuit_id in partial,
+            )
+            for circuit_id, row in meta.items()
+        ]
+        # A circuit nobody heard from sorts last, below one measured at nothing.
+        # Ordering a silence above a fact is what latest() already refuses to do
+        # and this list is read top-down for the same reason.
+        series.sort(key=lambda s: (s.kwh is None, -(s.kwh or 0.0), s.name))
+        return CircuitHistory(timestamps=tuple(stamps), series=tuple(series), tier=tier)
 
 
 # Who decided a change. Two values rather than a boolean because the audit is
