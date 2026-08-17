@@ -173,6 +173,13 @@
     </div>
     <div id="weatherBands"></div>
   </section>
+
+  <section class="p">
+    <div class="chead"><h2>Circuits</h2>
+      <span class="legend muted">per-circuit power from the Emporia module</span>
+    </div>
+    <div id="circuitBands"></div>
+  </section>
 </main>
 
 <script>
@@ -480,6 +487,7 @@ const SECTIONS = [
   { key: 'packs', host: 'packBands' },
   { key: 'ac', host: 'acBands' },
   { key: 'weather', host: 'weatherBands' },
+  { key: 'circuits', host: 'circuitBands' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -506,6 +514,7 @@ const GRAPH_TABS = [
   { key: 'packs', title: 'Packs' },
   { key: 'ac', title: 'AC' },
   { key: 'weather', title: 'Weather' },
+  { key: 'circuits', title: 'Circuits' },
 ];
 const DEFAULT_GRAPH_TAB = 'all';
 // Which tab this browser was on, and whether the weather bands are pinned. `as.`
@@ -515,13 +524,22 @@ const DEFAULT_GRAPH_TAB = 'all';
 const GRAPH_TAB_KEY = 'as.graphsTab';
 const GRAPH_PIN_KEY = 'as.graphsPinWeather';
 
-// The tabs this device has. Packs is hardware rather than a reading, so a
+// The tabs this installation has. Packs is hardware rather than a reading: a
 // machine whose driver declares no per-module battery is not offered a tab
-// that opens an empty section. Everything else is on every device, and an
-// undeclared one keeps the lot — capHasModules is what decides, so the tab bar
-// and the section agree by construction rather than by both remembering to.
-function graphTabsFor(hasModules) {
-  return GRAPH_TABS.filter((t) => t.key !== 'packs' || hasModules !== false);
+// that opens an empty section, and an undeclared answer keeps the tab, because
+// every shipped driver has packs and "unknown" is not a report that they are
+// absent. Circuits is the same rule pointed the other way: they come from the
+// optional Emporia module rather than from the inverter at all, so the module
+// is off until an owner turns it on and connects an account — and an
+// undeclared answer hides the tab instead, because here "unknown" has never
+// been shown to be present. Packs defaults present because the shipped norm is
+// to have them; circuits defaults absent because the shipped norm is not to
+// have connected the module yet. The asymmetry is deliberate; do not tidy the
+// two rules into matching one another.
+function graphTabsFor(hasModules, hasCircuits) {
+  return GRAPH_TABS
+    .filter((t) => t.key !== 'packs' || hasModules !== false)
+    .filter((t) => t.key !== 'circuits' || hasCircuits === true);
 }
 
 // The tab the reader should land on. The URL fragment wins when it names a tab;
@@ -572,13 +590,15 @@ const sectionVisible = (key) =>
 function wantedTab() {
   let held = null;
   try { held = localStorage.getItem(GRAPH_TAB_KEY); } catch (e) { /* private browsing */ }
-  return wantedGraphTab(location.hash.replace('#', ''), held, graphTabsFor(hasModules));
+  return wantedGraphTab(
+    location.hash.replace('#', ''), held, graphTabsFor(hasModules, hasCircuits)
+  );
 }
 
 function drawTabs() {
   const bar = $('tabs');
   if (!bar) return;
-  bar.innerHTML = graphTabsFor(hasModules).map((t) =>
+  bar.innerHTML = graphTabsFor(hasModules, hasCircuits).map((t) =>
     `<button type="button" role="tab" data-tab="${esc(t.key)}">${esc(t.title)}</button>`).join('');
   bar.querySelectorAll('button').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -694,6 +714,22 @@ async function loadCaps() {
   hasModules = capHasModules(device);
   bands = BANDS.filter((b) => b.site || neededBy(b).every((m) => capHasMetric(device, m)))
     .filter((b) => hasModules || !b.derived);
+}
+
+// Whether the Circuits tab has anything to draw. `enabled` is the setting
+// emporia.html itself gates its own circuit list on — the owner's switch, not
+// the poller's momentary connection state — so a module that is on but
+// between polls, or mid-reconnect, still keeps its tab rather than flickering
+// it away. A fetch that fails or a module this build does not carry at all
+// leaves hasCircuits at its default of false: unlike capabilities, silence
+// here is not "unknown, so keep it" but "never shown to be present."
+let hasCircuits = false;
+
+async function loadEmporiaStatus() {
+  try {
+    const r = await fetch('/api/emporia/status');
+    if (r.ok) hasCircuits = (await r.json()).enabled === true;
+  } catch (err) { /* unknown: circuits tab stays hidden */ }
 }
 
 // What the kept bands read, split by which writer's clock the metric lives on.
@@ -1266,9 +1302,10 @@ async function boot() {
   $('zoomReset').onclick = resetZoom;
   setInterval(refreshZoomState, 900);
   wirePin();
-  // Both answers shape the first request — the cadence decides the width and
-  // the capabilities decide the band list — and neither needs the other.
-  const [secs] = await Promise.all([pollInterval(), loadCaps()]);
+  // Three answers shape the first paint — the cadence decides the width, the
+  // capabilities decide the band list, and the Emporia status decides whether
+  // the Circuits tab is offered at all — and none of them needs another.
+  const [secs] = await Promise.all([pollInterval(), loadCaps(), loadEmporiaStatus()]);
   cadence = secs;
   buildSections();
   drawTabs();

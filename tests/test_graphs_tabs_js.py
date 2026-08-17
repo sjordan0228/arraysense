@@ -189,3 +189,29 @@ def test_the_packs_tab_leaves_with_its_section() -> None:
     assert results["hash"] == "all", "a link to a section this device lacks lands on All"
     assert results["stored"] == "all", "a remembered tab this device lacks falls back to All"
     assert results["kept"] == "packs"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_circuits_tab_is_offered_only_where_emporia_is_running() -> None:
+    # A tab that opens an empty section is the defect #12 named: a page must
+    # render from what the installation declares, not from one owner's shape.
+    # An installation with no Emporia account has no circuits to draw.
+    out = _run(
+        "console.log('with:' + graphTabsFor(true, true).map(t => t.key).join(','));"
+        "console.log('without:' + graphTabsFor(true, false).map(t => t.key).join(','));"
+    )
+    with_circuits, without = (line.split(":", 1)[1] for line in out.splitlines())
+    assert "circuits" in with_circuits.split(",")
+    assert "circuits" not in without.split(",")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_link_to_the_circuits_tab_lands_on_all_where_there_are_none() -> None:
+    # /graphs#circuits sent between two owners must land somewhere real for a
+    # receiver with no Emporia account, exactly as /graphs#packs already does
+    # for one with no packs.
+    out = _run(
+        "const tabs = graphTabsFor(true, false);"
+        "console.log(wantedGraphTab('circuits', null, tabs));"
+    )
+    assert out == "all"
