@@ -136,7 +136,12 @@
      lightness, which is the palette rule — but lightness alone is what the hatch
      washes out, and a reader who cannot see hue then has nothing left telling them
      where peak ends. Carved in the panel's own colour so it reads as a gap in both
-     themes rather than as a line of its own. */
+     themes rather than as a line of its own.
+
+     Deliberately unscoped to renderSpenders' bar alone: .splitbar is the class
+     renderSplit's own "By rate band" bar carries too, and a seam is a stronger
+     boundary cue than lightness there as well — for the same colour-blind reader,
+     not a side effect worth narrowing back out. */
   .splitbar span + span{box-shadow:inset 2px 0 0 var(--panel)}
   /* One row per circuit: the name, what it cost, what it used, and where the
      money went inside it. The band bar is renderSplit's bar at row height —
@@ -1012,7 +1017,7 @@ function renderSplit(p) {
       return `<span${short ? ' class="part"' : ''}`
         + ` style="flex:${(share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
         + ` title="${esc(v.name)} ${esc(pctStr(share))}${esc(why)}">`
-        + `${share > 0.13 ? esc(pctStr(share)) : ''}</span>`;
+        + `${share > 0.13 ? `<i>${esc(pctStr(share))}</i>` : ''}</span>`;
     }).join('');
     return `<div class="splitrow"><span class="sl">${esc(label)}</span>`
       + `<div class="splitbar">${cells}</div></div>`;
