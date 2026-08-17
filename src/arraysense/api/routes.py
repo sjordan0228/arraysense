@@ -3369,6 +3369,76 @@ async def emporia_circuits(request: Request) -> dict[str, Any]:
     }
 
 
+def _circuit_coverage(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    *,
+    circuits_kwh: float | None,
+    recorded_seconds: int,
+    window_seconds: int,
+) -> dict[str, Any]:
+    """What share of the house's energy the monitored circuits account for.
+
+    Written once and called twice: the circuit history endpoint draws bars
+    against it and the Costs page's circuit ranking prices against it, and two
+    copies of this arithmetic would answer the same question two ways on two
+    tabs of the same page. It is also the arithmetic #23 was reverted over
+    twice, which is reason enough for there to be one of it.
+
+    Computed from energy, never from minutes watched. The monitored circuits are
+    not the house — unmonitored branches are real, and two of the reference
+    account's outlets have been offline since April and August — so a page
+    naming a handful of circuits without this invites the reader to believe they
+    are the whole bill.
+
+    A numerator that recorded for a fraction of the window its denominator
+    covers is arithmetic between two different spans, not a share. ``fraction``
+    is withheld rather than re-based on the recorded span, because the answer
+    carries no house figure for that span — only for the whole window — and
+    inventing one by assuming the house drew power evenly is exactly the
+    estimate this project refuses to dress as a meter reading.
+
+    It is reported uncapped: a part cannot exceed the whole, so a figure above
+    one is not coverage at all but a fault saying so — a mains channel that
+    escaped the exclusion, a multiplier set for the wrong circuit, or two
+    windows that stopped being comparable. Clamping it to 1.0 renders every
+    one of those as perfect coverage, which is the one reading guaranteed to
+    be wrong, and would hide the fault for as long as it lasted. The page
+    renders anything above one as a disagreement rather than as a full bar.
+    """
+    span = timedelta(seconds=window_seconds)
+    coverage_end = _coverage_end(store, start, end, span)
+    house_kwh = (
+        counter_kwh(store, start, coverage_end)
+        if coverage_end is not None and coverage_end > start
+        else None
+    )
+    # Whether the two figures describe the same stretch of time closely enough
+    # for one to be read as a share of the other. ``_check_range`` has already
+    # refused anything that does not run forwards, so the guard is for a range
+    # whose seconds round to nothing: there is no shortfall to find in a window
+    # of no length, and the house figure over one is zero anyway.
+    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
+    return {
+        "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
+        "house_kwh": None if house_kwh is None else round(house_kwh, 3),
+        "fraction": (
+            None
+            if circuits_kwh is None or house_kwh is None or house_kwh <= 0 or not spans_match
+            else round(circuits_kwh / house_kwh, 4)
+        ),
+        # What the span check was decided on, so the page can say it without
+        # measuring it again. The old browser-side count credited every hourly
+        # bucket that held anything with a full 3,600 seconds, which reported
+        # a seven-day window holding one reading an hour as seven days
+        # recorded and defeated the check from the other side.
+        "recorded_seconds": recorded_seconds,
+        "window_seconds": window_seconds,
+        "spans_match": spans_match,
+    }
+
+
 @router.get("/emporia/history")
 def emporia_history(
     request: Request,
@@ -3444,27 +3514,22 @@ def emporia_history(
         history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
-        coverage_end = _coverage_end(store, start, end, span)
-        house_kwh = (
-            counter_kwh(store, start, coverage_end)
-            if coverage_end is not None and coverage_end > start
-            else None
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        measured = [s.kwh for s in parts if s.kwh is not None]
+        circuits_kwh = sum(measured) if measured else None
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=circuits_kwh,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
         )
 
     # The poller holds this, not the repository: it is what the last status call
     # said, refreshed on the module's own clock. emporia_circuits already reads
     # it from the same place.
     connections = poller.connections
-    parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
-    measured = [s.kwh for s in parts if s.kwh is not None]
-    circuits_kwh = sum(measured) if measured else None
-    # Whether the two figures describe the same stretch of time closely enough
-    # for one to be read as a share of the other. ``_check_range`` has already
-    # refused anything that does not run forwards, so the guard is for a range
-    # whose seconds round to nothing: there is no shortfall to find in a window
-    # of no length, and the house figure over one is zero anyway.
-    recorded_seconds = history.recorded_seconds
-    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
     return {
         "tier": history.tier,
         "timestamps": list(history.timestamps),
@@ -3482,42 +3547,7 @@ def emporia_history(
             }
             for s in parts
         ],
-        "coverage": {
-            "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
-            "house_kwh": None if house_kwh is None else round(house_kwh, 3),
-            "fraction": (
-                None
-                if circuits_kwh is None
-                or house_kwh is None
-                or house_kwh <= 0
-                # A numerator that recorded for a fraction of the window its
-                # denominator covers is arithmetic between two different spans,
-                # not a share. Withheld rather than re-based on the recorded
-                # span, because this response carries no house figure for that
-                # span — only for the whole window — and inventing one by
-                # assuming the house drew power evenly is exactly the estimate
-                # this project refuses to dress as a meter reading.
-                or not spans_match
-                # Reported uncapped, deliberately. A part cannot exceed the
-                # whole, so a fraction above one is not a coverage figure at
-                # all — it is a fault saying so: a mains channel that escaped
-                # the exclusion, a multiplier set for the wrong circuit, or two
-                # windows that stopped being comparable. Clamping it to 1.0
-                # would render every one of those as perfect coverage, which is
-                # the one reading guaranteed to be wrong, and would hide the
-                # fault for as long as it lasted. The page renders anything
-                # above one as a disagreement rather than as a full bar.
-                else round(circuits_kwh / house_kwh, 4)
-            ),
-            # What the span check was decided on, so the page can say it
-            # without measuring it again. The old browser-side count credited
-            # every hourly bucket that held anything with a full 3,600 seconds,
-            # which reported a seven-day window holding one reading an hour as
-            # seven days recorded and defeated the check from the other side.
-            "recorded_seconds": recorded_seconds,
-            "window_seconds": window_seconds,
-            "spans_match": spans_match,
-        },
+        "coverage": coverage,
     }
 
 
