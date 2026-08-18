@@ -49,6 +49,12 @@ const LIGHT_TOKENS = `
          dark crosshair where the dark theme's is white. */
       --tip:rgba(255,255,255,.96);
       --tip-shadow:0 6px 22px rgba(0,0,0,.18);
+      /* --tip with its transparency taken off, for the one place a canvas
+         needs it: the band names on the Circuits stack are stroked with it
+         before they are filled. A tooltip is meant to sit slightly over what
+         it covers, so --tip keeps its alpha; a halo that lets 4% of the band
+         through is not a halo, so this one does not. */
+      --label-halo:#fff;
       --cursor-x:rgba(0,0,0,.34);
       /* The same walk through the same hues, lightened: dawn rather than dusk.
          Keeping the shape means the page still reads as this installation's
@@ -149,6 +155,8 @@ const BASE_CSS = `
        are the originals these replaced, unchanged. */
     --tip:rgba(6,8,18,.94);
     --tip-shadow:0 6px 22px rgba(0,0,0,.45);
+    /* --tip at full opacity; see the light theme's note. */
+    --label-halo:#060812;
     --cursor-x:rgba(255,255,255,.34);
     /* The page itself. Left as a literal, a light theme put light panels and
        dark text on a dark page: the headings sat on their own background and
@@ -2059,6 +2067,7 @@ const INK_FALLBACK = {
   // Reached only when there is no computed style at all, which is the dark
   // theme's case by definition — with a stylesheet the media query answers.
   '--theme':'dark', '--zero-rule':'rgba(255,255,255,.28)', '--wash-rgb':'255,255,255',
+  '--label-halo':'#060812',
   // No stylesheet means no look, and the wash belongs to a look. Zero draws the
   // charts the way they were drawn before it existed.
   '--series-wash':'0',
