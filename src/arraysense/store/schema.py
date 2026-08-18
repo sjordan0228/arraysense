@@ -334,6 +334,13 @@ def _circuit_ddl(as_name: str) -> str:
         # because a clamp nobody has set up has none, and a zero here would be a
         # category rather than the absence of one.
         "    type_gid INTEGER,\n"
+        # What contains this circuit, as Emporia's device record states it.
+        # Nullable, and the null is the meaningful value: a device nothing else
+        # contains is the only kind that may be added to a total. Without it a
+        # subpanel's branches, a charger and a smart plug are summed on top of
+        # the main-panel clamps already measuring them (#212, #219).
+        "    parent_device_gid INTEGER,\n"
+        "    parent_channel_num TEXT,\n"
         "    first_seen INTEGER NOT NULL,\n"
         "    last_seen INTEGER NOT NULL,\n"
         "    UNIQUE (device_gid, channel_num)\n"
@@ -775,6 +782,11 @@ LATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     # guess, because their raw readings are pruned at thirty days and the
     # measurement cannot be made after the fact.
     CIRCUIT_HOURLY_TABLE: (("covered_seconds", "INTEGER"),),
+    # Added after the table shipped, so an installation recording circuits since
+    # 1.1.0 has rows with neither. They stay NULL until the next sync, which
+    # runs every poll and rewrites every circuit it is told about — so the gap
+    # closes on its own within one interval rather than needing a migration.
+    CIRCUIT_TABLE: (("parent_device_gid", "INTEGER"), ("parent_channel_num", "TEXT")),
 }
 
 

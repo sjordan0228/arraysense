@@ -7,6 +7,40 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.6 — 17 August 2026
+
+The monitored circuits stop out-totalling the house.
+
+### Fixed
+
+- **A device that sits inside a circuit is no longer counted beside it.** On the
+  reference account the monitored circuits summed to 131% of the house's own
+  measured energy, which is not a coverage figure at all — a part cannot exceed
+  the whole. The subpanel's sixteen branches, the EV charger and four smart
+  plugs were all added on top of the main panel's clamps that already measure
+  them: 629 kWh of an August that only 1,721 kWh passed through.
+
+  Emporia publishes the containment and we discarded it. It arrives as two flat
+  fields on each device, `parentDeviceGid` and `parentChannelNum`, rather than
+  as nesting in the reply — the only true nesting is a monitor's own channel
+  bank, which repeats its parent's identifier and declares nothing, so a
+  subpanel's branches read as the house's own until the bank inherits what its
+  monitor declared.
+
+  The rule is stated once, in `alerts.counts_toward_total`, and read by all
+  three sums: the Costs page's coverage sentence, the Circuits tab's coverage
+  block, and the dashboard's high-usage alert, which had the same fault at
+  instantaneous power. Coverage on the reference account now reads 94.9%.
+
+  **Nothing disappears from a page.** The rule governs what may be added, never
+  what may be named: a charger that genuinely drew 3 kW keeps its row and its
+  figure, because "which load" is the question a ranking exists to answer. Only
+  the total changed.
+
+  No migration and no rewritten history — this is a summing rule, not a storage
+  one. The two new columns arrive on an existing database when it is opened, and
+  fill themselves at the next poll.
+
 ## 1.1.5 — 17 August 2026
 
 The Costs page can say which circuits the money went on.

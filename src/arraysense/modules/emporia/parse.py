@@ -49,6 +49,15 @@ class Circuit:
     # for these (the API answers "apiMethod 'getChannelTypes' is invalid"), so
     # what each number means is learned from the account that uses it.
     type_gid: int | None = None
+    # What this circuit sits inside, as Emporia's own device record states it.
+    # The containment is published as two flat fields on the device rather than
+    # as JSON nesting, and without it every device reads as a peer of the house
+    # — so a subpanel's branches, a charger and a smart plug are all added on
+    # top of the main panel's clamps that already measure them, and the sum
+    # reaches 131% of the house (#212, #219). None means a device nothing else
+    # contains, which is the only kind that may be added to a total.
+    parent_device_gid: int | None = None
+    parent_channel_num: str | None = None
 
     @property
     def identity(self) -> tuple[int, str]:
@@ -130,9 +139,31 @@ def _label_for(
     return f"Device {device_gid} ch {channel_num}"
 
 
-def _walk(node: object, out: list[Circuit]) -> None:
+def _parent_of(
+    node: dict[str, object], inherited: tuple[int | None, str | None]
+) -> tuple[int | None, str | None]:
+    """What contains this device: its own declaration, or its ancestor's.
+
+    A monitor states its parent once, on the device record. Its channel bank
+    arrives as a nested record that repeats the gid and declares nothing, so
+    read on its own terms a subpanel's sixteen branches look like the house's
+    own — which is the larger half of the double count.
+    """
+    gid = node.get("parentDeviceGid")
+    if isinstance(gid, int) and not isinstance(gid, bool):
+        channel = node.get("parentChannelNum")
+        return gid, channel if isinstance(channel, str) else None
+    return inherited
+
+
+def _walk(
+    node: object,
+    out: list[Circuit],
+    inherited: tuple[int | None, str | None] = (None, None),
+) -> None:
     if not isinstance(node, dict):
         return
+    parent_gid, parent_channel = _parent_of(node, inherited)
     gid = node.get("deviceGid")
     model = str(node.get("model", ""))
     if isinstance(gid, int):
@@ -164,12 +195,14 @@ def _walk(node: object, out: list[Circuit]) -> None:
                             if isinstance(raw_type, int) and not isinstance(raw_type, bool)
                             else None
                         ),
+                        parent_device_gid=parent_gid,
+                        parent_channel_num=parent_channel,
                     )
                 )
     nested = node.get("devices")
     if isinstance(nested, list):
         for child in nested:
-            _walk(child, out)
+            _walk(child, out, (parent_gid, parent_channel))
 
 
 def circuits_from_devices(payload: object) -> list[Circuit]:

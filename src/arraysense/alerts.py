@@ -52,6 +52,24 @@ DEFAULT_TOP = 5
 NOT_A_CULPRIT = frozenset({"mains"})
 
 
+def counts_toward_total(kind: str, parent_device_gid: int | None) -> bool:
+    """Whether this circuit may be added to a total of the circuits.
+
+    Two ways to be inside something already counted, and both have been paid
+    for. A monitor's mains channel is the sum of the circuits beside it, so
+    adding it doubles the house. And a device Emporia says sits inside another
+    — a subpanel's branches, a charger on a clamped breaker, a plug in a
+    measured socket — is energy the counted circuits already carry: on the
+    reference account it took the circuit sum to 131% of the house, and a part
+    cannot exceed the whole (#212, #219).
+
+    Both are still shown. This governs what may be summed, never what may be
+    named — "which load" is the question a ranking exists to answer, and a
+    charger that genuinely drew 3 kW deserves its row.
+    """
+    return kind not in NOT_A_CULPRIT and parent_device_gid is None
+
+
 @dataclass(frozen=True)
 class Contributor:
     """One circuit that might be responsible, as this module needs it.
@@ -65,6 +83,9 @@ class Contributor:
     name: str
     watts: int | None
     kind: str
+    # What contains this circuit, as Emporia states it. None for a device
+    # nothing else contains — the only kind that may be added to a total.
+    parent_device_gid: int | None = None
 
 
 @dataclass(frozen=True)
@@ -117,7 +138,12 @@ def high_usage(
         for circuit in circuits
         if circuit.watts is not None and circuit.kind not in NOT_A_CULPRIT
     ]
-    accounted = sum(int(circuit.watts or 0) for circuit in measured) if measured else None
+    summable = [
+        circuit
+        for circuit in measured
+        if counts_toward_total(circuit.kind, circuit.parent_device_gid)
+    ]
+    accounted = sum(int(circuit.watts or 0) for circuit in summable) if summable else None
     ranked = sorted(measured, key=lambda circuit: (-(circuit.watts or 0), circuit.name))
     return HighUsage(
         load_w=load_w,

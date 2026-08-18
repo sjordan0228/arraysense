@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
-from arraysense.alerts import NOT_A_CULPRIT, Contributor, high_usage
+from arraysense.alerts import NOT_A_CULPRIT, Contributor, counts_toward_total, high_usage
 from arraysense.auth import (
     MIN_PASSWORD_LENGTH,
     Sessions,
@@ -765,7 +765,7 @@ def _high_usage_alert(
     contributors: tuple[Contributor, ...] = ()
     if poller is not None:
         contributors = tuple(
-            Contributor(circuit.name, circuit.watts, circuit.kind)
+            Contributor(circuit.name, circuit.watts, circuit.kind, circuit.parent_device_gid)
             for circuit in poller.repository.latest()
         )
     verdict = high_usage(
@@ -1631,7 +1631,15 @@ def costs_circuits(
             now=datetime.now(tz=UTC),
         )
         parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
-        measured = [s.kwh for s in parts if s.kwh is not None]
+        # Ranked from every part, summed from only the parts nothing else
+        # contains. A charger on a clamped breaker or a subpanel's branches are
+        # energy the counted circuits already carry, and adding them took the
+        # reference account to 131% of its own house (#212, #219).
+        measured = [
+            s.kwh
+            for s in parts
+            if s.kwh is not None and counts_toward_total(s.kind, s.parent_device_gid)
+        ]
         coverage = _circuit_coverage(
             store,
             start,
@@ -3602,8 +3610,11 @@ def _circuit_coverage(
 
     It is reported uncapped: a part cannot exceed the whole, so a figure above
     one is not coverage at all but a fault saying so — a mains channel that
-    escaped the exclusion, a multiplier set for the wrong circuit, or two
-    windows that stopped being comparable. Clamping it to 1.0 renders every
+    escaped the exclusion, a device counted on top of the circuit that already
+    measures it, a multiplier set for the wrong circuit, or two windows that
+    stopped being comparable. The second of those is what it caught: the
+    reference account read 131% until containment was read, and the fault was
+    real (#212, #219). Clamping it to 1.0 renders every
     one of those as perfect coverage, which is the one reading guaranteed to
     be wrong, and would hide the fault for as long as it lasted. The page
     renders anything above one as a disagreement rather than as a full bar.
@@ -3724,7 +3735,15 @@ def emporia_history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
         parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
-        measured = [s.kwh for s in parts if s.kwh is not None]
+        # Ranked from every part, summed from only the parts nothing else
+        # contains. A charger on a clamped breaker or a subpanel's branches are
+        # energy the counted circuits already carry, and adding them took the
+        # reference account to 131% of its own house (#212, #219).
+        measured = [
+            s.kwh
+            for s in parts
+            if s.kwh is not None and counts_toward_total(s.kind, s.parent_device_gid)
+        ]
         circuits_kwh = sum(measured) if measured else None
         coverage = _circuit_coverage(
             store,

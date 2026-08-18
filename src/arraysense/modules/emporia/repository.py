@@ -166,6 +166,8 @@ class CircuitLatest:
     channel_num: str
     name: str
     kind: str
+    # None for a device nothing else contains. Only those may be added up.
+    parent_device_gid: int | None
     watts: int | None
     ts: int | None
     # What the owner said this circuit is, in Emporia's own numbering. The page
@@ -205,6 +207,9 @@ class CircuitSeries:
     channel_num: str
     name: str
     kind: str
+    # None for a device nothing else contains. Only those may be added to a
+    # total: everything else is already inside a circuit that is counted.
+    parent_device_gid: int | None
     watts: tuple[int | None, ...]
     kwh: float | None
     partial: bool
@@ -268,13 +273,15 @@ class CircuitRepository:
                 conn.execute(
                     "INSERT INTO circuit"
                     " (device_gid, channel_num, name, multiplier, kind, type_gid,"
-                    "  first_seen, last_seen)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                    "  parent_device_gid, parent_channel_num, first_seen, last_seen)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT (device_gid, channel_num) DO UPDATE SET"
                     "   name = excluded.name,"
                     "   multiplier = excluded.multiplier,"
                     "   kind = excluded.kind,"
                     "   type_gid = excluded.type_gid,"
+                    "   parent_device_gid = excluded.parent_device_gid,"
+                    "   parent_channel_num = excluded.parent_channel_num,"
                     "   last_seen = excluded.last_seen",
                     (
                         circuit.device_gid,
@@ -283,6 +290,8 @@ class CircuitRepository:
                         circuit.multiplier,
                         circuit.kind,
                         circuit.type_gid,
+                        circuit.parent_device_gid,
+                        circuit.parent_channel_num,
                         stamp,
                         stamp,
                     ),
@@ -344,7 +353,7 @@ class CircuitRepository:
         try:
             rows = self._store._conn.execute(
                 "SELECT c.device_gid, c.channel_num, c.name, c.kind, c.multiplier,"
-                "       r.watts, r.timestamp, c.type_gid, c.id"
+                "       r.watts, r.timestamp, c.type_gid, c.id, c.parent_device_gid"
                 "  FROM circuit c"
                 "  LEFT JOIN circuit_reading r"
                 "    ON r.circuit_id = c.id"
@@ -362,6 +371,7 @@ class CircuitRepository:
                 channel_num=str(row[1]),
                 name=str(row[2]),
                 kind=str(row[3]),
+                parent_device_gid=None if row[9] is None else int(row[9]),
                 watts=None if row[5] is None else round(float(row[5]) * float(row[4])),
                 ts=None if row[6] is None else int(row[6]),
                 type_gid=None if row[7] is None else int(row[7]),
@@ -434,7 +444,8 @@ class CircuitRepository:
         last = int(end.timestamp())
         try:
             circuits = self._store._conn.execute(
-                "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
+                "SELECT id, device_gid, channel_num, name, kind, multiplier,"
+                "  parent_device_gid FROM circuit"
             ).fetchall()
             rows = self._store._conn.execute(
                 "SELECT timestamp, circuit_id, watts,"
@@ -528,6 +539,7 @@ class CircuitRepository:
                 channel_num=str(row[2]),
                 name=str(row[3]),
                 kind=str(row[4]),
+                parent_device_gid=None if row[6] is None else int(row[6]),
                 watts=tuple(watts[circuit_id]),
                 kwh=(joules[circuit_id] / 3_600_000) if circuit_id in seen else None,
                 partial=circuit_id in partial,
@@ -643,7 +655,8 @@ class CircuitRepository:
         query_first = (first // _HOUR_SECONDS) * _HOUR_SECONDS if counted else first
         try:
             circuits = self._store._conn.execute(
-                "SELECT id, device_gid, channel_num, name, kind, multiplier FROM circuit"
+                "SELECT id, device_gid, channel_num, name, kind, multiplier,"
+                "  parent_device_gid FROM circuit"
             ).fetchall()
             rows = self._store._conn.execute(
                 "SELECT timestamp, circuit_id, watts,"
