@@ -25,9 +25,15 @@ WEB = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
 # What a canvas cannot parse out of a custom property's computed text.
 UNPARSEABLE = ("light-dark(", "color-mix(")
 
+# Tokens whose whole job is to hide what is behind them. Most canvas tokens are
+# deliberately translucent — --grid-line is a whisper and --zero-rule is a rule
+# over a chart — so this is a named few rather than a rule for all of them.
+MUST_BE_OPAQUE = ("--label-halo",)
+
 _INK_READ = re.compile(r"""ink\(\s*['"](--[a-z0-9-]+)['"]""")
 _DECLARATION = re.compile(r"(--[a-z0-9-]+)\s*:\s*([^;{}]*);")
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_ALPHA_HEX = re.compile(r"^#(?:[0-9a-f]{4}|[0-9a-f]{8})$", re.IGNORECASE)
 
 
 def _sources() -> list[Path]:
@@ -61,6 +67,38 @@ def _declarations() -> list[tuple[str, str, str]]:
     return out
 
 
+def _carries_alpha(value: str) -> bool:
+    """Whether a colour states a transparency, in any of the forms CSS allows.
+
+    The slash form covers the modern syntaxes — ``rgb(r g b / a)``,
+    ``oklch(l c h / a)`` — and the named ``rgba()``/``hsla()`` functions and the
+    four- and eight-digit hex forms cover the rest.
+    """
+    lowered = value.strip().lower()
+    if _ALPHA_HEX.match(lowered):
+        return True
+    if lowered.startswith(("rgba(", "hsla(")):
+        return True
+    return "/" in lowered and "(" in lowered
+
+
+def test_the_halo_is_opaque_in_every_theme_that_states_it() -> None:
+    """A halo that lets the band through is not a halo; it is a tint of it.
+
+    This was half of the original defect: --tip is the tooltip's background and
+    is deliberately 88% opaque, which over a mid-blue band mixed 12% of the band
+    into the outline of every letter. Nothing in the check above would notice a
+    theme quietly putting that transparency back, because a translucent rgba()
+    is something a canvas parses perfectly well.
+    """
+    offences = [
+        f"{name} is declared in {where} as {value!r}, which states a transparency"
+        for name, value, where in _declarations()
+        if name in MUST_BE_OPAQUE and _carries_alpha(value)
+    ]
+    assert not offences, "\n".join(offences)
+
+
 def test_no_token_a_canvas_reads_is_declared_with_a_function_it_cannot_parse() -> None:
     read = _tokens_read_into_a_canvas()
     offences = [
@@ -90,3 +128,24 @@ def test_the_scan_finds_the_two_tokens_this_rule_was_written_for() -> None:
     # And the scan does see light-dark() where it genuinely is, or it would have
     # nothing to catch: the Glass sheet uses it widely on tokens no canvas reads.
     assert any("light-dark(" in value for _, value in glass)
+
+
+def test_the_transparency_check_knows_a_transparency_when_it_sees_one() -> None:
+    """The opacity guard is only worth its line if the helper under it can fail.
+
+    Every form CSS offers for stating an alpha, against the forms the halo is
+    actually declared in today. A helper that answered False to everything would
+    let the guard above pass on any value at all.
+    """
+    for stated in (
+        "rgba(255, 255, 255, .5)",
+        "hsla(0, 0%, 100%, 0.5)",
+        "#ffffff80",
+        "#fff8",
+        "rgb(8 13 26 / 0.88)",
+        "oklch(16% 0.03 268 / 0.88)",
+    ):
+        assert _carries_alpha(stated), f"{stated} states a transparency and was read as opaque"
+
+    for solid in ("#fff", "#060812", "rgb(8, 13, 26)", "rgb(255 255 255)", "oklch(16% 0.03 268)"):
+        assert not _carries_alpha(solid), f"{solid} is opaque and was read as transparent"

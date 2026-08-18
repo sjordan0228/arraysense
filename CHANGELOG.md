@@ -32,8 +32,8 @@ The circuit names painted inside the Split by circuit chart are legible again.
   read and fail to parse.
 
   The outline was also twice as wide as the letters could carry. A stroke is
-  centred on the glyph, so half of it goes inward: three device pixels of a six
-  pixel stroke, into a twenty-two pixel letter, closed the counters of `e`, `o`
+  centred on the glyph, so half of it goes inward: three device pixels of a
+  six-pixel stroke, into a twenty-two-pixel letter, closed the counters of `e`, `o`
   and `a` — and the fill that follows restores the letter's body but cannot
   reopen a counter. Halved, with round caps and joins, it separates the name
   from the band without touching the shapes.
