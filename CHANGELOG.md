@@ -7,6 +7,41 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.7 — 17 August 2026
+
+The circuit names painted inside the Split by circuit chart are legible again.
+
+### Fixed
+
+- **The band names on the Circuits stack were being outlined in the wrong
+  colour, and the outline was eating the letters.** They read as furred and
+  smeared rather than sharp, and worst of all over a pale band.
+
+  Neither cause was the one the labels looked like they had. The halo behind
+  each name is meant to be the hover readout's own background — near-black under
+  the dark theme, near-white under the light one — and under the Glass
+  appearance it was never applied at all. That token is written as a
+  `light-dark()` pair, which a canvas cannot parse; the assignment was dropped
+  and the outline was drawn in whatever colour uPlot had last used, measured on
+  the bench as `#c8cbd9`. A pale grey outline around white text is not a halo,
+  it is a second copy of the text.
+
+  The Glass sheet already carried this warning for its gridline colour, having
+  paid for it once. The halo now has a token of its own that is a plain opaque
+  colour in every theme, so there is nothing left in that sheet for a canvas to
+  read and fail to parse.
+
+  The outline was also twice as wide as the letters could carry. A stroke is
+  centred on the glyph, so half of it goes inward: three device pixels of a
+  six-pixel stroke, into a twenty-two-pixel letter, closed the counters of `e`, `o`
+  and `a` — and the fill that follows restores the letter's body but cannot
+  reopen a counter. Halved, with round caps and joins, it separates the name
+  from the band without touching the shapes.
+
+  Checked in the browser at `devicePixelRatio` 2 across all four combinations of
+  the two appearances and the two themes, reading back the colour the canvas
+  actually accepted rather than the one it was handed.
+
 ## 1.1.6 — 17 August 2026
 
 The monitored circuits stop out-totalling the house.
