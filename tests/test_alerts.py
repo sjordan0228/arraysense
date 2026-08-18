@@ -218,3 +218,24 @@ def test_the_order_is_the_ranking_and_not_the_order_it_was_given() -> None:
     got = high_usage(2000, 1500, circuits)
     assert got is not None
     assert [c.name for c in got.contributors] == ["large", "medium", "small"]
+
+
+def test_a_device_inside_a_counted_circuit_is_named_but_not_added_twice() -> None:
+    """The EV charger sits behind a breaker the panel already clamps.
+
+    Emporia states that containment on the device, and until it was read the
+    charger's own draw was added on top of the branch measuring it — the
+    instantaneous half of #219, and what made ``accounted_w`` overstate the
+    house. It still earns a row: "which load" is the question this answers.
+    """
+    verdict = high_usage(
+        load_w=10_000,
+        threshold_w=5_000,
+        circuits=[
+            Contributor("air conditioner main", 6000, "circuit", None),
+            Contributor("EVSE", 3000, "charger", 100000),
+        ],
+    )
+    assert verdict is not None
+    assert verdict.accounted_w == 6000, "the charger is already inside the clamped branch"
+    assert [c.name for c in verdict.contributors] == ["air conditioner main", "EVSE"]

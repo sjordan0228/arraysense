@@ -1475,3 +1475,76 @@ def test_the_page_decides_from_the_one_setting_that_exists(tmp_path: Path) -> No
     html = (Path(arraysense.__file__).parent / "web" / "charger.html").read_text()
     assert "c.managed_by" not in html, "that setting no longer exists"
     assert "c.authority !== 'app'" in html
+
+
+def test_history_leaves_a_contained_device_out_of_coverage_but_keeps_its_row(
+    tmp_path: Path,
+) -> None:
+    """A charger behind a clamped breaker is detail inside a circuit, not another one.
+
+    Emporia publishes the containment on the device; before it was read, the
+    reference account's circuits summed to 131% of the house, which is not a
+    coverage figure at all — a part cannot exceed the whole (#212, #219). The
+    row stays: "which load" is what the ranking is for.
+    """
+    app, store, _ = _app(tmp_path)
+    newest = END - timedelta(seconds=30)
+    repo = app.state.emporia.repository
+    repo.sync_circuits(
+        [
+            Circuit(100000, "5", "Dryer", 1.0, "circuit"),
+            Circuit(100000, "1", "Main panel", 1.0, "mains"),
+            Circuit(100002, "1,2,3", "EVSE", 1.0, "charger", None, 100000, "1,2,3"),
+        ],
+        newest,
+    )
+    for step in range(60):
+        when = newest - timedelta(minutes=step)
+        repo.append_readings(
+            [
+                Reading(100000, "5", 1000),
+                Reading(100000, "1", 4000),
+                Reading(100002, "1,2,3", 2000),
+            ],
+            when,
+        )
+    _seed_counters(store, END - INVERTER_LAG)
+    with TestClient(app) as c:
+        body = _history(c, hours=1)
+    store.close()
+
+    assert "EVSE" in {circuit["name"] for circuit in body["circuits"]}
+    # The dryer alone: 1 kW across sixty one-minute readings. The charger drew a
+    # real 2 kW and every watt of it is already inside the main panel's clamps.
+    assert body["coverage"]["circuits_kwh"] == pytest.approx(1.0)
+
+
+def test_the_live_alert_names_a_contained_device_without_adding_it(tmp_path: Path) -> None:
+    """The dashboard's ``accounted_w`` obeys the same containment rule as coverage.
+
+    Same fault at instantaneous power as #219 measures in energy: the charger's
+    3 kW is inside the branch already clamped at 4 kW, so adding both claims 7
+    kW of a 9 kW house that only 4 kW explains.
+    """
+    app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(HIGH_USAGE_WATTS_KEY, 5000)
+    when = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
+    store.append(Sample(timestamp=when, readings={"load_power_w": 9000.0}))
+    app.state.emporia.repository.sync_circuits(
+        [
+            Circuit(100000, "8", "air conditioner main", 1.0, "circuit"),
+            Circuit(100002, "1,2,3", "EVSE", 1.0, "charger", None, 100000, "1,2,3"),
+        ],
+        when,
+    )
+    app.state.emporia.repository.append_readings(
+        [Reading(100000, "8", 4000), Reading(100002, "1,2,3", 3000)], when
+    )
+
+    with TestClient(app) as c:
+        alert = c.get("/api/live").json()["alert"]
+    store.close()
+
+    assert alert is not None
+    assert "EVSE" in [c["name"] for c in alert["contributors"]]
+    assert alert["accounted_w"] == 4000

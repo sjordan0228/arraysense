@@ -293,7 +293,7 @@ def test_a_name_that_is_only_whitespace_gets_the_stable_label() -> None:
 # outlet, charger and monitor on the reference account. The name the owner gave
 # it in Emporia's app is in ``locationProperties``, one level up from the
 # channel — taken from the real reply on 17 August 2026, where six of the
-# thirty-nine circuits were reading as "Device 402097 ch 1,2,3" while Emporia
+# thirty-nine circuits were reading as "Device 100002 ch 1,2,3" while Emporia
 # held "EVSE", "Dishwasher", "Washer" and three more for them all along.
 NAMED_DEVICES = {
     "devices": [
@@ -578,3 +578,76 @@ def test_a_channel_with_no_category_has_none_rather_than_a_stand_in() -> None:
     # would be a category, and category zero is a claim nobody made.
     got = {c.channel_num: c for c in circuits_from_devices(TYPED)}
     assert got["7"].type_gid is None
+
+
+# Shaped like the reference account's real reply, measured 17 August 2026. The
+# nesting Emporia publishes is not the JSON tree: every device is a top-level
+# entry and the containment is stated in ``parentDeviceGid`` and
+# ``parentChannelNum``. The only true nesting is a monitor's own channel bank,
+# which repeats the parent's gid and declares no parent of its own.
+PARENTED = {
+    "devices": [
+        {
+            "deviceGid": 100000,
+            "model": "VUE002",
+            "parentDeviceGid": None,
+            "parentChannelNum": None,
+            "channels": [{"channelNum": "1,2,3", "name": None, "channelMultiplier": 1.0}],
+            "devices": [
+                {
+                    "deviceGid": 100000,
+                    "model": "WAT001",
+                    "channels": [{"channelNum": "5", "name": "Dryer", "channelMultiplier": 2.0}],
+                }
+            ],
+        },
+        {
+            "deviceGid": 100002,
+            "model": "VUE003",
+            "parentDeviceGid": 100000,
+            "parentChannelNum": "1,2,3",
+            "channels": [{"channelNum": "1,2,3", "name": None, "channelMultiplier": 1.0}],
+            "devices": [
+                {
+                    "deviceGid": 100002,
+                    "model": "WAT001",
+                    "channels": [{"channelNum": "4", "name": "Study", "channelMultiplier": 1.0}],
+                }
+            ],
+        },
+    ]
+}
+
+
+def _by_name(circuits: list[Circuit], name: str) -> Circuit:
+    return next(circuit for circuit in circuits if circuit.name == name)
+
+
+def test_a_device_records_the_parent_emporia_declares_for_it() -> None:
+    circuits = circuits_from_devices(PARENTED)
+    subpanel_mains = next(
+        circuit
+        for circuit in circuits
+        if circuit.device_gid == 100002 and circuit.channel_num == "1,2,3"
+    )
+    assert subpanel_mains.parent_device_gid == 100000
+    assert subpanel_mains.parent_channel_num == "1,2,3"
+
+
+def test_a_top_level_device_has_no_parent() -> None:
+    circuits = circuits_from_devices(PARENTED)
+    assert _by_name(circuits, "Dryer").parent_device_gid is None
+
+
+def test_a_nested_channel_bank_inherits_its_devices_parent() -> None:
+    """The 16 branches of a subpanel Vue are inside whatever that Vue is inside.
+
+    Emporia states the containment once, on the monitor, and its channel bank
+    arrives as a nested record repeating the gid and declaring nothing. Reading
+    the bank on its own terms makes a subpanel's branches look like the house's
+    own, which is the 327 kWh half of #219.
+    """
+    circuits = circuits_from_devices(PARENTED)
+    study = _by_name(circuits, "Study")
+    assert study.parent_device_gid == 100000
+    assert study.parent_channel_num == "1,2,3"

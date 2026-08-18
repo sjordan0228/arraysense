@@ -2235,3 +2235,51 @@ def test_opening_a_database_written_before_covered_seconds_repairs_it(tmp_path: 
     assert "covered_seconds" in columns
     assert row[:2] == (900, 30), "the hour that was there is untouched"
     assert row[2] is None, "and it says nothing about its own coverage, because nobody measured it"
+
+
+# The circuit table exactly as 1.1.5 shipped it, before containment was read.
+# Written out rather than generated, because the point of the test is a
+# database this driver did not create.
+_CIRCUIT_1_1_5 = (
+    "CREATE TABLE circuit ("
+    "  id INTEGER PRIMARY KEY,"
+    "  device_gid INTEGER NOT NULL,"
+    "  channel_num TEXT NOT NULL,"
+    "  name TEXT NOT NULL,"
+    "  multiplier REAL NOT NULL DEFAULT 1.0,"
+    "  kind TEXT NOT NULL DEFAULT 'circuit',"
+    "  type_gid INTEGER,"
+    "  first_seen INTEGER NOT NULL,"
+    "  last_seen INTEGER NOT NULL,"
+    "  UNIQUE (device_gid, channel_num)"
+    ")"
+)
+
+
+def test_a_database_recorded_before_containment_gains_the_new_columns(tmp_path: Path) -> None:
+    """An installation running since 1.1.0 has a circuit table without them.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing against a table that already
+    exists, so without the late-column repair the first read after upgrading
+    fails with "no such column" — and ``latest()`` catches sqlite errors and
+    returns an empty list, which would blank every circuit on the dashboard
+    rather than announce itself.
+    """
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(_CIRCUIT_1_1_5)
+    conn.execute(
+        "INSERT INTO circuit"
+        " (device_gid, channel_num, name, multiplier, kind, type_gid, first_seen, last_seen)"
+        " VALUES (100000, '5', 'Dryer', 1.0, 'circuit', NULL, 0, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    columns = {row[1] for row in store._conn.execute("PRAGMA table_info(circuit)")}
+    kept = store._conn.execute("SELECT name, parent_device_gid FROM circuit").fetchone()
+    store.close()
+
+    assert {"parent_device_gid", "parent_channel_num"} <= columns
+    assert kept == ("Dryer", None), "the existing circuit keeps its history and gains a null"

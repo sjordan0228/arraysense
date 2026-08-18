@@ -1661,3 +1661,27 @@ def test_a_decision_matches_an_earlier_one_only_when_every_part_of_it_does() -> 
     assert not earlier.same_decision(
         from_a=None, to_a=32, reason=earlier.reason, applied=False, source=MODULE
     )
+
+
+def test_a_circuits_parent_survives_the_round_trip(tmp_path: Path) -> None:
+    """What contains a circuit is stored, so a total can leave it out.
+
+    Emporia states containment on the device and we only learn it at sync time;
+    a total computed later reads the stored row. Losing it here is #219 — the
+    subpanel's branches, the charger and the plugs all added on top of the main
+    panel's clamps that already measure them.
+    """
+    repo, store = _repo(tmp_path)
+    start = NOW
+    repo.sync_circuits(
+        [
+            Circuit(100000, "5", "Dryer", 1.0, "circuit"),
+            Circuit(100002, "4", "Study", 1.0, "circuit", None, 100000, "1,2,3"),
+        ],
+        start,
+    )
+    repo.append_readings([Reading(100000, "5", 1000), Reading(100002, "4", 500)], start)
+    got = repo.history(start, start + timedelta(minutes=5), tier="full")
+    parents = {series.name: series.parent_device_gid for series in got.series}
+    assert parents == {"Dryer": None, "Study": 100000}
+    store.close()
