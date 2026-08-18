@@ -169,6 +169,31 @@ where packs genuinely disagree on *voltage* is reported separately and more loud
 because parallel packs are forced to the same voltage and a spread there means a
 cable, a lug or a busbar rather than arithmetic.
 
+### What is actually drawing the power
+
+Where an [Emporia Vue](https://www.emporiaenergy.com/) account is connected, the
+Graphs page adds a Circuits tab: the top five circuits by energy over whatever range
+is on screen, each drawn as its own strip scaled to its own peak, with that peak
+printed beside it — a 40 W circuit and a 4,000 W one sharing an axis would erase the
+smaller one. Change the range and the ranking follows it, so a kettle that led a
+one-hour window can drop out of the top five over a week; an expander reveals the
+rest. A gap in a strip means the circuit recorded nothing there, not that it drew
+nothing — a dead outlet and an idle one look different. A circuit that has gone
+quiet for good, rather than for a poll or two, draws no chart at all: just the
+reason and how long, instead of an empty box that reads as a bug.
+
+A summary panel above the strips reads the same window two ways: a ranked kWh bar
+chart by default, whose length alone carries the meaning, and a stacked view of the
+same circuits under the house's own load over time behind a switch. Underneath it a
+line states what share of the house the monitored circuits account for — the
+monitored circuits are not the whole house, and the page says what fraction they are
+rather than letting five bars imply they are all of it. That share is computed from
+energy rather than from minutes watched, and withheld rather than guessed whenever
+an honest figure cannot be given.
+
+Clicking a circuit's name on the Emporia page opens its own history on this tab, as
+a real link that can be copied and sent.
+
 ## Install
 
 One line, on a Linux host with systemd — a Raspberry Pi is the usual target:
@@ -229,6 +254,8 @@ the coarser tiers already holding every bucket being dropped. See
   missing battery data, and other things people run into
 - [docs/migrating-from-solar-assistant.md](docs/migrating-from-solar-assistant.md) —
   bringing your SolarAssistant history across, so switching does not cost you it
+- [docs/backfilling-emporia-history.md](docs/backfilling-emporia-history.md) —
+  filling the Circuits tab with the months your Vue recorded before you connected it
 
 ## Development
 

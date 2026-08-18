@@ -149,6 +149,26 @@ class Config:
     # until the wizard asks, and a driver then falls back to the host's clock.
     timezone: str = ""
 
+    # Where the optional Emporia module keeps its refresh token. Empty means
+    # "beside the database", which ``emporia_token_file`` resolves — the token
+    # is deliberately not in the database, so that a database shared while
+    # diagnosing a problem does not carry account access with it, and a path
+    # the owner can move is what makes that separation theirs to place.
+    emporia_token_path: str = ""
+
+    @property
+    def emporia_token_file(self) -> Path:
+        """The resolved token path, defaulted beside the database.
+
+        A property rather than a default value on the field, because the
+        default depends on another field: written as a default it would freeze
+        whatever ``database_path`` happened to be at class definition time,
+        which is nothing at all.
+        """
+        if self.emporia_token_path.strip():
+            return Path(self.emporia_token_path)
+        return Path(self.database_path).with_name("emporia-tokens.json")
+
     def __post_init__(self) -> None:
         """Reject a configuration that cannot work.
 

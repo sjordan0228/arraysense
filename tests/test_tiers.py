@@ -328,3 +328,35 @@ def test_module_ranges_are_scored_against_the_module_tiers() -> None:
     )
     assert choice.name == "hourly"
     assert choice.bounded is True
+
+
+def test_circuit_tiers_pick_raw_for_a_day_and_hourly_for_a_week() -> None:
+    # 24 h of 60 s readings is 1,440 points into a 1,200 px chart — a good fit.
+    # 7 d of the same is 10,080, which is eight doublings past the width, while
+    # the hourly tier gives 168. The fit rule is what decides; this pins the
+    # two ranges the Graphs page actually offers on either side of the flip.
+    day = select_tier(timedelta(hours=24), width_px=1200, cadence_seconds=60, circuit=True)
+    week = select_tier(timedelta(days=7), width_px=1200, cadence_seconds=60, circuit=True)
+    assert day == "full"
+    assert week == "hourly"
+
+
+def test_circuit_tiers_have_no_minute_tier() -> None:
+    # The circuit tables are raw and hourly only. A selection that returned
+    # "minute" would name a table that does not exist and fail at query time
+    # rather than here, which is the wrong place to find out.
+    for hours in (1, 6, 24, 24 * 7, 24 * 30):
+        chosen = select_tier(
+            timedelta(hours=hours), width_px=1200, cadence_seconds=60, circuit=True
+        )
+        assert chosen in {"full", "hourly"}
+
+
+def test_circuit_and_module_are_not_both_askable() -> None:
+    # Two tier families requested at once is a programming error, not a
+    # preference to resolve quietly. Resolving it would silently score one
+    # family's ranges against the other's tables.
+    with pytest.raises(ValueError, match="module and circuit"):
+        select_tier(
+            timedelta(hours=6), width_px=1200, cadence_seconds=60, module=True, circuit=True
+        )

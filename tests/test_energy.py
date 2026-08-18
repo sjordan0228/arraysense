@@ -27,9 +27,11 @@ from arraysense.energy import (
     ENERGY_FIELDS,
     MAX_EDGE_GAP,
     EnergyBucket,
+    _window_tier,
     attribute_energy,
     bucket_edges,
     bucket_totals,
+    counter_kwh,
     energy_totals,
     host_zone,
     resolve_zone,
@@ -974,3 +976,118 @@ def test_daily_totals_are_identical_from_hourly_and_minute_tiers(
                 assert hv is mv, f"{field} at {hb.start}: hourly={hv} minute={mv}"
             else:
                 assert hv == pytest.approx(mv), f"{field} at {hb.start}: hourly={hv} minute={mv}"
+
+
+# --- a counter over an exact window -----------------------------------------
+#
+# The calendar path widens outward to whole days, which is right for a history
+# table and wrong for a window on screen. These pin the exact-window read, and
+# every case where the honest answer is None.
+
+
+def test_counter_kwh_reads_the_climb_between_two_exact_instants(tmp_path: Path) -> None:
+    # Not widened to a calendar day. The Circuits tab asks about the hours on
+    # screen, and a day's answer to a three-hour question understates the
+    # circuits' share several times over.
+    start = datetime(2026, 8, 16, 12, tzinfo=UTC)
+    store = _store(tmp_path, _counters(start, hours=6))
+
+    got = counter_kwh(store, start, start + timedelta(hours=3))
+    store.close()
+
+    # The counter climbs 1 kWh an hour, so three hours is 3 kWh — not the
+    # twenty-four a calendar-widened read would return.
+    assert got == pytest.approx(3.0)
+
+
+def test_counter_kwh_is_none_when_a_bound_is_not_bracketed(tmp_path: Path) -> None:
+    # A ten-hour hole across the window's start means the energy in the hole
+    # belongs to nobody, and the shortfall is unknown rather than zero. A number
+    # here would be a partial figure presented as a complete one.
+    samples = [
+        Sample(timestamp=datetime(2026, 8, 16, 4, tzinfo=UTC), readings={LOAD: 90.0}),
+        Sample(timestamp=datetime(2026, 8, 16, 14, tzinfo=UTC), readings={LOAD: 104.5}),
+        Sample(timestamp=datetime(2026, 8, 16, 15, tzinfo=UTC), readings={LOAD: 105.5}),
+    ]
+    store = _store(tmp_path, samples)
+
+    got = counter_kwh(
+        store, datetime(2026, 8, 16, 12, tzinfo=UTC), datetime(2026, 8, 16, 15, tzinfo=UTC)
+    )
+    store.close()
+
+    assert got is None
+
+
+def test_counter_kwh_is_none_across_a_counter_reset(tmp_path: Path) -> None:
+    # load_energy_total_kwh is a lifetime counter, so it does not reset nightly
+    # — but a firmware update or a replaced BMS restarts it, and what it held
+    # before the restart is not knowable. The coverage fraction must go null
+    # rather than take the post-reset climb as though it were the whole window.
+    samples = [
+        Sample(timestamp=datetime(2026, 8, 16, 12, tzinfo=UTC), readings={LOAD: 950.0}),
+        Sample(timestamp=datetime(2026, 8, 16, 13, tzinfo=UTC), readings={LOAD: 2.0}),
+        Sample(timestamp=datetime(2026, 8, 16, 14, tzinfo=UTC), readings={LOAD: 3.0}),
+    ]
+    store = _store(tmp_path, samples)
+
+    got = counter_kwh(
+        store, datetime(2026, 8, 16, 12, tzinfo=UTC), datetime(2026, 8, 16, 14, tzinfo=UTC)
+    )
+    store.close()
+
+    assert got is None
+
+
+def test_counter_kwh_is_none_when_the_counter_stepped_backwards(tmp_path: Path) -> None:
+    # A small backwards step is a bad reading rather than a restart, and _delta
+    # attributes nothing to it. Crediting the new value as post-reset energy
+    # would add the inverter's whole lifetime to one window.
+    samples = [
+        Sample(timestamp=datetime(2026, 8, 16, 12, tzinfo=UTC), readings={LOAD: 950.0}),
+        Sample(timestamp=datetime(2026, 8, 16, 13, tzinfo=UTC), readings={LOAD: 948.0}),
+        Sample(timestamp=datetime(2026, 8, 16, 14, tzinfo=UTC), readings={LOAD: 949.0}),
+    ]
+    store = _store(tmp_path, samples)
+
+    got = counter_kwh(
+        store, datetime(2026, 8, 16, 12, tzinfo=UTC), datetime(2026, 8, 16, 14, tzinfo=UTC)
+    )
+    store.close()
+
+    assert got is None
+
+
+def test_counter_kwh_is_none_when_the_counter_never_reported(tmp_path: Path) -> None:
+    # An absent counter is not a house that used nothing. Zero here would make
+    # the coverage fraction divide by zero or, worse, read as full coverage.
+    store = _store(tmp_path, [])
+
+    got = counter_kwh(
+        store, datetime(2026, 8, 16, 12, tzinfo=UTC), datetime(2026, 8, 16, 15, tzinfo=UTC)
+    )
+    store.close()
+
+    assert got is None
+
+
+def test_counter_kwh_rejects_a_backwards_range(tmp_path: Path) -> None:
+    store = _store(tmp_path, _counters(datetime(2026, 8, 16, 12, tzinfo=UTC), hours=6))
+    with pytest.raises(ValueError, match="end must be after start"):
+        counter_kwh(
+            store, datetime(2026, 8, 16, 15, tzinfo=UTC), datetime(2026, 8, 16, 12, tzinfo=UTC)
+        )
+    store.close()
+
+
+def test_a_counter_window_across_a_clock_change_is_judged_by_the_hours_that_passed() -> None:
+    # Two aware datetimes sharing a tzinfo subtract as though they were naive:
+    # Python takes the identical zone as identical offsets and cancels them.
+    # Midnight to midnight across the November clock change is 49 real hours and
+    # reads as 48 — which is exactly the two-day hinge this tier choice turns
+    # on, so the window was answered from minute rows it is too long for.
+    start = datetime(2026, 11, 1, tzinfo=NY)
+    end = datetime(2026, 11, 3, tzinfo=NY)
+
+    assert end - start == timedelta(days=2), "what Python says, and it is wrong"
+    assert _window_tier(start, end) == "hourly"

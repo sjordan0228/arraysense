@@ -597,6 +597,22 @@ class BillEstimate:
     coverage and was the only money figure without a coverage statement; its
     projection was also the figure the second reverted attempt understated by
     $23.54 through a minutes-based denominator, which is finding 1 of #23.
+
+    ``is_projected`` is a different question from ``fraction_elapsed`` reaching
+    1.0, and the page that read them as the same thing lied: ``fraction_elapsed``
+    is 1.0 for any month the calendar has finished, whether or not the collector
+    was recording for all of it, while ``is_projected`` is false only once the
+    counted span itself reaches the whole month — a collector that started on
+    the tenth still scales its estimate up on the thirty-first.
+
+    A counted span reaching the whole month is not the same question either:
+    a month whose counters bracket its start and end can still have an
+    internal dropped span, and the total then prices the energy that
+    *was* measured while restoring the rest at its blended rate — a genuine
+    projection with nothing left to scale. Reading only the time-based
+    ``scale`` there said "what it came to" beside a total that was still
+    assuming a rate for kilowatt-hours nobody measured. ``is_projected`` has
+    to be true whenever either kind of scaling touched the total.
     """
 
     currency: str
@@ -614,6 +630,7 @@ class BillEstimate:
     projected_adjustment: float | None = None
     is_short: bool = False
     assumed_kwh: float | None = None
+    is_projected: bool = False
 
 
 def _parse_clock(token: str, entry: str) -> time:
@@ -1043,7 +1060,7 @@ def merge_shortfalls(spans: Sequence[PeriodEnergy]) -> Mapping[str, EnergyShortf
     return out
 
 
-def _by_band(
+def energy_by_band(
     values: Mapping[str, float | None] | None, bands: Sequence[RateBand], what: str
 ) -> dict[str, float] | None:
     """Key reported energy by band, dropping anything the tariff has no band for.
@@ -1053,6 +1070,11 @@ def _by_band(
     boundary sample catches up. Nothing is lost quietly by doing so — the band
     the energy should have landed in is then missing, and missing means the
     whole figure comes back absent.
+
+    Public for the same reason ``price_by_band`` is: the circuit ranking keys
+    its energy by the band names ``band_intervals`` handed it, and the
+    casefolding, the unknown-name warning and the skip are exactly this
+    function's job either way.
     """
     if values is None:
         return None
@@ -1068,7 +1090,7 @@ def _by_band(
     return out
 
 
-def _price(
+def price_by_band(
     bands: Sequence[RateBand], reported: Mapping[str, float] | None, partial: bool = False
 ) -> tuple[list[BandCost], float | None, float | None]:
     """Price every band: the breakdown, the exact total, and the energy behind it.
@@ -1086,6 +1108,12 @@ def _price(
     whoever needs it, because the rule for when it is unknown is the same
     rule, and a second copy of it would be a second place for a missing band
     to turn into a small number. It is what the per-kWh riders are charged on.
+
+    Public because a second caller needs it. The Costs page's per-circuit
+    ranking prices each circuit's band energy through this same function rather
+    than through arithmetic of its own — the rule for when a total is unknown is
+    one rule, and a second copy of it is a second place for a missing band to
+    turn quietly into a small number.
     """
     breakdown: list[BandCost] = []
     total: float | None = 0.0
@@ -1157,13 +1185,13 @@ def compute_cost(
     load_entry = entries.get("load")
     export_entry = entries.get("grid_export")
 
-    imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    breakdown, energy_cost, imported_kwh = _price(
+    imported = energy_by_band(energy.grid_import_kwh, active, "grid import")
+    breakdown, energy_cost, imported_kwh = price_by_band(
         active, imported, partial=import_entry is not None
     )
 
-    consumed = _by_band(energy.load_kwh, active, "house load")
-    _, no_solar, consumed_kwh = _price(active, consumed, partial=load_entry is not None)
+    consumed = energy_by_band(energy.load_kwh, active, "house load")
+    _, no_solar, consumed_kwh = price_by_band(active, consumed, partial=load_entry is not None)
 
     rider = tariff.adjustment_at(energy.start, energy.end)
     unknown_rider = rider.status == "unknown"
@@ -1259,8 +1287,8 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     entries = energy.shortfall or {}
     import_entry = entries.get("grid_import")
     export_entry = entries.get("grid_export")
-    imported = _by_band(energy.grid_import_kwh, active, "grid import")
-    _, so_far, imported_kwh = _price(active, imported, partial=import_entry is not None)
+    imported = energy_by_band(energy.grid_import_kwh, active, "grid import")
+    _, so_far, imported_kwh = price_by_band(active, imported, partial=import_entry is not None)
     whole_month = tariff.bands_in_effect(month_start, month_end) or tariff.bands
 
     # Scaled by the span the counters account for, not by the span requested
@@ -1290,6 +1318,21 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
     ):
         correction = (imported_kwh + import_entry.unattributed_kwh) / imported_kwh
         assumed = import_entry.unattributed_kwh
+
+    # Whether the total below is a genuine projection or the month priced as
+    # it stands. ``fraction_elapsed`` answers a different question — it is 1.0
+    # for any finished calendar month regardless of what was actually
+    # recorded in it — so an installation whose collection began mid-month
+    # still has ``scale`` above 1.0 once the month is over: ``estimated_total``
+    # is still being scaled up from the part that was measured, and calling
+    # that "what it came to rather than a projection" would be false. A
+    # ``scale`` of exactly 1.0 means the counted span reaches the whole month,
+    # but that alone is not "nothing was assumed": the counted span can still
+    # hold an internal dropped stretch that ``correction`` restored at a
+    # blended rate, which is a projection on the energy axis even when the
+    # time axis needed no scaling at all. Both have to be clean for the total
+    # to be what the month actually came to.
+    is_projected = scale is not None and (scale > 1.0 or correction > 1.0)
 
     projected = None if so_far is None or scale is None else so_far * scale * correction
 
@@ -1346,4 +1389,5 @@ def estimate_bill(tariff: Tariff | None, energy: PeriodEnergy) -> BillEstimate |
         is_short=(import_entry is not None and import_entry.short)
         or (pays_for_export and export_entry is not None and export_entry.short),
         assumed_kwh=assumed,
+        is_projected=is_projected,
     )

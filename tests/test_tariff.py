@@ -23,10 +23,12 @@ from arraysense.tariff import (
     apportion_fixed,
     compute_cost,
     counter_delta,
+    energy_by_band,
     estimate_bill,
     load_tariff,
     parse_adjustments,
     parse_bands,
+    price_by_band,
 )
 
 EAST = ZoneInfo("America/New_York")
@@ -563,6 +565,29 @@ def test_the_export_credit_is_projected_on_the_restored_export() -> None:
     assert bill.is_short is True
 
 
+def test_is_projected_reflects_a_shortfall_correction_even_at_full_scale() -> None:
+    """A month whose counters bracket start to end has ``scale`` of exactly
+    1.0 — the counted span already reaches the whole month — but an internal
+    dropped span can still force the total to price the measured energy while
+    restoring the rest at a blended rate. Reading only ``scale`` called that
+    "what the month came to" beside a total that was still assuming a rate
+    for kilowatt-hours nobody measured — a projection under any other name.
+    """
+    bill = estimate_bill(
+        tariff(**FLAT),
+        PeriodEnergy(
+            start=datetime(2026, 1, 1, tzinfo=EAST),
+            end=datetime(2026, 2, 1, tzinfo=EAST),
+            grid_import_kwh={"Flat": 100.0},
+            shortfall={"grid_import": _entry(100.0, 20.0)},
+        ),
+    )
+    assert bill is not None
+    assert bill.fraction_elapsed == pytest.approx(1.0)
+    assert bill.assumed_kwh == pytest.approx(20.0)
+    assert bill.is_projected is True
+
+
 # --- Export credit ----------------------------------------------------------
 
 
@@ -1089,3 +1114,37 @@ def test_the_adjustment_setting_needs_no_change_to_the_settings_page() -> None:
     (entry,) = [row for row in describe() if row["key"] == SETTING_ADJUSTMENTS]
     assert entry["multiline"] is True
     assert entry["default"] == ""
+
+
+def test_price_by_band_is_reachable_by_name() -> None:
+    """It is public because a second caller needs it, not as a courtesy.
+
+    The circuit ranking prices per-circuit energy through this same function.
+    A private copy of "a band nobody measured is not a band that used nothing"
+    is how the Costs page and the Python parser came to disagree about a tariff
+    within a day of each other.
+    """
+    bands = parse_bands("peak | 0.40 | 15:00-20:00; off-peak | 0.10 | 00:00-24:00")
+    breakdown, total, kwh = price_by_band(bands, {"peak": 2.0, "off-peak": 10.0})
+    assert total == pytest.approx(1.8)
+    assert kwh == pytest.approx(12.0)
+    assert [b.name for b in breakdown] == ["peak", "off-peak"]
+
+
+def test_price_by_band_still_withholds_a_total_over_an_unmeasured_band() -> None:
+    bands = parse_bands("peak | 0.40 | 15:00-20:00; off-peak | 0.10 | 00:00-24:00")
+    _, total, kwh = price_by_band(bands, {"peak": 2.0})
+    assert total is None
+    assert kwh is None
+
+
+def test_price_by_band_sums_what_reported_when_told_it_is_partial() -> None:
+    bands = parse_bands("peak | 0.40 | 15:00-20:00; off-peak | 0.10 | 00:00-24:00")
+    _, total, kwh = price_by_band(bands, {"peak": 2.0}, partial=True)
+    assert total == pytest.approx(0.8)
+    assert kwh == pytest.approx(2.0)
+
+
+def test_energy_by_band_is_reachable_by_name() -> None:
+    bands = parse_bands("peak | 0.40 | 15:00-20:00; off-peak | 0.10 | 00:00-24:00")
+    assert energy_by_band({"Peak": 3.0}, bands, "circuit energy") == {"peak": 3.0}

@@ -71,10 +71,12 @@ from arraysense.store.rollup import LATE_APPEND_SECONDS
 from arraysense.store.schema import (
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
+    LATE_COLUMNS,
     MODULE_TIERS,
     PENDING_TABLE,
     expected_columns,
     inverter_metric_columns,
+    late_column_ddl,
     migration_ddl,
     module_metric_columns,
     schema_ddl,
@@ -265,6 +267,17 @@ class SqliteStore:
             for table in expected_columns(declared)
         }
         for statement in migration_ddl(existing, declared):
+            self._conn.execute(statement)
+        # The same repair for the tables whose shape is written out by hand.
+        # Their columns do not come from the metric registry, so nothing above
+        # would ever notice one missing — and the first write would fail with
+        # "no such column" on exactly the installations that have been running
+        # longest.
+        late = {
+            table: tuple(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
+            for table in LATE_COLUMNS
+        }
+        for statement in late_column_ddl(late):
             self._conn.execute(statement)
         # What each tier actually has, read back after the migrations so a
         # column just added is counted. Reads answer from this rather than from
@@ -1052,8 +1065,15 @@ class SqliteStore:
             datetime.fromtimestamp(bounds[1], tz=UTC),
         )
 
-    def scored_days(self, config_version: int) -> set[int]:
-        """Return the day epochs already carrying a TOTAL row at ``config_version``.
+    def scored_days(self, config_version: int, valid_from: int = 0) -> set[int]:
+        """Return the day epochs that need no rescoring at ``config_version``.
+
+        ``valid_from`` is the earliest day the current version actually claims.
+        A day before it was scored against a description that still describes
+        it — appending a tilt adjustment for next October says nothing about
+        last March — so it counts as scored whatever version it carries. This is
+        what stops an owner with an adjustable mount losing the performance
+        trend every time they adjust it.
 
         A day scored against the array as it is described now is a day the
         backfill need not revisit. One carrying any other version was scored
@@ -1072,8 +1092,9 @@ class SqliteStore:
         ``EfficiencyRow``.
         """
         rows = self._conn.execute(
-            "SELECT DISTINCT day FROM efficiency_day WHERE string_name = '' AND config_version = ?",
-            (config_version,),
+            "SELECT DISTINCT day FROM efficiency_day WHERE string_name = '' "
+            "AND (config_version = ? OR day < ?)",
+            (config_version, valid_from),
         ).fetchall()
         return {int(row[0]) for row in rows}
 

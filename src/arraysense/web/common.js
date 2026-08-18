@@ -529,7 +529,7 @@ const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 // never as a broken layout or a thrown error.
 // ---------------------------------------------------------------------------
 
-const ICON_SPRITE_URL = '/vendor/phosphor.svg';
+const ICON_SPRITE_URL = '/vendor/phosphor-2.svg';
 let iconSpriteLoading = null;
 
 function mountIconSprite() {
@@ -826,6 +826,22 @@ function capParts(caps, parts) {
 function capHasModuleMetric(caps, metric) {
   if (!caps || !Array.isArray(caps.battery_module_metrics)) return true;
   return caps.battery_module_metrics.includes(metric);
+}
+
+// Whether the per-pack views exist for this device at all — the dashboard's
+// Battery modules card and the Graphs page's Packs section. capHasModuleMetric
+// above answers which readings a pack relays; this answers whether there are
+// packs to relay them, which is the question the whole card turns on.
+//
+// Only an explicit no suppresses, the same rule as capHasMetric: a device that
+// has not declared keeps both views. The distinction matters because the card
+// carries an advisory — "the battery block is populated over CAN, check the
+// packs are in closed loop" — that is a real fault on a machine with packs and
+// a wild goose chase on a machine without them. tourHasModules asks the same
+// field and demands an explicit yes instead, because a tour that describes a
+// card the reader cannot find is worse than a tour that skips a step.
+function capHasModules(caps) {
+  return !caps || caps.per_module_battery !== false;
 }
 // <<< caps-logic
 
@@ -1184,6 +1200,60 @@ function drawWaterfall(host, segments) {
 // Called again whenever the current view changes, not only at boot: on the
 // dashboard the marker moves between two entries without the document
 // reloading, and a marker left behind is worse than none.
+// An optional module is not a page every installation has, so its entry is not
+// in NAV: a permanent tab leading to a page about hardware the owner does not
+// own is the same fault as an empty card, one level up. The entry is appended
+// after the fact, only once the module says it is switched on, and a build
+// without the endpoint — or a fetch that fails — leaves the nav exactly as it
+// was drawn. Nothing on the page waits for this.
+// Each entry names the endpoint that decides whether it exists, and the
+// question to ask of the answer. Two different questions already: the module
+// being switched on, and a charger actually being present on the account —
+// most people who enable this have no EV charger at all, and a tab for one is
+// as wrong as an empty card.
+const MODULE_NAV = [
+  {
+    key: 'emporia',
+    label: 'Circuits',
+    href: '/emporia',
+    status: '/api/emporia/status',
+    shows: (body) => body.enabled === true,
+  },
+  {
+    key: 'charger',
+    label: 'Charger',
+    href: '/charger',
+    status: '/api/emporia/charger',
+    // Two facts, and the tab needs both. "Does this account have a charger",
+    // because most people who switch the module on have no EV charger at all —
+    // and "is the module actually on", which this asked for a long time by
+    // asking neither: the poller kept the last charger it read for the life of
+    // the process, so switching the module off left the tab in place over a
+    // page of live controls.
+    shows: (body) => body.enabled === true && !!body.charger,
+  },
+];
+
+async function revealModuleNav(current) {
+  const el = $('nav');
+  if (!el) return;
+  for (const mod of MODULE_NAV) {
+    try {
+      const r = await fetch(mod.status);
+      if (!r.ok) continue;
+      if (!mod.shows(await r.json())) continue;
+    } catch (e) {
+      continue;
+    }
+    if (el.querySelector(`a[href="${mod.href}"]`)) continue;
+    const a = document.createElement('a');
+    a.href = mod.href;
+    a.textContent = mod.label;
+    if (mod.key === current) a.setAttribute('aria-current', 'page');
+    el.appendChild(a);
+  }
+}
+
 function drawNav(current) {
   const el = $('nav');
   if (!el) return;
@@ -1194,6 +1264,9 @@ function drawNav(current) {
     (n.icon ? `<svg class="ic" aria-hidden="true"><use href="#${n.icon}"/></svg>` : '') +
     `${esc(n.label)}</a>`
   ).join('');
+  // After the nav exists, never before: this appends to what was just written,
+  // and an append that raced the assignment would be wiped by it.
+  revealModuleNav(current);
 }
 
 // ---------------------------------------------------------------------------

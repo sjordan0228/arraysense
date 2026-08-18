@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -144,3 +145,46 @@ def test_a_quoted_note_survives_compose_and_split() -> None:
     assert spec.note == 'he said "shaded" at 4pm'
     back = json.loads(_run(f"console.log(JSON.stringify(splitStringLine({json.dumps(line)})));"))
     assert back["advanced"]["note"] == 'he said "shaded" at 4pm'
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_composer_emits_a_tilt_schedule_the_parser_accepts() -> None:
+    # The editor holds the tilt field as free text and never parses it, so a
+    # schedule has to survive composition untouched. If the composer ever
+    # starts coercing this field to a number the seasonal mount silently
+    # becomes a fixed one, which is the failure this whole issue is about.
+    row = {
+        "name": "East",
+        "mppt": 1,
+        "panels": 9,
+        "watts": 410,
+        "tilt": "25,40@2027-10-01,25@2028-03-15",
+        "azimuth": 90,
+        "advanced": {},
+    }
+    line = _run(f"console.log(composeStringLine({json.dumps(row)}));")
+    (spec,) = parse_strings(line)
+    assert len(spec.tilt_schedule) == 3
+    assert spec.tilt_at(date(2026, 1, 1)) == 25.0
+    assert spec.tilt_at(date(2027, 12, 1)) == 40.0
+    assert spec.tilt_at(date(2028, 6, 1)) == 25.0
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_tilt_schedule_survives_the_round_trip_back_into_the_editor() -> None:
+    row = {
+        "name": "East",
+        "mppt": 1,
+        "panels": 9,
+        "watts": 410,
+        "tilt": "25,40@2027-10-01",
+        "azimuth": 90,
+        "advanced": {},
+    }
+    back = json.loads(
+        _run(
+            f"const line = composeStringLine({json.dumps(row)});"
+            "console.log(JSON.stringify(splitStringLine(line)));"
+        )
+    )
+    assert back["tilt"] == "25,40@2027-10-01"

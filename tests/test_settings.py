@@ -3,28 +3,39 @@
 from __future__ import annotations
 
 import errno
+import itertools
 import os
 import tempfile
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from arraysense.efficiency import EfficiencyRow
+from arraysense.energy import resolve_zone
+from arraysense.panels import parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
     BACKUP_ENABLED_KEY,
     BACKUP_HOUR_KEY,
     BACKUP_KEEP_KEY,
     BACKUP_MINUTE_KEY,
+    CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
+    EMPORIA_INTERVAL_KEY,
+    PANELS_STRINGS_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     SETTINGS,
     SettingsStore,
+    _schedule_reach,
     check_backup_directory,
     describe,
+    emporia_interval_seconds,
     lookup_setting,
 )
 from arraysense.store.sqlite_store import SqliteStore
@@ -756,3 +767,240 @@ def test_the_probe_leaves_nothing_behind(tmp_path: Path) -> None:
     files that are not backups."""
     check_backup_directory(str(tmp_path))
     assert list(tmp_path.iterdir()) == []
+
+
+def _local_epoch(year: int, month: int, day: int) -> int:
+    """Midnight on the site's own clock, which is how efficiency days are keyed.
+
+    Written out here rather than assumed to be UTC: the two differ by the site's
+    offset, and a test that assumed UTC would pass in London and fail in Sydney.
+    """
+    zone = resolve_zone(None, None)
+    return int(datetime(year, month, day, tzinfo=zone).timestamp())
+
+
+def test_writing_a_first_array_description_bumps_the_version(settings: SettingsStore) -> None:
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+
+
+def test_changing_the_panel_count_reaches_the_whole_history(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 10 | 400 | 25 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == 0
+
+
+def test_adding_a_string_reaches_the_whole_history(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0\nWest | 2 | 8 | 350 | 25 | 180")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == 0
+
+
+def test_renaming_a_string_reaches_the_whole_history(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "West | 1 | 9 | 400 | 25 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == 0
+
+
+def test_altering_a_tilt_already_in_force_reaches_the_whole_history(
+    settings: SettingsStore,
+) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 30 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == 0
+
+
+def test_appending_a_future_tilt_leaves_the_past_alone(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2027, 10, 1)
+
+
+def test_correcting_a_dated_entry_reaches_back_only_to_that_date(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,38@2027-10-01 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2027, 10, 1)
+
+
+def test_correcting_the_last_entry_leaves_the_earlier_adjustment_alone(
+    settings: SettingsStore,
+) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01,25@2028-03-15 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01,28@2028-03-15 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2028, 3, 15)
+
+
+def test_rewriting_the_identical_description_changes_nothing(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    assert settings.get(CONFIG_VERSION_KEY) == before
+
+
+def test_moving_the_site_reaches_the_whole_history(settings: SettingsStore) -> None:
+    before = settings.get(CONFIG_VERSION_KEY)
+    settings.set(SETTING_LATITUDE, 34.0522)
+    assert settings.get(CONFIG_VERSION_KEY) != before
+    assert settings.get(CONFIG_VALID_FROM_KEY) == 0
+
+
+def test_two_successive_future_appends_each_leave_the_past_alone(settings: SettingsStore) -> None:
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01 | 0")
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2027, 10, 1)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01,30@2028-03-15 | 0")
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2028, 3, 15)
+
+
+def test_the_floor_is_the_sites_own_midnight_not_utcs(settings: SettingsStore) -> None:
+    # East of Greenwich local midnight lands BEFORE UTC midnight. A floor built
+    # in UTC therefore sorts the first day of the new tilt below itself, blesses
+    # the stale score, and leaves the one day the owner changed the array
+    # scored against the geometry it no longer had.
+    settings.set(SETTING_TIMEZONE, "Australia/Sydney")
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01 | 0")
+    sydney = ZoneInfo("Australia/Sydney")
+    first_day = int(datetime(2027, 10, 1, tzinfo=sydney).timestamp())
+    assert settings.get(CONFIG_VALID_FROM_KEY) == first_day
+    # The day itself is not below the floor, so it is rescored rather than kept.
+    assert not first_day < first_day
+    assert first_day < int(datetime(2027, 10, 1, tzinfo=UTC).timestamp())
+
+
+def test_a_second_seasonal_append_does_not_reopen_the_first(tmp_path: Path) -> None:
+    # With history already scored below the standing floor, a further future
+    # adjustment must raise the floor rather than be pinned at the earlier one.
+    # Counting those blessed rows as outstanding froze the floor forever, so the
+    # second adjustment an owner ever made rescored everything back to the
+    # first — the exact punishment a tilt schedule exists to remove.
+    store = SqliteStore(str(tmp_path / "r.db"), device=TEST_DEVICE)
+    settings = SettingsStore(store)
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25 | 0")
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01 | 0")
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2027, 10, 1)
+
+    # A day scored long ago, under a version that has since moved on. It sits
+    # below the floor, so it is legitimately blessed rather than outstanding.
+    zone = resolve_zone(None, None)
+    old_day = datetime(2026, 6, 1, tzinfo=zone)
+    store.write_efficiency_day(
+        [
+            EfficiencyRow(
+                day=old_day,
+                string_name="",
+                expected_kwh=10.0,
+                actual_kwh=9.0,
+                curtailed_kwh=0.0,
+                unexplained_kwh=1.0,
+                modelled_hours=12,
+                partial=False,
+                pr=0.9,
+                config_version=1,
+            )
+        ]
+    )
+    settings.set(PANELS_STRINGS_KEY, "East | 1 | 9 | 400 | 25,40@2027-10-01,30@2028-03-15 | 0")
+    assert settings.get(CONFIG_VALID_FROM_KEY) == _local_epoch(2028, 3, 15)
+
+
+@pytest.mark.parametrize(
+    ("zone_name", "year", "month", "day"),
+    [
+        ("Asia/Beirut", 2027, 3, 28),  # local midnight is skipped entirely
+        ("America/Havana", 2027, 3, 14),  # same, other hemisphere's neighbour
+        ("America/Santiago", 2027, 9, 5),  # the shift lands at 24:00
+        ("Asia/Beirut", 2027, 10, 31),  # local midnight happens twice
+    ],
+)
+def test_the_floor_matches_the_row_key_across_a_midnight_dst_shift(
+    zone_name: str, year: int, month: int, day: int
+) -> None:
+    # The floor and the day key must be the same instant, and on these dates
+    # local midnight either never happens or happens twice. Both sides build it
+    # the same way and so resolve the fold identically; a floor built any other
+    # way would sort the day either side of itself twice a year.
+    zone = ZoneInfo(zone_name)
+    floor = int(datetime(year, month, day, tzinfo=zone).timestamp())
+    row_key = int(
+        datetime.combine(date(year, month, day), datetime.min.time(), tzinfo=zone).timestamp()
+    )
+    assert floor == row_key
+
+
+def test_the_reach_is_the_first_day_the_two_descriptions_actually_disagree() -> None:
+    # A property, checked exhaustively over a small domain rather than argued.
+    # The reach is what decides which stored days keep their scores, and the
+    # dangerous direction is returning a date LATER than the real disagreement:
+    # that leaves a day believed which was scored against geometry it no longer
+    # had. Both schedules are step functions, so agreeing at every step and
+    # before the first implies agreeing everywhere — this is what proves it.
+    def line(tilt: str) -> str:
+        return f"East | 1 | 9 | 410 | {tilt} | 90"
+
+    stamps = ["2027-03-01", "2027-10-01", "2028-03-15"]
+    angles = [20, 25, 30]
+    schedules: list[str] = [str(a) for a in angles]
+    for opening in angles:
+        for count in (1, 2):
+            for chosen in itertools.combinations(stamps, count):
+                for degrees in itertools.product(angles, repeat=count):
+                    tail = ",".join(f"{g}@{d}" for g, d in zip(degrees, chosen, strict=True))
+                    schedules.append(f"{opening},{tail}")
+
+    first = date(2026, 1, 1)
+    days = [first + timedelta(days=i) for i in range(1096)]
+    for before, after in itertools.product(schedules, repeat=2):
+        (old,) = parse_strings(line(before))
+        (new,) = parse_strings(line(after))
+        truth = next((d for d in days if old.tilt_at(d) != new.tilt_at(d)), None)
+        reach = _schedule_reach(line(before), line(after))
+        if truth is None:
+            assert reach is None, f"{before!r} -> {after!r} claimed a reach of {reach}"
+        elif truth == first:
+            assert reach == date.min, f"{before!r} -> {after!r} should reach everything"
+        else:
+            assert reach == truth, f"{before!r} -> {after!r}: want {truth}, got {reach}"
+
+
+def test_the_emporia_interval_refuses_a_stored_value_outside_its_registered_bounds(
+    settings: SettingsStore,
+) -> None:
+    # The registry permits 10 to 3600 and a reader that checks only "is it a
+    # positive whole number" accepts 1 and 3601. This figure is both a divisor
+    # and a multiplier for an energy figure — one second would credit a reading
+    # with a sixtieth of what it covers — and it is what the poller spaces its
+    # calls to Emporia's cloud by. Written straight into the table because
+    # ``set`` already refuses these; the case is a database another build wrote
+    # or somebody edited by hand.
+    spec = lookup_setting(EMPORIA_INTERVAL_KEY)
+    for stored in ("1", "3601", "0", "soon", ""):
+        settings._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (EMPORIA_INTERVAL_KEY, stored),
+        )
+        settings._conn.commit()
+        assert emporia_interval_seconds(settings) == spec.default, stored
+
+
+def test_the_emporia_interval_reads_a_value_the_registry_accepts(
+    settings: SettingsStore,
+) -> None:
+    settings.set(EMPORIA_INTERVAL_KEY, 10)
+    assert emporia_interval_seconds(settings) == 10

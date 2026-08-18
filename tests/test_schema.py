@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -18,11 +19,13 @@ from arraysense.store.schema import (
     FORECAST_TABLE,
     FOREIGN_KEYS_PRAGMA,
     INVERTER_TIERS,
+    LATE_COLUMNS,
     MODULE_TIERS,
     PENDING_TABLE,
     SETTINGS_TABLE,
     expected_columns,
     inverter_metric_columns,
+    late_column_ddl,
     migration_ddl,
     module_metric_columns,
     schema_ddl,
@@ -151,6 +154,13 @@ def test_executing_ddl_creates_expected_tables() -> None:
             FORECAST_TABLE,
             EFFICIENCY_TABLE,
             PENDING_TABLE,
+            # Created whether or not the Emporia module is enabled: an empty
+            # table costs nothing, and the alternative is running DDL on a
+            # request path the first time somebody switches the module on.
+            "circuit",
+            "circuit_reading",
+            "circuit_hourly",
+            "charger_change",
         }
     )
     assert tables == expected
@@ -283,6 +293,85 @@ def test_migration_adds_sample_count_to_a_rollup_table() -> None:
         conn.execute(stmt)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(inverter_minute)")}
     assert "sample_count" in cols
+    conn.close()
+
+
+# --- the tables whose shape is written out by hand --------------------------
+#
+# migration_ddl only knows the metric tiers, because those derive their columns
+# from the registry. A column added to charger_change or circuit is invisible to
+# it, so the installations that have been running longest are exactly the ones
+# that would fail on the first write with "no such column".
+
+
+def test_a_hand_shaped_table_gains_a_column_it_is_missing() -> None:
+    conn = _open()
+    conn.execute("ALTER TABLE charger_change DROP COLUMN source")
+    conn.execute(
+        "INSERT INTO charger_change (timestamp, device_gid, from_a, to_a, reason, applied)"
+        " VALUES (1, 900001, 32, 6, 'written by the older build', 1)"
+    )
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+
+    stmts = late_column_ddl(existing)
+
+    assert stmts == ("ALTER TABLE charger_change ADD COLUMN source TEXT",)
+    for stmt in stmts:
+        conn.execute(stmt)
+    row = conn.execute("SELECT reason, source FROM charger_change").fetchone()
+    assert row[0] == "written by the older build"
+    assert row[1] is None, "the rows that were already there say nothing about who moved the rate"
+    conn.close()
+
+
+def test_the_hourly_circuit_tier_gains_its_coverage_column_on_open() -> None:
+    # An installation that has been recording circuits since 1.1.0 has this
+    # table without the column, and every rollup after the upgrade would fail
+    # with "no such column" — on precisely the installations with the most
+    # history. The rows already there keep NULL: their raw readings are pruned
+    # at thirty days, so the coverage cannot be measured after the fact, and a
+    # zero written here would claim those hours recorded nothing at all.
+    conn = _open()
+    conn.execute("ALTER TABLE circuit_hourly DROP COLUMN covered_seconds")
+    conn.execute(
+        "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count)"
+        " VALUES (3600, 1, 900, 30)"
+    )
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+
+    stmts = late_column_ddl(existing)
+
+    assert "ALTER TABLE circuit_hourly ADD COLUMN covered_seconds INTEGER" in stmts
+    for stmt in stmts:
+        conn.execute(stmt)
+    row = conn.execute("SELECT sample_count, covered_seconds FROM circuit_hourly").fetchone()
+    assert row == (30, None), "an hour written by the older build says nothing about its coverage"
+    conn.close()
+
+
+def test_a_hand_shaped_table_that_is_current_needs_no_migration() -> None:
+    conn = _open()
+    existing = {
+        t: tuple(r[1] for r in conn.execute(f"PRAGMA table_info({t})")) for t in LATE_COLUMNS
+    }
+    assert late_column_ddl(existing) == ()
+    conn.close()
+
+
+def test_every_late_column_is_addable_to_a_table_that_already_has_rows() -> None:
+    # SQLite refuses a NOT NULL column added to a non-empty table unless it
+    # carries a default, and a migration that raises on open bricks the service
+    # for exactly the installations with the most history in them. Asserted over
+    # the whole mapping so a column added later cannot skip the rule.
+    conn = _open()
+    for table, columns in LATE_COLUMNS.items():
+        for name, sql_type in columns:
+            declared = f"{name} {sql_type}".upper()
+            assert "NOT NULL" not in declared or "DEFAULT" in declared, f"{table}.{name}"
     conn.close()
 
 
@@ -440,3 +529,121 @@ def test_migration_adds_only_declared_missing_columns() -> None:
     # structural on the rollup tiers. Nothing undeclared is added.
     assert added == {"battery_soc_pct", "voltage_v", "sample_count"}
     assert not any("pv1_power_w" in s for s in statements)
+
+
+# --- The Emporia module's tables -----------------------------------------
+#
+# Circuits are rows rather than columns because they have no ceiling: 32 across
+# two monitors here, 8 in an apartment, 48 with a third monitor. A fixed slot
+# count would need a migration the day somebody added one.
+
+
+def test_the_circuit_tables_are_part_of_the_schema() -> None:
+    from arraysense.store.schema import schema_ddl
+
+    ddl = schema_ddl()
+    assert "CREATE TABLE IF NOT EXISTS circuit " in ddl
+    assert "CREATE TABLE IF NOT EXISTS circuit_reading " in ddl
+
+
+def test_a_circuit_is_identified_by_device_and_channel_never_its_name() -> None:
+    from arraysense.store.schema import ddl_for
+
+    ddl = ddl_for("circuit")
+    assert "UNIQUE (device_gid, channel_num)" in ddl
+    # The name must be updatable in place without colliding.
+    assert "name TEXT NOT NULL UNIQUE" not in ddl
+
+
+def test_a_circuit_reading_may_be_absent() -> None:
+    # NULL is the whole point: an offline outlet reports null and must store as
+    # null, not zero.
+    from arraysense.store.schema import ddl_for
+
+    ddl = ddl_for("circuit_reading")
+    assert "watts INTEGER" in ddl
+    assert "watts INTEGER NOT NULL" not in ddl
+
+
+def test_the_circuit_table_can_generate_its_own_ids() -> None:
+    # A surrogate key needs SQLite to count. WITHOUT ROWID removes the rowid
+    # aliasing that does the counting, so the same table carrying both refuses
+    # its first insert — which is how this was found rather than reasoned.
+    from arraysense.store.schema import ddl_for
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute(ddl_for("circuit"))
+    conn.execute(
+        "INSERT INTO circuit"
+        " (device_gid, channel_num, name, multiplier, kind, first_seen, last_seen)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (100000, "1", "Dryer", 2.0, "circuit", 0, 0),
+    )
+    assert conn.execute("SELECT id FROM circuit").fetchone()[0] == 1
+    conn.close()
+
+
+def test_the_tables_are_created_by_an_ordinary_store(tmp_path: Path) -> None:
+    from arraysense.store.sqlite_store import SqliteStore
+    from conftest import TEST_DEVICE
+
+    store = SqliteStore(str(tmp_path / "s.db"), device=TEST_DEVICE)
+    names = {
+        row[0]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    assert {"circuit", "circuit_reading"} <= names
+    store.close()
+
+
+def test_circuit_readings_use_the_same_time_column_as_everything_else() -> None:
+    # Every other table in this store calls it `timestamp`, and the retention
+    # engine reads that name directly. A table that spelled it differently
+    # could not be pruned by the machinery that prunes all the others.
+    from arraysense.store.schema import ddl_for
+
+    assert "timestamp INTEGER NOT NULL" in ddl_for("circuit_reading")
+
+
+def test_circuits_have_an_hourly_tier_to_be_pruned_into() -> None:
+    # Raw circuit readings arrive once a minute per circuit — 56,000 rows a day
+    # on the reference account. The store's answer to that everywhere else is a
+    # coarser tier that outlives the raw rows, and retention refuses to delete
+    # anything this table does not already cover.
+    from arraysense.store.schema import ddl_for, schema_ddl
+
+    ddl = ddl_for("circuit_hourly")
+    assert "PRIMARY KEY (timestamp, circuit_id)" in ddl
+    assert "watts INTEGER" in ddl
+    assert "watts INTEGER NOT NULL" not in ddl, "an hour nobody reported is absent, not zero"
+    assert "sample_count INTEGER NOT NULL" in ddl
+    assert "CREATE TABLE IF NOT EXISTS circuit_hourly " in schema_ddl()
+
+
+def test_the_charger_audit_records_what_moved_and_why() -> None:
+    # A rate that persists for ever needs a record of who last touched it and
+    # what for. Without it, a car found at 6 A in the morning has no history at
+    # all — only the number, which is the one thing that does not explain
+    # itself.
+    from arraysense.store.schema import ddl_for, schema_ddl
+
+    ddl = ddl_for("charger_change")
+    assert "from_a INTEGER" in ddl
+    assert "to_a INTEGER" in ddl
+    assert "reason TEXT NOT NULL" in ddl
+    assert "applied INTEGER NOT NULL" in ddl, "a refused change is as worth recording as a made one"
+    assert "PRIMARY KEY (timestamp, device_gid)" not in ddl, (
+        "an audit has no natural key: two decisions in one second are two rows"
+    )
+    assert "CREATE TABLE IF NOT EXISTS charger_change " in schema_ddl()
+
+
+def test_the_audit_can_record_a_change_from_a_rate_nobody_knew() -> None:
+    # from_a is nullable on purpose: the first write after a restart may find a
+    # charger it has never read. "From nothing known to 16 A" is the truth, and
+    # a zero there would be a claim that the charger had been off.
+    from arraysense.store.schema import ddl_for
+
+    assert "from_a INTEGER NOT NULL" not in ddl_for("charger_change")

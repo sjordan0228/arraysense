@@ -7,6 +7,390 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.6 — 17 August 2026
+
+The monitored circuits stop out-totalling the house.
+
+### Fixed
+
+- **A device that sits inside a circuit is no longer counted beside it.** On the
+  reference account the monitored circuits summed to 131% of the house's own
+  measured energy, which is not a coverage figure at all — a part cannot exceed
+  the whole. The subpanel's sixteen branches, the EV charger and four smart
+  plugs were all added on top of the main panel's clamps that already measure
+  them: 629 kWh of an August that only 1,721 kWh passed through.
+
+  Emporia publishes the containment and we discarded it. It arrives as two flat
+  fields on each device, `parentDeviceGid` and `parentChannelNum`, rather than
+  as nesting in the reply — the only true nesting is a monitor's own channel
+  bank, which repeats its parent's identifier and declares nothing, so a
+  subpanel's branches read as the house's own until the bank inherits what its
+  monitor declared.
+
+  The rule is stated once, in `alerts.counts_toward_total`, and read by all
+  three sums: the Costs page's coverage sentence, the Circuits tab's coverage
+  block, and the dashboard's high-usage alert, which had the same fault at
+  instantaneous power. Coverage on the reference account now reads 94.9%.
+
+  **Nothing disappears from a page.** The rule governs what may be added, never
+  what may be named: a charger that genuinely drew 3 kW keeps its row and its
+  figure, because "which load" is the question a ranking exists to answer. Only
+  the total changed.
+
+  No migration and no rewritten history — this is a summing rule, not a storage
+  one. The two new columns arrive on an existing database when it is opened, and
+  fill themselves at the next poll.
+
+## 1.1.5 — 17 August 2026
+
+The Costs page can say which circuits the money went on.
+
+### Added
+
+- **The five circuits that cost the most in the month being shown**, ranked by
+  what they cost rather than by what they drew, each with its split across the
+  rate bands. A circuit that only ever runs at peak can outrank one that used
+  twice the energy, which is the useful thing to learn and a baffling one to
+  meet without the split beside it.
+
+  Priced through the same band walk every other figure on the page goes
+  through. Nothing about money is computed twice.
+
+- **`GET /api/costs/circuits`**, which answers it. Measured on the bench at 16
+  to 23 ms for a calendar month across thirty-three circuits, reading the
+  hourly tier — which is kept indefinitely, so a month the picker can reach is
+  a month this can price.
+
+### The figure that keeps the list honest
+
+Thirty-nine monitored channels do not add up to a house. The remainder is real:
+unmonitored branches, and on the reference account two outlets that have been
+offline since April and August. So the list is drawn beside a statement of what
+share of the period's energy those circuits account for, computed from energy
+rather than from minutes watched — the distinction #23 was reverted twice for
+missing, and the one money depends on.
+
+That share is withheld rather than guessed when the circuits and the house
+counter do not describe the same stretch of time, and it is reported uncapped:
+a share above one is not coverage at all but a fault announcing itself, and
+clamping it to 100% would render every such fault as perfect coverage.
+
+A circuit thin in one band is labelled in that band, not across the month — a
+circuit can be recorded end to end through the off-peak stretch and thin in the
+one evening hour that costs the most. A circuit that reported nothing is a dash
+and sorts below one measured at nothing. `mains` never appears: it is the total,
+not a part.
+
+## 1.1.4 — 17 August 2026
+
+The Costs page can be pointed at a month other than the one in progress.
+
+### Added
+
+- **A month picker on the Costs page.** Every figure follows it — the three
+  money cards, the diagram, the rate-band table and the energy grid — so a
+  finished month can be read the way the current one always could. The control
+  is the one the Efficiency page already carries, in the strip that already
+  named the billing month.
+
+  **Forward stops at the month in progress.** Asked about next month the
+  service answers rather than refuses, partially and with its elapsed fraction
+  clamped, so a month that has not happened would have arrived on the page
+  looking like an ordinary part month.
+
+### Fixed
+
+- **A month that is over no longer describes itself as an estimate.** Eleven
+  strings on the page assumed the month was still running: "Cost so far",
+  "Estimated bill", "Month to date", "it assumes the rest of the month uses
+  each rate band at the rate this one has so far". Each now has a finished-month
+  form, decided in one place from the same elapsed threshold the month strip
+  already used, because a page that relabelled some of them and not the others
+  would mislead more than one that relabelled none.
+
+- **The five-minute refresh no longer returns the reader to today.** It rebuilt
+  its window from the clock on every pass, so a reader looking at July would
+  have been moved to August five minutes after arriving, with nothing on screen
+  to say why. It now leaves a finished month alone entirely — a month that is
+  over cannot change, and re-reading it is a month of counter history read for
+  nothing.
+
+## 1.1.3 — 17 August 2026
+
+The Circuits tab can be given the months your Vue recorded before ArraySense
+was ever pointed at it.
+
+### Added
+
+- **`tools/backfill_emporia_history.py`, a one-off import of Emporia's own
+  archive.** The Circuits tab offers thirty days and thirteen months, and a
+  fresh installation has hours — every reading before the module was connected
+  is sitting in Emporia's cloud and nothing had asked for it. One run per
+  installation fills the hourly tier from it; on the reference account that was
+  21,723 rows across thirty-nine circuits and thirty days, in about a minute.
+  See [docs/backfilling-emporia-history.md](docs/backfilling-emporia-history.md).
+
+  **It never overwrites an hour ArraySense measured itself.** Our rollup is
+  built from readings taken here; Emporia's figure is taken on trust, so where
+  both exist ours stands. An hour the cloud has no figure for gets no row at
+  all rather than a row claiming the circuit drew nothing, and the hour still
+  running is skipped — Emporia will answer for it, but that answer covers only
+  the minutes so far and nothing later would correct it.
+
+  Safe against a live installation, and running it twice writes nothing the
+  second time.
+
+### Notes
+
+- **A backfilled hour is not labelled "partial" and a polled one is.** That is
+  not backwards. An Emporia hourly bucket is the device's own aggregate of its
+  own continuous record, so it covers the whole hour; polling that device once
+  a minute covers around 3,540 seconds of it. The label says how an hour was
+  measured, not how good it is.
+
+## 1.1.2 — 17 August 2026
+
+Six circuits stop being called by their serial numbers.
+
+### Fixed
+
+- **A device that Emporia has a name for is called by it.** An outlet, a
+  charger and a monitor all report themselves on the mains channel, and none of
+  them name that channel — so the Circuits page and the Circuits tab showed
+  "Device 402097 ch 1,2,3" for six of the reference account's thirty-nine
+  rows while Emporia had held "EVSE", "Dishwasher", "Washer", "Garage fridge",
+  "Garage Freezer" and "Subpanel Vue" for them the whole time. The name was
+  never on the channel; it is one level up, in the device's own
+  `locationProperties`, which is why nothing had read it. Rename a device in
+  Emporia's app and the page follows.
+
+  **An unnamed clamp is still called by its number, deliberately.** The name
+  belongs to the device, so lending it to every unnamed channel would render a
+  monitor's four unconfigured clamps as four separate rows all reading
+  "Subpanel Vue" — worse than the identifier it replaced, which at least tells
+  them apart. Only a device's own mains channel takes the device's name.
+
+## 1.1.1 — 16 August 2026
+
+The Graphs page can now show what is actually drawing the power, for an
+installation with an Emporia Vue connected — the per-circuit history the
+Emporia module has been recording since it shipped in 1.1.0, and nothing had
+ever queried.
+
+**This release adds a column, and it is applied automatically on the first
+start.** `circuit_hourly` gains `covered_seconds` — how much of each hour the
+readings behind it actually account for, measured when the hour is rolled up.
+Hours recorded before the upgrade have no figure and keep none: the raw
+readings they were built from are pruned after thirty days, so the measurement
+cannot be made after the fact, and inventing one would be worse than the
+estimate those hours already fall back to. **Nothing already stored is
+rewritten**, and hours recorded from the upgrade onwards are exact.
+
+### Added
+
+- **A Circuits tab on the Graphs page, shown only where an Emporia account is
+  connected.** The top five circuits by energy over the range on screen, each
+  drawn as its own strip scaled to its own peak with that peak printed beside
+  it — a circuit at 40 W and one at 4,000 W sharing an axis would erase the
+  smaller one. Change the range and the ranking follows it: a kettle that led
+  a one-hour window can drop out of the top five over a week. An expander
+  reveals the rest. A gap in a strip means the circuit recorded nothing there,
+  not that it drew nothing — a dead outlet and an idle one look different. A
+  circuit that has gone quiet for good, rather than for a poll or two, draws
+  no strip at all: just the reason and how long, in place of an empty box that
+  would read as a bug.
+- **A summary panel above the strips, with two readings of the same window.**
+  A ranked kWh bar chart by default — length alone carries the meaning, so it
+  needs no colour at all — and a stacked view of the same circuits under the
+  house's own load over time, behind a switch that is remembered per browser.
+- **A coverage line stating what share of the house the monitored circuits
+  account for.** Computed from energy rather than from minutes watched, which
+  is the distinction #23 was reverted twice for missing — a numerator that
+  only recorded for part of the window a house counter covers is a different
+  question from one that recorded for the whole of it, and the line answers
+  the one it can rather than dividing the two together as though they agreed.
+  It is qualified or withheld outright rather than guessed whenever an honest
+  share cannot be given, and it never reads as full or empty coverage merely
+  because the house figure is absent.
+- **`GET /api/emporia/history`.** Circuits over a range, ranked by energy, at
+  raw or hourly resolution chosen from the range and the chart's own width —
+  the same fit rule the inverter and per-module charts already use.
+- **A circuit's name on the Emporia page is now a link to its own history**,
+  a real link that can be copied and sent rather than a row that only means
+  something inside that page.
+- **Circuit energy no longer depends on what the poll interval is set to
+  today.** How much of each hour its readings account for is measured when the
+  hour is summarised, minutes after the readings arrived, and stored with it.
+  Changing `emporia.interval` used to move the energy of every hour already
+  recorded: an hour holding thirty minutes of ten-second readings accounts for
+  1,800 of its seconds, and read back at a sixty-second setting the same 180
+  readings claimed 10,800 — clamped to the hour, so the half hour doubled into a
+  whole one and took its energy with it. The rebuild reaches three hours back,
+  so a change made now still meets readings collected under the old setting; an
+  hour's coverage is therefore only ever raised by a rebuild and never lowered,
+  and lowering the interval cannot rewrite three hours of honest readings as a
+  fraction of the energy they recorded. A window read at full resolution is
+  bounded the same way: one reading accounts for at most one poll interval, so
+  two 1 kW readings three hours apart at a sixty-second interval are worth the
+  two minutes they were taken for — 33 Wh — rather than the 6 kWh that crediting
+  each of them with the whole gap would give, and the three hours nobody
+  recorded break the line instead of being drawn straight across.
+- **An hour's stored watts and its stored coverage are measured from the same
+  spans, and are written together or not at all.** Each reading holds until the
+  next one arrives, capped at one poll interval; the span is cut where it
+  crosses the hour, and both figures come from those same pieces. A plain
+  average beside a duration-weighted coverage is two different weightings of
+  one hour multiplied together by whatever reads them: 100 W held for five
+  seconds followed by 1,000 W held for two minutes stored 700 W where the hour
+  really averaged 964, and the energy came out 27% short. Cutting at the
+  boundary is the other half — a reading at 12:59:59 used to take a whole
+  interval inside the 12:00 bucket and give 13:00 nothing. And because the two
+  columns are multiplied, a rebuild replaces both or neither: keeping the larger
+  coverage while overwriting the watts left 100 W for five seconds followed by
+  1,000 W reading as 45,500 J, where those readings account for 60,500 J at a
+  sixty-second interval and 10,500 J at a ten-second one — a figure neither
+  setting produces, and so one nothing downstream could attribute to either.
+  That rule now covers an hour's removal as well as its rewriting. An hour can
+  hold nothing but the seconds a reading just before the boundary ran over into
+  it, and re-measured at a shorter interval that reading no longer reaches the
+  boundary at all — so the hour had nothing to rebuild from and was deleted
+  outright, taking real recorded energy with it: one 500 W reading at 59:50
+  books fifty seconds into the next hour, and lowering `emporia.interval` from
+  sixty seconds to ten erased that hour. A rebuild now clears an hour only where
+  the stored row accounts for nothing.
+- **The recorded-for figure describes the module rather than the circuits
+  asked for.** A poll that reached one clamp reached the monitor, so asking for
+  a single outlet that has been offline since April no longer reads as a module
+  outage and no longer withholds a share the module could honestly support.
+
+## 1.1.0 — 16 August 2026
+
+The first optional module. An Emporia Vue's circuits, and an Emporia EV
+charger, sit beside the inverter rather than inside it — and an adjustable
+mount stops costing you the performance history every time you adjust it.
+
+A minor version rather than a patch because modules are a new shape for this
+service to have, not a new reading. The module adds its own tables, which are
+created when the database is next opened; nothing already stored is rewritten,
+and an installation that never switches the module on gets the tables and
+nothing else.
+
+### Added
+
+- **An Emporia module, off by default, that costs nothing while it is off.** No
+  poller, no HTTP, no rows: an installation that never enables it behaves
+  exactly as it did before this existed. Switching it on reads the circuits an
+  Emporia Vue measures and stores them on their own fifteen-second clock,
+  entirely separately from the inverter — Emporia's cloud being down, slow, or
+  refusing the credential costs solar collection nothing, which is the point of
+  a module rather than a feature. Circuits are keyed on the monitor and the
+  channel rather than the name, so renaming one in Emporia's app moves a label
+  instead of stranding a year of history. The login is one JSON POST to Cognito
+  using the standard library alone, and the refresh token lives in a 0600 file
+  outside the database, so a database shared while diagnosing a problem does
+  not carry account access with it.
+- **A warning when the house is drawing more than it usually does, and what is
+  drawing it.** Whether to warn comes from the inverter's own load figure every
+  eleven seconds, so it fires on an installation that has never heard of
+  Emporia. What is responsible comes from Emporia and only from Emporia, and a
+  set of circuits accounting for a fraction of the draw says so rather than
+  being presented as the whole explanation.
+- **Control of an Emporia EV charger, on the accounts that have one.** A page
+  of its own rather than a card, because a charger is a thing you act on and
+  circuits are a thing you read, and the tab appears only where there is a
+  charger to reach. How much say the service has is one setting with four
+  positions — the Emporia app keeps it, propose only, may set a rate, may also
+  stop and start — each strictly more powerful than the last, defaulting to the
+  Emporia app keeping it, and an unrecognised value means the charger is not
+  ours. Permission to drive somebody's car charger fails closed at every level.
+  The rate is a slider from 6 to 48 A that starts wherever the charger actually
+  is, because amps are a quantity you feel your way to rather than type.
+- **A record of every change to the charge rate, and every one refused.** A
+  charge rate persists for ever once set — it does not time out or revert, and
+  nothing at Emporia's end will put it back — so a car found at 6 A in the
+  morning is a number with no history attached. The page lists what moved, who
+  moved it, and why, refusals included: a module that proposed twenty things
+  and did none of them otherwise looks identical to one nobody asked.
+- **A warning when Emporia is driving the same charger.** Emporia ships four
+  controllers of its own, and on the reference account the one the design
+  expected to find was off while two others were on — one of which moved the
+  rate from 16 A to 7 A during testing. All four are now checked and named. It
+  warns and never refuses: it is the owner's charger and their account.
+- **Tilt can be a schedule rather than a single angle.** An array on a
+  seasonally adjustable mount is moved twice a year, and until now the owner
+  had to choose between a model that matched the array today and one that
+  matched what it was under last winter. The tilt field accepts a list of
+  angles with the dates they came into force — `25,40@2027-10-01` means 25°
+  until the first of October 2027 and 40° from it — and every hour is scored
+  against the angle the array really stood at. A fixed mount is still written
+  as one number and nothing about it changes.
+- **The settings page has a way to enter one.** Each string gets a collapsed
+  *I adjust this mount seasonally* fold holding a date, an angle, and a button
+  that appends the adjustment to the tilt box. The common case stays a single
+  number in a single field.
+- **The Efficiency page answers what adjusting was worth.** A new panel scores
+  the period twice — once as the array really stood, once as though the mount
+  had never been moved — and shows the difference with the number of hours it
+  was drawn from. Both sides are modelled, because the road not taken has no
+  meter on it, and a fixed mount shows nothing at all rather than a zero.
+
+### Fixed
+
+- **The first-run wizard asks where the installation is before the button, not
+  after it.** "Where is this installation?" sat below *Set up and start*, so
+  the obvious way through the form was to fill in the inverter and press the
+  button — and the location, which the weather poller cannot work without and
+  which needs an explicit backfill to recover, was below the fold and easy to
+  walk straight past.
+- **Restore on startup no longer overrules a rate you set by hand.** The
+  service puts a rate back after a restart so that dying mid-throttle does not
+  leave a car at 6 A all night — but it decided a rate was its own to put back
+  by asking only what was last applied, and your own change reaches the charger
+  the same way its does. So a rate somebody set deliberately was undone by the
+  next restart, inside the two-hour window meant to protect it, and the window
+  itself was never consulted. The record now says who decided each change, and
+  the restore puts back only what it can show is its own work and only when
+  nobody's hand is on the charger. A change recorded before this was tracked
+  says nothing about who made it, and is left alone rather than assumed.
+- **Switching the module off now switches the charger off with it.** The
+  Charger tab stayed in the nav, the page behind it reported a charger at a
+  rate, and both controls would have attempted a real write — the last charger
+  read was kept for the life of the process, and neither write route asked
+  whether the module was still on. It is now forgotten when a tick finds the
+  module disabled, the endpoint answers with no charger, and both writes are
+  refused with a reason rather than accepted and dropped.
+- **The per-pack views ask the device whether it has packs.** On a machine
+  whose driver declares no per-module battery, the dashboard drew a Battery
+  modules card over an empty grid, advising the owner to check that the packs
+  are in closed loop — a CAN link that cannot be down because it does not
+  exist. The Graphs page had the same hole one level up: a Packs tab, a Packs
+  section, and two spread bands, none of them gated. Only an explicit "no"
+  suppresses them, because absent capability is not absent data, and the
+  advisory stays for the case it was written for: a device that declares packs
+  and has none reporting, which is a real fault.
+- **A circuit that is blank says which kind of blank it is.** A clamp measuring
+  nothing and a monitor that has been dead since April rendered identically.
+  Every device's connection is now read, and the page says why a row is empty
+  and since when.
+- **A restore that cannot be applied is not written down again every restart.**
+  Under an authority that may only propose, nothing about the charger moves, so
+  the identical sentence was recorded on every restart for ever — and the
+  history is read to answer "what has this service done to my car", which a
+  hundred copies of one line answers less well than none. A change that was
+  actually applied is never suppressed: it did something, and it happened again.
+- **Adding a future adjustment no longer discards the scored history.** Editing
+  the array bumps the efficiency config version, which marks every stored day
+  stale and rescores it. That was right when any edit could change what the
+  array was expected to produce on any day, and wrong the moment tilt acquired
+  a date: appending next October's adjustment says nothing whatever about last
+  March. A companion setting now records how far back a change actually
+  reaches, so a future adjustment rescores nothing, a correction to a past one
+  rescores only from that date, and a change to anything else still rescores
+  everything. The floor is built at midnight on the site's own clock, which is
+  how the stored days are keyed — reading it as UTC midnight put the first day
+  of a new tilt on the wrong side of its own boundary anywhere east of
+  Greenwich.
+
 ## 1.0.10 — 15 August 2026
 
 The dashboard's three summary cards stop being unreadable on a phone.

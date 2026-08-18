@@ -19,8 +19,11 @@ from arraysense.collector import service as service_module
 from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.models import Sample
+from arraysense.modules.emporia.parse import Circuit, Reading
+from arraysense.modules.emporia.repository import CircuitRepository
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
+    EMPORIA_INTERVAL_KEY,
     RETENTION_ENABLED_KEY,
     RETENTION_RAW_DAYS_KEY,
     SettingsStore,
@@ -465,3 +468,40 @@ async def test_an_hour_written_through_a_write_connection_is_promoted_too(tmp_pa
     store.close()
     assert len(rows) == 1
     assert rows[0]["ghi_wm2"] == 250.0
+
+
+async def test_changing_the_interval_does_not_rewrite_hours_already_measured(
+    tmp_path: Path,
+) -> None:
+    # The pass rebuilds the previous three hours from the interval in force
+    # *now*. Lowering emporia.interval from sixty seconds to ten re-capped three
+    # hours of sixty-second readings at ten seconds apiece and rewrote them as a
+    # sixth of the energy they recorded — readings measured honestly, overwritten
+    # by a setting they were never collected under.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC).replace(minute=0, second=0, microsecond=0)
+    hour = now - timedelta(hours=2)
+    repo = CircuitRepository(store)
+    repo.sync_circuits([Circuit(100000, "1", "Heat pump", 1.0, "circuit")], hour)
+    for minute in range(60):
+        repo.append_readings([Reading(100000, "1", 500)], hour + timedelta(minutes=minute))
+
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_INTERVAL_KEY, 60)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    await service.maintain_rollups(now=now)
+    measured = store._conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE timestamp = ?",
+        (int(hour.timestamp()),),
+    ).fetchone()
+    assert measured == (3600,), "an hour of one-minute polls is a whole hour"
+
+    settings.set(EMPORIA_INTERVAL_KEY, 10)
+    await service.maintain_rollups(now=now)
+
+    again = store._conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE timestamp = ?",
+        (int(hour.timestamp()),),
+    ).fetchone()
+    store.close()
+    assert again == (3600,), "600 is what the new setting says, not what was recorded"

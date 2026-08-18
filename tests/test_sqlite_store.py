@@ -2178,3 +2178,108 @@ def test_site_only_rows_do_not_stretch_the_claimed_span(tmp_path: Path) -> None:
     store.close()
     assert spans["full"] == (inverter_at, inverter_at)
     assert spans["hourly"] == (inverter_at, inverter_at)
+
+
+def test_opening_a_database_written_before_the_source_column_repairs_it(tmp_path: Path) -> None:
+    # The two installations this had to be right for. Both already hold a
+    # charger_change table with rows in it, and CREATE TABLE IF NOT EXISTS does
+    # nothing at all to a table that already exists — so without the repair the
+    # first audit write after the upgrade would fail with "no such column", on
+    # the boxes with the most history rather than the least.
+    path = str(tmp_path / "old.db")
+    store = SqliteStore(path, device=TEST_DEVICE)
+    with store._conn:
+        store._conn.execute("ALTER TABLE charger_change DROP COLUMN source")
+        store._conn.execute(
+            "INSERT INTO charger_change (timestamp, device_gid, from_a, to_a, reason, applied)"
+            " VALUES (1786900000, 900001, 32, 6, 'restored on startup', 1)"
+        )
+    store.close()
+
+    reopened = SqliteStore(path, device=TEST_DEVICE)
+    columns = {r[1] for r in reopened._conn.execute("PRAGMA table_info(charger_change)")}
+    row = reopened._conn.execute("SELECT reason, source FROM charger_change").fetchone()
+    reopened.close()
+
+    assert "source" in columns
+    assert row[0] == "restored on startup", "the history that was there is untouched"
+    assert row[1] is None, (
+        "and it says nothing about who moved the rate, because nobody recorded it"
+    )
+
+
+def test_opening_a_database_written_before_covered_seconds_repairs_it(tmp_path: Path) -> None:
+    # The same shape for the circuit tier, and with more at stake: without the
+    # repair every rollup after the upgrade fails with "no such column", so the
+    # hourly tier stops advancing and retention stops being able to prune raw
+    # readings that grow by 56,000 rows a day. The hours already stored keep
+    # NULL — the raw readings behind them are pruned at thirty days, so their
+    # coverage cannot be measured now, and rewriting them would be inventing it.
+    path = str(tmp_path / "old.db")
+    store = SqliteStore(path, device=TEST_DEVICE)
+    with store._conn:
+        store._conn.execute("ALTER TABLE circuit_hourly DROP COLUMN covered_seconds")
+        store._conn.execute(
+            "INSERT INTO circuit_hourly (timestamp, circuit_id, watts, sample_count)"
+            " VALUES (1786896000, 1, 900, 30)"
+        )
+    store.close()
+
+    reopened = SqliteStore(path, device=TEST_DEVICE)
+    columns = {r[1] for r in reopened._conn.execute("PRAGMA table_info(circuit_hourly)")}
+    row = reopened._conn.execute(
+        "SELECT watts, sample_count, covered_seconds FROM circuit_hourly"
+    ).fetchone()
+    reopened.close()
+
+    assert "covered_seconds" in columns
+    assert row[:2] == (900, 30), "the hour that was there is untouched"
+    assert row[2] is None, "and it says nothing about its own coverage, because nobody measured it"
+
+
+# The circuit table exactly as 1.1.5 shipped it, before containment was read.
+# Written out rather than generated, because the point of the test is a
+# database this driver did not create.
+_CIRCUIT_1_1_5 = (
+    "CREATE TABLE circuit ("
+    "  id INTEGER PRIMARY KEY,"
+    "  device_gid INTEGER NOT NULL,"
+    "  channel_num TEXT NOT NULL,"
+    "  name TEXT NOT NULL,"
+    "  multiplier REAL NOT NULL DEFAULT 1.0,"
+    "  kind TEXT NOT NULL DEFAULT 'circuit',"
+    "  type_gid INTEGER,"
+    "  first_seen INTEGER NOT NULL,"
+    "  last_seen INTEGER NOT NULL,"
+    "  UNIQUE (device_gid, channel_num)"
+    ")"
+)
+
+
+def test_a_database_recorded_before_containment_gains_the_new_columns(tmp_path: Path) -> None:
+    """An installation running since 1.1.0 has a circuit table without them.
+
+    ``CREATE TABLE IF NOT EXISTS`` does nothing against a table that already
+    exists, so without the late-column repair the first read after upgrading
+    fails with "no such column" — and ``latest()`` catches sqlite errors and
+    returns an empty list, which would blank every circuit on the dashboard
+    rather than announce itself.
+    """
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(_CIRCUIT_1_1_5)
+    conn.execute(
+        "INSERT INTO circuit"
+        " (device_gid, channel_num, name, multiplier, kind, type_gid, first_seen, last_seen)"
+        " VALUES (100000, '5', 'Dryer', 1.0, 'circuit', NULL, 0, 0)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteStore(str(path), device=TEST_DEVICE)
+    columns = {row[1] for row in store._conn.execute("PRAGMA table_info(circuit)")}
+    kept = store._conn.execute("SELECT name, parent_device_gid FROM circuit").fetchone()
+    store.close()
+
+    assert {"parent_device_gid", "parent_channel_num"} <= columns
+    assert kept == ("Dryer", None), "the existing circuit keeps its history and gains a null"

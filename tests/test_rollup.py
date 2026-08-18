@@ -10,7 +10,9 @@ counts, not just presence.
 from __future__ import annotations
 
 import logging
+import random
 import sqlite3
+from typing import NamedTuple
 
 import pytest
 
@@ -22,6 +24,7 @@ from arraysense.store.rollup import (
     merge_site_hours,
     pack_scale,
     promote_pending_hours,
+    rebuild_circuit_hourly,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -919,3 +922,803 @@ def test_the_late_write_threshold_sits_inside_the_rebuild_window() -> None:
     from arraysense.collector.service import HOURLY_REBUILD_WINDOW
 
     assert LATE_APPEND_SECONDS < HOURLY_REBUILD_WINDOW
+
+
+# --- circuits ------------------------------------------------------------
+#
+# Raw circuit readings are the fastest-growing table in the store — one row per
+# circuit per minute, 56,000 a day on a house with two monitors — and the only
+# reason they can be deleted at all is that this tier holds what they said.
+
+
+def _circuit_store(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+        " first_seen, last_seen) VALUES (1, 100000, '5', 'Dryer', 2.0, 'circuit', 0, 0)"
+    )
+    conn.execute(
+        "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+        " first_seen, last_seen) VALUES (2, 100000, '1', 'Bathroom', 1.0, 'circuit', 0, 0)"
+    )
+
+
+def test_an_hour_of_readings_becomes_one_row_per_circuit() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(3):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+            (hour + minute * 60, 100 + minute * 100),
+        )
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 2, 50)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    rows = dict(
+        (row[0], (row[1], row[2]))
+        for row in conn.execute(
+            "SELECT circuit_id, watts, sample_count FROM circuit_hourly WHERE timestamp = ?",
+            (hour,),
+        )
+    )
+    assert rows[1] == (200, 3), "100, 200 and 300 average to 200 over three readings"
+    assert rows[2] == (50, 3)
+    conn.close()
+
+
+def test_an_hour_of_silence_averages_to_nothing_rather_than_zero() -> None:
+    # The rule this project exists for, carried into the coarse tier. A circuit
+    # that reported null for an hour did not use no power.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(2):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (None, 0), "no readings means no average and no coverage claimed"
+    conn.close()
+
+
+def test_a_partly_silent_hour_averages_only_what_was_heard() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 90)", (hour,)
+    )
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
+        (hour + 60,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT watts, sample_count FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (90, 1), "sample_count counts readings, so a partial hour says so"
+    conn.close()
+
+
+def test_rebuilding_the_same_hour_twice_does_not_double_it() -> None:
+    # The rebuild has to be idempotent: the maintenance pass runs it over a
+    # window that overlaps what it did a minute ago, every minute.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 80)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    assert conn.execute("SELECT COUNT(*) FROM circuit_hourly").fetchone()[0] == 1
+    conn.close()
+
+
+def test_coverage_is_measured_here_because_only_here_knows_the_interval() -> None:
+    # The whole of the fix. Thirty minutes of readings at ten seconds is 1,800
+    # seconds of the hour, and this is the only moment anything can say so: by
+    # the time a page asks, the owner may have changed the interval, and the
+    # same sample count would then mean six times as much.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for tick in range(180):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+            (hour + tick * 10,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=10)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (180, 1800)
+    conn.close()
+
+
+def test_coverage_comes_from_the_stamps_and_never_exceeds_the_hour() -> None:
+    # Measured from the real timestamps rather than multiplied out of the
+    # count, so a retried poll landing seconds behind its predecessor adds
+    # seconds and not a whole interval. And an hour holds 3,600 seconds however
+    # generously the last reading's own period runs past the end of it.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    # A poll at the top of the hour, a retry five seconds later, and one at the
+    # half hour. At a sixty-second interval that is 5 + 60 + 60 seconds.
+    for offset in (0, 5, 1800):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 700)",
+            (hour + offset,),
+        )
+    # One reading in the hour at an hourly interval claims the hour and no more.
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 2, 700)",
+        (hour + 1800,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    retried = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert retried == (125,), "5 + 60 + 60, not three whole intervals"
+
+    conn.execute("DELETE FROM circuit_hourly")
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=3600)
+    lone = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 2 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    # A reading at the half hour covers the half hour after it, not the half
+    # hour before it existed. The remaining 1,800 seconds of its period belong
+    # to the next hour and are booked there.
+    assert lone == (1800,), "a reading credits the time after it, never before"
+    conn.close()
+
+
+def test_a_span_crossing_the_hour_is_split_between_the_two_hours() -> None:
+    # The partition used to be by hour, so a reading at 12:59:59 took a whole
+    # interval inside the 12:00 bucket and gave 13:00 nothing at all — the
+    # energy either side of every hour edge misfiled, and one second of it
+    # claiming sixty.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 900)",
+        (hour + 3599,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 7200, cadence_seconds=60)
+
+    rows = dict(
+        (row[0], (row[1], row[2], row[3]))
+        for row in conn.execute(
+            "SELECT timestamp, watts, sample_count, covered_seconds"
+            " FROM circuit_hourly WHERE circuit_id = 1"
+        )
+    )
+    assert rows[hour] == (900, 1, 1), "one second of the period lies in this hour"
+    # Stamped in the hour before, so it is not a sample of this one — but the
+    # fifty-nine seconds it covers are this hour's energy and are booked here.
+    assert rows[hour + 3600] == (900, 0, 59)
+    conn.close()
+
+
+def test_the_stored_watts_are_weighted_by_how_long_each_reading_held() -> None:
+    # 100 W for five seconds and 1,000 W for two minutes is an hour averaging
+    # 964 W, not 700. The reader multiplies these watts by the coverage below
+    # them, so an unweighted mean beside a duration-weighted coverage is two
+    # different weightings of the same hour — it under-reported this one by 27%.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for offset, watts in ((0, 100), (5, 1000), (65, 1000)):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+            (hour + offset, watts),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT watts, covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert row == (964, 125)
+    # And the two multiply out to the energy that was really measured.
+    assert row[0] * row[1] / 3_600_000 == pytest.approx(
+        (100 * 5 + 1000 * 60 + 1000 * 60) / 3_600_000, rel=1e-3
+    )
+    conn.close()
+
+
+def test_a_rebuild_at_a_new_interval_does_not_shrink_what_was_already_measured() -> None:
+    # The rebuild reaches three hours back, so lowering emporia.interval used to
+    # re-cap three hours of sixty-second readings at the new ten seconds and
+    # rewrite them as one sixth of the energy they recorded. Coverage is written
+    # once and afterwards only grows.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    for minute in range(60):
+        conn.execute(
+            "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+            (hour + minute * 60,),
+        )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    measured = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert measured == (3600,)
+
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=10)
+
+    again = conn.execute(
+        "SELECT covered_seconds FROM circuit_hourly WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert again == (3600,), "600 seconds is what the new setting says, not what was recorded"
+    conn.close()
+
+
+def test_a_rebuild_still_grows_an_hour_that_late_readings_filled_in() -> None:
+    # The other half of the same rule. Only-grows must not mean frozen: a
+    # reading that lands after the first pass has to be able to raise the hour.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, 500)",
+        (hour + 60,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly"
+        " WHERE circuit_id = 1 AND timestamp = ?",
+        (hour,),
+    ).fetchone()
+    assert row == (2, 120)
+    conn.close()
+
+
+def test_a_rebuild_writes_the_watts_and_the_coverage_as_one_unit_or_not_at_all() -> None:
+    # The only-grows rule has to cover the whole row, because the reader
+    # multiplies the two columns together. Keeping the larger coverage while
+    # replacing the watts outright left a row holding watts measured at the new
+    # cadence beside coverage measured at the old one, and their product matched
+    # neither: 100 W for five seconds then 1,000 W with nothing after is 60,500 J
+    # at a sixty-second interval and 10,500 J at a ten-second one, and the mixed
+    # row read 45,500 J — a figure no rule produced, so no reader could tell
+    # which one had.
+    def measured(cadences: tuple[int, ...]) -> tuple[int, int, int]:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(schema_ddl())
+        _circuit_store(conn)
+        hour = 3600 * 100
+        for offset, watts in ((0, 100), (5, 1000)):
+            conn.execute(
+                "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, ?)",
+                (hour + offset, watts),
+            )
+        for cadence in cadences:
+            rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=cadence)
+        row = conn.execute(
+            "SELECT watts, sample_count, covered_seconds FROM circuit_hourly"
+            " WHERE circuit_id = 1 AND timestamp = ?",
+            (hour,),
+        ).fetchone()
+        conn.close()
+        return (int(row[0]), int(row[1]), int(row[2]))
+
+    slow = measured((60,))
+    fast = measured((10,))
+    assert slow == (931, 2, 65), "5 s of 100 W and 60 s of 1,000 W, averaging 931"
+    assert fast == (700, 2, 15), "the same readings re-capped at ten seconds"
+    # Rounding the watts to an integer is worth 15 J out of 60,500 here; the
+    # mixture this test exists for was out by a quarter of the figure.
+    assert slow[0] * slow[2] == pytest.approx(100 * 5 + 1000 * 60, rel=1e-3)
+    assert fast[0] * fast[2] == pytest.approx(100 * 5 + 1000 * 10, rel=1e-3)
+
+    # Lowering the interval measures less, so the row is left exactly as the
+    # earlier pass wrote it rather than half-rewritten.
+    assert measured((60, 10)) == slow, "a smaller measurement leaves the whole row alone"
+    # Raising it measures at least as much, so all three columns move together
+    # and the product is the new pass's own answer.
+    assert measured((10, 60)) == slow, "a larger measurement replaces the whole row"
+
+
+def test_an_hour_nobody_answered_stores_zero_coverage_rather_than_unknown() -> None:
+    # NULL in this column means one thing only: a row written before the column
+    # existed, which a reader falls back to a guess for. An hour that really
+    # recorded nothing has to say zero, or the two become the same row.
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)", (hour,)
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 3600, cadence_seconds=60)
+
+    row = conn.execute(
+        "SELECT sample_count, covered_seconds FROM circuit_hourly WHERE circuit_id = 1"
+    ).fetchone()
+    assert row == (0, 0)
+    conn.close()
+
+
+# --- the circuit rollup's conservation law --------------------------------
+#
+# The arithmetic above was wrong three times running, and each fix introduced the
+# next one: coverage multiplied out of a sample count, then a duration-weighted
+# coverage sitting beside an unweighted mean, then a row holding one pass's
+# coverage next to another pass's watts. Three example-based fixes, three
+# escapes — an example only checks the timings somebody thought of, and every
+# round proved the round before it had not thought of enough.
+#
+# So these assert the invariant instead of an example of it. **Energy is
+# conserved through the rollup**: the energy the stored rows imply is the energy
+# the readings they were built from imply, hour by hour as well as in total,
+# over readings drawn at random from the shapes that have actually bitten. The
+# stored product is what a reader multiplies — the repository's ``history``
+# credits each hour with its stored watts, scaled by the circuit's own
+# multiplier, times its stored coverage — so a rollup whose two columns disagree
+# about the same hour is a bill that disagrees with the meter.
+#
+# They caught a fourth escape, of the same family as the third: see
+# test_a_shorter_interval_leaves_an_hour_that_holds_energy_alone.
+
+# Deterministic, so a failure names a case that replays exactly. Two hundred
+# draws is what it takes for every shape below to appear in numbers: counted over
+# these seeds, the 4,936 readings they produce hold 595 hour-boundary straddles,
+# 159 gaps longer than an hour, 1,286 gaps longer than the interval, 533 retried
+# polls, 93 readings landing exactly on a boundary, 249 single-reading hours, 137
+# hours with no reading at all, 1,231 NULLs and 376 real zeroes beside them.
+_SEEDS = tuple(range(1, 201))
+
+# Both ends of the range emporia.interval permits, its default, and three
+# between. A reading's period is capped at the interval, so the interval is what
+# decides how much of an hour a given set of readings can account for.
+_CADENCES = (10, 15, 60, 300, 3600)
+
+# Three listed circuits, one of which stays silent throughout every scenario.
+_CIRCUIT_IDS = (1, 2, 3)
+
+
+class _Hour(NamedTuple):
+    """What one hour of one circuit really holds, from the readings alone."""
+
+    joules: int
+    covered: int
+    samples: int
+
+
+class _Scenario(NamedTuple):
+    """One drawn set of circuit readings, with the range to rebuild over."""
+
+    seed: int
+    cadence: int
+    start: int
+    end: int
+    readings: tuple[tuple[int, int, int | None], ...]
+
+    @property
+    def note(self) -> str:
+        """Name the case in an assertion message, so a failure can be replayed."""
+        return f"seed {self.seed} at a {self.cadence} s interval"
+
+
+def _drawn_watts(rng: random.Random, never_answers: bool) -> int | None:
+    """Draw one reading: absence, a real zero, or a power in watts.
+
+    NULL is a circuit that was listed and did not answer, and it must never be
+    read as zero — the rule this project exists for. A real zero has to sit in
+    the draw beside it, or nothing asserting on the result could tell that the
+    rollup keeps the two apart.
+    """
+    if never_answers or rng.random() < 0.12:
+        return None
+    if rng.random() < 0.1:
+        return 0
+    return rng.randint(1, 20_000)
+
+
+def _next_stamp(rng: random.Random, stamp: int, cadence: int) -> int:
+    """Advance to the next poll, in one of the spacings a real poller produces."""
+    draw = rng.random()
+    boundary = (stamp // 3600 + 1) * 3600 - rng.randint(0, 5)
+    if draw < 0.12 and boundary > stamp:
+        # Shortly before the hour, or exactly on it. Its period runs over the
+        # boundary and has to be booked on both sides in the proportion it
+        # really occupies them.
+        return boundary
+    if draw < 0.22:
+        # A retried poll landing seconds behind its predecessor. This is the
+        # shape that made the unweighted mean wrong by 27%.
+        return stamp + rng.randint(1, 5)
+    if draw < 0.32:
+        # A gap: several intervals with nothing recorded in them.
+        return stamp + cadence * rng.randint(2, 6)
+    if draw < 0.38:
+        # A gap longer than an hour, so some hours hold no reading at all.
+        return stamp + rng.randint(3600, 7300)
+    if draw < 0.5:
+        # Jitter either side of the interval: an achieved cadence is the round
+        # trip plus the wait, so it is never exactly the configured figure.
+        return stamp + max(1, cadence + rng.randint(-3, 3))
+    return stamp + cadence
+
+
+def _circuit_scenario(seed: int) -> _Scenario:
+    """Draw one scenario of circuit readings from a seed, deterministically.
+
+    The shapes are the ones that have cost something plus the ones nobody has
+    looked at: evenly spaced polls at the interval, a retry seconds behind its
+    predecessor, gaps longer than the interval and longer than an hour,
+    a reading shortly before the hour whose period runs over it, a reading
+    exactly on the boundary, NULLs from a circuit that did not answer, a real
+    zero beside them, hours holding one reading and hours holding none, and one
+    of the three listed circuits silent throughout.
+
+    The range asked for is deliberately not hour-aligned, so the widening in
+    ``_bucket_bounds`` is exercised, and reaches one interval past the last
+    reading, so every reading's period falls inside the range and no energy is
+    booked to an hour outside it.
+    """
+    rng = random.Random(seed)
+    cadence = rng.choice(_CADENCES)
+    base = 3600 * rng.choice((100, 400_000)) + rng.choice((0, 7, 1800))
+    finish = base + rng.randint(1, 4) * 3600
+    silent = rng.choice(_CIRCUIT_IDS)
+    readings: list[tuple[int, int, int | None]] = []
+    for circuit_id in _CIRCUIT_IDS:
+        if circuit_id == silent:
+            continue
+        never_answers = rng.random() < 0.15
+        stamp = base + rng.randrange(cadence)
+        while stamp < finish:
+            readings.append((stamp, circuit_id, _drawn_watts(rng, never_answers)))
+            stamp = _next_stamp(rng, stamp, cadence)
+    readings.sort(key=lambda row: (row[0], row[1]))
+    first = min(row[0] for row in readings)
+    last = max(row[0] for row in readings)
+    return _Scenario(
+        seed, cadence, first - rng.randrange(3600), last + cadence + 1, tuple(readings)
+    )
+
+
+def _lay_down(ddl: str, scenario: _Scenario) -> sqlite3.Connection:
+    """Open a database holding one scenario's three circuits and its readings."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(ddl)
+    for circuit_id in _CIRCUIT_IDS:
+        conn.execute(
+            "INSERT INTO circuit (id, device_gid, channel_num, name, multiplier, kind,"
+            " first_seen, last_seen) VALUES (?, 100000, ?, ?, 1.0, 'circuit', 0, 0)",
+            (circuit_id, str(circuit_id), f"circuit {circuit_id}"),
+        )
+    conn.executemany(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, ?, ?)",
+        scenario.readings,
+    )
+    return conn
+
+
+def _hours_recorded(
+    scenario: _Scenario, cadence: int | None = None
+) -> dict[tuple[int, int], _Hour]:
+    """Return what each hour of each circuit really holds, from the readings.
+
+    The raw truth the rollup is judged against, written independently of it. A
+    reading credits the time *after* it and never more than one poll interval:
+    from its own stamp until the next reading arrives or the interval runs out,
+    whichever comes first. Its period is then cut at every hour boundary it
+    crosses, so an hour's energy is what was live inside that hour and nothing
+    else.
+
+    A NULL bounds its predecessor's period — it is a poll, and it is the poll
+    the predecessor was waiting for — while accounting for nothing itself. That
+    asymmetry is the whole difference between absence and zero, and both the
+    energy and the coverage are summed over answered readings alone.
+    """
+    interval = scenario.cadence if cadence is None else cadence
+    by_circuit: dict[int, list[tuple[int, int | None]]] = {}
+    for stamp, circuit_id, watts in scenario.readings:
+        by_circuit.setdefault(circuit_id, []).append((stamp, watts))
+    joules: dict[tuple[int, int], int] = {}
+    covered: dict[tuple[int, int], int] = {}
+    samples: dict[tuple[int, int], int] = {}
+    for circuit_id, readings in by_circuit.items():
+        # By stamp alone: a NULL beside an integer is not orderable, and one
+        # circuit cannot hold two readings at the same second anyway.
+        readings.sort(key=lambda row: row[0])
+        for index, (stamp, watts) in enumerate(readings):
+            following = readings[index + 1][0] if index + 1 < len(readings) else None
+            held = interval if following is None else min(following - stamp, interval)
+            if watts is None:
+                continue
+            own = (stamp // 3600 * 3600, circuit_id)
+            samples[own] = samples.get(own, 0) + 1
+            live, left = stamp, held
+            while left > 0:
+                hour = live // 3600 * 3600
+                piece = min(left, hour + 3600 - live)
+                key = (hour, circuit_id)
+                joules[key] = joules.get(key, 0) + watts * piece
+                covered[key] = covered.get(key, 0) + piece
+                live += piece
+                left -= piece
+    return {
+        key: _Hour(joules.get(key, 0), covered.get(key, 0), samples.get(key, 0))
+        for key in set(joules) | set(covered) | set(samples)
+    }
+
+
+def _stored_hours(
+    conn: sqlite3.Connection,
+) -> dict[tuple[int, int], tuple[int | None, int, int | None]]:
+    """Read every hourly row back as watts, sample count and coverage."""
+    return {
+        (int(row[0]), int(row[1])): (row[2], int(row[3]), row[4])
+        for row in conn.execute(
+            "SELECT timestamp, circuit_id, watts, sample_count, covered_seconds FROM circuit_hourly"
+        )
+    }
+
+
+def test_circuit_energy_is_conserved_through_the_rollup_at_any_timings() -> None:
+    """Every stored hour's watts times its coverage is the energy really recorded.
+
+    Asserted per hour and not only in total: a rollup that moves energy across
+    an hour boundary while conserving the sum is still wrong, and the per-hour
+    check is what catches a straddle booked to the wrong side of the line.
+
+    The tolerance is the rounding of the column and nothing more. ``watts`` is
+    stored as an integer — the tables are STRICT — so the stored figure is
+    ``round(sum(w*c) / sum(c))`` and its product with the coverage is out by at
+    most half a watt for every second of that coverage: 1,800 J in a full hour,
+    0.0005 kWh. The 1e-6 beside it absorbs the last bit of the double division
+    SQLite performs before rounding, which can sit either side of an exact half.
+    Coverage itself is integer arithmetic on both sides and is compared exactly,
+    which is what pins any energy discrepancy on the watts rather than leaving
+    the two free to trade error.
+    """
+    ddl = schema_ddl()
+    for seed in _SEEDS:
+        scenario = _circuit_scenario(seed)
+        conn = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        stored = _stored_hours(conn)
+        conn.close()
+        recorded = _hours_recorded(scenario)
+        totals: dict[int, list[float]] = {}
+        for key in sorted(set(stored) | set(recorded)):
+            truth = recorded.get(key, _Hour(0, 0, 0))
+            watts, samples, seconds = stored.get(key, (None, 0, 0))
+            coverage = 0 if seconds is None else int(seconds)
+            assert coverage == truth.covered, (
+                f"{scenario.note}, hour {key}: stored {coverage} s of coverage where the"
+                f" readings account for {truth.covered} s"
+            )
+            assert samples == truth.samples, (
+                f"{scenario.note}, hour {key}: stored {samples} readings against"
+                f" {truth.samples} stamped inside it"
+            )
+            energy = 0.0 if watts is None else float(watts) * coverage
+            assert abs(energy - truth.joules) <= 0.5 * coverage + 1e-6, (
+                f"{scenario.note}, hour {key}: stored {watts} W over {coverage} s is"
+                f" {energy} J where the readings hold {truth.joules} J"
+            )
+            circuit = totals.setdefault(key[1], [0.0, 0.0, 0.0])
+            circuit[0] += energy
+            circuit[1] += truth.joules
+            circuit[2] += coverage
+        for circuit_id, (got, want, watched) in totals.items():
+            assert abs(got - want) <= 0.5 * watched + 1e-6, (
+                f"{scenario.note}, circuit {circuit_id}: {got} J stored over the window"
+                f" where {want} J was recorded"
+            )
+
+
+def test_circuit_coverage_stays_inside_the_hour_and_absence_stays_absent() -> None:
+    """An hour claims at most itself, and an hour nobody answered claims nothing.
+
+    Three separate rules, none of which the conservation law implies on its own.
+    Coverage inside ``[0, 3600]`` because the reader multiplies by it and an
+    hour holding 3,700 s of energy is a bill nobody can defend. Coverage never
+    NULL, because NULL in that column means one specific thing — a row written
+    before it existed, which a reader falls back to a guess for — and an hour
+    that genuinely recorded nothing has to be distinguishable from one that
+    cannot be read. And NULL watts exactly where nothing was heard: a circuit
+    that answered 0 W stores 0, a circuit that did not answer stores NULL, and
+    collapsing those two is the mistake this project exists to refuse.
+    """
+    ddl = schema_ddl()
+    for seed in _SEEDS:
+        scenario = _circuit_scenario(seed)
+        conn = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        stored = _stored_hours(conn)
+        conn.close()
+        recorded = _hours_recorded(scenario)
+        for key, (watts, samples, seconds) in stored.items():
+            assert seconds is not None, (
+                f"{scenario.note}, hour {key}: coverage NULL, which is reserved for a row"
+                " written before the column existed"
+            )
+            assert 0 <= seconds <= 3600, f"{scenario.note}, hour {key}: {seconds} s of an hour"
+            assert samples >= 0
+            answered = recorded.get(key, _Hour(0, 0, 0)).covered > 0
+            if answered:
+                assert watts is not None, (
+                    f"{scenario.note}, hour {key}: NULL watts for an hour that was heard"
+                )
+            else:
+                assert watts is None, (
+                    f"{scenario.note}, hour {key}: {watts} W for an hour nobody answered —"
+                    " absent data is not zero"
+                )
+                assert (samples, seconds) == (0, 0), f"{scenario.note}, hour {key}"
+
+
+def test_rebuilding_any_scenario_twice_writes_the_same_rows() -> None:
+    """Idempotence over arbitrary timings, not over one convenient hour.
+
+    The maintenance pass runs this every minute over a window that overlaps what
+    it did the minute before, so a rebuild that is not a function of its source
+    rows alone would drift with every pass, and the hourly tier is kept for ever.
+    """
+    ddl = schema_ddl()
+    for seed in _SEEDS:
+        scenario = _circuit_scenario(seed)
+        conn = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        once = _stored_hours(conn)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        twice = _stored_hours(conn)
+        conn.close()
+        assert twice == once, f"{scenario.note}: a second identical rebuild moved rows"
+
+
+def test_a_shorter_interval_leaves_an_hour_that_holds_energy_alone() -> None:
+    """Lowering the interval may not take energy off an hour already measured.
+
+    The fourth escape in this family, and it is the third one over again: the
+    fix that made ``watts`` and ``covered_seconds`` move as a unit guarded the
+    upsert and left the delete beside it asking only whether the pass had
+    rebuilt the row. Measuring nothing is the smallest measurement of all, and a
+    bucket can hold nothing but the spill from a reading in the hour before it —
+    nothing is stamped inside it, so its sample count is nought. Re-capped at a
+    shorter interval that span stops reaching the boundary, the bucket produces
+    no row, and the delete erased it: one 500 W reading at 59:50 books fifty
+    seconds into the next hour at a sixty-second interval, and lowering the
+    interval to ten deleted that hour outright.
+
+    A row accounting for nothing is not protected, and needs no protection: the
+    pass that measured nothing may clear it, and no energy leaves with it.
+    """
+    ddl = schema_ddl()
+    checked = 0
+    for seed in _SEEDS:
+        scenario = _circuit_scenario(seed)
+        shorter = max(10, scenario.cadence // 6)
+        if shorter >= scenario.cadence:
+            continue
+        checked += 1
+        conn = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        before = _stored_hours(conn)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=shorter)
+        after = _stored_hours(conn)
+        conn.close()
+        for key, row in before.items():
+            _, samples, seconds = row
+            if not (seconds or samples):
+                continue
+            assert after.get(key) == row, (
+                f"{scenario.note} re-measured at {shorter} s: hour {key} held {row} and now"
+                f" holds {after.get(key)} — watts, count and coverage move as one unit or"
+                " not at all"
+            )
+    assert checked > 100, "most scenarios must have a shorter interval to be re-measured at"
+
+
+def test_a_longer_interval_re_measures_every_hour_it_can_account_for_more_of() -> None:
+    """Only-grows must not mean frozen: raising the interval replaces the row.
+
+    The other half of the same rule, and the half a guard is easiest to break.
+    Capping a reading's period at a longer interval can only raise an hour's
+    coverage, so every row a longer interval touches is entitled to be rewritten
+    — and the result has to be exactly what that interval would have written on
+    its own, or the stored hour is a mixture of two rules again and nothing
+    downstream can tell which one produced it.
+    """
+    ddl = schema_ddl()
+    checked = 0
+    for seed in _SEEDS:
+        scenario = _circuit_scenario(seed)
+        longer = min(3600, scenario.cadence * 6)
+        if longer <= scenario.cadence:
+            continue
+        checked += 1
+        conn = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=scenario.cadence)
+        rebuild_circuit_hourly(conn, scenario.start, scenario.end, cadence_seconds=longer)
+        raised = _stored_hours(conn)
+        conn.close()
+        fresh = _lay_down(ddl, scenario)
+        rebuild_circuit_hourly(fresh, scenario.start, scenario.end, cadence_seconds=longer)
+        alone = _stored_hours(fresh)
+        fresh.close()
+        assert raised == alone, (
+            f"{scenario.note} re-measured at {longer} s: the rows differ from what a"
+            " rebuild at that interval writes on its own"
+        )
+        recorded = _hours_recorded(scenario, longer)
+        for key, (watts, _, seconds) in raised.items():
+            truth = recorded.get(key, _Hour(0, 0, 0))
+            coverage = 0 if seconds is None else int(seconds)
+            energy = 0.0 if watts is None else float(watts) * coverage
+            assert abs(energy - truth.joules) <= 0.5 * coverage + 1e-6, (
+                f"{scenario.note} at {longer} s, hour {key}: {energy} J stored against"
+                f" {truth.joules} J recorded"
+            )
+    assert checked > 100, "most scenarios must have a longer interval to be re-measured at"
+
+
+def test_an_hour_that_holds_no_energy_is_still_cleared_when_nothing_supports_it() -> None:
+    """The delete's guard is a guard, not a refusal to delete.
+
+    Retention will not prune a raw reading until this tier holds its bucket, so
+    a row that says "this hour was heard and answered nothing" is worth keeping
+    while the readings behind it exist — and the rebuild keeps it, because a
+    NULL reading stamped inside the hour still forms a bucket. What may go is a
+    bucket nothing supports at all and which claims nothing either. Without
+    that, a spill re-measured shorter would leave a row no reading and no
+    coverage stands behind, permanently.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(schema_ddl())
+    _circuit_store(conn)
+    hour = 3600 * 100
+    # A NULL a few seconds before the hour: its unanswered period spills over the
+    # boundary, so the next hour gets a row holding nothing at all.
+    conn.execute(
+        "INSERT INTO circuit_reading (timestamp, circuit_id, watts) VALUES (?, 1, NULL)",
+        (hour + 3590,),
+    )
+    rebuild_circuit_hourly(conn, hour, hour + 7200, cadence_seconds=60)
+    assert _stored_hours(conn)[(hour + 3600, 1)] == (None, 0, 0)
+
+    rebuild_circuit_hourly(conn, hour, hour + 7200, cadence_seconds=10)
+
+    stored = _stored_hours(conn)
+    assert (hour + 3600, 1) not in stored, "a row claiming nothing goes with its support"
+    assert stored[(hour, 1)] == (None, 0, 0), "the hour the NULL was stamped in stays"
+    conn.close()
