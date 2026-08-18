@@ -293,7 +293,7 @@ def test_a_name_that_is_only_whitespace_gets_the_stable_label() -> None:
 # outlet, charger and monitor on the reference account. The name the owner gave
 # it in Emporia's app is in ``locationProperties``, one level up from the
 # channel — taken from the real reply on 17 August 2026, where six of the
-# thirty-nine circuits were reading as "Device 402097 ch 1,2,3" while Emporia
+# thirty-nine circuits were reading as "Device 100002 ch 1,2,3" while Emporia
 # held "EVSE", "Dishwasher", "Washer" and three more for them all along.
 NAMED_DEVICES = {
     "devices": [

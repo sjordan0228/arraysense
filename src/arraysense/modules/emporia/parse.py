@@ -110,7 +110,7 @@ def _device_name(node: dict[str, object]) -> str | None:
     It sits in ``locationProperties`` rather than on the channel, which is why
     it went unused: an outlet, a charger and a monitor all report themselves on
     the mains channel and none of them name it, so the whole device read as
-    "Device 402097 ch 1,2,3" while Emporia had held "EVSE" all along.
+    "Device 100002 ch 1,2,3" while Emporia had held "EVSE" all along.
     """
     properties = node.get("locationProperties")
     if not isinstance(properties, dict):
