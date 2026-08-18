@@ -7,6 +7,51 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.8 — 18 August 2026
+
+Per-circuit energy is right for a window whose edges do not land on the hour.
+
+### Fixed
+
+- **An hourly bucket straddling the start of a window was dropped whole, and
+  one straddling the end was counted whole.** A circuit that had recorded every
+  minute of an hour reported no energy at all for a window lying inside that
+  hour — not a smaller figure, a dash — and a window ending mid-hour booked the
+  entire hour's energy and the entire hour's recorded seconds against the few
+  minutes of it that were actually asked for.
+
+  `circuit_hourly` stamps a bucket at the floor of the hour it covers, so the
+  bucket holding a mid-hour start sits *before* that start and a plain
+  `timestamp >= first` never sees it. `band_kwh`, which prices the same rows
+  for the Costs page, has widened its own read for exactly this since the
+  per-circuit spend work; `history`, which the Circuits tab and the coverage
+  share are drawn from, still read from the boundary itself. Two readers of the
+  same rows disagreeing about how much energy is in them is how a page comes to
+  answer the same question two ways.
+
+  Both edges are now honoured the way a rate band's are: the read reaches back
+  to the hour containing the start and every row is clipped to the window,
+  so the energy and the coverage figure move together. The arithmetic is no
+  longer written twice — `history` and `band_kwh` share it, along with the rule
+  that tells a bucket still being written from one that finished long ago and
+  merely ends after the window does. The raw tier keeps its own rule, where a
+  reading belongs whole to the window its stamp falls in.
+
+  Whether an installation saw this depends on its clock and its question. A
+  calendar month in a zone a whole number of hours from UTC lands on the hour
+  at both ends and is unaffected, which is why the reference installation never
+  showed it; a zone at a fractional offset — Asia/Kolkata among them — and any
+  rolling window ending "now" are cut mid-hour every time.
+
+  The chart is unchanged by the wider read: the series still begins inside the
+  window rather than an hour before it. A generated property test now asserts
+  that the energy and the coverage `history` reports match an independently
+  written reference across hundreds of windows, rather than leaving the same
+  span arithmetic to be re-derived a third time.
+
+  No migration, and no rewritten history — this is a reading rule, not a
+  storage one.
+
 ## 1.1.7 — 17 August 2026
 
 The circuit names painted inside the Split by circuit chart are legible again.
