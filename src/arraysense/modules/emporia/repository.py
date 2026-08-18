@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import pairwise
@@ -88,6 +88,18 @@ def _reading_seconds(stamps: Sequence[int], cadence_seconds: int) -> int:
     return max(1, min(gaps[len(gaps) // 2], cadence_seconds))
 
 
+def _clipped(when: int, span: int, lo: int, hi: int) -> int:
+    """The seconds of ``[when, when + span)`` that lie inside ``[lo, hi)``.
+
+    The one place a stored row is intersected with a window, so the two
+    readers of these rows cannot reach different answers about how much of an
+    hour a query actually asked for. Zero or less means they do not meet at
+    all, which every caller reads as "this row contributes nothing" rather
+    than as a negative share.
+    """
+    return min(when + span, hi) - max(when, lo)
+
+
 def _mark_missing_hour(
     thin: set[str],
     windows: Sequence[tuple[int, int, str]],
@@ -105,10 +117,73 @@ def _mark_missing_hour(
     the same set through the same overlap arithmetic rather than keeping two
     copies of it that could drift apart.
     """
-    hour_end = hour_start + _HOUR_SECONDS
     for iv_start, iv_end, band in windows:
-        if min(hour_end, iv_end, last) - max(hour_start, iv_start, first) > 0:
+        if _clipped(hour_start, _HOUR_SECONDS, max(iv_start, first), min(iv_end, last)) > 0:
             thin.add(band)
+
+
+def _covered_and_span(
+    *,
+    counted: bool,
+    when: int,
+    samples: int,
+    stored: int | None,
+    following: Mapping[int, int],
+    reading_seconds: int,
+    cadence_seconds: int,
+    last: int,
+    now_ts: int,
+) -> tuple[int, int]:
+    """One row's recorded seconds, and the stretch its energy is spread over.
+
+    Both readers of these rows — ``history`` and ``band_kwh`` — need this, and
+    for a while each answered it for itself. They disagreed: the second had
+    its trailing-edge rule hardened over three rounds of review while the
+    first still credited every boundary bucket in full. Money is exactly the
+    wrong thing to derive twice, so the rule lives here once.
+
+    ``covered`` is how much of the row was actually sampled. The hourly tier
+    knows, because the rollup measured it while the interval that produced the
+    readings was still in force; a NULL is a row written before that column
+    existed and falls back to the sample count times the interval running
+    *now*, which is right until somebody changes the setting and wrong by the
+    ratio afterwards. The raw tier never wrote a figure down, so a reading is
+    worth one poll interval, lowered to the distance to its successor where
+    that is tighter — a retried poll five seconds behind its predecessor is
+    worth five seconds, not sixty.
+
+    ``span`` is the stretch that coverage is smeared across, and on the hourly
+    tier it is the whole hour rather than the recorded part of it: where in
+    the hour those seconds fell is precisely what the row does not say. The
+    one exception is a row genuinely still being written, where
+    ``covered_seconds`` already *is* the part of the hour that existed when it
+    was measured, because the rest had not happened yet. Smearing that exact
+    figure across a remainder that does not exist applies the same fraction
+    twice — a 1 kW row covering 12:00-12:30, asked about a window ending
+    12:30, returned 0.25 kWh instead of the 0.5 it measured.
+
+    Telling that row apart is what the reviews were about. ``hour_end > last``
+    finds the boundary row but cannot tell one still forming from one that
+    finished long ago and merely ends after the window does: every month's
+    last hour on a site whose UTC offset is not a whole number of hours has
+    that shape, and a collection gap that left such an hour thin records only
+    how much of it was sampled, never where. Booked as a top-of-hour prefix it
+    claims energy measured on the far side of ``last``. ``hour_end > now_ts``
+    is what a fully elapsed hour can never satisfy, so that is what actually
+    separates the two; ``last`` alone was only ever a proxy for it.
+    """
+    if not counted:
+        nxt = following.get(when)
+        covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
+        return covered, covered
+    covered = (
+        min(int(stored), _HOUR_SECONDS)
+        if stored is not None
+        else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
+    )
+    hour_end = when + _HOUR_SECONDS
+    live = hour_end > last and covered < _HOUR_SECONDS and hour_end > now_ts
+    return covered, (covered if live else _HOUR_SECONDS)
 
 
 def _with_breaks(stamps: Sequence[int], cadence_seconds: int) -> list[int]:
@@ -388,6 +463,7 @@ class CircuitRepository:
         tier: str,
         circuit_ids: Sequence[int] | None = None,
         cadence_seconds: int = _POLL_SECONDS,
+        now: datetime | None = None,
     ) -> CircuitHistory:
         """Circuits over a window, ranked by the energy each one used.
 
@@ -432,6 +508,29 @@ class CircuitRepository:
         synthetic stamp carries no reading, so it is worth nothing and cannot
         move a kWh figure or mark an hour partial.
 
+        A window's own edges are honoured on the hourly tier the way
+        ``band_kwh`` honours a band's, through the same ``_covered_and_span``
+        and ``_clipped``. An hourly bucket is stamped at the floor of the hour
+        it covers, so a window that starts mid-hour leaves the bucket
+        straddling that start stamped *before* it: read from ``first`` itself,
+        that bucket is dropped whole and a circuit that recorded the entire
+        hour reports no energy at all. The read is widened to the hour
+        containing ``first`` and every row is then clipped back to
+        ``[first, last)``, which is also what stops the bucket straddling the
+        end being credited in full to a window holding a few minutes of it —
+        the shape of every rolling window ending "now". The clip lands on the
+        energy and on ``recorded_seconds`` alike, since they are the same
+        seconds counted for two purposes.
+
+        The wider read is for the arithmetic alone: ``timestamps`` still
+        begins inside the window, so a page draws the range it asked for
+        rather than one silently backdated by up to an hour.
+
+        ``now`` is the real instant unless a caller pins it, and it is what
+        tells a bucket still being written from one that finished long ago and
+        merely ends after the window does. ``_covered_and_span`` carries why
+        that distinction is not ``last``'s to make.
+
         A database error yields an empty history rather than raising. This runs
         unattended on someone's inverter and a page saying it has no circuits
         tells the owner more than a page returning 500.
@@ -442,6 +541,15 @@ class CircuitRepository:
         counted = tier == "hourly"
         first = int(start.timestamp())
         last = int(end.timestamp())
+        now_ts = int((now if now is not None else datetime.now(UTC)).timestamp())
+        # Read from the hour that contains ``first``, not from ``first``, for
+        # the reason ``band_kwh`` gives at the same line: an hourly bucket is
+        # stamped at the floor of the hour it covers, so the one straddling a
+        # mid-hour start sits before it and a plain ``>= first`` drops it
+        # whole. The clip below holds every row to ``[first, last)``, so
+        # widening the read here cannot pull in energy from outside what was
+        # asked for.
+        query_first = (first // _HOUR_SECONDS) * _HOUR_SECONDS if counted else first
         try:
             circuits = self._store._conn.execute(
                 "SELECT id, device_gid, channel_num, name, kind, multiplier,"
@@ -453,7 +561,7 @@ class CircuitRepository:
                 f"  FROM {table}"
                 "  WHERE timestamp >= ? AND timestamp < ?"
                 "  ORDER BY timestamp",
-                (first, last),
+                (query_first, last),
             ).fetchall()
         except sqlite3.Error as exc:
             logger.warning("could not read circuit history: %s", exc)
@@ -475,7 +583,16 @@ class CircuitRepository:
         # instead of being drawn straight across — which it was while the
         # threshold came from the window's own spacing, since a window that is
         # mostly hole measures the hole as its ordinary spacing.
-        drawn = _with_breaks(stamps, _HOUR_SECONDS if counted else reading_seconds)
+        # Only the stamps at or after ``first`` are drawn. On the hourly tier
+        # the read above deliberately reaches back into the hour containing
+        # ``first`` so its energy can be apportioned, and a chart handed that
+        # bucket's stamp would show an hour outside the range the owner asked
+        # for — and would put a break in the line where the widened read simply
+        # stopped, rather than where collection did.
+        drawn = _with_breaks(
+            [stamp for stamp in stamps if stamp >= first],
+            _HOUR_SECONDS if counted else reading_seconds,
+        )
         slot = {stamp: index for index, stamp in enumerate(drawn)}
         # The stamp after each recorded one, so a reading is credited with the
         # distance to its successor rather than with a flat interval — a retried
@@ -492,45 +609,67 @@ class CircuitRepository:
         # the widest coverage any one circuit had there: a poll that reached one
         # clamp reached the monitor, and this is a fact about the module rather
         # than about a circuit.
-        recorded_at: dict[int, int] = {}
+        recorded_at: dict[int, float] = {}
         for stamp, circuit_id, raw, samples, stored in rows:
             if raw is None:
                 continue
             key = int(circuit_id)
             when = int(stamp)
+            # How much of this row was recorded, and the stretch it is spread
+            # over. ``partial`` is read off the same ``covered`` the energy is,
+            # so the flag and the arithmetic cannot drift apart.
+            covered, span = _covered_and_span(
+                counted=counted,
+                when=when,
+                samples=samples,
+                stored=stored,
+                following=following,
+                reading_seconds=reading_seconds,
+                cadence_seconds=cadence_seconds,
+                last=last,
+                now_ts=now_ts,
+            )
+            if span <= 0 or covered <= 0:
+                continue
+            # The share of this row the window actually asked for: one for an
+            # hourly bucket lying wholly inside it, less at either edge, and
+            # the only thing that stops the bucket straddling ``first`` or
+            # ``last`` being credited to the window in full.
+            #
+            # Clipped on the hourly tier alone, and that is the same decision
+            # as widening the read only there. A stored hour is aligned to the
+            # clock, so the same bucket is offered to both windows that share a
+            # boundary and each must take its own share or the energy is
+            # counted twice. A raw reading is aligned to nothing: it is offered
+            # once, to the window its own stamp falls in, and clipping it there
+            # without widening the far edge would simply lose the poll period
+            # that straddles every boundary.
             if counted:
-                # An hour holds 3,600 seconds however many readings landed in
-                # it. ``covered_seconds`` is what the rollup measured while the
-                # interval that produced those readings was still in force, and
-                # ``partial`` is read off the same figure so the flag and the
-                # arithmetic cannot drift apart. NULL is a row written before
-                # that column existed, and only there is the old guess used:
-                # the sample count times the interval running *now*, which is
-                # right until somebody changes the setting and wrong by the
-                # ratio afterwards.
-                covered = (
-                    min(int(stored), _HOUR_SECONDS)
-                    if stored is not None
-                    else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
-                )
+                overlap = _clipped(when, span, first, last)
+                if overlap <= 0:
+                    continue
+                share = overlap / span
             else:
-                nxt = following.get(when)
-                covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
+                share = 1.0
             # Taken from every circuit the window returned, before the narrowing
             # below. This is a fact about the module, not about a circuit: a
             # poll that reached one clamp reached the monitor. Measured after
             # the narrowing, a request for one circuit read that circuit's
             # silence as a module outage and withheld a share the module could
             # honestly support.
-            recorded_at[when] = max(recorded_at.get(when, 0), covered)
+            recorded_at[when] = max(recorded_at.get(when, 0.0), covered * share)
             if key not in meta:
                 continue
             value = round(float(raw) * float(meta[key][5]))
-            watts[key][slot[when]] = value
+            index = slot.get(when)
+            # A row from before ``first`` carries energy the window asked for
+            # but no point the window may draw; ``slot`` is what says which.
+            if index is not None:
+                watts[key][index] = value
             seen.add(key)
             if counted and covered < _HOUR_SECONDS:
                 partial.add(key)
-            joules[key] += value * covered
+            joules[key] += value * covered * share
 
         series = [
             CircuitSeries(
@@ -554,7 +693,7 @@ class CircuitRepository:
             timestamps=tuple(drawn),
             series=tuple(series),
             tier=tier,
-            recorded_seconds=sum(recorded_at.values()),
+            recorded_seconds=round(sum(recorded_at.values())),
         )
 
     def band_kwh(
@@ -725,64 +864,21 @@ class CircuitRepository:
                     _mark_missing_hour(thin[key], windows, when, first, last)
                 continue
             seen.add(key)
-            if counted:
-                covered = (
-                    min(int(stored), _HOUR_SECONDS)
-                    if stored is not None
-                    else min(int(samples) * cadence_seconds, _HOUR_SECONDS)
-                )
-                # The span the energy is spread across is the hour, not the
-                # part of it that was recorded — where in the hour those
-                # seconds fell is precisely what the row does not say — except
-                # at the trailing edge of a row that is genuinely still being
-                # written, where it is not a guess at all. The current month
-                # always ends mid-hour, and there the rollup's own
-                # covered_seconds already IS the part of the hour that existed
-                # by the time it was measured, because the rest of it had not
-                # happened yet. Smearing that already-exact figure across a
-                # remainder that does not exist applies the same fraction
-                # twice: a 1 kW row covering 12:00-12:30, asked about a window
-                # ending 12:30, returned 0.25 kWh instead of the 0.5 it
-                # actually measured. Shrinking span to match is what stops the
-                # second reduction — but only for a row that is actually
-                # short. ``hour_end > last`` alone is not enough to tell that:
-                # it is also true of a fully recorded *past* hour whose
-                # nominal end merely falls after the window's own end, which
-                # is every month's last hour on a site whose UTC offset is not
-                # a whole number of hours — that hour was booked at three
-                # quarters of its energy for a query that asked about half of
-                # it. ``covered < _HOUR_SECONDS`` is what tells the two apart,
-                # since only a row that is actually partial can measure less
-                # than the whole hour. And the shrunk span is ``covered``
-                # itself rather than ``last - when``: the two agree only when
-                # the row was measured up to exactly ``last``, which is not
-                # guaranteed when the caller's ``last`` is earlier than the
-                # real "now" a still-forming row was recorded up to.
-                #
-                # ``hour_end > last`` alone finds the boundary row, but it
-                # cannot tell a bucket still being written from one that
-                # finished long ago and merely happens to end after the
-                # window's own close — a finished month's last hour on a site
-                # off a whole UTC offset is exactly that shape, and if a
-                # collection gap also left that hour thin, ``covered_seconds``
-                # records only how much of it was sampled, never where. Book
-                # the whole thin figure as a top-of-hour prefix there and it
-                # can claim energy that was actually measured on the far side
-                # of ``last``, past the boundary rather than proportional to
-                # it — the defect three rounds of review kept finding in this
-                # line. ``hour_end > now_ts`` is what a fully elapsed hour can
-                # never satisfy, live or not, so it is what actually tells
-                # the two apart; ``last`` alone was only ever a proxy for it.
-                hour_end = when + _HOUR_SECONDS
-                span = (
-                    covered
-                    if hour_end > last and covered < _HOUR_SECONDS and hour_end > now_ts
-                    else _HOUR_SECONDS
-                )
-            else:
-                nxt = following.get(when)
-                covered = reading_seconds if nxt is None else min(nxt - when, reading_seconds)
-                span = covered
+            # How much of this row was recorded, and over what stretch it is
+            # spread. Shared with ``history`` rather than derived again here:
+            # see ``_covered_and_span`` for the rule and for the three rounds
+            # of review the still-forming hour took to get right.
+            covered, span = _covered_and_span(
+                counted=counted,
+                when=when,
+                samples=samples,
+                stored=stored,
+                following=following,
+                reading_seconds=reading_seconds,
+                cadence_seconds=cadence_seconds,
+                last=last,
+                now_ts=now_ts,
+            )
             if span <= 0 or covered <= 0:
                 continue
             value = round(float(raw) * float(meta[key][5]))
@@ -799,7 +895,7 @@ class CircuitRepository:
                 # shrunk any more, so without this clip a query ending
                 # mid-hour would count that hour's energy past the window's
                 # own end — exactly the over-credit this fixes.
-                overlap = min(when + span, iv_end, last) - max(when, iv_start, first)
+                overlap = _clipped(when, span, max(iv_start, first), min(iv_end, last))
                 if overlap <= 0:
                     continue
                 joules[key][band] = joules[key].get(band, 0.0) + energy * (overlap / span)
