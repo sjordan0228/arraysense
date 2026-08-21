@@ -736,6 +736,65 @@ def test_recorded_seconds_describes_the_module_even_when_one_circuit_is_asked_fo
     store.close()
 
 
+def test_history_reads_the_hour_the_windows_start_lands_inside(tmp_path: Path) -> None:
+    # circuit_hourly stamps a bucket at the floor of the hour it covers, so a
+    # window starting half an hour in -- local midnight at +5:30, or any
+    # rolling window -- leaves that bucket sitting before ``first``. A plain
+    # ``timestamp >= first`` drops it whole and the circuit reads as though it
+    # never reported at all. band_kwh widens its query for exactly this reason
+    # and returns the slice that was asked for; asked the same question, these
+    # two must not disagree about how much energy is in the same rows.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], hour)
+    for minute in range(60):
+        repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(minutes=minute))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
+    )
+
+    got = repo.history(hour + timedelta(minutes=30), hour + timedelta(minutes=45), tier="hourly")
+
+    (series,) = got.series
+    # A quarter of an hour of a fully recorded 1 kW hour. Not None, which is
+    # what dropping the bucket gives, and not 1.0, which is what counting the
+    # whole hour without clipping to the window gives.
+    assert series.kwh == pytest.approx(0.25)
+    assert got.recorded_seconds == 900
+    # The wider read is for the energy alone. The series a chart draws must
+    # still start inside the window, or the page shows an hour nobody asked for.
+    assert got.timestamps == ()
+    store.close()
+
+
+def test_history_does_not_over_credit_a_fully_recorded_hour_cut_by_last(tmp_path: Path) -> None:
+    # The trailing half of the same fault. An hourly bucket is credited in
+    # full however little of it the window holds, so a window ending mid-hour
+    # -- every rolling window ending "now" -- books the whole hour's energy and
+    # the whole hour's coverage against a fraction of it.
+    repo, store = _repo(tmp_path)
+    hour = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+    repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], hour)
+    for minute in range(60):
+        repo.append_readings([Reading(100000, "1", 1000)], hour + timedelta(minutes=minute))
+    rebuild_circuit_hourly(
+        store._conn,
+        int(hour.timestamp()),
+        int((hour + timedelta(hours=1)).timestamp()),
+        cadence_seconds=60,
+    )
+
+    got = repo.history(hour, hour + timedelta(minutes=30), tier="hourly")
+
+    (series,) = got.series
+    assert series.kwh == pytest.approx(0.5)
+    assert got.recorded_seconds == 1800
+    store.close()
+
+
 # --- circuit energy split by rate band ------------------------------------
 
 
@@ -1314,6 +1373,113 @@ def test_band_kwh_conserves_energy_across_bands(tmp_path: Path) -> None:
                     f"bands={bands} first={first} last={last} now_ts={now_ts} "
                     f"expected={exp} got={got}"
                 )
+    finally:
+        store.close()
+
+
+def _oracle_history(
+    rows: list[tuple[int, int, int]], first: int, last: int, now_ts: int
+) -> tuple[float, float]:
+    """An independent reference for ``history()``'s energy and coverage.
+
+    The same specification ``_oracle_band_kwh`` is written from, asked the
+    question ``history()`` asks instead: not how a window's energy divides
+    between bands, but how much of a stored hour lies inside the window at
+    all. Written from the rule rather than from the function, for the reason
+    that oracle gives -- a formula copied from the code under test reproduces
+    whatever the code under test has wrong.
+
+    Returns ``(kwh, recorded_seconds)`` for one circuit's ``(when, watts,
+    covered_seconds)`` rows. The two are returned together because they are
+    the same clip applied to the same row: a window holding half an hour holds
+    half its energy and half its recorded seconds, and a fix that shrinks one
+    without the other is the shape of the defect this guards.
+    """
+    hour_seconds = 3600
+    kwh = 0.0
+    recorded = 0.0
+    for when, watts, covered in rows:
+        hour_end = when + hour_seconds
+        live = hour_end > last and covered < hour_seconds and hour_end > now_ts
+        span = covered if live else hour_seconds
+        if span <= 0 or covered <= 0:
+            continue
+        overlap = min(when + span, last) - max(when, first)
+        if overlap <= 0:
+            continue
+        share = overlap / span
+        kwh += float(watts) * covered * share / 3_600_000
+        recorded += covered * share
+    return kwh, recorded
+
+
+def test_history_conserves_energy_and_coverage_over_any_window(tmp_path: Path) -> None:
+    """The same invariant ``band_kwh`` already asserts, for the function it
+    was factored out of. ``history()`` derived this arithmetic a second time
+    and got a different answer: it dropped the bucket straddling a
+    non-hour-aligned start whole, and credited the one straddling the end in
+    full, so a window lying inside a single hour reported a circuit that had
+    recorded the lot as having never reported at all.
+
+    Cases come from the generator the band property already uses -- windows
+    that start inside an hour, end inside an hour, or lie wholly within one,
+    over hours that are fully or only partly covered, with the final hour
+    either genuinely still forming or long finished and merely thin. The seed
+    is printed on failure so a case can be reproduced rather than chased.
+
+    The hourly table is cleared between cases because ``recorded_seconds`` is
+    deliberately measured across every circuit the window holds, not only the
+    requested ones, so a leftover row from an earlier case whose hours happen
+    to collide would be a real contribution rather than noise.
+    """
+    seed = 20260818
+    rng = random.Random(seed)
+    repo, store = _repo(tmp_path)
+    try:
+        ids = repo.sync_circuits([Circuit(100000, "1", "Dryer", 1.0, "circuit")], NOW)
+        circuit_id = ids[(100000, "1")]
+        for case_index in range(400):
+            rows, _bands, first, last, now_ts = _random_band_kwh_case(rng)
+            conn = store._conn
+            with conn:
+                conn.execute("DELETE FROM circuit_hourly")
+                conn.executemany(
+                    "INSERT INTO circuit_hourly"
+                    " (timestamp, circuit_id, watts, sample_count, covered_seconds)"
+                    " VALUES (?, ?, ?, 1, ?)",
+                    [(when, circuit_id, watts, covered) for when, watts, covered in rows],
+                )
+
+            got = repo.history(
+                datetime.fromtimestamp(first, UTC),
+                datetime.fromtimestamp(last, UTC),
+                tier="hourly",
+                circuit_ids=[circuit_id],
+                now=datetime.fromtimestamp(now_ts, UTC),
+            )
+
+            expected_kwh, expected_recorded = _oracle_history(rows, first, last, now_ts)
+            where = (
+                f"seed={seed} case={case_index} rows={rows} "
+                f"first={first} last={last} now_ts={now_ts}"
+            )
+            (series,) = got.series
+            if expected_kwh == 0.0:
+                # Nothing this circuit recorded lies inside the window -- its
+                # hour exists, but the seconds actually sampled fell outside.
+                # That is absence, and absence is a dash rather than a zero;
+                # band_kwh says the same thing by leaving the band out of
+                # ``by_band`` entirely. Any overlap at all carries energy,
+                # since a row is stored with watts and coverage both above
+                # zero, so this case is exactly "no overlap".
+                assert series.kwh is None, f"{where} got={series.kwh}"
+            else:
+                assert series.kwh == pytest.approx(expected_kwh, abs=1e-6), (
+                    f"{where} expected_kwh={expected_kwh} got={series.kwh}"
+                )
+            assert got.recorded_seconds == pytest.approx(expected_recorded, abs=1.0), (
+                f"{where} expected_recorded={expected_recorded} got={got.recorded_seconds}"
+            )
     finally:
         store.close()
 

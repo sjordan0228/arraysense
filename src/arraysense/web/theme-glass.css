@@ -267,6 +267,11 @@
   --tint-2: light-dark(oklch(30% 0.02 265 / 0.09), oklch(95% 0.02 265 / 0.11));
   --tint-3: light-dark(oklch(30% 0.02 265 / 0.15), oklch(95% 0.02 265 / 0.18));
   --tip: light-dark(oklch(100% 0 0 / 0.94), oklch(16% 0.03 268 / 0.88));
+  /* --tip resolved to a plain opaque colour, for the same reason --grid-line
+     is one: canvas reads this through getComputedStyle and cannot parse
+     light-dark(). rgb(8, 13, 26) is what oklch(16% 0.03 268) rasterises to,
+     checked against the browser rather than converted by hand. */
+  --label-halo: rgb(8, 13, 26);
   --tip-shadow: 0 18px 44px -18px light-dark(oklch(45% 0.05 265 / 0.35), oklch(4% 0.03 268 / 0.90));
 
   /* The semantic layer's names, as this look means them. Everything not named
@@ -281,12 +286,12 @@
   --border: var(--edge);
 }
 
-/* The light counterpart of --grid-line, kept out of light-dark() for the reason
-   given above. Both light selectors, so an explicit choice and the device
-   default agree. */
-:root[data-theme="light"] { --grid-line: rgba(38, 42, 58, 0.08); }
+/* The light counterparts of --grid-line and --label-halo, kept out of
+   light-dark() for the reason given above. Both light selectors, so an explicit
+   choice and the device default agree. */
+:root[data-theme="light"] { --grid-line: rgba(38, 42, 58, 0.08); --label-halo: rgb(255, 255, 255); }
 @media (prefers-color-scheme: light) {
-  :root:not([data-theme]) { --grid-line: rgba(38, 42, 58, 0.08); }
+  :root:not([data-theme]) { --grid-line: rgba(38, 42, 58, 0.08); --label-halo: rgb(255, 255, 255); }
 }
 
 /* The light bloom, in the same two selectors and for a different reason:

@@ -1702,8 +1702,11 @@ let circuitsExpanded = false;
 // circuit that starts reporting has to change shape in the DOM rather than
 // merely gain data, and the count because the expander's own words are built
 // from it.
+// The separator is written as an escape rather than as the byte itself: a
+// literal NUL in the file makes grep call the whole of graphs.html binary and
+// print nothing for any pattern in it, which costs a reader more than it saves.
 const circuitKeyOf = (rows, hidden) =>
-  [hidden, ...rows.map((r) => r.id + (r.silent ? ':s' : ':c'))].join(' ');
+  [hidden, ...rows.map((r) => r.id + (r.silent ? ':s' : ':c'))].join('\0');
 
 // Emporia's own offline timestamp, as a date. Parsed rather than printed raw
 // because what arrives is a full ISO instant with milliseconds and a Z —
@@ -2051,6 +2054,7 @@ function stackLabels(getSpec, houseIdx) {
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
         ctx.lineJoin = 'round';
+        ctx.lineCap = 'round';
         // What has already been written, so a second name cannot be laid over
         // the first. Two bands thickest at nearby instants put their labels at
         // the same height, and overlapping text is less readable than one label
@@ -2121,12 +2125,28 @@ function stackLabels(getSpec, houseIdx) {
           const spot = place(true) || place(false);
           if (!spot) continue;
           placed.push(spot.box);
-          // A halo in the readout's own background token, so the name stays
-          // legible over a light band and a dark one alike — and over the house
-          // line where it came to that — without any new colour being
+          // A halo in the readout's own background colour, taken opaque, so the
+          // name stays legible over a light band and a dark one alike — and over
+          // the house line where it came to that — without any new hue being
           // introduced to do it.
-          ctx.strokeStyle = ink('--tip');
-          ctx.lineWidth = 3 * ratio;
+          //
+          // Two faults were measured here on the bench at devicePixelRatio 2,
+          // rather than reasoned about, and the first is the whole of the
+          // smearing: the colour was never applied. --tip is a light-dark() pair
+          // in the glass sheet, canvas cannot parse that and drops the
+          // assignment, so the halo was stroked in whatever uPlot had last set —
+          // #c8cbd9, a pale grey a shade off the white fill it was meant to
+          // separate from the band. This is the same fault --grid-line already
+          // carries a warning about in that sheet, which is why --label-halo is
+          // a plain opaque colour of its own rather than --tip read from here.
+          //
+          // The second: strokeText centres the stroke on the glyph outline, so
+          // half of it goes inward. Three device px of a six px stroke, into a
+          // 22 px glyph, closed the counters of e, o and a; the fill that
+          // follows restores the glyph body but cannot reopen a counter. A
+          // halo this dark against a fill this light does not need the width.
+          ctx.strokeStyle = ink('--label-halo');
+          ctx.lineWidth = 1.5 * ratio;
           ctx.strokeText(band.name, spot.x, spot.y);
           ctx.fillStyle = ink('--ink');
           ctx.fillText(band.name, spot.x, spot.y);
