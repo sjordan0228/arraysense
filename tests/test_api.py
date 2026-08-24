@@ -9,9 +9,11 @@ always agrees.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import re
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
@@ -33,6 +35,7 @@ from arraysense.collector.service import CollectorService
 from arraysense.collector.source import FakeSource
 from arraysense.config import Config
 from arraysense.models import BatteryModuleSample, Sample
+from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.settings import _mask
 from arraysense.store.rollup import rebuild_inverter_hourly, rebuild_inverter_minute
 from arraysense.store.sqlite_store import SqliteStore
@@ -4854,3 +4857,125 @@ def test_efficiency_carries_the_hour_count_beside_the_tilt_gain(
         assert found["gain_kwh"] == pytest.approx(
             found["scheduled_kwh"] - found["unadjusted_kwh"], abs=0.002
         )
+
+
+class _ThreadWatchingConnection:
+    """A stand-in for the primary connection that records who used it.
+
+    Not a mock of the database — every call goes to the real connection and
+    returns its real answer. It records only the thread, because that is the
+    fact under test: ``sqlite3.Connection`` is one object with one statement
+    cache, and two threads using it at once corrupt each other's reads.
+    Measured, not assumed: six threads reading one connection for eight
+    seconds produced 75 ``InterfaceError: bad parameter or other API misuse``
+    and 104 rows that came back ``None`` or empty for keys that were certainly
+    there — the two shapes #223 recorded on the reference installation.
+
+    ``sqlite3.Connection.execute`` is a read-only slot and cannot be patched
+    onto an instance, so this wraps rather than intercepts.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+        self.off_loop: dict[int, tuple[str, str]] = {}
+
+    def _note(self, sql: str) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop on this thread, so this is not the event loop —
+            # it is a threadpool worker, and the primary connection is not its
+            # to use. Asked this way rather than by thread name, which is a
+            # detail of whichever async library is underneath.
+            thread = threading.current_thread()
+            self.off_loop.setdefault(thread.ident or 0, (thread.name, " ".join(sql.split())[:70]))
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        self._note(sql)
+        return self._real.execute(sql, *args, **kwargs)
+
+    def executemany(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        self._note(sql)
+        return self._real.executemany(sql, *args, **kwargs)
+
+    def executescript(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+        self._note(sql)
+        return self._real.executescript(sql, *args, **kwargs)
+
+    def __enter__(self) -> Any:
+        return self._real.__enter__()
+
+    def __exit__(self, *exc: Any) -> Any:
+        return self._real.__exit__(*exc)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def test_a_threadpool_handler_never_reads_the_primary_connection(tmp_path: Path) -> None:
+    """The invariant #223 exists for, asserted rather than left to review.
+
+    ``_read_store`` gives every plain ``def`` handler its own connection
+    precisely so a threadpool thread never shares the collector's, and its
+    docstring says why in detail. The settings reads went around it: they were
+    built on ``request.app.state.store``, the primary, from inside handlers
+    FastAPI runs on its threadpool. Two threads on one connection is not a
+    slow read, it is a wrong one — the reference installation returned four
+    500s in three days, twice as ``InterfaceError`` and twice as a settings
+    value that came back ``None`` and reached ``float()``.
+
+    Asserted by watching which threads touch the primary connection while
+    requests are served, rather than by racing threads and hoping the
+    corruption shows: a timing test that passes is no evidence at all, and
+    this one names the offending query and thread when it fails.
+    """
+    store = SqliteStore(str(tmp_path / "c.db"), device=TEST_DEVICE)
+    store.append(
+        Sample(timestamp=T0, readings={"pv_total_power_w": 1000.0, "battery_soc_pct": 50.0})
+    )
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "c.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    # The Emporia module has to be present, or the two circuit handlers take
+    # their "no poller" early return and the cadence read this guards is never
+    # reached — which is exactly what a review caught: reverting that read to
+    # the primary connection left this test green.
+    app.state.emporia = EmporiaPoller(store, tmp_path / "tok.json")
+    watcher = _ThreadWatchingConnection(store._conn)
+    # Swapped in after set-up, so the schema and the seeded reading above are
+    # not counted as a second thread; only what the requests do is watched.
+    store._conn = watcher  # type: ignore[assignment]
+
+    # A window with width to it. ``_check_range`` rejects start == end, and a
+    # rejected range returns before any of the reads under test.
+    window = {"start": T0.isoformat(), "end": (T0 + timedelta(hours=6)).isoformat()}
+    with TestClient(app) as client:
+        # A tariff, or /costs/circuits answers "nothing to price" and stops
+        # short of the cadence read too. Written through the API so the value
+        # goes in the way the settings page writes it.
+        client.put(
+            "/api/settings",
+            json={"tariff.bands": "Flat | 0.20 | 00:00-24:00", "alerts.high_usage_watts": 5000},
+        )
+        for path in ("/api/live", "/api/auth", "/api/costs/circuits", "/api/emporia/history"):
+            client.get(path, params=window)
+        # The two that read the password, and the one that writes it. A
+        # credential checked against a corrupted read is the worst shape this
+        # can take, so they are driven here rather than trusted to the reads
+        # above; both answer without a password set, which is the state a
+        # fresh installation is in.
+        client.post("/api/auth/login", json={"password": "wrong"})
+        client.post("/api/auth/password", json={"new_password": "hunter2hunter2"})
+
+    store._conn = watcher._real
+    store.close()
+
+    assert not watcher.off_loop, "the primary connection was used off the event loop: " + "; ".join(
+        f"{name} ran {sql!r}" for name, sql in watcher.off_loop.values()
+    )
