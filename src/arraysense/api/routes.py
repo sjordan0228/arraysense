@@ -739,12 +739,12 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
         # it is decided from the same inverter reading already in hand, and a
         # wall display should not have to ask twice to be told its house is
         # drawing hard. Null when the threshold is off or the house is under it.
-        "alert": _high_usage_alert(request, inverter),
+        "alert": _high_usage_alert(store, request, inverter),
     }
 
 
 def _high_usage_alert(
-    request: Request, inverter: Mapping[str, Any] | None
+    store: SqliteStore, request: Request, inverter: Mapping[str, Any] | None
 ) -> dict[str, Any] | None:
     """Whether the house is drawing more than the owner asked to hear about.
 
@@ -755,8 +755,15 @@ def _high_usage_alert(
     Attribution is the Emporia module's, and only if it is running. Without it
     the warning still fires and names nobody, which is the difference between
     "your house is drawing 11 kW" and silence.
+
+    The threshold is read from the caller's own store, never
+    ``app.state.store``. This runs inside a plain ``def`` handler, which
+    FastAPI serves on its threadpool, and the primary connection belongs to
+    the event loop: one ``sqlite3.Connection`` has one statement cache, and a
+    second thread stepping it does not read slowly, it reads wrongly. See
+    ``_read_store`` for the view this is handed, and #223 for what it cost.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     threshold = settings.get(HIGH_USAGE_WATTS_KEY)
     if not isinstance(threshold, int) or threshold <= 0:
         return None
@@ -764,9 +771,13 @@ def _high_usage_alert(
     poller = _emporia(request)
     contributors: tuple[Contributor, ...] = ()
     if poller is not None:
+        # Through this request's own view, not ``poller.repository``, which
+        # holds the primary connection. That it reads one row per circuit is
+        # not the question: a cheap read on a connection another thread is
+        # stepping is a *wrong* read, not a slow one.
         contributors = tuple(
             Contributor(circuit.name, circuit.watts, circuit.kind, circuit.parent_device_gid)
-            for circuit in poller.repository.latest()
+            for circuit in CircuitRepository(store).latest()
         )
     verdict = high_usage(
         int(load) if isinstance(load, int | float) else None, threshold, contributors
@@ -1148,15 +1159,18 @@ def _is_mask(key: str, value: object) -> bool:
 
 
 @router.get("/auth")
-def auth_status(request: Request) -> dict[str, Any]:
+def auth_status(request: Request, store: _ReadStore) -> dict[str, Any]:
     """Whether authentication is on, and whether this client holds a session.
 
     A read and deliberately open: the login form has to know whether to render
     at all, and this reveals only that a password is set — not the password,
     and not any other setting. That fact is not secret; every write endpoint
     already answers it, by answering 401 or not.
+
+    Read through the per-request view, since this is a threadpool handler and
+    the primary connection is the event loop's — #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     token = request.cookies.get(_SESSION_COOKIE)
     authenticated = token is not None and request.app.state.sessions.valid(token)
     return {"required": password_is_set(settings), "authenticated": authenticated}
@@ -1169,7 +1183,9 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/auth/login")
-def login(request: Request, response: Response, body: LoginRequest) -> dict[str, Any]:
+def login(
+    request: Request, response: Response, body: LoginRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Start a session in exchange for the password.
 
     The cookie is HttpOnly so the page's own script cannot read it,
@@ -1179,6 +1195,10 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
     lifetime. Deliberately not Secure: this is plain HTTP on a LAN, and a
     Secure cookie would simply never be sent, so setting it would leave the
     owner unable to log in and nothing on the page to say why.
+
+    The stored hash is read through the per-request view: this is a threadpool
+    handler, and a password check that reads the primary connection alongside
+    the event loop can read it wrongly rather than merely slowly — #223.
     """
     key = request.client.host if request.client else "unknown"
     now = time.time()
@@ -1187,7 +1207,7 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
             status_code=429,
             detail="too many failed attempts; try again shortly",
         )
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is None:
         # Nothing to guess yet, so nothing is counted. Counting here let a
@@ -1238,7 +1258,9 @@ class PasswordRequest(BaseModel):
 
 
 @router.post("/auth/password")
-def change_password(request: Request, response: Response, body: PasswordRequest) -> dict[str, Any]:
+def change_password(
+    request: Request, response: Response, body: PasswordRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Set, change or clear the password.
 
     Setting the first password needs no credential — there is none yet, and
@@ -1257,8 +1279,14 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
     counting would let a stranger fill the throttle the owner is going to need.
     A consequence worth naming: five wrong guesses here also block login from
     that address for a minute, which is right, since it is one secret.
+
+    Neither the read nor the write touches ``app.state.store``. This is a
+    threadpool handler, and that connection is the event loop's: the read
+    comes from the per-request view, and the write takes a connection of its
+    own, which is what ``write_connection`` exists for. A password verified
+    against a corrupted read is the worst version of #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is not None:
         key = request.client.host if request.client else "unknown"
@@ -1273,17 +1301,19 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
             request.app.state.throttle.record_failure(key, now)
             raise HTTPException(status_code=401, detail="current password is required")
         request.app.state.throttle.record_success(key)
-    if body.new_password:
-        if len(body.new_password) < MIN_PASSWORD_LENGTH:
-            raise HTTPException(
-                status_code=400,
-                detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
-            )
-        set_password(settings, body.new_password)
-    else:
-        clear_password(settings)
-        request.app.state.sessions.revoke_all()
-        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    with request.app.state.store.write_connection() as writer:
+        writable = SettingsStore(writer)
+        if body.new_password:
+            if len(body.new_password) < MIN_PASSWORD_LENGTH:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
+                )
+            set_password(writable, body.new_password)
+        else:
+            clear_password(writable)
+            request.app.state.sessions.revoke_all()
+            response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
     return {"ok": True}
 
 
@@ -1613,7 +1643,7 @@ def costs_circuits(
     if tariff is None or poller is None:
         return empty
 
-    cadence = _emporia_cadence_seconds(request)
+    cadence = _emporia_cadence_seconds(store)
     with _inside_the_calendar():
         intervals = [
             (interval.start, interval.end, interval.band)
@@ -3425,7 +3455,7 @@ def _parse_circuit_ids(ids: str | None) -> list[int] | None:
         raise HTTPException(status_code=400, detail=f"bad circuit ids: {ids!r}") from exc
 
 
-def _emporia_cadence_seconds(request: Request) -> int:
+def _emporia_cadence_seconds(store: SqliteStore) -> int:
     """The Emporia poll interval, which is the circuit raw tier's resolution.
 
     Not the inverter's. Scored at eleven seconds a seven-day circuit range comes
@@ -3439,8 +3469,12 @@ def _emporia_cadence_seconds(request: Request) -> int:
     was still in force, and handing this figure to rows recorded under another
     one is the defect that doubled every stored hour's energy the day the bench
     interval was raised.
+
+    Read from the caller's store rather than ``app.state.store``: both callers
+    are threadpool handlers, and the primary connection is the event loop's.
+    See ``_read_store`` and #223.
     """
-    return emporia_interval_seconds(SettingsStore(request.app.state.store))
+    return emporia_interval_seconds(SettingsStore(store))
 
 
 def _coverage_end(
@@ -3719,7 +3753,7 @@ def emporia_history(
         }
 
     wanted = _parse_circuit_ids(ids)
-    cadence = _emporia_cadence_seconds(request)
+    cadence = _emporia_cadence_seconds(store)
     tier = select_tier(span, width_px=width, cadence_seconds=cadence, circuit=True)
     with _inside_the_calendar():
         # Read through the injected view, not through ``poller.repository``.
@@ -3729,8 +3763,12 @@ def emporia_history(
         # of rows. Running it there is the shape ``_read_store`` was written to
         # end, and its own docstring names the cost, measured at 1.6 to 3.2
         # seconds a response while issue #63 was chased through the rollup.
-        # ``latest()`` stays on the poller's connection because it reads one row
-        # per circuit and is not worth a second handle.
+        # Every caller on a threadpool reads through its own view, ``latest()``
+        # included. An earlier note here excused it on the grounds that one row
+        # per circuit is not worth a second handle, which weighed the cost and
+        # missed the correctness: two threads on one connection do not read
+        # slowly, they read wrongly. ``emporia_circuits`` keeps the poller's
+        # repository because it is ``async`` and runs on the loop.
         history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )

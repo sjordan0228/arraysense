@@ -7,6 +7,62 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.9 — 21 August 2026
+
+Every read a threadpool handler makes now runs on a connection that thread
+owns, so a page stops failing outright a few times a week.
+
+### Fixed
+
+- **A settings read taken from a threadpool thread could come back wrong, and
+  the request died with it.** On the reference installation this returned four
+  500s in three days — `/api/live` twice, `/api/settings` and
+  `/api/emporia/history` once each. The page blanked for one load and recovered
+  on the next, which is why it was never reported: it reads as a flaky
+  dashboard rather than as a fault.
+
+  Two shapes, one cause. Twice `sqlite3.InterfaceError: bad parameter or other
+  API misuse` straight from the read; twice a stored value that came back
+  `None` and reached `float()`, which raises `TypeError` and is not caught by
+  the `ValueError` guard beside it.
+
+  `_read_store` gives every plain `def` handler its own connection precisely so
+  a threadpool thread never shares the collector's, and its docstring has said
+  why since #63. The settings reads went around it — they were built on
+  `app.state.store`, the primary connection — inside six handlers FastAPI
+  serves on its threadpool. One `sqlite3.Connection` has one statement cache
+  however serialised the SQLite build underneath it is, so a second thread
+  stepping it does not read slowly, it reads wrongly. Measured directly rather
+  than inferred: six threads reading one connection for eight seconds produced
+  75 `InterfaceError`s and 104 reads that came back `None` or empty for keys
+  that were certainly there.
+
+  Six sites now read through the connection their own request owns, and
+  `change_password` takes a connection of its own to write on — a credential
+  verified against a corrupted read being the worst form this could take. No
+  new locking, and no change to the collector.
+
+  One of the six is not a settings read at all. The high-usage alert listed the
+  circuits drawing power through the Emporia poller's own repository, which
+  holds the primary connection, and a comment beside a second caller excused
+  exactly that on the grounds that one row per circuit is not worth a separate
+  handle. That weighed the cost and missed the point: a cheap read on a
+  connection another thread is stepping is a wrong read, not a slow one. It was
+  found because a review pointed out the new test could not fail — the guard
+  had no Emporia module, no alert threshold and a zero-width window, so three
+  of the paths it claimed to cover returned before reaching them.
+
+  **The absent-looking value is deliberately not defaulted away.** A `None`
+  here was never a setting that had not been set; it was a corrupted read of a
+  value that is really there, and answering it with the registry default would
+  hide a wrong read behind a plausible number. The rule this project is built
+  on cuts the other way: the read is fixed, and a value that genuinely cannot
+  be decoded still says so.
+
+  Guarded by a test that watches which threads touch the primary connection
+  while requests are served, and names the offending query and thread when one
+  does — the invariant asserted, rather than a race run and hoped over.
+
 ## 1.1.8 — 18 August 2026
 
 Per-circuit energy is right for a window whose edges do not land on the hour.
