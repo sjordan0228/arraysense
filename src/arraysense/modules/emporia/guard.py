@@ -1,10 +1,17 @@
 """guard.py — hold the inverter under the owner's limit by moving the car's amps.
 
 The guard is a control loop that reads how much power the inverter itself is
-supplying, compares it against a limit the owner sets, and moves the EV charger's
-amps to keep the inverter under that limit. It cuts fast and releases slowly: a
-cut is taken immediately, but the rate only goes back up after the house has been
-continuously clear for five minutes.
+supplying, compares it against a limit the owner sets, and lowers the EV
+charger's amps to keep the inverter under that limit.
+
+**It only ever lowers.** There is no path here that raises a charge rate. That
+is deliberate: reducing current is protection and needs nobody's permission,
+while increasing it is a preference that belongs to whoever set the number —
+and a rate this guard did not choose belongs to somebody else, since Emporia's
+own app and three other controllers can all move the same slider. The cost is
+that a cut does not lift on its own; ``restore_target`` puts back a rate this
+module can prove it set, so a restart undoes its work, and otherwise the owner
+does. See ``plan`` for the whole of that reasoning.
 
 The pure half — allowance() and plan() — imports nothing from the store, the
 client, or asyncio. It mirrors control.py, whose docstring explains why:
@@ -34,7 +41,6 @@ from arraysense.modules.emporia.parse import ChargerState
 from arraysense.modules.emporia.poller import LOOP_RESTART_SECONDS, STORE_ERRORS
 from arraysense.modules.emporia.repository import MODULE, ChargerAudit, CircuitRepository
 from arraysense.settings import (
-    CHARGE_DEFAULT_KEY,
     EMPORIA_ENABLED_KEY,
     INVERTER_LIMIT_KEY,
     SettingsStore,
@@ -48,7 +54,6 @@ logger = logging.getLogger(__name__)
 GUARD_INTERVAL_SECONDS = 10
 MARGIN_W = 1000
 SETTLE_SECONDS = 90
-RELEASE_HOLD_SECONDS = 300
 INVERTER_STALE_SECONDS = 60
 EVSE_STALE_MULTIPLE = 2
 
@@ -98,7 +103,8 @@ class GuardPlan:
     """What the guard wants done about it."""
 
     amps: int | None  # None means do nothing
-    kind: str  # "cut" | "release" | "hold"
+    # Only two, and there is no "release": this guard never raises a rate.
+    kind: str  # "cut" | "hold"
     reason: str
 
 
@@ -200,16 +206,27 @@ def plan(
     allowed: Allowance,
     *,
     rate_a: int | None,
-    default_a: int,
     settled: bool,
-    safe_for_s: float | None,
 ) -> GuardPlan:
     """Decide what to do about an allowance, in exactly the pinned order.
 
+    **This guard only ever lowers the charge rate.** It has no path that raises
+    one, and that is the owner's decision rather than an omission: a rate it did
+    not choose is somebody else's — set in Emporia's own app, or by the charger —
+    and a service that quietly raises the current going into a car because it
+    calculated some headroom is the second controller this module warns about
+    everywhere else. Reducing is protection and needs no permission; increasing
+    is a preference, and it belongs to whoever set the number.
+
+    What that costs, stated plainly so nobody rediscovers it as a bug: a cut does
+    not lift on its own. If the dryer pulls the car down to the floor, it stays
+    at the floor until somebody raises it or the service restarts —
+    ``restore_target`` puts back a rate it can prove it set, so a restart still
+    undoes this guard's own work. That is the whole of the recovery story.
+
     The settle check sits above the cut check on purpose: a cut computed from a
-    reading the car has not responded to yet is the oscillation this feature would
-    otherwise have. The release waits for the house to stay clear, and is capped
-    at the owner's default.
+    reading the car has not responded to yet is the oscillation this feature
+    would otherwise have.
 
     The reason on a success path is one sentence, not two: plan() decides and
     names the action, so allowance()'s reason is never echoed.
@@ -228,22 +245,10 @@ def plan(
                 f"inverter supplying {allowed.supplied_w} W against a {allowed.limit_w} W limit"
             ),
         )
-    if safe_for_s is None or safe_for_s < RELEASE_HOLD_SECONDS:
-        return GuardPlan(amps=None, kind="hold", reason="waiting for the house to stay clear")
-    target = min(allowed.amps, default_a)
-    if target <= rate_a:
-        return GuardPlan(
-            amps=None,
-            kind="hold",
-            reason="already at the rate the house can afford",
-        )
     return GuardPlan(
-        amps=target,
-        kind="release",
-        reason=(
-            f"inverter supplying {allowed.supplied_w} W, clear of the "
-            f"{allowed.limit_w} W limit for {int(safe_for_s // 60)} minutes"
-        ),
+        amps=None,
+        kind="hold",
+        reason=f"inverter supplying {allowed.supplied_w} W, within the {allowed.limit_w} W limit",
     )
 
 
@@ -267,7 +272,6 @@ class InverterGuard:
         self._settings = SettingsStore(store)
         self._last_plan: GuardPlan | None = None
         self._last_allowance: Allowance | None = None
-        self._safe_since: datetime | None = None
         self._settled_until: datetime | None = None
         self._task: asyncio.Task[None] | None = None
 
@@ -398,28 +402,8 @@ class InverterGuard:
         reading = self.read(now)
         allowed = allowance(reading, limit_w=limit_w)
 
-        # Update the safe clock before plan() uses it.
-        if allowed.amps is None or (reading.rate_a is not None and allowed.amps < reading.rate_a):
-            self._safe_since = None
-        elif self._safe_since is None:
-            self._safe_since = now
-
-        safe_for_s: float | None = None
-        if self._safe_since is not None:
-            safe_for_s = (now - self._safe_since).total_seconds()
-
-        default_a = self._settings.get(CHARGE_DEFAULT_KEY)
-        if not isinstance(default_a, int):
-            default_a = 32
-
         settled = self._settled_until is None or now >= self._settled_until
-        p = plan(
-            allowed,
-            rate_a=reading.rate_a,
-            default_a=default_a,
-            settled=settled,
-            safe_for_s=safe_for_s,
-        )
+        p = plan(allowed, rate_a=reading.rate_a, settled=settled)
 
         self._last_allowance = allowed
         self._last_plan = p

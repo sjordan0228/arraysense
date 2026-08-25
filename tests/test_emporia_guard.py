@@ -24,7 +24,6 @@ from arraysense.modules.emporia.guard import (
     EVSE_STALE_MULTIPLE,
     GUARD_INTERVAL_SECONDS,
     INVERTER_STALE_SECONDS,
-    RELEASE_HOLD_SECONDS,
     SETTLE_SECONDS,
     Allowance,
     GuardReading,
@@ -318,7 +317,7 @@ def test_no_voltage_at_all_holds() -> None:
 
 def test_a_cut_is_taken_immediately() -> None:
     allowed = Allowance(amps=22, supplied_w=13500, charger_w=8018, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=32, default_a=32, settled=True, safe_for_s=None)
+    got = plan(allowed, rate_a=32, settled=True)
     assert got.kind == "cut"
     assert got.amps == 22
     assert got.reason == "inverter supplying 13500 W against a 12000 W limit"
@@ -327,60 +326,45 @@ def test_a_cut_is_taken_immediately() -> None:
 def test_a_cut_waits_while_settling() -> None:
     # Identical inputs to test_a_cut_is_taken_immediately but settled=False.
     allowed = Allowance(amps=22, supplied_w=13500, charger_w=8018, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=32, default_a=32, settled=False, safe_for_s=None)
+    got = plan(allowed, rate_a=32, settled=False)
     assert got.kind == "hold"
     assert got.amps is None
     assert got.reason == "settling after the last change"
 
 
-def test_a_release_waits_for_the_hold_window() -> None:
-    # Two cases, identical apart from safe_for_s.
+def test_plenty_of_headroom_never_raises_the_rate() -> None:
+    """The guard lowers and nothing else. Headroom is not an instruction.
+
+    The fixture is deliberately the most tempting case there is: the charger sits
+    at the 6 A floor while the arithmetic says the house could carry 45 A, and
+    the settle window is open. Any code path that raises a rate fires here.
+    """
     allowed = Allowance(amps=45, supplied_w=5000, charger_w=0, limit_w=_LIMIT_W, reason="")
-    rate_a = 6
-    settled = True
-
-    # Just under the threshold.
-    got_under = plan(allowed, rate_a=rate_a, default_a=32, settled=settled, safe_for_s=299.0)
-    assert got_under.kind == "hold"
-
-    # At the threshold.
-    got_at = plan(allowed, rate_a=rate_a, default_a=32, settled=settled, safe_for_s=300.0)
-    assert got_at.kind == "release"
-
-
-def test_a_release_is_capped_at_the_owner_default() -> None:
-    allowed = Allowance(amps=45, supplied_w=5000, charger_w=0, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=6, default_a=32, settled=True, safe_for_s=RELEASE_HOLD_SECONDS + 10)
-    assert got.amps == 32
-    assert got.kind == "release"
-
-
-def test_a_release_that_would_not_raise_the_rate_holds() -> None:
-    allowed = Allowance(amps=40, supplied_w=5000, charger_w=0, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=32, default_a=32, settled=True, safe_for_s=RELEASE_HOLD_SECONDS + 10)
+    got = plan(allowed, rate_a=6, settled=True)
     assert got.kind == "hold"
-    assert got.reason == "already at the rate the house can afford"
+    assert got.amps is None
+    assert got.reason == "inverter supplying 5000 W, within the 12000 W limit"
+
+
+def test_an_allowance_equal_to_the_rate_holds() -> None:
+    # The boundary: equal is not "below", so it must not be read as a cut.
+    allowed = Allowance(amps=22, supplied_w=9000, charger_w=1250, limit_w=_LIMIT_W, reason="")
+    got = plan(allowed, rate_a=22, settled=True)
+    assert got.kind == "hold"
+    assert got.amps is None
 
 
 def test_an_unknown_rate_holds() -> None:
     allowed = Allowance(amps=22, supplied_w=13500, charger_w=8018, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=None, default_a=32, settled=True, safe_for_s=None)
+    got = plan(allowed, rate_a=None, settled=True)
     assert got.kind == "hold"
     assert got.reason == "the charge rate is unknown"
-
-
-def test_the_release_reason_reports_whole_minutes() -> None:
-    # 330.0 s is 5.5 minutes; floor gives 5, round would give 6.
-    allowed = Allowance(amps=45, supplied_w=5000, charger_w=0, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=6, default_a=32, settled=True, safe_for_s=330.0)
-    assert got.kind == "release"
-    assert "for 5 minutes" in got.reason
 
 
 def test_the_order_of_the_rules_is_settle_before_cut() -> None:
     # Both a cut and the settle window apply; assert hold.
     allowed = Allowance(amps=22, supplied_w=13500, charger_w=8018, limit_w=_LIMIT_W, reason="")
-    got = plan(allowed, rate_a=32, default_a=32, settled=False, safe_for_s=None)
+    got = plan(allowed, rate_a=32, settled=False)
     assert got.kind == "hold"
     assert got.reason == "settling after the last change"
 
@@ -732,61 +716,56 @@ async def test_the_settle_window_blocks_a_second_change(tmp_path: Path) -> None:
     assert len(poller.writes) == 2, "third tick must be allowed after settle window"
 
 
-# Test 31: a clear house releases after the hold window
-async def test_a_clear_house_releases_after_the_hold_window(tmp_path: Path) -> None:
+async def test_a_clear_house_never_raises_the_rate(tmp_path: Path) -> None:
+    """However long the house stays clear, the guard never touches the rate.
+
+    This is the guarantee the owner asked for, so the fixture is the most
+    tempting case available: the charger sits at the 6 A floor while the
+    arithmetic says the house could carry 24 A, and the loop runs for ten
+    minutes of continuously clear readings — longer than any window a release
+    would plausibly have waited for. A single write here is a regression.
+    """
     guard, store, poller = _make_guard(tmp_path, enabled=True, limit_w=_LIMIT_W)
-    # Start with a clear house and rate at 6.
     _insert_inverter_sample(store, 5000.0, 0.0)
     _insert_charger_circuit(poller, 900001, 0)
     poller.charger = FakeChargerState(rate_a=6)
 
-    # Advance past RELEASE_HOLD_SECONDS with clear readings.
-    for i in range(int(RELEASE_HOLD_SECONDS / GUARD_INTERVAL_SECONDS) + 2):
+    for i in range(60):
         tick_ts = NOW + timedelta(seconds=(i + 1) * GUARD_INTERVAL_SECONDS)
         _insert_inverter_sample(store, 5000.0, 0.0, ts=tick_ts)
         _insert_charger_circuit(poller, 900001, 0, ts=tick_ts)
         poller.charger = FakeChargerState(rate_a=6)
         await guard.tick(tick_ts)
 
-    assert len(poller.writes) == 1
-    assert poller.writes[0] == 24, "should release to computed amps"
-    assert poller.audit.changes[0]["reason"].startswith(  # type: ignore[attr-defined]
-        "inverter supplying 5000 W, clear of the"
-    )
+    assert poller.writes == []
+    assert poller.audit.changes == []
+    assert guard.last_plan is not None
+    assert guard.last_plan.kind == "hold"
+    assert guard.last_plan.reason == "inverter supplying 5000 W, within the 12000 W limit"
 
 
-# Test 32: an absent reading restarts the safe clock
-async def test_an_absent_reading_restarts_the_safe_clock(tmp_path: Path) -> None:
+async def test_a_cut_still_happens_after_a_long_clear_spell(tmp_path: Path) -> None:
+    """Not raising must not become not acting. The cut path stays live.
+
+    Ten minutes of a clear house, then the dryer starts. Without this, deleting
+    the whole of plan() below the settle check would still pass the test above.
+    """
     guard, store, poller = _make_guard(tmp_path, enabled=True, limit_w=_LIMIT_W)
-    # Clear for 280 s.
-    _insert_inverter_sample(store, 5000.0, 0.0)
-    _insert_charger_circuit(poller, 900001, 0)
-    poller.charger = FakeChargerState(rate_a=6)
-
-    for i in range(28):
+    for i in range(60):
         tick_ts = NOW + timedelta(seconds=(i + 1) * GUARD_INTERVAL_SECONDS)
         _insert_inverter_sample(store, 5000.0, 0.0, ts=tick_ts)
-        _insert_charger_circuit(poller, 900001, 0, ts=tick_ts)
-        poller.charger = FakeChargerState(rate_a=6)
+        _insert_charger_circuit(poller, 900001, 8018, ts=tick_ts)
+        poller.charger = FakeChargerState(rate_a=32)
         await guard.tick(tick_ts)
+    assert poller.writes == []
 
-    # One tick with an absent house reading.
-    absent_ts = NOW + timedelta(seconds=29 * GUARD_INTERVAL_SECONDS)
-    _insert_inverter_sample(store, None, None, ts=absent_ts)
-    _insert_charger_circuit(poller, 900001, 0, ts=absent_ts)
-    poller.charger = FakeChargerState(rate_a=6)
-    await guard.tick(absent_ts)
+    heavy_ts = NOW + timedelta(seconds=61 * GUARD_INTERVAL_SECONDS)
+    _insert_inverter_sample(store, 13500.0, 0.0, ts=heavy_ts)
+    _insert_charger_circuit(poller, 900001, 8018, ts=heavy_ts)
+    poller.charger = FakeChargerState(rate_a=32)
+    await guard.tick(heavy_ts)
 
-    # Clear again for 100 s — should not release because clock restarted.
-    for i in range(10):
-        tick_ts = NOW + timedelta(seconds=(30 + i + 1) * GUARD_INTERVAL_SECONDS)
-        _insert_inverter_sample(store, 5000.0, 0.0, ts=tick_ts)
-        _insert_charger_circuit(poller, 900001, 0, ts=tick_ts)
-        poller.charger = FakeChargerState(rate_a=6)
-        await guard.tick(tick_ts)
-
-    # Should not have released because the clock was restarted by the absent reading.
-    assert len(poller.writes) == 0, "absent reading must restart the safe clock"
+    assert poller.writes == [22]
 
 
 # Test 33: an unreachable cloud audits the failure and backs off
