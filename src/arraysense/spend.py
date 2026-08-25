@@ -32,7 +32,7 @@ reaching for. The route measures it beside this list.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 
 from .alerts import DEFAULT_TOP, NOT_A_CULPRIT
@@ -92,6 +92,17 @@ class CircuitSpend:
     with nothing explaining the gap: $4.50 of segments beside a $4.65 total.
     None when ``cost`` is None too — an unpublished month's rider is exactly
     as unknown as the total it would have ridden on.
+
+    ``grid_kwh`` and ``grid_cost`` are the part of this circuit the meter
+    actually charged for — its band energy weighted by the house's own grid
+    share in each band, since nothing meters a single circuit's supply. They are
+    None together, and None whenever any band the circuit was priced in had no
+    knowable share: a grid figure built from three bands of four is a smaller
+    number than the truth with nothing on screen saying so, and a reader cannot
+    tell it from a circuit that genuinely ran on solar. That absence is
+    independent of ``partial`` — a circuit measured end to end can still have an
+    unknowable grid share, because it is the inverter's counter that went unread
+    rather than the circuit's.
     """
 
     name: str
@@ -101,6 +112,128 @@ class CircuitSpend:
     bands: tuple[BandSpend, ...]
     partial: bool
     rider: float | None = None
+    grid_kwh: float | None = None
+    grid_cost: float | None = None
+    grid_partial: bool = False
+
+
+def grid_share_by_band(
+    imported: Mapping[str, float | None],
+    load: Mapping[str, float | None] | None,
+    bands: Sequence[RateBand],
+) -> dict[str, float]:
+    """What fraction of each band's house load came straight off the meter.
+
+    Nothing meters a single circuit's supply — an Emporia clamp measures current
+    through a branch and has no idea whether the electrons behind it came down
+    the service drop or off the roof. The house-level answer is metered, so a
+    circuit's grid figure is this ratio applied to the circuit's own energy.
+
+    Per band rather than per period, because that is the granularity at which
+    the answer is exact in the money: a band has one price, so a circuit's grid
+    cost in a band is its band cost times this share with no rounding path of
+    its own. A month's single ratio applied to an evening circuit understates
+    its grid share badly, since the evening is grid-heavy and midday is not.
+
+    Battery discharge is not counted as grid supply, which is an accounting
+    choice and the correct one: grid energy that charged the bank was already
+    counted as import at the moment it was charged and billed at that hour's
+    rate. Counting it again on the way out would charge the owner twice for one
+    kilowatt-hour and make this column sum to more than the meter read.
+
+    A band is absent from the result whenever its share cannot be told — either
+    counter unread, or a house load of zero that nothing can be divided by.
+    Absent is what the caller needs: a share of zero would be the claim that the
+    circuit ran on solar, which is a different thing from nobody knowing.
+
+    Clamped to 0..1. A share above one is legitimate — a band in which the grid
+    both ran the house and charged the bank imports more than the house loaded —
+    but it has nothing to say on a page that can only draw a circuit as at most
+    wholly grid-fed, and printing a grid cost larger than the total beside it
+    reads as a bug whatever the accounting says.
+
+    Keyed by ``RateBand.key`` rather than by band name, because that is what the
+    pricing matches against. ``energy_by_band`` does the casefolding, drops the
+    Nones and warns about a name no band answers to, which is the same job here
+    as it is everywhere else it is called.
+    """
+    metered = energy_by_band(imported, bands, "grid import") or {}
+    house = energy_by_band(load, bands, "house load") or {}
+    out: dict[str, float] = {}
+    for key, total in house.items():
+        drawn = metered.get(key)
+        if drawn is None or total <= 0.0:
+            continue
+        out[key] = min(1.0, max(0.0, drawn / total))
+    return out
+
+
+def _grid_energy(
+    reported: Mapping[str, float], shares: Mapping[str, float]
+) -> dict[str, float] | None:
+    """One circuit's band energy weighted by the grid's share of each band.
+
+    None the moment any band the circuit was priced in has no share, and that
+    is the whole point of the function existing separately. A grid figure built
+    from three of four bands is a smaller number than the truth with nothing on
+    screen saying so, and a reader cannot tell it from a circuit that genuinely
+    ran on solar — #23's rule at the scale of one column, and #23 was reverted
+    twice for exactly this shape of shortfall.
+    """
+    out: dict[str, float] = {}
+    for key, kwh in reported.items():
+        share = shares.get(key)
+        if share is None:
+            return None
+        out[key] = kwh * share
+    return out
+
+
+def _grid_figures(
+    present: Mapping[str, float],
+    bands: Sequence[RateBand],
+    grid_share: Mapping[str, float] | None,
+    *,
+    short: Collection[str],
+    unknown_rider: bool,
+    rider_per_kwh: float | None,
+) -> tuple[float | None, float | None, bool]:
+    """One circuit's metered energy, what it cost, and whether it is a part.
+
+    Lifted out of ``top_spenders``'s loop rather than left inline, because the
+    loop was already the most branched thing in this module and this added a
+    fourth nested level to it. The rider arithmetic is duplicated from the
+    total's rather than shared with it: they charge the same rate on different
+    energy, and a helper taking "which energy" as an argument would be the same
+    number of lines with an extra thing to get wrong.
+
+    Priced through ``price_by_band`` for the reason everything here is — the
+    rule for when a total is unknown is one rule, and a second copy of it is a
+    second place for a missing band to turn quietly into a small number.
+    """
+    if grid_share is None or not present:
+        return None, None, False
+    weighted = _grid_energy(present, grid_share)
+    if weighted is None:
+        return None, None, False
+    _, cost, kwh = price_by_band(bands, weighted, partial=True)
+    # Only the bands this circuit actually spent in. A flag raised from the
+    # period would label a circuit that never entered the short band, and a
+    # figure carrying a caption that does not describe it is worse than an
+    # unlabelled one.
+    #
+    # No guard here on ``kwh`` being present, deliberately. It cannot be absent
+    # at this point: ``present`` is already filtered to band keys by
+    # ``energy_by_band``, so every key in ``weighted`` matches a band and
+    # ``price_by_band`` counts at least one — and the only route to an empty
+    # ``weighted`` is an empty ``present``, which returned above. A guard that
+    # cannot be false is dead code that reads as a live protection.
+    label = any(key in short for key in present)
+    if cost is None or unknown_rider:
+        return kwh, None, label
+    if rider_per_kwh is not None and kwh is not None:
+        cost += kwh * rider_per_kwh
+    return kwh, cost, label
 
 
 def top_spenders(
@@ -108,6 +241,8 @@ def top_spenders(
     bands: Sequence[RateBand],
     *,
     adjustment: AdjustmentRate | None = None,
+    grid_share: Mapping[str, float] | None = None,
+    grid_short: Collection[str] | None = None,
     top: int = DEFAULT_TOP,
 ) -> tuple[CircuitSpend, ...]:
     """Rank circuits by what they cost, and say where each one spent it.
@@ -139,6 +274,20 @@ def top_spenders(
     is configured at all: that is a fact about the tariff, known and zero,
     which is a different claim from a published month's rider being unstated.
 
+    ``grid_share`` is ``grid_share_by_band``'s answer, resolved by the caller
+    the way ``bands`` and ``adjustment`` already are — this function has no
+    business reading the inverter's counters. Omitted, both grid fields come
+    back None and every existing caller behaves exactly as it did, which is
+    what keeps the ranking's own tests measuring the ranking.
+
+    ``grid_short`` names the bands whose *house* window was only partly
+    measured, from the inverter's own shortfall accounting. A band there still
+    has a share — it is the ratio over the hours that did report — so the
+    figure stands and is labelled rather than withheld, which is the owner's
+    settled reading of #23: a labelled partial is fine, and a dash is right
+    only when nothing was measured. Band names, matched casefolded, because
+    that is how the shortfall speaks them.
+
     Ranked by cost rather than by energy because the page is about money, and a
     circuit that only ever runs at peak outranking one that used twice the
     energy is the useful thing this panel exists to show. Both figures come
@@ -148,6 +297,7 @@ def top_spenders(
     Two constants that have to agree are one constant too many.
     """
     unknown_rider = adjustment is not None and adjustment.status == "unknown"
+    short = {name.strip().casefold() for name in (grid_short or ())}
     rider_per_kwh = None if adjustment is None else adjustment.per_kwh
     ranked: list[CircuitSpend] = []
     for circuit in circuits:
@@ -173,6 +323,18 @@ def top_spenders(
                 cost += rider
             else:
                 rider = 0.0
+        # The grid's own share of this circuit, priced through the same
+        # function as the total beside it rather than by arithmetic here.
+        # Two ways of turning a kilowatt-hour into money is how this page
+        # came to hold a second tariff parser that disagreed within a day.
+        grid_kwh, grid_cost, grid_partial = _grid_figures(
+            present,
+            bands,
+            grid_share,
+            short=short,
+            unknown_rider=unknown_rider,
+            rider_per_kwh=rider_per_kwh,
+        )
         thin = {name.strip().casefold() for name in circuit.partial_bands}
         split = tuple(
             BandSpend(
@@ -194,6 +356,9 @@ def top_spenders(
                 bands=split,
                 partial=any(b.partial for b in split) or (cost is not None and missing_band),
                 rider=rider,
+                grid_kwh=grid_kwh,
+                grid_cost=grid_cost,
+                grid_partial=grid_partial,
             )
         )
     # A circuit nobody heard from sorts last, below one measured at nothing.
