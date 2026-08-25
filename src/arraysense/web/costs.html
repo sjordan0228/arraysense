@@ -143,16 +143,23 @@
      boundary cue than lightness there as well — for the same colour-blind reader,
      not a side effect worth narrowing back out. */
   .splitbar span + span{box-shadow:inset 2px 0 0 var(--panel)}
-  /* One row per circuit: the name, what it cost, what it used, and where the
-     money went inside it. The band bar is renderSplit's bar at row height —
-     same hue, same shades, same hatch for a partly-unmeasured segment — because
-     a second way of drawing a band split on one page is a second thing to learn
-     for no new information. */
-  .spend{display:flex;flex-direction:column;gap:9px;margin-top:4px}
-  .spendrow{display:grid;grid-template-columns:minmax(0,1.4fr) 78px 82px minmax(120px,1fr);
-    align-items:center;gap:10px}
-  @media(max-width:700px){.spendrow{grid-template-columns:minmax(0,1fr) 78px 82px}
-    .spendrow .splitbar{grid-column:1/-1}}
+   /* One column template, named once. The header row below the panel title and
+      every data row have to agree exactly or the labels sit over the wrong
+      figures, and two copies of a five-track template is the standing invitation
+      to have them disagree. */
+   #spendSec{--spendcols:minmax(0,1.4fr) 70px 70px 74px minmax(120px,1fr)}
+   .spendrow,.spendhead{display:grid;grid-template-columns:var(--spendcols);
+     align-items:center;gap:10px}
+   /* Two money figures side by side are unreadable without saying which is
+      which. The smallest thing that answers "what is this second number" is a
+      label over it, and it is the only reason this row exists. */
+   .spendhead{margin-bottom:3px}
+   .spendhead span{font-size:10px;text-transform:uppercase;letter-spacing:.14em;
+     color:var(--ink3)}
+   .spendhead span:nth-child(2),.spendhead span:nth-child(3),
+   .spendhead span:nth-child(4){text-align:right}
+   @media(max-width:700px){#spendSec{--spendcols:minmax(0,1fr) 70px 70px 74px}
+     .spendrow .splitbar{grid-column:1/-1}}
   .spendrow .cn{font-size:13px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;
     white-space:nowrap}
   .spendrow .cv{font-size:13px;text-align:right;font-variant-numeric:tabular-nums;color:var(--ink)}
@@ -308,6 +315,9 @@
     <div class="chead">
       <h2>The five circuits that cost the most</h2>
       <span class="legend muted" id="spendCoverage"></span>
+    </div>
+    <div class="spendhead" aria-hidden="true">
+      <span></span><span>cost</span><span>from grid</span><span>energy</span><span></span>
     </div>
     <div class="spend" id="spendList"></div>
     <span class="cap" id="spendCap"></span>
@@ -1214,7 +1224,6 @@ function renderSpenders(body, cur) {
   if (!list.length || !measured) { $('spendSec').hidden = true; return; }
   $('spendSec').hidden = false;
   $('spendCoverage').textContent = coverageWords(body.coverage);
-  const shades = [0.9, 0.62, 0.42, 0.28];
   // >>> costs-hatch-earns-its-place
   // Whether a hatched segment would distinguish anything. A marker every segment
   // carries marks nothing: on an installation whose circuit history is younger
@@ -1229,6 +1238,16 @@ function renderSpenders(body, cur) {
   };
   // <<< costs-hatch-earns-its-place
   const blanket = everyBandPartial(list);
+  // The gate has to measure the same thing it gates, and this one nearly did
+  // not. `blanket` asks whether every measured BAND is partial — the question
+  // the band segments used to pose. The hatch now sits on a whole row and is
+  // driven by c.partial, which is true in a case blanket deliberately ignores:
+  // a band in effect the circuit never reported in at all. A month whose peak
+  // window no circuit has entered yet makes every row partial and no band
+  // partial, so the band gate stayed shut, every bar in the panel hatched, and
+  // every label was struck through — #31 exactly, re-created one level up and
+  // invisible to every test that did not draw the panel.
+  const everyRowPartial = list.length > 0 && list.every((c) => c.partial);
   $('spendList').innerHTML = list.map((c) => {
     // A band this circuit never reported in is absent, not zero — dropped
     // here as it is everywhere else. A band it reported at exactly $0 is a
@@ -1240,23 +1259,58 @@ function renderSpenders(body, cur) {
     const total = priced.reduce((a, b) => a + b.cost, 0);
     // A circuit whose bands were all unmeasured gets the hatch the rest of the
     // page gives an unknown, never an empty bar reading as "spent nothing".
-    const bar = priced.length
-      ? `<div class="splitbar">${priced.map((b, i) => {
-          // total can be zero when every measured band genuinely cost
-          // nothing — an equal share draws a real bar instead of dividing by
-          // zero, which is a different claim from "nothing was measured".
-          const share = total > 0 ? b.cost / total : 1 / priced.length;
-          const shade = shades[Math.min(i, shades.length - 1)];
-          const why = b.partial ? ' — part of this band’s window was not measured' : '';
-          // The title still tells the truth about every segment; only the
-          // texture is withheld when it would cover the whole panel.
-          const hatch = b.partial && !blanket;
-          return `<span${hatch ? ' class="part"' : ''}`
-            + ` style="flex:${Math.max(2, share * 1000).toFixed(2)};background:${fade('--grid', shade)}"`
-            + ` title="${esc(b.band)} ${esc(money(b.cost, cur))}${esc(why)}">`
-            + `${share > 0.18 ? `<i>${esc(b.band)}</i>` : ''}</span>`;
-        }).join('')}</div>`
-      : '<div class="splitbar none"></div>';
+    // >>> costs-supply-bar
+    // The band split moves into the tooltip and the bar answers the bigger
+    // question instead: how much of this circuit the meter actually charged
+    // for. A rate-band split is the secondary fact once there is a grid figure
+    // in the row, and a bar that showed both would be two encodings competing
+    // for one strip of nineteen pixels.
+    // `blanket` still gates a per-band mark, which is what it was written for —
+    // only the mark moved. Naming every band "(part)" in a tooltip where every
+    // band is partial is the same nothing the texture was, and the caption says
+    // it once instead.
+    const bandWords = priced
+      .map((b) => `${b.band} ${money(b.cost, cur)}${b.partial && !blanket ? ' (part)' : ''}`)
+      .join(' · ');
+    // grid_kwh is null when any band this circuit was priced in had no knowable
+    // house split. A bar cannot be drawn from a figure that does not exist, so
+    // the row falls back to the hatch-or-nothing treatment every other unknown
+    // on this page gets rather than drawing a guess.
+    //
+    // `measured` and `gShare` are two different questions, and collapsing them
+    // is a bug this row has already had. A circuit measured at exactly zero has
+    // no supply to divide — but it *was* measured, and `.splitbar.none` is this
+    // file's word for absent data. Rendering it there says "nobody heard from
+    // this circuit" about one that reported all month that it used nothing:
+    // precisely the two claims #23 exists to keep apart. An empty track says
+    // "nothing to divide" instead, which is what actually happened.
+    const measured = c.grid_kwh !== null && c.grid_kwh !== undefined
+      && c.kwh !== null && c.kwh !== undefined;
+    const gShare = measured && c.kwh > 0
+      ? Math.min(1, Math.max(0, c.grid_kwh / c.kwh))
+      : null;
+    // The hatch means what it always meant — this row's measurement was thin —
+    // and it now sits on the supply segments because that is what the bar is
+    // made of. Withheld when every row would carry it, since a mark on all five
+    // marks nothing and costs the bars their labels (#31). Gated on rows rather
+    // than on bands because a row is what it now marks; see everyRowPartial.
+    const hatch = c.partial && !everyRowPartial;
+    // A segment at exactly zero is dropped rather than floored to a sliver.
+    // The band bar floors its segments so a thin band stays visible, but a zero
+    // grid share is a real measurement and a two-pixel wedge of grid beside it
+    // would be the page inventing an import that did not happen.
+    const supply = gShare === null ? [] : [
+      ['grid', gShare, fade('--grid', 0.85), 'Bought from the grid'],
+      ['solar', 1 - gShare, fade('--pv', 0.85), 'Supplied by solar and the battery'],
+    ].filter((s) => s[1] > 0);
+    const bar = supply.length
+      ? `<div class="splitbar">${supply.map(([label, share, colour, why]) =>
+          `<span${hatch ? ' class="part"' : ''}`
+          + ` style="flex:${(share * 1000).toFixed(2)};background:${colour}"`
+          + ` title="${esc(why)} — ${esc(bandWords)}">`
+          + `${share > 0.18 ? `<i>${esc(label)}</i>` : ''}</span>`).join('')}</div>`
+      : `<div class="splitbar${measured ? '' : ' none'}" title="${esc(bandWords)}"></div>`;
+    // <<< costs-supply-bar
     // A band this circuit is short a whole hour of, or never reported in at
     // all over an in-effect band, has no width to hatch — cost is null, so
     // it never reaches `priced` and no segment above can carry the mark. The
@@ -1278,9 +1332,40 @@ function renderSpenders(body, cur) {
         + 'split out in the bar below.');
     }
     const cvTitle = cvNotes.length ? ` title="${esc(cvNotes.join(' '))}"` : '';
+    // Two money figures, and the header above the list says which is which.
+    // The right-hand one can be a dash while the left-hand one is a number:
+    // the circuit's own measurement and the inverter's are different readings
+    // and either can be the one that went missing.
+    // Three states, not two. A dash here has two quite different causes and
+    // saying the wrong one is worse than saying nothing: the split may be
+    // unreadable, or the split may be perfectly known while the month's rate
+    // rider is unpublished and so no price can be stated at all. grid_kwh is
+    // what tells them apart — it survives the second and not the first.
+    const gridKnown = c.grid_kwh !== null && c.grid_kwh !== undefined;
+    const gPriced = c.grid_cost !== null && c.grid_cost !== undefined;
+    // Built as a sentence first and quoted once at the end. Assembled with the
+    // closing quote inline, an appended clause lands *outside* the attribute
+    // and the browser reads every word of it as an attribute of its own — 24
+    // of them on this one span. Every gate stayed green through it; only the
+    // rendered DOM showed it.
+    const gWhy = gPriced
+      ? 'What the meter charged for this circuit. The rest of its energy came from the'
+        + ' array or the battery.'
+        + (c.grid_partial
+          ? ' The inverter’s own counters were short over part of a rate band this circuit'
+            + ' ran in, so this is drawn from the hours that did report.'
+          : '')
+      : gridKnown
+        ? 'This month’s rate rider (PCRF/SCRF) has not been published, so what the meter'
+          + ' charged cannot be priced. The energy behind it is known.'
+        : 'The house’s own grid split could not be read for every band this circuit ran'
+          + ' in, so what the meter charged for it cannot be told apart from what the'
+          + ' array supplied.';
+    const gTitle = ` title="${esc(gWhy)}"`;
     return `<div class="spendrow">
       <span class="cn" title="${esc(c.name)}">${esc(c.name)}</span>
       <span class="cv${missingBand ? ' part' : ''}"${cvTitle}>${esc(money(c.cost, cur))}</span>
+      <span class="cv${c.grid_partial ? ' part' : ''}"${gTitle}>${esc(money(c.grid_cost, cur))}</span>
       <span class="ck">${esc(uStr(c.kwh, 1, 'kWh'))}</span>
       ${bar}
     </div>`;
@@ -1288,20 +1373,41 @@ function renderSpenders(body, cur) {
   const anyPartial = list.some((c) => c.partial);
   const anySilent = list.some((c) => c.cost === null);
   const notes = [];
-  if (blanket) {
+  if (everyRowPartial) {
+    // Every bar would have been hatched, so none is. The claim still holds over
+    // every figure in the panel; it is made once, in words, rather than in a
+    // texture that would have cost the bars their labels to say it five times.
+    notes.push('Every circuit above was only partly recorded over this period, so each '
+      + 'figure is what was measured rather than the whole of it.');
+  } else if (blanket) {
     // Said once, in words, because saying it five times in texture said nothing
     // and cost the bars their labels. Same claim, and it still qualifies every
     // figure in the panel — it simply names them all at once.
     notes.push('Every band above was only partly recorded, so each figure is what was '
       + 'measured rather than the whole of it.');
   } else if (anyPartial) {
-    notes.push('A hatched segment is a band whose window was only partly recorded, so that '
-      + 'part of the figure is what was measured rather than the whole of it.');
+    notes.push('A hatched bar is a circuit whose window was only partly recorded, so its '
+      + 'figures are what was measured rather than the whole of it.');
   }
   if (anySilent) {
     notes.push('A circuit showing ' + DASH + ' reported nothing at all over this period. That '
       + 'is not a circuit that used nothing.');
   }
+  if (list.some((c) => c.grid_partial)) {
+    // The house counters, not the circuits'. A band the inverter covered only
+    // part of still reports a figure, so the share behind it is a ratio over
+    // the hours that did report — real, usable, and not the whole story. #23's
+    // rule is that such a figure may be shown as long as it is labelled, and
+    // this is the label.
+    notes.push('A dotted grid figure is one where the inverter’s own counters were short '
+      + 'over part of a rate band, so it is drawn from the hours that did report.');
+  }
+  // Unconditional, because it qualifies every figure in the grid column
+  // whenever the column is drawn. Nothing meters a single circuit's supply,
+  // and a column that looked like a reading when it is a share-out is exactly
+  // the shape of claim #23 exists to prevent.
+  notes.push('Nothing meters one circuit’s supply, so the grid figures are the house’s own '
+    + 'grid-versus-self split in each rate band, applied to that circuit’s energy.');
   $('spendCap').innerHTML = notes.join(' ');
 }
 

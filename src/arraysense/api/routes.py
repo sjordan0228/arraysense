@@ -128,7 +128,7 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.setup import describe_setup
-from arraysense.spend import top_spenders
+from arraysense.spend import grid_share_by_band, top_spenders
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -1318,6 +1318,76 @@ def change_password(
     return {"ok": True}
 
 
+def _counter_rows(
+    store: SqliteStore, start: datetime, end: datetime
+) -> tuple[list[dict[str, Any]], str]:
+    """The lifetime-counter rows a period must be priced from, and their tier.
+
+    Two endpoints need exactly these rows and exactly this fallback chain: the
+    Costs page's own totals, and the per-circuit grid split beside them. A
+    second copy would drift, and the comments below are the record of four
+    separate defects already fixed in this search — a second copy is four
+    defects waiting to be found again.
+    """
+    # Read back before the period starts so its first interval has a reading to
+    # be measured *from*, rather than starting at whatever row happens to fall
+    # inside it. Without the lead, the first stretch of every month is short by
+    # however long it took the first sample to arrive.
+    with _inside_the_calendar():
+        lead = start - COUNTER_LEAD
+    # Minute first, then coarser, then raw. Hourly has to be in the chain and
+    # not just as a last resort: the minute tier is kept for a year, so a month
+    # older than that has nothing there while the hourly tier holds it back to
+    # the beginning. Falling straight from minute to raw — which is kept thirty
+    # days — found nothing and priced August 2025 as unknown, while the History
+    # page read the same month out of the hourly tier and showed $87.65.
+    #
+    # A candidate is only taken outright if its earliest row actually reaches
+    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
+    # the minute tier from its oldest end, so a month straddling that cutoff
+    # still gets *some* minute rows back: the stretch after the cutoff. The old
+    # "if rows: break" took them anyway, and the stretch before the cutoff,
+    # having no rows at all, priced as though it had never happened rather
+    # than falling to the hourly tier, which is kept indefinitely and always
+    # reaches back this far.
+    #
+    # A month whose collection genuinely began after ``lead`` — a fresh
+    # install, or one old enough that even the tier which does hold it starts
+    # partway through — fails that bracket check on *every* candidate, and
+    # nothing ever breaks the loop. Every remaining candidate then has to be
+    # judged on how far back its own earliest row reaches, because the loop
+    # order (minute, hourly, full) is not an order of coverage — it is the
+    # order resolution gets coarser. Each tier is pruned from its own oldest
+    # end on its own schedule, so "full" is not reliably empty by the time the
+    # loop reaches it: thirty days of retention can still leave it holding the
+    # tail of an old month, later and worse than what hourly already found.
+    # Keeping whichever candidate merely happened to be nonempty and tried
+    # last picked exactly that tail once, silently discarding the earlier,
+    # more complete rows hourly was already holding — the same loss the
+    # bracket check exists to prevent, reached by a different door. So
+    # ``rows`` is only replaced here when a candidate both has rows and
+    # reaches further back than whatever is already kept, never merely for
+    # being nonempty and later in the loop; the first candidate to bracket
+    # ``lead`` is by definition as good as this gets, so it still stops the
+    # search rather than being compared against tiers coarser than it needs.
+    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
+    # this only stops a labelled partial from being thrown away in favour of
+    # a worse one that happened to be tried last.
+    rows: list[dict[str, Any]] = []
+    tier = "minute"
+    earliest: datetime | None = None
+    for candidate in ("minute", "hourly", "full"):
+        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
+        if not candidate_rows:
+            continue
+        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
+        if earliest is None or candidate_earliest < earliest:
+            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
+        if candidate_earliest - lead <= MAX_EDGE_GAP:
+            break
+    return rows, tier
+
+
 @router.get("/costs")
 def costs(
     request: Request,
@@ -1379,62 +1449,7 @@ def costs(
     # as midnight wherever the service happens to be installed.
     start, end = with_zone(start, zone), with_zone(end, zone)
 
-    # Read back before the period starts so its first interval has a reading to
-    # be measured *from*, rather than starting at whatever row happens to fall
-    # inside it. Without the lead, the first stretch of every month is short by
-    # however long it took the first sample to arrive.
-    with _inside_the_calendar():
-        lead = start - COUNTER_LEAD
-    # Minute first, then coarser, then raw. Hourly has to be in the chain and
-    # not just as a last resort: the minute tier is kept for a year, so a month
-    # older than that has nothing there while the hourly tier holds it back to
-    # the beginning. Falling straight from minute to raw — which is kept thirty
-    # days — found nothing and priced August 2025 as unknown, while the History
-    # page read the same month out of the hourly tier and showed $87.65.
-    #
-    # A candidate is only taken outright if its earliest row actually reaches
-    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
-    # the minute tier from its oldest end, so a month straddling that cutoff
-    # still gets *some* minute rows back: the stretch after the cutoff. The old
-    # "if rows: break" took them anyway, and the stretch before the cutoff,
-    # having no rows at all, priced as though it had never happened rather
-    # than falling to the hourly tier, which is kept indefinitely and always
-    # reaches back this far.
-    #
-    # A month whose collection genuinely began after ``lead`` — a fresh
-    # install, or one old enough that even the tier which does hold it starts
-    # partway through — fails that bracket check on *every* candidate, and
-    # nothing ever breaks the loop. Every remaining candidate then has to be
-    # judged on how far back its own earliest row reaches, because the loop
-    # order (minute, hourly, full) is not an order of coverage — it is the
-    # order resolution gets coarser. Each tier is pruned from its own oldest
-    # end on its own schedule, so "full" is not reliably empty by the time the
-    # loop reaches it: thirty days of retention can still leave it holding the
-    # tail of an old month, later and worse than what hourly already found.
-    # Keeping whichever candidate merely happened to be nonempty and tried
-    # last picked exactly that tail once, silently discarding the earlier,
-    # more complete rows hourly was already holding — the same loss the
-    # bracket check exists to prevent, reached by a different door. So
-    # ``rows`` is only replaced here when a candidate both has rows and
-    # reaches further back than whatever is already kept, never merely for
-    # being nonempty and later in the loop; the first candidate to bracket
-    # ``lead`` is by definition as good as this gets, so it still stops the
-    # search rather than being compared against tiers coarser than it needs.
-    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
-    # this only stops a labelled partial from being thrown away in favour of
-    # a worse one that happened to be tried last.
-    rows: list[dict[str, Any]] = []
-    tier = "minute"
-    earliest: datetime | None = None
-    for candidate in ("minute", "hourly", "full"):
-        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if not candidate_rows:
-            continue
-        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
-        if earliest is None or candidate_earliest < earliest:
-            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
-        if candidate_earliest - lead <= MAX_EDGE_GAP:
-            break
+    rows, tier = _counter_rows(store, start, end)
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 
@@ -1700,10 +1715,32 @@ def costs_circuits(
         or tariff.bands_in_effect(start, end)
         or tariff.bands
     )
+    # The house's own grid-versus-self split, per band, from the same counter
+    # rows and the same fallback chain the Costs totals are priced from.
+    # Nothing meters a single circuit's supply, so this ratio is what the
+    # per-circuit grid figure is shared out from.
+    with _inside_the_calendar():
+        house = period_energy(tariff, _counter_rows(store, start, end)[0], start, end, zone)
+    shares = grid_share_by_band(house.grid_import_kwh, house.load_kwh, bands)
+    # A band the house's own counters covered only part of still reports — as a
+    # sum over the stretch that was measured — so its share is a ratio over
+    # those hours applied to the circuit's whole band energy. The figure stands
+    # and carries a label, which is the owner's settled reading of #23; thrown
+    # away here, it would be an extrapolation rendered as a reading. Both
+    # counters are read from the same rows, so a gap takes both and the union
+    # is the honest set.
+    entries = house.shortfall or {}
+    short = _short_bands(entries, "grid_import") | _short_bands(entries, "load")
     # The same PCRF/SCRF rider compute_cost charges the house's own total —
     # resolved once here, the way bands is, rather than inside top_spenders,
     # which has no business knowing what a tariff's adjustment table is.
-    ranked = top_spenders(energies, bands, adjustment=tariff.adjustment_at(start, end))
+    ranked = top_spenders(
+        energies,
+        bands,
+        adjustment=tariff.adjustment_at(start, end),
+        grid_share=shares,
+        grid_short=short,
+    )
     return {
         "configured": True,
         "currency": tariff.currency,
@@ -1718,6 +1755,19 @@ def costs_circuits(
                 # any band below it — a page summing the bands alone would
                 # come up short of cost with nothing explaining the gap.
                 "rider": None if c.rider is None else round(c.rider, 2),
+                # What the meter actually charged for this circuit, as opposed
+                # to what its energy would have cost had all of it been bought.
+                # None when any band it was priced in had no knowable house
+                # split — a partial grid figure is indistinguishable from a
+                # circuit that genuinely ran on solar.
+                "grid_kwh": None if c.grid_kwh is None else round(c.grid_kwh, 3),
+                "grid_cost": None if c.grid_cost is None else round(c.grid_cost, 2),
+                # The house counters, not this circuit's, were short over a
+                # band it spent in — so the grid figures beside it are an
+                # extrapolation from the hours that did report. A different
+                # absence from "partial" above, and it needs its own flag or
+                # the page marks the wrong figure.
+                "grid_partial": c.grid_partial,
                 "bands": [
                     {
                         "band": b.band,

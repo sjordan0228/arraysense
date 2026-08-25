@@ -11,6 +11,7 @@ was measured.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -178,6 +179,9 @@ def _circuit(
     bands: list[dict[str, Any]],
     partial: bool = False,
     rider: float | None = None,
+    grid_kwh: float | None = None,
+    grid_cost: float | None = None,
+    grid_partial: bool = False,
 ) -> dict[str, Any]:
     return {
         "name": name,
@@ -186,6 +190,9 @@ def _circuit(
         "kwh": kwh,
         "partial": partial,
         "rider": rider,
+        "grid_kwh": grid_kwh,
+        "grid_cost": grid_cost,
+        "grid_partial": grid_partial,
         "bands": bands,
     }
 
@@ -226,6 +233,7 @@ def test_a_zero_cost_partial_band_stays_in_the_bar() -> None:
                 {"band": "off-peak", "kwh": 5.0, "cost": 2.0, "partial": False},
             ],
             partial=True,
+            grid_kwh=4.0,
         )
     ]
     els = _render(circuits)
@@ -233,7 +241,16 @@ def test_a_zero_cost_partial_band_stays_in_the_bar() -> None:
     assert "splitbar none" not in html, (
         "the zero-cost band was dropped and the row read as unmeasured"
     )
-    assert 'class="part"' in html, "the partial band itself disappeared from the bar"
+    # The band split moved out of the bar's segments and into its tooltip, so
+    # that is where this test's subject now lives — and the assertion moved
+    # with it rather than being dropped. The old check here was
+    # `class="part" in html`, a hatch on the *band* segment that priced the
+    # zero-cost band; segments are the supply split now and carry no band, so
+    # that check could no longer fail for this test's reason. Whether the hatch
+    # is drawn at all is a row-level question with two tests of its own below.
+    assert "peak $0.00 (part)" in html, (
+        "the zero-cost band vanished from the tooltip the band split now lives in"
+    )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -334,11 +351,17 @@ def test_a_circuit_measured_at_zero_everywhere_is_not_hatched_like_an_unmeasured
                 {"band": "peak", "kwh": 0.0, "cost": 0.0, "partial": False},
                 {"band": "off-peak", "kwh": 0.0, "cost": 0.0, "partial": False},
             ],
+            grid_kwh=0.0,
         )
     ]
     els = _render(circuits)
     html = els["spendList"]["innerHTML"]
-    assert "splitbar none" not in html
+    # The fixture must stay at zero on every band. Moved off it, the row has a
+    # supply split to draw and the assertion below passes for a reason that has
+    # nothing to do with what this test is named for.
+    assert "splitbar none" not in html, (
+        "a circuit that reported zero all month rendered as one nobody heard from"
+    )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -346,11 +369,17 @@ def test_the_bar_fill_is_derived_from_the_grid_token_not_a_literal() -> None:
     """A palette or theme override updates --grid but leaves a hard-coded rgba
     on the old colour, bypassing the CVD-validated palette the token carries."""
     circuits = [
-        _circuit("Dryer", 4.5, 15.0, [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}])
+        _circuit(
+            "Dryer",
+            4.5,
+            15.0,
+            [{"band": "peak", "kwh": 15.0, "cost": 4.5, "partial": False}],
+            grid_kwh=12.0,
+        )
     ]
     els = _render(circuits)
     html = els["spendList"]["innerHTML"]
-    assert "FADE(--grid," in html
+    assert "FADE(--grid,0.85)" in html
     assert "176,72,110" not in html
 
 
@@ -404,3 +433,187 @@ def test_the_house_wide_split_bars_are_also_derived_from_the_grid_token() -> Non
     html = _render_split(rows)
     assert "FADE(--grid," in html
     assert "176,72,110" not in html
+
+
+# --- costs-supply-bar --------------------------------------------------------
+
+_BAR_PRELUDE = """
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// fade() reads a CSS custom property off the live document, which node has
+// none of. The tests care which token a segment was painted from, not what
+// hex it resolved to, so the stub returns the token's own name.
+const fade = (name, alpha) => `${name}@${alpha}`;
+const money = (v, cur) => v === null || v === undefined ? '\\u2014' : `$${v.toFixed(2)}`;
+"""
+
+
+def _bar_slice() -> str:
+    text = COSTS.read_text()
+    start = text.index("// >>> costs-supply-bar")
+    end = text.index("// <<< costs-supply-bar")
+    assert start < end, "costs-supply-bar markers are out of order in costs.html"
+    return text[start:end]
+
+
+def _bar(circuit: dict[str, Any], blanket: bool) -> str:
+    assert NODE is not None
+    body = (
+        f"{_BAR_PRELUDE}\n"
+        "function drawBar(c, priced, blanket, cur, everyRowPartial) {\n"
+        f"{_bar_slice()}\n"
+        "  return bar;\n"
+        "}\n"
+        f"console.log(drawBar({json.dumps(circuit)}, "
+        f"{json.dumps(circuit['bands'])}, {json.dumps(blanket)}, '$', false));"
+    )
+    result = subprocess.run(["node", "-e", body], capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_supply_bar_splits_grid_and_self_in_proportion() -> None:
+    """A circuit that is 80% grid draws two segments in 4:1 proportion, the
+    first carrying --grid and the second --pv. Pinning the flex values keeps
+    the test from passing if the proportion is inverted."""
+    circuit = {"grid_kwh": 8.0, "kwh": 10.0, "bands": [{"band": "Flat", "cost": 2.0}]}
+    html = _bar(circuit, False)
+    assert 'style="flex:800.00;background:--grid@0.85"' in html
+    assert 'style="flex:200.00;background:--pv@0.85"' in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_an_unknown_grid_share_draws_no_supply_segments() -> None:
+    """A null grid_kwh means the house split was unreadable, and the row falls
+    back to the hatch-or-nothing treatment rather than drawing a guess."""
+    circuit = {"grid_kwh": None, "kwh": 10.0, "bands": [{"band": "Flat", "cost": 2.0}]}
+    html = _bar(circuit, False)
+    assert 'class="splitbar none"' in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_zero_grid_share_draws_only_the_pv_segment() -> None:
+    """A zero grid share is a real measurement — the circuit ran entirely on
+    solar and battery — so it must not render as a sliver of grid."""
+    circuit = {"grid_kwh": 0.0, "kwh": 10.0, "bands": [{"band": "Flat", "cost": 2.0}]}
+    html = _bar(circuit, False)
+    assert 'style="flex:1000.00;background:--pv@0.85"' in html
+    assert "--grid" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_wholly_grid_circuit_draws_only_the_grid_segment() -> None:
+    """When grid_kwh equals kwh the circuit ran entirely off the meter, so
+    only the --grid segment appears."""
+    circuit = {"grid_kwh": 10.0, "kwh": 10.0, "bands": [{"band": "Flat", "cost": 2.0}]}
+    html = _bar(circuit, False)
+    assert 'style="flex:1000.00;background:--grid@0.85"' in html
+    assert "--pv" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_every_row_partial_hatches_none_of_them() -> None:
+    """#31 one level up, and only a rendered panel could have caught it.
+
+    A month whose peak window no circuit has entered yet gives every row
+    ``partial: true`` from the missing band, while the one band anybody
+    reported in is not thin and so is not partial. The band-level gate
+    therefore stays shut and every bar in the panel is hatched — which marks
+    nothing and strikes out every label, exactly what the gate exists to
+    prevent. The gate has to measure rows, because rows are what it gates.
+
+    The fixture must have NO partial band and EVERY row partial, or it cannot
+    tell the row gate from the band gate.
+    """
+    circuits = [
+        _circuit(
+            name,
+            1.0,
+            5.0,
+            [
+                {"band": "peak", "kwh": None, "cost": None, "partial": False},
+                {"band": "off-peak", "kwh": 5.0, "cost": 1.0, "partial": False},
+            ],
+            partial=True,
+            grid_kwh=4.0,
+        )
+        for name in ("Dryer", "Fridge")
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert 'class="part"' not in html, (
+        "every bar was hatched, so the hatch marked nothing and struck out every label"
+    )
+    assert "Every circuit above was only partly recorded" in els["spendCap"]["innerHTML"], (
+        "the hatch was withheld and nothing said so in words"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_one_whole_row_keeps_the_hatch_meaningful() -> None:
+    """The other side of the same gate. One unqualified row among partial ones
+    means the hatch distinguishes something, so it is drawn."""
+    circuits = [
+        _circuit(
+            "Dryer",
+            1.0,
+            5.0,
+            [{"band": "off-peak", "kwh": 5.0, "cost": 1.0, "partial": False}],
+            partial=True,
+            grid_kwh=4.0,
+        ),
+        _circuit(
+            "Fridge",
+            1.0,
+            5.0,
+            [{"band": "off-peak", "kwh": 5.0, "cost": 1.0, "partial": False}],
+            partial=False,
+            grid_kwh=4.0,
+        ),
+    ]
+    els = _render(circuits)
+    html = els["spendList"]["innerHTML"]
+    assert 'class="part"' in html, "the one partial row lost the mark that qualifies it"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_grid_cell_carries_exactly_one_title_and_no_stray_attributes() -> None:
+    """Built by string concatenation, an appended clause can land outside the
+    quoted attribute — and every word of it then parses as an attribute of its
+    own. That shipped here once: 24 junk attributes on a single span, through
+    four green gates and the whole suite, visible only in the rendered DOM.
+
+    All four states of the cell are exercised, because the clause that escaped
+    was on one branch of three and the other two looked fine. Asserted on the
+    raw markup, not through a parser — a parser is exactly what absorbs the
+    damage into attributes nobody thinks to look at.
+    """
+    cases = [
+        (0.24, 2.4, True),  # priced, and drawn from a short house window
+        (0.24, 2.4, False),  # priced, whole
+        (None, 2.4, False),  # energy known, rider unpublished, so no price
+        (None, None, False),  # the house split itself was unreadable
+    ]
+    for grid_cost, grid_kwh, grid_partial in cases:
+        circuits = [
+            _circuit(
+                "Dryer",
+                0.6,
+                3.0,
+                [{"band": "peak", "kwh": 3.0, "cost": 0.6, "partial": False}],
+                grid_kwh=grid_kwh,
+                grid_cost=grid_cost,
+                grid_partial=grid_partial,
+            )
+        ]
+        html = _render(circuits)["spendList"]["innerHTML"]
+        cell = html.split('<span class="ck"')[0].split('<span class="cv')[-1]
+        # The tag must CLOSE straight after the title. Counting `="` cannot
+        # catch this: in the raw string an escaped clause carries no `=` at
+        # all — the junk attributes only appear once a browser parses it, and
+        # a first version of this assertion passed with the bug reintroduced.
+        # Matching the whole opening tag is what makes it falsifiable.
+        opening = cell[: cell.index(">") + 1]
+        assert re.fullmatch(r'( part)?" title="[^"]*">', opening), (
+            f"something escaped the title attribute and will parse as markup: {opening!r}"
+        )
