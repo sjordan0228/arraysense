@@ -101,6 +101,7 @@ from arraysense.modules.emporia.client import (
     EmporiaUnreachableError,
 )
 from arraysense.modules.emporia.control import clamp_rate
+from arraysense.modules.emporia.guard import InverterGuard
 from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
@@ -3360,6 +3361,12 @@ def _emporia(request: Request) -> EmporiaPoller | None:
     return poller if isinstance(poller, EmporiaPoller) else None
 
 
+def _emporia_guard(request: Request) -> InverterGuard | None:
+    """The running guard, or None when this build is not running one."""
+    guard = getattr(request.app.state, "emporia_guard", None)
+    return guard if isinstance(guard, InverterGuard) else None
+
+
 # How far the house's own window may fall short of the circuits' before the two
 # stop describing the same span. Five minutes is the floor, and it is sized on
 # what the store can actually answer rather than chosen: the driver reads the
@@ -3887,7 +3894,7 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
     enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
     poller = _emporia(request)
     if poller is None or poller.charger is None or not enabled:
-        return {"charger": None, "changes": [], "enabled": enabled}
+        return {"charger": None, "changes": [], "enabled": enabled, "guard": None}
     state = poller.charger
     return {
         "enabled": enabled,
@@ -3920,6 +3927,27 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
             }
             for change in poller.audit.recent_changes()
         ],
+        "guard": _emporia_guard_payload(request),
+    }
+
+
+def _emporia_guard_payload(request: Request) -> dict[str, object] | None:
+    """The guard's newest plan and allowance, or None when there is none."""
+    guard = _emporia_guard(request)
+    if guard is None or guard.last_plan is None:
+        return None
+    allowance = guard.last_allowance
+    plan = guard.last_plan
+    if allowance is None:
+        return None
+    return {
+        "limit_w": allowance.limit_w,
+        "supplied_w": allowance.supplied_w,
+        "charger_w": allowance.charger_w,
+        "allowance_a": allowance.amps,
+        "amps": plan.amps,
+        "kind": plan.kind,
+        "reason": plan.reason,
     }
 
 
