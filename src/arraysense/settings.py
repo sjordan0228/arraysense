@@ -143,6 +143,7 @@ CHARGE_FLOOR_KEY = "emporia.charge_floor_a"
 CHARGE_CEILING_KEY = "emporia.charge_ceiling_a"
 CHARGE_DEFAULT_KEY = "emporia.charge_default_a"
 CHARGE_OVERRIDE_MINUTES_KEY = "emporia.charge_override_minutes"
+INVERTER_LIMIT_KEY = "emporia.inverter_limit_w"
 # When the current manual override lapses, as a unix epoch. Written by the
 # service rather than chosen, like the efficiency rescore floor: it has to
 # survive a restart, because an owner who set a rate by hand ten minutes ago
@@ -1223,6 +1224,25 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "How long the module keeps its hands off after you set a rate "
             "yourself. Somebody standing at the car knows something this "
             "service does not."
+        ),
+    ),
+    SettingSpec(
+        key=INVERTER_LIMIT_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=30000,
+        unit="W",
+        label="Back the car off when the inverter supplies more than",
+        help=(
+            "Zero is off, which is the default. When set, this moves only the "
+            "EV charger's rate — it never stops charging — to keep the inverter "
+            "under the limit. The figure compared is what the inverter itself "
+            "supplies: the house load with grid import taken out, so nothing "
+            "happens when the grid is carrying the house. Reaction takes about "
+            "twenty to thirty seconds, not instant: the inverter row lands every "
+            "~12 s, the guard ticks every 10 s, and the charger settles within "
+            "about 8 s of a write."
         ),
     ),
     SettingSpec(

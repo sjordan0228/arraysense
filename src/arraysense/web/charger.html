@@ -40,6 +40,11 @@
   .state.unreachable .dot{background:var(--warn)}
   .state.reconnect_required .dot{background:var(--warn)}
   .state .detail{color:var(--ink3)}
+  /* display:flex beats the browser's own [hidden] rule, exactly as it does for
+     form.login below. Without this the guard line is on screen for ever —
+     including on an installation that has never set an inverter limit, where
+     there is nothing to say. */
+  .state[hidden]{display:none}
   /* Borrowed from the wizard's fields and the password dialog's, rather than
      invented here: two pages that already ask for a credential look one way,
      and a third look would read as a different application. */
@@ -100,6 +105,7 @@
     <div class="state" id="chargerState"><span class="dot"></span>
       <span id="chargerRate">—</span></div>
     <p class="note err" id="chargerConflicts" hidden></p>
+    <div class="state" id="guardState" hidden><span class="detail" id="guardDetail"></span></div>
     <form class="login" id="rateForm">
       <label for="amps" class="muted">Set the rate</label>
       <input type="range" id="amps" min="6" max="48" step="1" list="ampstops">
@@ -163,6 +169,23 @@ async function loadCharger() {
     : `${rate} A of a possible ${numOrNull(c.max_rate_a) ?? DASH} A` +
       ` · this service may go ${c.floor_a}–${c.ceiling_a} A · ${c.authority}`;
   $('chargerState').className = 'state ' + (c.connected === false ? 'unreachable' : 'ok');
+
+  // The guard: what the inverter output guard is doing, or nothing when there
+  // is no guard. A hold shows the reason; a cut or release shows the reason
+  // plus the amps it wants. The page prints what the endpoint says, never
+  // recomputing anything in JavaScript.
+  const guard = body.guard;
+  const guardState = $('guardState');
+  if (guard === null || guard === undefined) {
+    guardState.hidden = true;
+  } else {
+    guardState.hidden = false;
+    // Into the inner span, not the container: writing textContent on the
+    // container would delete the span that carries the muted colour.
+    $('guardDetail').textContent = guard.kind === 'hold'
+      ? guard.reason
+      : `${guard.reason} · ${numOrNull(guard.amps)} A`;
+  }
 
   // A warning, never a block. It is the owner's charger and their account; what
   // they need is the name of the exact setting that will fight this one.

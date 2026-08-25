@@ -202,7 +202,7 @@ class EmporiaPoller:
     def _interval(self) -> float:
         return float(emporia_interval_seconds(self._settings))
 
-    def _override_until(self) -> datetime | None:
+    def override_until(self) -> datetime | None:
         """When the owner's hand stops holding the charger, or None if it is not.
 
         Stored as a Unix second by the route that sets a rate, and read back
@@ -330,7 +330,7 @@ class EmporiaPoller:
             authority=authority if isinstance(authority, str) else APP,
             limits=self.limits(),
             now=now,
-            override_until=self._override_until(),
+            override_until=self.override_until(),
         )
         reason = f"restored to {verdict.rate_a} A on startup: {verdict.reason}"
         # A proposal that has not changed is not news. Under an authority that
