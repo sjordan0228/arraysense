@@ -190,7 +190,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "pylxpweb", specifier = ">=0.9.38" },
+    { name = "pylxpweb", git = "https://github.com/sjordan0228/pylxpweb?rev=c01ba5b12f8e9fdd8137be4801ad5480e5193b4d" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
@@ -1182,15 +1182,11 @@ wheels = [
 [[package]]
 name = "pylxpweb"
 version = "0.9.38"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/sjordan0228/pylxpweb?rev=c01ba5b12f8e9fdd8137be4801ad5480e5193b4d#c01ba5b12f8e9fdd8137be4801ad5480e5193b4d" }
 dependencies = [
     { name = "aiohttp" },
     { name = "pydantic" },
     { name = "pymodbus" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d6/22/e23c3440a47c4be07cd3750b1323f171291cb2248673c7458576ffeea7cc/pylxpweb-0.9.38.tar.gz", hash = "sha256:48b97dcd6cb9be9763ed6e54d44ba36b5d58a56284f0a83a1c9ab8610b706f02", size = 409047, upload-time = "2026-07-13T16:49:19.108Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e0/28/5d0ad048f420ad942f45236d4e503979a5a8fd36b1a2c59b96bbb0bce8c8/pylxpweb-0.9.38-py3-none-any.whl", hash = "sha256:795eabadcb43f737b13db16835d5c103e376d78feb99432bed70d94041c1fe4c", size = 462871, upload-time = "2026-07-13T16:49:17.375Z" },
 ]
 
 [[package]]
