@@ -7,11 +7,27 @@ requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
-    "pylxpweb>=0.9.38",
+    # Pinned to a fork commit, not to a PyPI version, and the distinction is the
+    # whole point. Stock pylxpweb rewrites an unreported battery state of health
+    # into 100, which is also a real reading, so a silent BMS is indistinguishable
+    # from a healthy bank (upstream issue #309, fix in PR #286).
+    #
+    # The commit is v0.9.38 plus that three-line change and nothing else, so this
+    # moves no version: it is the library the Pi already runs, with the fix in it.
+    # A plain `==0.9.38` would not do, because `uv sync` reinstalls stock over a
+    # hand-patched venv and the loss is silent. Upgrading the library is a separate
+    # job; 0.9.38 to 0.9.40 is 59 commits across the serial transport and the
+    # battery registers, and only the live inverter can tell you it worked.
+    # Move back to a PyPI spec once upstream releases the fix.
+    "pylxpweb @ git+https://github.com/sjordan0228/pylxpweb@c01ba5b12f8e9fdd8137be4801ad5480e5193b4d",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pyserial>=3.5",
 ]
+
+[tool.hatch.metadata]
+# Required for the git pin on pylxpweb above. Remove with it.
+allow-direct-references = true
 
 [project.scripts]
 arraysense = "arraysense.__main__:main"
