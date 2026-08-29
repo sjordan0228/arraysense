@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import itertools
+import logging
 import os
 import tempfile
 from datetime import UTC, date, datetime, timedelta
@@ -22,15 +23,18 @@ from arraysense.settings import (
     BACKUP_HOUR_KEY,
     BACKUP_KEEP_KEY,
     BACKUP_MINUTE_KEY,
+    CHARGER_AUTHORITY_KEY,
     CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
     EMPORIA_INTERVAL_KEY,
+    HIGH_USAGE_WATTS_KEY,
     PANELS_STRINGS_KEY,
     SETTING_CONTACT_EMAIL,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
     SETTING_TIMEZONE,
     SETTINGS,
+    SettingSpec,
     SettingsStore,
     _schedule_reach,
     check_backup_directory,
@@ -1004,3 +1008,111 @@ def test_the_emporia_interval_reads_a_value_the_registry_accepts(
 ) -> None:
     settings.set(EMPORIA_INTERVAL_KEY, 10)
     assert emporia_interval_seconds(settings) == 10
+
+
+def _unconstrained_settings_table(settings: SettingsStore) -> None:
+    """Rebuild the settings table without the constraints the live schema has.
+
+    The shipped table is STRICT with ``value TEXT NOT NULL``, so a store this
+    build wrote cannot hold the cells the next tests need. A database written
+    before the constraint — or edited by hand, the way #223 found one — can,
+    and the reader has to answer those too, because a database from before a
+    constraint is a database somebody is still running.
+    """
+    settings._conn.execute("DROP TABLE settings")
+    settings._conn.execute("CREATE TABLE settings (key TEXT NOT NULL PRIMARY KEY, value TEXT)")
+    settings._conn.commit()
+
+
+def test_a_non_text_cell_reads_as_absent_with_the_default(
+    settings: SettingsStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The crash from the journal, reproduced: a NULL cell reaches decode as
+    # None, the int and float paths raise TypeError past the ValueError guard
+    # beside it, and the page blanks. An unreadable setting is an absent
+    # setting and answers with its registered default — the guard sits above
+    # decode, so no kind's decoder ever sees the cell. The three kinds here
+    # have different defaults on purpose: a fallback that landed anywhere but
+    # the registry would fail at least one of them.
+    _unconstrained_settings_table(settings)
+    for key in (HIGH_USAGE_WATTS_KEY, BACKUP_ENABLED_KEY, CHARGER_AUTHORITY_KEY):
+        spec = lookup_setting(key)
+        settings._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, NULL)",
+            (key,),
+        )
+        settings._conn.commit()
+        with caplog.at_level(logging.WARNING, logger="arraysense.settings"):
+            assert settings.get(key) == spec.default, key
+    assert any(HIGH_USAGE_WATTS_KEY in record.getMessage() for record in caplog.records)
+
+
+def test_a_numeric_blob_is_read_as_absent_not_coerced(settings: SettingsStore) -> None:
+    # float(b"12") is 12.0, so a guard that only ruled out None would answer
+    # twelve seconds for a cell the schema could never have written. Text is
+    # the storage format; anything else carries no meaning decode could read.
+    _unconstrained_settings_table(settings)
+    settings._conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)",
+        (EMPORIA_INTERVAL_KEY, b"12"),
+    )
+    settings._conn.commit()
+    assert settings.get(EMPORIA_INTERVAL_KEY) == 60
+
+
+def test_an_optional_empty_cell_still_reaches_the_decoder(
+    settings: SettingsStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An optional setting's empty cell is a decoded answer — "not configured",
+    # which decode turns into None — while a NULL is a cell that answered
+    # nothing at all. The guard above decode must stop the second without
+    # stopping the first, so the spy proves decode is still handed the empty
+    # string itself rather than a shortcut around it.
+    seen: list[str] = []
+    original = SettingSpec.decode
+
+    def spy(self: SettingSpec, stored: str) -> object:
+        seen.append(stored)
+        return original(self, stored)
+
+    monkeypatch.setattr(SettingSpec, "decode", spy)
+    settings.set(SETTING_LATITUDE, None)
+    assert settings.get(SETTING_LATITUDE) is None
+    assert seen == [""]
+
+
+def test_the_emporia_interval_answers_a_null_cell_with_its_default(
+    settings: SettingsStore,
+) -> None:
+    # /api/emporia/history fell on this exact shape: the read raising on the
+    # way into the caller's own bounds check. get() handing back the typed
+    # default is what lets that check go on checking a number — a None
+    # arriving instead would raise on the caller's line, one step later.
+    _unconstrained_settings_table(settings)
+    settings._conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, NULL)",
+        (EMPORIA_INTERVAL_KEY,),
+    )
+    settings._conn.commit()
+    assert emporia_interval_seconds(settings) == 60
+
+
+def test_the_startup_merge_skips_a_non_text_cell(
+    settings: SettingsStore, caplog: pytest.LogCaptureFixture
+) -> None:
+    # overrides() feeds the file merge at start-up, so the same unreadable
+    # cell that blanks a page through get() would take down the whole start
+    # here. The key is skipped with the warning the retired-key path already
+    # logs, and the readable neighbours merge untouched.
+    _unconstrained_settings_table(settings)
+    settings.set(EMPORIA_INTERVAL_KEY, 10)
+    settings._conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, NULL)",
+        (HIGH_USAGE_WATTS_KEY,),
+    )
+    settings._conn.commit()
+    with caplog.at_level(logging.WARNING, logger="arraysense.settings"):
+        merged = settings.overrides()
+    assert merged[EMPORIA_INTERVAL_KEY] == 10
+    assert HIGH_USAGE_WATTS_KEY not in merged
+    assert any(HIGH_USAGE_WATTS_KEY in record.getMessage() for record in caplog.records)
