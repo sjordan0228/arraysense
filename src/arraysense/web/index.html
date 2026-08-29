@@ -1917,10 +1917,12 @@ function drawSoc(points) {
 // gap between the two by lunchtime.
 //
 // Both series share --pv as their hue. The distinction between forecast
-// and measurement is carried by texture — hatch, dash, solid — which is how
-// the chart reads under every form of colour vision deficiency. The foresight
-// of using texture over colour only helps the colour-blind reader; it does
-// not rely on them to see anything differently.
+// and measurement is carried by texture — hatch, dash, solid — rather than
+// by the hue separation the validator measures under protanopia,
+// deuteranopia and tritanopia. Those three, not "every form", because that
+// is what was actually run. The foresight of using texture over colour only
+// helps the colour-blind reader; it does not rely on them to see anything
+// differently.
 // ---------------------------------------------------------------------------
 
 // How often the prediction is re-made, in words. The interval arrives from the
