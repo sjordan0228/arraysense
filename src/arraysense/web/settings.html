@@ -328,11 +328,6 @@
     <div class="facts" id="facts"></div>
     <p class="masknote" id="factnote"></p>
   </section>
-
-  <details>
-    <summary>Where these live, and what reads them</summary>
-    <p class="masknote" id="about"></p>
-  </details>
 </main>
 
 <script>
@@ -684,20 +679,7 @@ function render() {
   }
   dirtyCheck();
 
-  const secret = fields.filter((f) => f.secret).map((f) => f.label);
-  $('about').textContent = 'These are held in the service’s own database rather than in a '
-    + 'file beside it, so they survive a reinstall and are the same for every browser that '
-    + 'opens the installation. The collector reads them at startup, which is why changing how '
-    + 'it connects needs a restart.'
-    + (secret.length
-      ? ` ${secret.join(' and ')} come back from the service with their middles replaced. `
-        + 'Leave a masked value alone and it is left alone; retype it in full to change it.'
-      : '');
-
   // Build the tab bar and select the initial tab. Done after the form is
-  // populated so drawTabs can tell which tabs have content.
-  drawTabs();
-  selectTab(wantedTab());
 }
 
 // ---------------------------------------------------------------------------
@@ -805,7 +787,6 @@ function selectTab(id) {
   // with the tab it belongs to.
   const heatSec = $('heatSec');
   if (heatSec) heatSec.hidden = id !== 'rate-bands';
-  // The "Where these live" details stay visible regardless.
 
   // Persist the choice and update the URL without a page reload.
   try { localStorage.setItem('as.settingsTab', id); } catch (e) { /* private browsing */ }
