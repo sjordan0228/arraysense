@@ -32,6 +32,7 @@ PAGE = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web" / "
 
 _RELEASE = ("// >>> release-check", "// <<< release-check")
 _FACTS = ("// >>> about-facts", "// <<< about-facts")
+_FETCH = ("// >>> release-fetch", "// <<< release-fetch")
 
 # The words are decided in the release-check slice and pushed into the row by
 # the about-facts slice, so both are run: the row shape comes from the real
@@ -258,11 +259,119 @@ def test_the_row_sits_with_the_facts_about_this_install() -> None:
 def test_the_row_offers_text_to_copy_and_nothing_that_runs() -> None:
     # #34 is the work that would let the page run something. Until it is done the
     # row prints a command an owner runs themselves, so the answer has to be
-    # selectable text — and the slice that decides the words asks nothing of the
-    # network and prints no control, which is the same rule said from the other
-    # side: a check cannot reach out and change the machine on its own.
+    # selectable text. The real assurance of that is the integration test below,
+    # which pins the wiring end to end; this substring check on the wording slice
+    # is the cheap second witness, not the load-bearing one.
     value = _release_row(_status("1.1.9"), _tags("v1.2.0"))
     assert value == f"v1.2.0 {_NEWER}"
     slice_text = _slice(*_RELEASE)
     assert "<button" not in slice_text
     assert "fetch(" not in slice_text
+
+
+def _run_async(body: str) -> str:
+    """A node run in module mode, so a test can await the async loadFacts."""
+    assert NODE is not None
+    env = {**os.environ, "TZ": "UTC"}
+    slices = "\n".join(_slice(start, end) for start, end in (_FACTS, _RELEASE, _FETCH))
+    out = subprocess.run(
+        [NODE, "--input-type=module", "-e", slices + "\n" + body],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    return out.stdout.strip()
+
+
+# A fetch whose local endpoints answer at once and whose GitHub endpoint answers
+# only when the test hands it the envelope. The timer loadFacts arms for its own
+# timeout is unref'd, so a never-answering GitHub cannot hold the process open.
+_FETCH_STUB = r"""
+const calls = [];
+const responders = {};
+const pending = {};
+const realSetTimeout = setTimeout;
+globalThis.setTimeout = (fn, ms) => realSetTimeout(fn, ms).unref();
+globalThis.fetch = (input) => {
+  const url = String(input);
+  calls.push(url);
+  if (responders[url] !== undefined) {
+    const body = responders[url];
+    return Promise.resolve({ ok: true, json: async () => JSON.parse(body) });
+  }
+  return new Promise((resolve) => { pending[url] = resolve; });
+};
+"""
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_panel_draws_before_github_answers_and_wires_the_answer_in() -> None:
+    # The two ways this wiring can quietly break: the whole panel waiting on a
+    # third party that may never answer, and the answer never reaching the row
+    # at all. The local facts are drawn before GitHub is heard from — the row
+    # says the check is running, not that it failed — the tags URL is asked
+    # exactly once, and the answer that eventually arrives becomes the row.
+    body = (
+        _STUBS
+        + _FETCH_STUB
+        + f"""
+responders['/api/status'] = JSON.stringify({_status("1.1.9")});
+responders['/api/capabilities'] = 'null';
+responders['/api/database'] = 'null';
+const checking = loadFacts();
+await new Promise((r) => realSetTimeout(r, 20));
+console.log(rowValue('Latest release'));
+console.log(String(calls.filter((u) => u.includes('api.github.com')).length));
+console.log(String(calls.length));
+console.log(String(factsMarkup().includes('Version')));
+pending[RELEASE_TAGS_URL]({{ ok: true, json: async () => {_tags("v1.2.0")} }});
+await checking;
+console.log(rowValue('Latest release'));
+"""
+    )
+    lines = _run_async(body).splitlines()
+    assert lines[0] == '<span class="muted">checking</span>'
+    assert lines[1] == "1"
+    assert lines[2] == "4"
+    assert lines[3] == "true"
+    assert lines[4] == f"v1.2.0 {_NEWER}"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_pending_check_says_it_is_running_not_that_it_failed() -> None:
+    # Undefined tags is the first drawing, before the outside answer exists;
+    # null is the answer that came back empty. The two take different words,
+    # because "could not check" shown for a check still in flight is the same
+    # false all-clear in reverse.
+    assert _release_row(_status("1.1.9"), "undefined") == '<span class="muted">checking</span>'
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_component_past_the_number_ceiling_still_compares() -> None:
+    # Number folds every integer past 2^53 onto values it has already used, so
+    # two different components can read as equal and a page comparing them
+    # would tell an owner on the older one that nothing is newer. The parts
+    # compare as BigInt, and the case is built exactly on that fold.
+    value = _release_row(_status("9007199254740992.0.0"), _tags("v9007199254740993.0.0"))
+    assert value == f"v9007199254740993.0.0 {_NEWER}"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_leading_zeroes_are_the_same_number_not_a_newer_release() -> None:
+    # A tag typed with a leading zero names the release the running version
+    # already is; the grammar allows it and the comparison reads it as one.
+    assert _release_row(_status("1.1.0"), _tags("v01.1.0")) == "this install is current"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_shapes_that_are_not_tag_lists_are_failed_checks_not_crashes() -> None:
+    # An array-like object, junk entries beside the real names, and tag
+    # objects carrying the fields GitHub really sends: the row comes out of
+    # each with an answer, and only the truly answerless one says it could
+    # not check.
+    assert _release_row(_status("1.1.9"), '{"length": 2}') == (
+        '<span class="muted">could not check</span>'
+    )
+    mixed = json.dumps([None, 5, {"name": 7}, {"name": "v1.2.0", "commit": {"sha": "x"}}])
+    assert _release_row(_status("1.1.9"), mixed) == f"v1.2.0 {_NEWER}"

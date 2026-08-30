@@ -2727,10 +2727,13 @@ function drawFacts(status, caps, db, tags) {
 // The three numbers of a version, or null for anything that is not three
 // dot-separated integers. A tag name brings a leading "v" and the running
 // version does not — /api/status answers "1.1.9" straight from __version__ —
-// so the two patterns differ by that one prefix rather than by stripping.
+// so the two patterns differ by that one prefix rather than by stripping. The
+// parts become BigInt because Number quietly folds every integer past 2^53
+// onto a value it has already used, and a tag name is third-party input the
+// pattern does not bound.
 const asTriple = (text, pattern) => {
   const parts = String(text ?? '').match(pattern);
-  return parts === null ? null : [Number(parts[1]), Number(parts[2]), Number(parts[3])];
+  return parts === null ? null : [BigInt(parts[1]), BigInt(parts[2]), BigInt(parts[3])];
 };
 
 // Part by part, because as text "1.10.0" sorts below "1.9.9" and a page that
@@ -2743,8 +2746,9 @@ const compareTriples = (a, b) => {
 };
 
 // The newest release in the answer by its numbers, not by the order the
-// endpoint sent it: a draft or a retagged release moves that order around
-// without moving what the newest release is. A name that is not v<triple>
+// endpoint sent it: that order is a convenience of commit dates, and a
+// force-push or a re-sort moves it without moving what the newest release
+// is. A name that is not v<triple>
 // takes no part in the comparison, since a tag list carries prereleases and
 // branch tags beside releases, and an answer with no usable name in it has
 // told us no more than no answer at all.
@@ -2763,11 +2767,16 @@ const newestTag = (tags) => {
 
 // A check that could not run — no network, a rate limit, an answer with no
 // release in it — says it could not check and never "up to date", because "up
-// to date" is the one answer an owner acts on by doing nothing. A version that
+// to date" is the one answer an owner acts on by doing nothing. Undefined tags
+// is the first drawing, before the outside answer exists, and it is a
+// different word from the null that means the check came back with nothing:
+// "could not check" shown for a check still in flight is the all-clear's
+// mirror image. A version that
 // is not three integers has nothing to compare against, so it takes the same
 // plain unknown the rest of the panel uses. An install ahead of the newest tag
 // is a local build rather than a fault, so it gets no muted span.
 const releaseWords = (status, tags) => {
+  if (tags === undefined) return '<span class="muted">checking</span>';
   const running = status == null || status.version == null
     ? null
     : asTriple(status.version, /^(\d+)\.(\d+)\.(\d+)$/);
@@ -2780,32 +2789,54 @@ const releaseWords = (status, tags) => {
 };
 // <<< release-check
 
-async function readJson(url) {
-  const response = await fetch(url);
+// >>> release-fetch
+// readJson is here because loadFacts below is its only caller on this page.
+async function readJson(url, init) {
+  const response = await fetch(url, init);
   if (!response.ok) throw new Error(`${url} answered ${response.status}`);
   return response.json();
 }
 
+// The one address this page asks outside the house. One page of a hundred is
+// far more than the tag list holds today, and the answer's newest release is
+// decided by the numbers, not by the order the page arrives in — but a newest
+// tag that ever fell outside that first page would be invisible here, and the
+// row would call an older release current. Revisit this before tag one
+// hundred and one exists, not after.
+const RELEASE_TAGS_URL = 'https://api.github.com/repos/sjordan0228/arraysense/tags?per_page=100';
+
 async function loadFacts() {
-  const [status, caps, db, tags] = await Promise.all([
+  // The three facts this service answers are drawn as soon as they arrive.
+  // The release check rides on its own clock: a GitHub that is slow, rate
+  // limited or simply unreachable must not hold the version, the database
+  // rows and the capabilities hostage, so the panel renders without it, the
+  // row says the check is running, and the drawing happens again when the
+  // check settles — with the answer, or with the words for not having been
+  // able to ask. The check arms a ten-second abort of its own so a GitHub
+  // that never answers ends in "could not check" instead of leaving a row
+  // that says checking for as long as the browser tolerates the connection.
+  const [status, caps, db] = await Promise.all([
     readJson('/api/status').catch(() => null),
     readJson('/api/capabilities').catch(() => null),
     readJson('/api/database').catch(() => null),
-    // The one call this page makes outside the house, made once per load
-    // because unauthenticated api.github.com answers sixty an hour per
-    // address. A refused answer becomes the same null as a refused read of the
-    // service, and the row that uses it has words for not having been able to
-    // ask rather than an all-clear.
-    readJson('https://api.github.com/repos/sjordan0228/arraysense/tags?per_page=100')
-      .catch(() => null),
   ]);
-  drawFacts(status, caps, db, tags);
+  drawFacts(status, caps, db, undefined);
   $('factnote').textContent = status === null || caps === null || db === null
     ? 'Some of this could not be read from the service, and is shown as unknown rather than '
       + 'guessed at.'
     : 'What the driver declares the hardware to be, rather than what it has reported. A '
       + 'capability nothing declared is shown as undeclared, not as absent.';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const tags = await readJson(RELEASE_TAGS_URL, { signal: controller.signal })
+      .catch(() => null);
+    drawFacts(status, caps, db, tags);
+  } finally {
+    clearTimeout(timer);
+  }
 }
+// <<< release-fetch
 
 // ---------------------------------------------------------------------------
 // Theme: the two choices on this page the registry knows nothing about.
