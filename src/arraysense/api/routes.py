@@ -40,6 +40,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from arraysense import __version__, drivers
 from arraysense import mode as operating_mode
+from arraysense.alerts import NOT_A_CULPRIT, Contributor, counts_toward_total, high_usage
 from arraysense.auth import (
     MIN_PASSWORD_LENGTH,
     Sessions,
@@ -66,18 +67,53 @@ from arraysense.costs import (
 )
 from arraysense.curtailment import StringBaseline
 from arraysense.efficiency import (
+    CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
     EfficiencyRow,
+    TiltBenefit,
     compute_day,
     compute_hours,
     fitted_baselines,
     mppt_groups,
+    rows_are_current,
+    tilt_benefit,
 )
-from arraysense.energy import ENERGY_FIELDS, Period, read_energy, resolve_zone, with_zone
+from arraysense.energy import (
+    ENERGY_FIELDS,
+    MAX_EDGE_GAP,
+    Period,
+    # Private to energy.py, and imported rather than copied for the reason
+    # ``tariff._elapsed`` is below: it decides which tier a counter read over a
+    # window is answered from, and the coverage clamp has to look for the last
+    # reading in that same tier. A second copy of the rule would drift, and the
+    # symptom would be a coverage line that is silently blank.
+    _window_tier,
+    counter_kwh,
+    read_energy,
+    resolve_zone,
+    with_zone,
+)
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
+from arraysense.modules.emporia import tokens as emporia_tokens
+from arraysense.modules.emporia.client import (
+    EmporiaAuthExpiredError,
+    EmporiaChallengeError,
+    EmporiaUnreachableError,
+)
+from arraysense.modules.emporia.control import clamp_rate
+from arraysense.modules.emporia.guard import InverterGuard
+from arraysense.modules.emporia.poller import EmporiaPoller
+from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
+    CHARGE_CEILING_KEY,
+    CHARGE_FLOOR_KEY,
+    CHARGE_OVERRIDE_MINUTES_KEY,
+    CHARGE_OVERRIDE_UNTIL_KEY,
+    CHARGER_AUTHORITY_KEY,
+    EMPORIA_ENABLED_KEY,
+    HIGH_USAGE_WATTS_KEY,
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -88,9 +124,11 @@ from arraysense.settings import (
     check_backup_directory,
     check_serial_device,
     describe,
+    emporia_interval_seconds,
     lookup_setting,
 )
 from arraysense.setup import describe_setup
+from arraysense.spend import grid_share_by_band, top_spenders
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -698,6 +736,63 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
         },
         "battery": battery_block,
         "sky": sky,
+        # The high-usage warning rides this response rather than a second poll:
+        # it is decided from the same inverter reading already in hand, and a
+        # wall display should not have to ask twice to be told its house is
+        # drawing hard. Null when the threshold is off or the house is under it.
+        "alert": _high_usage_alert(store, request, inverter),
+    }
+
+
+def _high_usage_alert(
+    store: SqliteStore, request: Request, inverter: Mapping[str, Any] | None
+) -> dict[str, Any] | None:
+    """Whether the house is drawing more than the owner asked to hear about.
+
+    The verdict is computed here rather than in the browser for the reason the
+    Costs page settled: a threshold compared in two places is two thresholds the
+    day one of them changes. The page prints what this says.
+
+    Attribution is the Emporia module's, and only if it is running. Without it
+    the warning still fires and names nobody, which is the difference between
+    "your house is drawing 11 kW" and silence.
+
+    The threshold is read from the caller's own store, never
+    ``app.state.store``. This runs inside a plain ``def`` handler, which
+    FastAPI serves on its threadpool, and the primary connection belongs to
+    the event loop: one ``sqlite3.Connection`` has one statement cache, and a
+    second thread stepping it does not read slowly, it reads wrongly. See
+    ``_read_store`` for the view this is handed, and #223 for what it cost.
+    """
+    settings = SettingsStore(store)
+    threshold = settings.get(HIGH_USAGE_WATTS_KEY)
+    if not isinstance(threshold, int) or threshold <= 0:
+        return None
+    load = inverter.get("load_power_w") if inverter else None
+    poller = _emporia(request)
+    contributors: tuple[Contributor, ...] = ()
+    if poller is not None:
+        # Through this request's own view, not ``poller.repository``, which
+        # holds the primary connection. That it reads one row per circuit is
+        # not the question: a cheap read on a connection another thread is
+        # stepping is a *wrong* read, not a slow one.
+        contributors = tuple(
+            Contributor(circuit.name, circuit.watts, circuit.kind, circuit.parent_device_gid)
+            for circuit in CircuitRepository(store).latest()
+        )
+    verdict = high_usage(
+        int(load) if isinstance(load, int | float) else None, threshold, contributors
+    )
+    if verdict is None:
+        return None
+    return {
+        "load_w": verdict.load_w,
+        "threshold_w": verdict.threshold_w,
+        "accounted_w": verdict.accounted_w,
+        "complete": verdict.complete,
+        "contributors": [
+            {"name": c.name, "watts": c.watts, "kind": c.kind} for c in verdict.contributors
+        ],
     }
 
 
@@ -1065,15 +1160,18 @@ def _is_mask(key: str, value: object) -> bool:
 
 
 @router.get("/auth")
-def auth_status(request: Request) -> dict[str, Any]:
+def auth_status(request: Request, store: _ReadStore) -> dict[str, Any]:
     """Whether authentication is on, and whether this client holds a session.
 
     A read and deliberately open: the login form has to know whether to render
     at all, and this reveals only that a password is set — not the password,
     and not any other setting. That fact is not secret; every write endpoint
     already answers it, by answering 401 or not.
+
+    Read through the per-request view, since this is a threadpool handler and
+    the primary connection is the event loop's — #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     token = request.cookies.get(_SESSION_COOKIE)
     authenticated = token is not None and request.app.state.sessions.valid(token)
     return {"required": password_is_set(settings), "authenticated": authenticated}
@@ -1086,7 +1184,9 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/auth/login")
-def login(request: Request, response: Response, body: LoginRequest) -> dict[str, Any]:
+def login(
+    request: Request, response: Response, body: LoginRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Start a session in exchange for the password.
 
     The cookie is HttpOnly so the page's own script cannot read it,
@@ -1096,6 +1196,10 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
     lifetime. Deliberately not Secure: this is plain HTTP on a LAN, and a
     Secure cookie would simply never be sent, so setting it would leave the
     owner unable to log in and nothing on the page to say why.
+
+    The stored hash is read through the per-request view: this is a threadpool
+    handler, and a password check that reads the primary connection alongside
+    the event loop can read it wrongly rather than merely slowly — #223.
     """
     key = request.client.host if request.client else "unknown"
     now = time.time()
@@ -1104,7 +1208,7 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
             status_code=429,
             detail="too many failed attempts; try again shortly",
         )
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is None:
         # Nothing to guess yet, so nothing is counted. Counting here let a
@@ -1155,7 +1259,9 @@ class PasswordRequest(BaseModel):
 
 
 @router.post("/auth/password")
-def change_password(request: Request, response: Response, body: PasswordRequest) -> dict[str, Any]:
+def change_password(
+    request: Request, response: Response, body: PasswordRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Set, change or clear the password.
 
     Setting the first password needs no credential — there is none yet, and
@@ -1174,8 +1280,14 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
     counting would let a stranger fill the throttle the owner is going to need.
     A consequence worth naming: five wrong guesses here also block login from
     that address for a minute, which is right, since it is one secret.
+
+    Neither the read nor the write touches ``app.state.store``. This is a
+    threadpool handler, and that connection is the event loop's: the read
+    comes from the per-request view, and the write takes a connection of its
+    own, which is what ``write_connection`` exists for. A password verified
+    against a corrupted read is the worst version of #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is not None:
         key = request.client.host if request.client else "unknown"
@@ -1190,18 +1302,90 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
             request.app.state.throttle.record_failure(key, now)
             raise HTTPException(status_code=401, detail="current password is required")
         request.app.state.throttle.record_success(key)
-    if body.new_password:
-        if len(body.new_password) < MIN_PASSWORD_LENGTH:
-            raise HTTPException(
-                status_code=400,
-                detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
-            )
-        set_password(settings, body.new_password)
-    else:
-        clear_password(settings)
-        request.app.state.sessions.revoke_all()
-        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    with request.app.state.store.write_connection() as writer:
+        writable = SettingsStore(writer)
+        if body.new_password:
+            if len(body.new_password) < MIN_PASSWORD_LENGTH:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
+                )
+            set_password(writable, body.new_password)
+        else:
+            clear_password(writable)
+            request.app.state.sessions.revoke_all()
+            response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
     return {"ok": True}
+
+
+def _counter_rows(
+    store: SqliteStore, start: datetime, end: datetime
+) -> tuple[list[dict[str, Any]], str]:
+    """The lifetime-counter rows a period must be priced from, and their tier.
+
+    Two endpoints need exactly these rows and exactly this fallback chain: the
+    Costs page's own totals, and the per-circuit grid split beside them. A
+    second copy would drift, and the comments below are the record of four
+    separate defects already fixed in this search — a second copy is four
+    defects waiting to be found again.
+    """
+    # Read back before the period starts so its first interval has a reading to
+    # be measured *from*, rather than starting at whatever row happens to fall
+    # inside it. Without the lead, the first stretch of every month is short by
+    # however long it took the first sample to arrive.
+    with _inside_the_calendar():
+        lead = start - COUNTER_LEAD
+    # Minute first, then coarser, then raw. Hourly has to be in the chain and
+    # not just as a last resort: the minute tier is kept for a year, so a month
+    # older than that has nothing there while the hourly tier holds it back to
+    # the beginning. Falling straight from minute to raw — which is kept thirty
+    # days — found nothing and priced August 2025 as unknown, while the History
+    # page read the same month out of the hourly tier and showed $87.65.
+    #
+    # A candidate is only taken outright if its earliest row actually reaches
+    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
+    # the minute tier from its oldest end, so a month straddling that cutoff
+    # still gets *some* minute rows back: the stretch after the cutoff. The old
+    # "if rows: break" took them anyway, and the stretch before the cutoff,
+    # having no rows at all, priced as though it had never happened rather
+    # than falling to the hourly tier, which is kept indefinitely and always
+    # reaches back this far.
+    #
+    # A month whose collection genuinely began after ``lead`` — a fresh
+    # install, or one old enough that even the tier which does hold it starts
+    # partway through — fails that bracket check on *every* candidate, and
+    # nothing ever breaks the loop. Every remaining candidate then has to be
+    # judged on how far back its own earliest row reaches, because the loop
+    # order (minute, hourly, full) is not an order of coverage — it is the
+    # order resolution gets coarser. Each tier is pruned from its own oldest
+    # end on its own schedule, so "full" is not reliably empty by the time the
+    # loop reaches it: thirty days of retention can still leave it holding the
+    # tail of an old month, later and worse than what hourly already found.
+    # Keeping whichever candidate merely happened to be nonempty and tried
+    # last picked exactly that tail once, silently discarding the earlier,
+    # more complete rows hourly was already holding — the same loss the
+    # bracket check exists to prevent, reached by a different door. So
+    # ``rows`` is only replaced here when a candidate both has rows and
+    # reaches further back than whatever is already kept, never merely for
+    # being nonempty and later in the loop; the first candidate to bracket
+    # ``lead`` is by definition as good as this gets, so it still stops the
+    # search rather than being compared against tiers coarser than it needs.
+    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
+    # this only stops a labelled partial from being thrown away in favour of
+    # a worse one that happened to be tried last.
+    rows: list[dict[str, Any]] = []
+    tier = "minute"
+    earliest: datetime | None = None
+    for candidate in ("minute", "hourly", "full"):
+        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
+        if not candidate_rows:
+            continue
+        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
+        if earliest is None or candidate_earliest < earliest:
+            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
+        if candidate_earliest - lead <= MAX_EDGE_GAP:
+            break
+    return rows, tier
 
 
 @router.get("/costs")
@@ -1265,25 +1449,7 @@ def costs(
     # as midnight wherever the service happens to be installed.
     start, end = with_zone(start, zone), with_zone(end, zone)
 
-    # Read back before the period starts so its first interval has a reading to
-    # be measured *from*, rather than starting at whatever row happens to fall
-    # inside it. Without the lead, the first stretch of every month is short by
-    # however long it took the first sample to arrive.
-    with _inside_the_calendar():
-        lead = start - COUNTER_LEAD
-    # Minute first, then coarser, then raw. Hourly has to be in the chain and
-    # not just as a last resort: the minute tier is kept for a year, so a month
-    # older than that has nothing there while the hourly tier holds it back to
-    # the beginning. Falling straight from minute to raw — which is kept thirty
-    # days — found nothing and priced August 2025 as unknown, while the History
-    # page read the same month out of the hourly tier and showed $87.65.
-    rows: list[dict[str, Any]] = []
-    tier = "minute"
-    for candidate in ("minute", "hourly", "full"):
-        tier = candidate
-        rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if rows:
-            break
+    rows, tier = _counter_rows(store, start, end)
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 
@@ -1420,6 +1586,202 @@ def _band_rows(
             }
         )
     return rows
+
+
+@router.get("/costs/circuits")
+def costs_circuits(
+    request: Request,
+    store: _ReadStore,
+    start: datetime,
+    end: datetime,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """Which circuits spent the most over a period, and what they account for.
+
+    The Costs page answers "how much" and "in which band" and could not answer
+    "on what". This is that half — the same window every other figure on the
+    page is asked about, priced through the same band walk, and ranked by
+    money because the page is about money.
+
+    Nothing is computed here. ``band_intervals`` cuts the period, ``band_kwh``
+    reads the rows, ``top_spenders`` ranks them and prices them; this route
+    resolves the zone, picks the band set and forwards the answer. A second
+    implementation of any of that is how this page came to hold its own
+    tariff parser, which disagreed with the Python one inside a day.
+
+    ``coverage`` is the figure that keeps the list honest. Thirty-nine
+    channels do not add up to a house, and naming five circuits over a
+    month's bill invites the reader to believe those five are the bill. It is
+    the same block the circuit history endpoint reports, from the same
+    helper, and it is measured in energy rather than in minutes watched —
+    that distinction is what #23 was reverted twice for missing, and money
+    depends on the second.
+
+    The zone is resolved with ``with_zone`` *and* converted with
+    ``.astimezone(zone)``, matching ``costs.py``'s own ``_local``. A naive
+    bound is what the browser sends when it means local midnight in the
+    installation's own zone, so it is attached — but the month picker also
+    sends an aware instant, and ``with_zone`` leaves an aware one exactly as
+    it arrived. Left unconverted, ``tariff.bands_in_effect`` reads its
+    calendar fields off whatever zone the browser happened to send, which is
+    the bug that put a 15:00-20:00 peak window at 10:00-15:00 local on the
+    reference installation.
+
+    The hourly tier, always. ``circuit_hourly`` is written before the raw
+    readings are pruned and is itself never pruned, so every month the page
+    can select is answerable from it; the raw tier is a million rows to the
+    hourly tier's twenty-five thousand and buys nothing, because a tariff's
+    band edges fall on the hour.
+
+    The route answers rather than 500s on the two ways an installation can be
+    unready to price this: no tariff entered yet, and no Emporia module
+    running at all. Both report the same empty shape a page can render
+    without branching on which one happened.
+    """
+    try:
+        zone = _request_zone(store, tz)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Attached to the installation's zone for a naive bound, and *converted*
+    # to it for an aware one — see the docstring above.
+    start, end = with_zone(start, zone).astimezone(zone), with_zone(end, zone).astimezone(zone)
+    _check_range(start, end)
+
+    tariff = load_tariff(SettingsStore(store).all())
+    window_seconds = int(_elapsed(start, end))
+    empty: dict[str, Any] = {
+        "configured": tariff is not None,
+        "currency": tariff.currency if tariff is not None else None,
+        "circuits": [],
+        "coverage": {**_NO_COVERAGE, "window_seconds": window_seconds},
+    }
+    poller = _emporia(request)
+    if tariff is None or poller is None:
+        return empty
+
+    cadence = _emporia_cadence_seconds(store)
+    with _inside_the_calendar():
+        intervals = [
+            (interval.start, interval.end, interval.band)
+            for interval in band_intervals(tariff, start, end, zone)
+        ]
+        history = CircuitRepository(store).history(
+            start, end, tier="hourly", cadence_seconds=cadence
+        )
+        energies = CircuitRepository(store).band_kwh(
+            start,
+            end,
+            intervals,
+            tier="hourly",
+            cadence_seconds=cadence,
+            now=datetime.now(tz=UTC),
+        )
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        # Ranked from every part, summed from only the parts nothing else
+        # contains. A charger on a clamped breaker or a subpanel's branches are
+        # energy the counted circuits already carry, and adding them took the
+        # reference account to 131% of its own house (#212, #219).
+        measured = [
+            s.kwh
+            for s in parts
+            if s.kwh is not None and counts_toward_total(s.kind, s.parent_device_gid)
+        ]
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=sum(measured) if measured else None,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
+        )
+
+    # The bands actually present in the interval walk, not every band the
+    # period's season admits — bands_in_effect only excludes an out-of-season
+    # band, so a current-month request ending before the first peak window
+    # still got peak back, top_spenders treated it as unmeasured rather than
+    # not-yet-occurred, and every circuit's total came back partial for a
+    # band the clock had not reached. Narrowed from ``intervals`` the same
+    # way price_period already narrows a whole tariff to the bands a split
+    # period's own energy names (costs.py's own ``entered``/``narrowed``),
+    # because band_intervals has already applied the season filter internally
+    # by the time it names them — matching that safeguard rather than a
+    # second one answers the season question and the not-yet-occurred one at
+    # once. The season-only fallback stays for the edge a window carries no
+    # named interval at all — a wholly unpriced stretch — so bands is never
+    # emptied outright.
+    entered = {name.strip().casefold() for _, _, name in intervals if name is not None}
+    bands = (
+        tuple(band for band in tariff.bands if band.key in entered)
+        or tariff.bands_in_effect(start, end)
+        or tariff.bands
+    )
+    # The house's own grid-versus-self split, per band, from the same counter
+    # rows and the same fallback chain the Costs totals are priced from.
+    # Nothing meters a single circuit's supply, so this ratio is what the
+    # per-circuit grid figure is shared out from.
+    with _inside_the_calendar():
+        house = period_energy(tariff, _counter_rows(store, start, end)[0], start, end, zone)
+    shares = grid_share_by_band(house.grid_import_kwh, house.load_kwh, bands)
+    # A band the house's own counters covered only part of still reports — as a
+    # sum over the stretch that was measured — so its share is a ratio over
+    # those hours applied to the circuit's whole band energy. The figure stands
+    # and carries a label, which is the owner's settled reading of #23; thrown
+    # away here, it would be an extrapolation rendered as a reading. Both
+    # counters are read from the same rows, so a gap takes both and the union
+    # is the honest set.
+    entries = house.shortfall or {}
+    short = _short_bands(entries, "grid_import") | _short_bands(entries, "load")
+    # The same PCRF/SCRF rider compute_cost charges the house's own total —
+    # resolved once here, the way bands is, rather than inside top_spenders,
+    # which has no business knowing what a tariff's adjustment table is.
+    ranked = top_spenders(
+        energies,
+        bands,
+        adjustment=tariff.adjustment_at(start, end),
+        grid_share=shares,
+        grid_short=short,
+    )
+    return {
+        "configured": True,
+        "currency": tariff.currency,
+        "circuits": [
+            {
+                "name": c.name,
+                "kind": c.kind,
+                "cost": None if c.cost is None else round(c.cost, 2),
+                "kwh": None if c.kwh is None else round(c.kwh, 3),
+                "partial": c.partial,
+                # The PCRF/SCRF rider already folded into cost but not into
+                # any band below it — a page summing the bands alone would
+                # come up short of cost with nothing explaining the gap.
+                "rider": None if c.rider is None else round(c.rider, 2),
+                # What the meter actually charged for this circuit, as opposed
+                # to what its energy would have cost had all of it been bought.
+                # None when any band it was priced in had no knowable house
+                # split — a partial grid figure is indistinguishable from a
+                # circuit that genuinely ran on solar.
+                "grid_kwh": None if c.grid_kwh is None else round(c.grid_kwh, 3),
+                "grid_cost": None if c.grid_cost is None else round(c.grid_cost, 2),
+                # The house counters, not this circuit's, were short over a
+                # band it spent in — so the grid figures beside it are an
+                # extrapolation from the hours that did report. A different
+                # absence from "partial" above, and it needs its own flag or
+                # the page marks the wrong figure.
+                "grid_partial": c.grid_partial,
+                "bands": [
+                    {
+                        "band": b.band,
+                        "kwh": None if b.kwh is None else round(b.kwh, 3),
+                        "cost": None if b.cost is None else round(b.cost, 2),
+                        "partial": b.partial,
+                    }
+                    for b in c.bands
+                ],
+            }
+            for c in ranked
+        ],
+        "coverage": coverage,
+    }
 
 
 @router.get("/history")
@@ -2388,10 +2750,16 @@ def efficiency(
             "days": [],
             "worst_hour": None,
             "baseline": dict(_NO_BASELINE),
+            # Present even here. A key that appears only sometimes is a key
+            # every caller has to guard, and the one that forgets reads a
+            # missing array as a missing answer.
+            "tilt_benefit": None,
         }
 
     config_version_raw = settings.get(CONFIG_VERSION_KEY)
     config_version = config_version_raw if isinstance(config_version_raw, int) else 0
+    valid_from_raw = settings.get(CONFIG_VALID_FROM_KEY)
+    valid_from = valid_from_raw if isinstance(valid_from_raw, int) else 0
 
     # Collect daily rows: try stored first, compute live for missing days.
     daily_rows: list[EfficiencyRow] = []
@@ -2403,7 +2771,7 @@ def efficiency(
         # count or moves the site every older day would keep a score taken
         # against an array that no longer exists -- and be served without a
         # word to say so. Recomputing is the honest answer and is cheap.
-        if stored and all(r.config_version == config_version for r in stored):
+        if rows_are_current(stored, config_version, valid_from):
             daily_rows.extend(stored)
         else:
             daily_rows.extend(compute_day(store, settings, ds, de, strings, config_version))
@@ -2423,6 +2791,10 @@ def efficiency(
             "days": [],
             "worst_hour": None,
             "baseline": dict(_NO_BASELINE),
+            # Present even here. A key that appears only sometimes is a key
+            # every caller has to guard, and the one that forgets reads a
+            # missing array as a missing answer.
+            "tilt_benefit": None,
         }
 
     # Aggregate: group by string_name.  The total row has string_name == "".
@@ -2628,6 +3000,30 @@ def efficiency(
         ],
         "worst_hour": worst_hour,
         "baseline": baseline,
+        # Null on a fixed mount, and null rather than zero on purpose: an owner
+        # who has never adjusted anything would read a zero as "adjusting won
+        # you nothing" rather than as "you have not adjusted".
+        "tilt_benefit": _tilt_benefit_info(
+            tilt_benefit(store, settings, range_start, range_end, strings)
+        ),
+    }
+
+
+def _tilt_benefit_info(found: TiltBenefit | None) -> dict[str, Any] | None:
+    """Shape the seasonal-adjustment comparison for the page, or nothing.
+
+    ``hours`` travels with the figure rather than beside it, because the number
+    means different things at eight hours and at eight hundred and a caller that
+    can drop it will.
+    """
+    if found is None:
+        return None
+    return {
+        "scheduled_kwh": round(found.scheduled_kwh, 3),
+        "unadjusted_kwh": round(found.unadjusted_kwh, 3),
+        "gain_kwh": round(found.gain_kwh, 3),
+        "hours": found.hours,
+        "adjustments": found.adjustments,
     }
 
 
@@ -2990,6 +3386,783 @@ async def resume(request: Request) -> dict[str, Any]:
     """Take the dongle back before the yield timer runs out."""
     await request.app.state.service.resume()
     return {"yielding": False}
+
+
+# --- The Emporia module -------------------------------------------------------
+#
+# Every one of these answers when the module is absent rather than raising: a
+# build with the module never started, or an installation that has not enabled
+# it, must serve a page that says "off" rather than a 500. The reads stay open
+# like every other read — the wall display is not logged in — while anything
+# that stores a credential or changes what the service does sits behind the
+# password.
+
+
+class EmporiaLogin(BaseModel):
+    """An Emporia account login. The password is used once and never stored."""
+
+    email: str
+    password: str
+
+
+def _emporia(request: Request) -> EmporiaPoller | None:
+    """The running poller, or None when this build is not running one."""
+    poller = getattr(request.app.state, "emporia", None)
+    return poller if isinstance(poller, EmporiaPoller) else None
+
+
+def _emporia_guard(request: Request) -> InverterGuard | None:
+    """The running guard, or None when this build is not running one."""
+    guard = getattr(request.app.state, "emporia_guard", None)
+    return guard if isinstance(guard, InverterGuard) else None
+
+
+# How far the house's own window may fall short of the circuits' before the two
+# stop describing the same span. Five minutes is the floor, and it is sized on
+# what the store can actually answer rather than chosen: the driver reads the
+# energy registers on a sixty-second clock of their own, and a window of two
+# days or under is answered from the minute tier, whose buckets are stamped at
+# the start of the minute they cover and are rebuilt once a minute. The last
+# instant the house is known for therefore sits a couple of minutes behind the
+# wall clock even on a perfectly healthy installation.
+COVERAGE_SLACK = timedelta(minutes=5)
+
+# ...and one percent of the window besides, which is what carries the long
+# ranges. Past two days a counter read is answered from the hourly tier, whose
+# newest bucket is stamped on the hour and so trails the end of a live range by
+# up to fifty-nine minutes — 0.6% of the seven-day range the Graphs page offers
+# and less of the thirty-day one. A flat five minutes would refuse both of them
+# for ever, which is not caution but a line that never works.
+#
+# What neither allowance may become is an excuse. Past it the numerator covers
+# time the denominator does not and the share reads over 100% — a partial
+# figure presented as a complete one, which is the one thing this line exists
+# to prevent — so the honest answer there is that the house total is unknown.
+COVERAGE_SHORTFALL = 0.01
+
+# How much of a window the circuits must have recorded for before their energy
+# may be read as a share of the house's own counter.
+#
+# Ninety per cent, and the number is the whole of this rule. A healthy
+# installation loses at most one poll at each edge of the window — two minutes
+# of the shortest range the Graphs page offers, three per cent — so this never
+# fires on ordinary operation. Below it the share is understated by more than a
+# tenth of its own value, which is more than a percentage rounded to whole
+# numbers can absorb, and the sentence stops describing what a reader thinks it
+# does: measured on the bench, a seven-day window in which the module had
+# recorded for six hours returned circuits 18.392 kWh, house 254.8 kWh, fraction
+# 0.0722. Every figure correct, and "monitored circuits cover 7% of the house"
+# invites the reader to conclude the house is barely monitored when the truth is
+# that the module was not running.
+#
+# Here rather than in the browser because a page draws what an endpoint tells
+# it, and because ``docs/api.md`` has promised since this endpoint shipped that
+# the fraction is null when the two do not cover closely enough the same span.
+# Only the browser checked, so the promise was not kept for any other consumer.
+CIRCUIT_SPAN_ENOUGH = 0.9
+
+# house_kwh is rounded to three places below for display, same as the
+# efficiency page's own EFF_RATIO_FLOOR_KWH guards a ratio whose denominator
+# is rounded to two. "Greater than zero" alone lets a real but tiny positive
+# figure — 0.00004 kWh of house energy against a nonzero circuit total —
+# divide out to a percentage in the thousands while the printed house_kwh
+# reads 0.000, the same rounding-noise ratio the hours either side of sunrise
+# produce on the efficiency chart. Half the smallest displayed unit is the
+# threshold below which house_kwh reads the same as no counter reading at all.
+_COVERAGE_HOUSE_FLOOR_KWH = 0.0005
+
+# An empty coverage answer, so a module that is not running says "unknown" in
+# the same shape a running one says a number. A page that had to branch on a
+# missing key would be one refactor away from rendering "0%" for "no module".
+_NO_COVERAGE: dict[str, Any] = {
+    "circuits_kwh": None,
+    "house_kwh": None,
+    "fraction": None,
+    "recorded_seconds": 0,
+    "window_seconds": 0,
+    "spans_match": False,
+}
+
+
+def _aware(when: datetime) -> datetime:
+    """A query bound with a zone attached, reading a naive one as the server's.
+
+    The pages send instants with an offset, but a hand-typed URL need not, and
+    ``counter_kwh`` refuses a naive bound outright rather than guessing — which
+    would answer a mistyped range with a 500. ``astimezone`` on a naive value
+    assumes the machine's own zone, which is exactly the assumption
+    ``datetime.timestamp`` was already making one layer down, so nothing about
+    which instant is meant changes here; it is only said out loud.
+    """
+    return when if when.tzinfo is not None else when.astimezone()
+
+
+def _parse_circuit_ids(ids: str | None) -> list[int] | None:
+    """Turn ``ids=3,7,11`` into a list, or None for every circuit.
+
+    A malformed entry is a bad request rather than a silently narrowed answer:
+    dropping an unparseable id would return four strips where five were asked
+    for, and the page has no way to notice.
+    """
+    if ids is None or not ids.strip():
+        return None
+    try:
+        return [int(part) for part in ids.split(",") if part.strip()]
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"bad circuit ids: {ids!r}") from exc
+
+
+def _emporia_cadence_seconds(store: SqliteStore) -> int:
+    """The Emporia poll interval, which is the circuit raw tier's resolution.
+
+    Not the inverter's. Scored at eleven seconds a seven-day circuit range comes
+    out at 55,000 points and picks the raw tier, which holds ten thousand rows
+    for it — the tier choice would be made against a cadence that does not
+    describe this data at all. It is also the bound on what one raw reading may
+    account for, since the raw tier records no cadence of its own.
+
+    It is *not* the hourly tier's arithmetic any more. That tier stores the
+    coverage the rollup measured while the interval that produced the readings
+    was still in force, and handing this figure to rows recorded under another
+    one is the defect that doubled every stored hour's energy the day the bench
+    interval was raised.
+
+    Read from the caller's store rather than ``app.state.store``: both callers
+    are threadpool handlers, and the primary connection is the event loop's.
+    See ``_read_store`` and #223.
+    """
+    return emporia_interval_seconds(SettingsStore(store))
+
+
+def _coverage_end(
+    store: SqliteStore, start: datetime, end: datetime, span: timedelta, field: str = "load_kwh"
+) -> datetime | None:
+    """The last instant the house's own counter is known for, or None.
+
+    The house figure is read to the last instant the inverter actually
+    reported, not to the wall clock. ``counter_kwh`` is right to refuse a bound
+    it cannot bracket — that refusal is what stops an outage being billed to
+    the day collection came back in — but every range the Graphs page offers
+    ends at "now", and there is never a reading after now. Asked as written,
+    the coverage line would be blank on every live request, permanently.
+
+    The circuits' own energy is deliberately not re-cut to this instant. There
+    is nothing in the tail to cut: the shortfall is a poll or two of the
+    inverter's, and the two windows describe the same span for every purpose
+    this percentage has. What keeps that true is the allowance below — past it
+    the numerator would cover hours the denominator does not, and None is
+    returned so the page can say the house total is unknown instead.
+
+    The search runs against the tier ``counter_kwh`` will read and falls back
+    the same way, because a clamp landing on an instant that tier has no row
+    for is no better than no clamp at all. A minute bucket is stamped at the
+    start of the minute it covers rather than at the reading inside it, so the
+    newest raw reading is later than the newest minute row on all but the one
+    second they can share — measured here as a raw counter at 17:59:18 against
+    a minute bucket at 17:59:00, where clamping to the raw instant returned
+    None and clamping to the bucket returned the figure. Where the mirror is
+    imperfect the answer is None and the page says "unknown", which is the safe
+    direction to be wrong in.
+
+    Reading forward as far as ``MAX_EDGE_GAP`` is what keeps a historical
+    window unclamped: if any reading lands at or after ``end`` then the window
+    is bracketed as asked and nothing needs pulling back.
+
+    ``span`` is handed in rather than measured from the two bounds, because
+    subtracting two aware datetimes ignores the zone they share: a window
+    running midnight to midnight across the November clock change is 49 hours
+    long and reads as 48. The caller has already measured it through
+    ``tariff._elapsed``, and one request must not measure one window twice.
+    """
+    metric = ENERGY_FIELDS[field]
+    allowance = max(COVERAGE_SLACK, span * COVERAGE_SHORTFALL)
+    floor, ceiling = end - allowance, end + MAX_EDGE_GAP
+    rows = store.query([metric], floor, ceiling, tier=_window_tier(start, end))
+    if not rows:
+        rows = store.query([metric], floor, ceiling, tier="full")
+    moments = [
+        when for row in rows if row.get(metric) is not None and (when := _row_time(row)) is not None
+    ]
+    if not moments:
+        return None
+    return end if moments[-1] >= end else moments[-1]
+
+
+@router.get("/emporia/status")
+async def emporia_status(request: Request) -> dict[str, Any]:
+    """What the module is doing, and whether it needs the owner.
+
+    Reports the poller's own state because nothing else can: circuits live in
+    their own tables specifically so they never satisfy the store's staleness
+    witness, which means an outage here leaves no symptom anywhere else.
+    """
+    # ``enabled`` is the owner's setting and ``status`` is what the poller is
+    # doing, and they are deliberately two questions. Deriving the first from
+    # the second would make the module invisible for the first interval after
+    # it was switched on, because a poller that has not ticked yet reports
+    # "off" — which is exactly when somebody is looking for it.
+    settings = SettingsStore(request.app.state.store)
+    enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
+    poller = _emporia(request)
+    if poller is None:
+        return {"status": "off", "detail": "", "last_success": None, "enabled": enabled}
+    state = poller.state
+    return {
+        "status": state.status,
+        "detail": state.detail,
+        "last_success": state.last_success,
+        "enabled": enabled,
+    }
+
+
+@router.get("/emporia/circuits")
+async def emporia_circuits(request: Request) -> dict[str, Any]:
+    """Every known circuit with its latest reading, biggest draw first.
+
+    ``watts`` is null for a circuit that has not reported, and stays null all
+    the way to the page. Zero would be a claim that it drew nothing.
+
+    ``connected`` and ``offline_since`` are what separates the two ways of
+    drawing nothing. Two of the reference account's outlets have been offline
+    since April and August, and without these a page can only render them the
+    same as a circuit that happened to be idle. They belong to the device rather
+    than the channel, so every circuit on a dead monitor carries the same answer.
+
+    ``id`` is what lets a row on this page link to that circuit's own chart on
+    ``/graphs#circuits=<id>``. It is the same surrogate ``/api/emporia/history``
+    reports for the same circuit — the two must agree, since a link is only as
+    good as the id it names being the id the other endpoint answers to.
+    """
+    poller = _emporia(request)
+    if poller is None:
+        return {"circuits": []}
+    connections = poller.connections
+    return {
+        "circuits": [
+            {
+                "id": circuit.circuit_id,
+                "name": circuit.name,
+                "kind": circuit.kind,
+                "watts": circuit.watts,
+                "ts": circuit.ts,
+                # Emporia's own category number, passed through raw. Which icon
+                # it earns is the page's business: a number here and a picture
+                # there keeps the mapping in one place, and it is presentation
+                # rather than a reading.
+                "type_gid": circuit.type_gid,
+                # None for a device Emporia said nothing about. Silence is not
+                # health, and a default of true here would quietly declare every
+                # unmentioned device up.
+                "connected": (
+                    connections[circuit.device_gid].connected
+                    if circuit.device_gid in connections
+                    else None
+                ),
+                "offline_since": (
+                    connections[circuit.device_gid].offline_since
+                    if circuit.device_gid in connections
+                    else None
+                ),
+            }
+            for circuit in poller.repository.latest()
+        ]
+    }
+
+
+def _circuit_coverage(
+    store: SqliteStore,
+    start: datetime,
+    end: datetime,
+    *,
+    circuits_kwh: float | None,
+    recorded_seconds: int,
+    window_seconds: int,
+) -> dict[str, Any]:
+    """What share of the house's energy the monitored circuits account for.
+
+    Written once and called twice: the circuit history endpoint draws bars
+    against it and the Costs page's circuit ranking prices against it, and two
+    copies of this arithmetic would answer the same question two ways on two
+    tabs of the same page. It is also the arithmetic #23 was reverted over
+    twice, which is reason enough for there to be one of it.
+
+    Computed from energy, never from minutes watched. The monitored circuits are
+    not the house — unmonitored branches are real, and two of the reference
+    account's outlets have been offline since April and August — so a page
+    naming a handful of circuits without this invites the reader to believe they
+    are the whole bill.
+
+    A numerator that recorded for a fraction of the window its denominator
+    covers is arithmetic between two different spans, not a share. ``fraction``
+    is withheld rather than re-based on the recorded span, because the answer
+    carries no house figure for that span — only for the whole window — and
+    inventing one by assuming the house drew power evenly is exactly the
+    estimate this project refuses to dress as a meter reading.
+
+    It is reported uncapped: a part cannot exceed the whole, so a figure above
+    one is not coverage at all but a fault saying so — a mains channel that
+    escaped the exclusion, a device counted on top of the circuit that already
+    measures it, a multiplier set for the wrong circuit, or two windows that
+    stopped being comparable. The second of those is what it caught: the
+    reference account read 131% until containment was read, and the fault was
+    real (#212, #219). Clamping it to 1.0 renders every
+    one of those as perfect coverage, which is the one reading guaranteed to
+    be wrong, and would hide the fault for as long as it lasted. The page
+    renders anything above one as a disagreement rather than as a full bar.
+
+    The denominator's guard is a floor at ``_COVERAGE_HOUSE_FLOOR_KWH``, not
+    merely "greater than zero" — a short range whose real ``house_kwh`` is a
+    rounding-noise fraction of a watt-hour still divides out to a percentage
+    nobody could check against the ``0.000`` the same figure prints as.
+    """
+    span = timedelta(seconds=window_seconds)
+    coverage_end = _coverage_end(store, start, end, span)
+    house_kwh = (
+        counter_kwh(store, start, coverage_end)
+        if coverage_end is not None and coverage_end > start
+        else None
+    )
+    # Whether the two figures describe the same stretch of time closely enough
+    # for one to be read as a share of the other. ``_check_range`` has already
+    # refused anything that does not run forwards, so the guard is for a range
+    # whose seconds round to nothing: there is no shortfall to find in a window
+    # of no length, and the house figure over one is zero anyway.
+    spans_match = window_seconds <= 0 or recorded_seconds >= window_seconds * CIRCUIT_SPAN_ENOUGH
+    return {
+        "circuits_kwh": None if circuits_kwh is None else round(circuits_kwh, 3),
+        "house_kwh": None if house_kwh is None else round(house_kwh, 3),
+        "fraction": (
+            None
+            if circuits_kwh is None
+            or house_kwh is None
+            or house_kwh < _COVERAGE_HOUSE_FLOOR_KWH
+            or not spans_match
+            else round(circuits_kwh / house_kwh, 4)
+        ),
+        # What the span check was decided on, so the page can say it without
+        # measuring it again. The old browser-side count credited every hourly
+        # bucket that held anything with a full 3,600 seconds, which reported
+        # a seven-day window holding one reading an hour as seven days
+        # recorded and defeated the check from the other side.
+        "recorded_seconds": recorded_seconds,
+        "window_seconds": window_seconds,
+        "spans_match": spans_match,
+    }
+
+
+@router.get("/emporia/history")
+def emporia_history(
+    request: Request,
+    store: _ReadStore,
+    start: datetime,
+    end: datetime,
+    ids: str | None = None,
+    width: int = Query(default=1000, ge=1, le=10000),
+) -> dict[str, Any]:
+    """Circuits over a range, ranked by energy, at a resolution that suits the chart.
+
+    ``ids`` narrows the answer to named circuits; omitted, every circuit is
+    returned and the page decides how many strips to draw. The narrowing is
+    here rather than in the browser because the reference account has
+    thirty-nine circuits and fetching all of them to draw five is the query
+    this argument exists to avoid.
+
+    ``coverage`` is the one figure on this endpoint that can mislead. The
+    monitored circuits are not the house — unmonitored branches are real, and
+    two of the reference account's outlets have been offline since April and
+    August — so a page drawing five bars without it invites the reader to
+    believe those five are the house. It is computed from energy rather than
+    from minutes watched, which is the distinction #23 was reverted twice for
+    missing, and it is None rather than 1.0 when the house's own figure is
+    absent: a fraction taken against an unknown denominator would read as full
+    coverage, which inverts the truth exactly. The circuits' own total is None
+    on the same terms, since a monitor nobody has heard from did not measure
+    nothing.
+
+    Both sides of that comparison are bounded here. ``_coverage_end`` pulls the
+    house figure back to the last instant the inverter's own counter is known
+    for; ``spans_match`` is the other half, and it was missing — the circuits
+    could have recorded for six hours of a seven-day window and the share was
+    still divided out and reported. It is null past that point, with
+    ``recorded_seconds`` and ``window_seconds`` alongside it so a page can say
+    what happened rather than measure it again.
+
+    A build with no poller answers an empty history rather than 404ing. The tab
+    is gated on the module, but a bookmark outlives the account it was made on.
+    """
+    start, end = _aware(start), _aware(end)
+    _check_range(start, end)
+    poller = _emporia(request)
+    # Through ``_elapsed``, not by subtraction, and measured once for the whole
+    # request. A range that spans a clock change is 23 or 25 hours long and the
+    # naive difference says 24, which would put a fully recorded autumn window
+    # under the span threshold and withhold a share that was perfectly good —
+    # and would have this one request answer "how long is this window" three
+    # different ways, for the tier, for the coverage allowance, and here.
+    window_seconds = int(_elapsed(start, end))
+    span = timedelta(seconds=window_seconds)
+    if poller is None:
+        return {
+            "tier": "full",
+            "timestamps": [],
+            "circuits": [],
+            "coverage": {**_NO_COVERAGE, "window_seconds": window_seconds},
+        }
+
+    wanted = _parse_circuit_ids(ids)
+    cadence = _emporia_cadence_seconds(store)
+    tier = select_tier(span, width_px=width, cadence_seconds=cadence, circuit=True)
+    with _inside_the_calendar():
+        # Read through the injected view, not through ``poller.repository``.
+        # The poller's repository holds the primary connection — the one the
+        # collector writes through — and this is the heaviest read the module
+        # makes: thirty days across thirty-nine circuits is tens of thousands
+        # of rows. Running it there is the shape ``_read_store`` was written to
+        # end, and its own docstring names the cost, measured at 1.6 to 3.2
+        # seconds a response while issue #63 was chased through the rollup.
+        # Every caller on a threadpool reads through its own view, ``latest()``
+        # included. An earlier note here excused it on the grounds that one row
+        # per circuit is not worth a second handle, which weighed the cost and
+        # missed the correctness: two threads on one connection do not read
+        # slowly, they read wrongly. ``emporia_circuits`` keeps the poller's
+        # repository because it is ``async`` and runs on the loop.
+        history = CircuitRepository(store).history(
+            start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
+        )
+        parts = [s for s in history.series if s.kind not in NOT_A_CULPRIT]
+        # Ranked from every part, summed from only the parts nothing else
+        # contains. A charger on a clamped breaker or a subpanel's branches are
+        # energy the counted circuits already carry, and adding them took the
+        # reference account to 131% of its own house (#212, #219).
+        measured = [
+            s.kwh
+            for s in parts
+            if s.kwh is not None and counts_toward_total(s.kind, s.parent_device_gid)
+        ]
+        circuits_kwh = sum(measured) if measured else None
+        coverage = _circuit_coverage(
+            store,
+            start,
+            end,
+            circuits_kwh=circuits_kwh,
+            recorded_seconds=history.recorded_seconds,
+            window_seconds=window_seconds,
+        )
+
+    # The poller holds this, not the repository: it is what the last status call
+    # said, refreshed on the module's own clock. emporia_circuits already reads
+    # it from the same place.
+    connections = poller.connections
+    return {
+        "tier": history.tier,
+        "timestamps": list(history.timestamps),
+        "circuits": [
+            {
+                "id": s.circuit_id,
+                "name": s.name,
+                "kind": s.kind,
+                "watts": list(s.watts),
+                "kwh": None if s.kwh is None else round(s.kwh, 3),
+                "partial": s.partial,
+                "offline_since": (
+                    connections[s.device_gid].offline_since if s.device_gid in connections else None
+                ),
+            }
+            for s in parts
+        ],
+        "coverage": coverage,
+    }
+
+
+@router.post("/emporia/login", dependencies=[Depends(_require_write)])
+async def emporia_login(request: Request, body: EmporiaLogin) -> dict[str, Any]:
+    """Exchange a password for tokens. The password is not retained anywhere."""
+    poller = _emporia(request)
+    if poller is None:
+        raise HTTPException(status_code=404, detail="the Emporia module is not available")
+    try:
+        token_set = await asyncio.to_thread(poller.client.login, body.email, body.password)
+    except EmporiaChallengeError as exc:
+        raise HTTPException(status_code=409, detail=f"Emporia asked for {exc}") from exc
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(
+            status_code=401, detail="Emporia rejected that email or password"
+        ) from exc
+    except EmporiaUnreachableError as exc:
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    await asyncio.to_thread(emporia_tokens.save, poller.token_path, token_set)
+    # Tick once, here, before answering. The page reads the poller's state, and
+    # the poller's clock is a minute wide — so without this a login that worked
+    # leaves "the saved Emporia login has expired" on screen with the form still
+    # open, for up to a minute. Somebody watching that types their password
+    # again, which is precisely what happened the first time this was tried
+    # against a real account. The tick is one extra call at the one moment the
+    # owner is certainly watching, and it never raises.
+    await poller.tick(datetime.now(tz=UTC))
+    return {"ok": True}
+
+
+class ChargeRate(BaseModel):
+    """A charge rate somebody asked for, in amps."""
+
+    amps: int
+
+
+def _refuse_while_disabled(settings: SettingsStore) -> None:
+    """Stop a write to the charger while the module is switched off.
+
+    The enable is not the authority setting and neither implies the other, so
+    both write routes checked ``charger_authority`` and neither checked this —
+    which left a disabled module holding a stale charger, a live token, and two
+    endpoints that would have reached a real car. Refused with a 409 in the
+    manner of the app-authority refusal rather than accepted and dropped,
+    because a control that takes a number and does nothing with it is worse than
+    one that is not there.
+    """
+    if not bool(settings.get(EMPORIA_ENABLED_KEY)):
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia module is switched off; switch it on in Settings first",
+        )
+
+
+@router.get("/emporia/charger")
+async def emporia_charger(request: Request) -> dict[str, Any]:
+    """The charger, who else is driving it, and what this service has done to it.
+
+    ``conflicts`` names Emporia's own controllers that are switched on for this
+    charger. It is a warning and never a refusal — it is the owner's charger and
+    their account — but it has to be said, because two controllers moving one
+    rate will undo each other and neither will look broken.
+
+    A switched-off module answers with no charger at all, and that is the rule
+    stated in one place so nothing downstream has to remember it: the nav draws
+    the Charger tab from this answer, and it kept drawing it — over a page of
+    live controls — for a module the owner had turned off.
+    """
+    settings = SettingsStore(request.app.state.store)
+    enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
+    poller = _emporia(request)
+    if poller is None or poller.charger is None or not enabled:
+        return {"charger": None, "changes": [], "enabled": enabled, "guard": None}
+    state = poller.charger
+    return {
+        "enabled": enabled,
+        "charger": {
+            "device_gid": state.device_gid,
+            "rate_a": state.rate_a,
+            "max_rate_a": state.max_rate_a,
+            "on": state.on,
+            "status": state.status,
+            "message": state.message,
+            "conflicts": list(state.conflicts),
+            "plugged_in": state.plugged_in,
+            "connected": state.connected,
+            "offline_since": state.offline_since,
+            "fault": state.fault,
+            "authority": settings.get(CHARGER_AUTHORITY_KEY),
+            "floor_a": settings.get(CHARGE_FLOOR_KEY),
+            "ceiling_a": settings.get(CHARGE_CEILING_KEY),
+        },
+        "changes": [
+            {
+                "timestamp": change.timestamp,
+                "from_a": change.from_a,
+                "to_a": change.to_a,
+                "reason": change.reason,
+                "applied": change.applied,
+                # Who decided it. Null on a line written before this was
+                # recorded, which the page must not render as either party.
+                "source": change.source,
+            }
+            for change in poller.audit.recent_changes()
+        ],
+        "guard": _emporia_guard_payload(request),
+    }
+
+
+def _emporia_guard_payload(request: Request) -> dict[str, object] | None:
+    """The guard's newest plan and allowance, or None when there is none."""
+    guard = _emporia_guard(request)
+    if guard is None or guard.last_plan is None:
+        return None
+    allowance = guard.last_allowance
+    plan = guard.last_plan
+    if allowance is None:
+        return None
+    return {
+        "limit_w": allowance.limit_w,
+        "supplied_w": allowance.supplied_w,
+        "charger_w": allowance.charger_w,
+        "allowance_a": allowance.amps,
+        "amps": plan.amps,
+        "kind": plan.kind,
+        "reason": plan.reason,
+    }
+
+
+@router.post("/emporia/charger/rate", dependencies=[Depends(_require_write)])
+async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]:
+    """Set the charge rate by hand, through every guard the module has.
+
+    A request from this route is the owner asking, so it is applied whatever the
+    authority setting says — advisory means the *module* proposes rather than
+    acts, not that the owner may not act. The floor, the ceiling and the
+    hardware maximum still hold, because those are about what the charger and
+    the wiring can take rather than about who is asking.
+
+    It also starts the override window. Somebody who has just set a rate by hand
+    should not have it moved out from under them by the next automatic decision.
+    """
+    # The enable is asked first, and before the charger is looked for. A tick
+    # clears the cached charger the moment the module is switched off, so asking
+    # about the charger first answers "no Emporia charger is being read" — true,
+    # but not the reason, and the reason is the thing somebody who has just
+    # turned the module off needs to be told.
+    settings = SettingsStore(request.app.state.store)
+    _refuse_while_disabled(settings)
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    if settings.get(CHARGER_AUTHORITY_KEY) == "app":
+        # Refused rather than quietly ignored. The owner said the Emporia app
+        # has this charger, and a control that accepts a number and does
+        # nothing with it is worse than one that is not there.
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia app manages this charger; change that in Settings first",
+        )
+    charger = poller.charger
+    rate, refused = clamp_rate(body.amps, poller.limits())
+    now = datetime.now(tz=UTC)
+    # The window opens when the owner presses, not when Emporia answers. The
+    # write below is a round trip to a cloud service, and the restore runs on
+    # the poller's own clock — so opening it afterwards left a gap in which an
+    # automatic decision could look at a charger the owner was in the middle of
+    # changing, find no hold, and write over it. A failed write holds too: they
+    # reached for the charger either way, and the conservative reading of that
+    # is the one this module owes them.
+    minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
+    hold = int(minutes) if isinstance(minutes, int) else 120
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
+    try:
+        confirmed = await asyncio.to_thread(poller.write_rate, rate)
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(status_code=401, detail="Emporia rejected the saved login") from exc
+    except EmporiaUnreachableError as exc:
+        poller.audit.record_change(
+            charger.device_gid,
+            from_a=charger.rate_a,
+            to_a=rate,
+            reason=f"failed: {exc}",
+            applied=False,
+            source=OWNER,
+            now=now,
+        )
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    # Applied means the charger says so, not that Emporia returned a 200. The
+    # write is accepted asynchronously, and auditing on the status code alone
+    # made a working write look like a failed one the first time this ran
+    # against a real car — worse, a restore that trusts a rate the charger is
+    # not at will happily leave it there.
+    took = confirmed is not None and confirmed.rate_a == rate
+    poller.audit.record_change(
+        charger.device_gid,
+        from_a=charger.rate_a,
+        to_a=rate,
+        reason=("set by hand" if took else "set by hand, but the charger still reads differently")
+        + (f" ({refused})" if refused else ""),
+        applied=took,
+        source=OWNER,
+        now=now,
+    )
+    return {"ok": True, "rate_a": rate, "refused": refused, "confirmed": took}
+
+
+class ChargerPower(BaseModel):
+    """Whether the charger should be delivering at all."""
+
+    on: bool
+
+
+@router.post("/emporia/charger/power", dependencies=[Depends(_require_write)])
+async def emporia_set_power(request: Request, body: ChargerPower) -> dict[str, Any]:
+    """Stop or start charging.
+
+    A different power from setting a rate, and a heavier one: a rate that is too
+    low charges a car slowly, while a charger switched off charges it not at
+    all. For the *module* that distinction is the ``full`` authority level. This
+    route is the owner asking, so it acts either way — but it is audited like
+    everything else, because "why is the car not charged" has to have an answer.
+    """
+    # The enable is asked first, and before the charger is looked for. A tick
+    # clears the cached charger the moment the module is switched off, so asking
+    # about the charger first answers "no Emporia charger is being read" — true,
+    # but not the reason, and the reason is the thing somebody who has just
+    # turned the module off needs to be told.
+    settings = SettingsStore(request.app.state.store)
+    _refuse_while_disabled(settings)
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    if settings.get(CHARGER_AUTHORITY_KEY) == "app":
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia app manages this charger; change that in Settings first",
+        )
+    charger = poller.charger
+    now = datetime.now(tz=UTC)
+    try:
+        confirmed = await asyncio.to_thread(poller.write_charger, {"chargerOn": body.on})
+    except EmporiaAuthExpiredError as exc:
+        raise HTTPException(status_code=401, detail="Emporia rejected the saved login") from exc
+    except EmporiaUnreachableError as exc:
+        poller.audit.record_change(
+            charger.device_gid,
+            from_a=charger.rate_a,
+            # No rate was decided. Recording the current one here made a power
+            # press look like a decision about the rate, and the audit is what
+            # restore-on-startup reads to work out whose rate the charger is
+            # sitting at — so pressing stop once retired the restore for good.
+            to_a=None,
+            reason=f"failed to {'start' if body.on else 'stop'} charging: {exc}",
+            applied=False,
+            source=OWNER,
+            now=now,
+        )
+        raise HTTPException(status_code=503, detail=f"could not reach Emporia: {exc}") from exc
+    took = confirmed is not None and confirmed.on is body.on
+    poller.audit.record_change(
+        charger.device_gid,
+        from_a=charger.rate_a,
+        # See the failure path above: a power press decides nothing about the
+        # rate, and an absent rate is absent rather than a repeat of the one
+        # that happened to be set.
+        to_a=None,
+        reason=("started charging" if body.on else "stopped charging")
+        + ("" if took else ", but the charger still reads otherwise"),
+        applied=took,
+        source=OWNER,
+        now=now,
+    )
+    return {"ok": True, "on": body.on, "confirmed": took}
+
+
+@router.post("/emporia/disconnect", dependencies=[Depends(_require_write)])
+async def emporia_disconnect(request: Request) -> dict[str, Any]:
+    """Forget the stored credential.
+
+    Revoking it at AWS as well is the right behaviour and is Stage 3 work: the
+    Cognito ``RevokeToken`` call is documented but has never been tested against
+    Emporia's pool, and claiming to revoke while only forgetting would be worse
+    than saying plainly that this forgets. ``revoked`` is false so that nothing
+    reading this can believe otherwise.
+    """
+    poller = _emporia(request)
+    if poller is None:
+        raise HTTPException(status_code=404, detail="the Emporia module is not available")
+    emporia_tokens.clear(poller.token_path)
+    return {"ok": True, "revoked": False}
 
 
 def _battery_block(inverter: Mapping[str, Any] | None) -> dict[str, Any]:

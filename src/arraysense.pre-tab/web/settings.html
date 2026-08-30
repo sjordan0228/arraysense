@@ -1,0 +1,1919 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings · Solar ArraySense</title>
+<!-- Every control on this page is built from what /api/settings describes.
+     Nothing here names a setting, states a bound, or lists a choice: the
+     registry in settings.py does all three, and a page that repeated any of
+     them would drift from the validation the moment either changed. The drift
+     always looks the same from the outside — a control offering a value the
+     server then refuses. -->
+<script src="/common.js"></script>
+<style>
+  .grp{margin-bottom:12px}
+  .grp .intro{font-size:12px;color:var(--ink2);line-height:1.6;max-width:80ch;margin:0 0 14px}
+  .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px 20px}
+  @media(max-width:760px){.fields{grid-template-columns:1fr}}
+  /* A field whose value is long prose — the rate bands — needs the row to
+     itself; sat in a 50% column it wraps every band onto three lines. */
+  .fields .wide{grid-column:1/-1}
+  .f{display:flex;flex-direction:column;gap:5px;min-width:0}
+  .f .lbl{display:block}
+  .f input,.f select,.f textarea{background:var(--tint);border:1px solid var(--panel-b);
+    color:var(--ink);border-radius:8px;padding:7px 10px;font:inherit;font-size:13px;width:100%;
+    font-variant-numeric:tabular-nums}
+  .f textarea{resize:vertical;min-height:74px;line-height:1.55;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  .f input:focus,.f select:focus,.f textarea:focus{outline:2px solid var(--pv);outline-offset:1px;
+    border-color:transparent}
+  .f .help{font-size:11px;color:var(--ink3);line-height:1.55}
+  /* A field the server rejected. The message sits with the control that caused
+     it: a single banner saying "invalid" leaves the reader hunting ten fields
+     for the one at fault. */
+  .f.bad input,.f.bad select,.f.bad textarea{border-color:var(--bad)}
+  .f .err{font-size:11px;color:var(--bad);line-height:1.55}
+  .f .err[hidden]{display:none}
+  .actions{display:flex;align-items:center;gap:11px;flex-wrap:wrap;margin-top:2px}
+  .actions .grow{margin-left:auto}
+  #save{background:var(--pv);border-color:transparent;color:#1a1204;font-weight:600;font-size:13px;
+    padding:6px 16px}
+  #save:hover{background:#e08c33;color:#1a1204}
+  #save:disabled{opacity:.45;cursor:default}
+  .said{font-size:12px;line-height:1.55}
+  .said.ok{color:var(--good)}
+  .said.bad{color:var(--bad)}
+  .said.warn{color:var(--warn)}
+  /* The identifying values come back from the service with their middles
+     replaced. Saying so beside them stops the mask reading as a corrupt value. */
+  .masknote{font-size:11px;color:var(--ink3);line-height:1.6;margin:12px 0 0;max-width:80ch}
+  /* A unit the registry declared, beside the control it belongs to. Nothing on
+     this page knows what any setting is measured in; a field with no declared
+     unit renders exactly as it did before. */
+  .f .ctl{display:flex;align-items:center;gap:8px;min-width:0}
+  .f .ctl .u{font-size:11.5px;color:var(--ink3);white-space:nowrap}
+
+  /* --- The location helper --------------------------------------------- */
+  .geo{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .geo .said{font-size:11.5px}
+
+  /* --- The rate-band editor -------------------------------------------- */
+  /* Everything below composes one string: the same pipe-separated text the
+     service has always stored, still held by the textarea, which stays in the
+     DOM so the save path, the dirty check and the error reporting never learn
+     that these controls exist. Nothing here decides whether a tariff is valid;
+     parse_bands on the service does, as it did before. */
+  .bands{display:flex;flex-direction:column;gap:10px}
+  .band{border:1px solid var(--panel-b);border-radius:10px;padding:11px 12px;
+    background:var(--tint);display:flex;flex-direction:column;gap:10px}
+  .band .top{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+  .band .top .who{flex:1 1 200px;min-width:0}
+  .band .top .rate{flex:0 1 210px;min-width:0}
+  .cap{font-size:9.5px;letter-spacing:.15em;text-transform:uppercase;color:var(--ink3);
+    display:block;margin-bottom:5px}
+  .band .rate .box{display:flex;align-items:center;gap:6px}
+  .band .rate .box span{font-size:11.5px;color:var(--ink3);white-space:nowrap}
+  .span{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:6px}
+  .span select{width:auto;font-variant-numeric:tabular-nums}
+  .span .to{font-size:12px;color:var(--ink3)}
+  .span .hint{font-size:11px;color:var(--ink3)}
+  .span .hint.warn{color:var(--warn)}
+  .mons{display:flex;gap:5px;flex-wrap:wrap;align-items:center}
+  .mons button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink3);
+    border-radius:7px;padding:3px 8px;font:inherit;font-size:11.5px;cursor:pointer;line-height:1.4}
+  .mons button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  .mons .season{font-size:11px;color:var(--ink3);margin-left:4px}
+  .bandacts{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .bandacts .iconbtn{font-size:11.5px;padding:3px 9px}
+  .bandnote{font-size:11px;color:var(--ink3);line-height:1.55}
+  .bandnote.keep,.bandnote.warn{color:var(--warn)}
+  .rawline{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+  /* A rejection marks the field, and the field is the whole editor. Painting
+     every box inside it red says nothing about which band was wrong, so the
+     mark goes on the edge of the editor and the controls are left alone. */
+  .f.bad .bands input,.f.bad .bands select{border-color:var(--panel-b)}
+  .f.bad .bands{border-left:3px solid var(--bad);padding-left:10px}
+
+  /* --- About ------------------------------------------------------------ */
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(230px,100%),1fr));
+    gap:9px 22px}
+  .facts .row{display:flex;justify-content:space-between;gap:14px;font-size:12px;
+    border-bottom:1px solid var(--grid-line);padding-bottom:5px}
+  .facts .row u{text-decoration:none;color:var(--ink3)}
+  .facts .row b{font-weight:500;text-align:right}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div class="conn" id="stamp"></div>
+  </header>
+
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="p pn" id="pnote" hidden></div>
+
+  <form id="form" autocomplete="off"></form>
+
+  <section class="p">
+    <div class="actions">
+      <button class="iconbtn" id="save" type="button" disabled>Save changes</button>
+      <button class="iconbtn" id="revert" type="button" disabled>Discard</button>
+      <span class="said" id="said"></span>
+      <span class="muted grow" style="font-size:11px">
+        Stored in the database on the service, not in this browser.
+      </span>
+    </div>
+  </section>
+
+  <!-- Not a setting: what the process running behind this page actually is.
+       It is read from /api/status and /api/capabilities and nothing here can
+       be typed into, which is why it sits outside the form. -->
+  <section class="p">
+    <div class="chead"><h2>About this installation</h2></div>
+    <div class="facts" id="facts"></div>
+    <p class="masknote" id="factnote"></p>
+  </section>
+
+  <details>
+    <summary>Where these live, and what reads them</summary>
+    <p class="masknote" id="about"></p>
+  </details>
+</main>
+
+<script>
+// ---------------------------------------------------------------------------
+// State. `fields` is the registry as the service describes it; `saved` is what
+// the service currently holds. Nothing else is remembered — after a write the
+// service's own reply becomes the new `saved`, so the page can never believe a
+// value the service did not accept.
+// ---------------------------------------------------------------------------
+
+let fields = [];
+let saved = {};
+// The /api/setup payload the Connection group's picker renders from. It is the
+// same renderer the first-run wizard uses — one component, two shells — so the
+// two can never drift. Null until load() reads it; a build whose /api/setup
+// cannot be read falls back to the loose registry controls for connection.
+let setupPayload = null;
+
+// The groups, in the order they are shown, keyed by the prefix of the settings
+// that belong to each. A prefix with no entry here still renders — under its
+// own name — so adding a setting to the registry can never make it invisible.
+const GROUPS = [
+  {
+    prefix: 'tariff',
+    title: 'What electricity costs',
+    intro: 'The Costs page prices nothing until these are entered.',
+  },
+  {
+    prefix: 'connection',
+    title: 'The inverter',
+    intro: 'How the collector reaches the dongle. Changing any of these needs the collector '
+      + 'restarted before it takes effect.',
+  },
+  {
+    prefix: 'collector',
+    title: 'Collection',
+    intro: 'How often the inverter is read. Over the dongle, keep this at 11 seconds or more: '
+      + 'it accepts one connection at a time and answers at its own pace, so asking faster '
+      + 'mostly produces reads that overlap the previous one. RS485 can be read faster, and 10 '
+      + 'seconds is the recommendation there. Every poll is a row written — around 8,600 a day '
+      + 'at 10 seconds — so the database grows in proportion to how often you ask.',
+  },
+  {
+    prefix: 'site',
+    title: 'General',
+  },
+  {
+    prefix: 'panels',
+    title: 'Solar panels',
+    intro: 'The array, one line per string — the efficiency model reads exactly what is '
+      + 'entered here, and every value left blank falls to a default the form shows.',
+  },
+  {
+    prefix: 'battery',
+    title: 'Battery bank',
+    intro: 'Static specs for the bank. Live BMS readings win wherever they exist; these '
+      + 'fill the gaps and set the heater and idle-draw accounting.',
+  },
+  {
+    prefix: 'display',
+    title: 'Display',
+  },
+];
+
+const groupOf = (key) => key.split('.')[0];
+
+// ---------------------------------------------------------------------------
+// Rendering. One control per registry entry, chosen from its declared kind.
+// ---------------------------------------------------------------------------
+
+// Whether the value is a paragraph rather than a line — declared by the
+// registry, not guessed from the key. Guessing means the page decides which
+// settings may contain a newline while the server decides separately, and the
+// two then disagree: the tariff got a textarea here and was refused there for
+// containing a control character.
+const isLong = (spec) => spec.kind === 'str' && spec.multiline === true;
+
+// A setting that may legitimately hold nothing at all. It exists because a
+// coordinate of zero is a place — 0°, 0° is open water in the Gulf of Guinea —
+// so an empty latitude box cannot be submitted as 0.0 and an unset latitude
+// cannot be drawn as one. The registry says which settings are like this; the
+// page only has to keep "nothing" and "nought" apart everywhere it touches
+// them, which is the same rule the readings follow.
+const isOptional = (spec) => spec.optional === true;
+
+// Values the registry offers without insisting on. Unlike `choices`, which the
+// server enforces, these only fill a dropdown list beside a box that still
+// accepts anything — so a page rendering them can never refuse a value the
+// server would take.
+const suggestionsOf = (spec) => (Array.isArray(spec.suggestions) ? spec.suggestions : []);
+
+function control(spec, value) {
+  const id = `f_${spec.key.replace(/\W/g, '_')}`;
+  const shown = value === null || value === undefined ? '' : String(value);
+  if (spec.choices && spec.choices.length) {
+    const options = spec.choices.map((c) =>
+      `<option value="${esc(c)}"${c === shown ? ' selected' : ''}>${esc(c)}</option>`).join('');
+    return `<select id="${id}" data-key="${esc(spec.key)}">${options}</select>`;
+  }
+  // Every cap and bound below comes from the registry, so the control refuses
+  // exactly what the server refuses rather than approximately.
+  const cap = spec.max_length ? ` maxlength="${esc(String(spec.max_length))}"` : '';
+  if (isLong(spec)) {
+    return `<textarea id="${id}" data-key="${esc(spec.key)}" spellcheck="false"${cap}`
+      + `>${esc(shown)}</textarea>`;
+  }
+  // Rendered as a sibling of the control and referenced by id, because a
+  // datalist is a list of options and not a constraint: the box still takes
+  // anything typed into it, which is what makes it safe to fill from a
+  // registry the server validates against separately.
+  const hints = suggestionsOf(spec);
+  const listId = `l_${spec.key.replace(/\W/g, '_')}`;
+  const list = hints.length ? ` list="${listId}"` : '';
+  const datalist = hints.length
+    ? `<datalist id="${listId}">`
+      + hints.map((h) => `<option value="${esc(h)}"></option>`).join('') + '</datalist>'
+    : '';
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    const step = spec.kind === 'int' ? '1' : 'any';
+    const lo = spec.lower === null ? '' : ` min="${esc(String(spec.lower))}"`;
+    const hi = spec.upper === null ? '' : ` max="${esc(String(spec.upper))}"`;
+    return `<input id="${id}" data-key="${esc(spec.key)}" type="number" step="${step}"`
+      + `${lo}${hi} value="${esc(shown)}" inputmode="decimal"${list}>${datalist}`;
+  }
+  return `<input id="${id}" data-key="${esc(spec.key)}" type="text"${cap} value="${esc(shown)}"`
+    + `${list}>${datalist}`;
+}
+
+// What is wrong with a value, in the server's own terms, or null if nothing is.
+// Checked here as well as there so a mistake is caught beside the control that
+// made it — the server validates every value before writing any of them, so
+// one bad field otherwise means a whole form rejected with a single message.
+//
+// This is a courtesy, never the authority, and it is deliberately the more
+// permissive of the two. Where the two cannot agree exactly — Node and Python
+// disagree about which code points are assigned, and the tariff's grammar is
+// checked only by the parser, which this page must not carry a second copy of
+// — the difference has to fall this way round. A page that accepts what the
+// server refuses shows the server's own message on the field. A page that
+// refuses what the server would accept is a value nobody can save and no
+// message that explains why.
+function fault(spec, value) {
+  if (value === undefined) return null;
+  // An optional setting cleared back to nothing. The bounds below are about
+  // numbers and this is the absence of one, so checking it against them would
+  // report "must be at least -90" for a field nobody filled in.
+  if (value === null) return isOptional(spec) ? null : `${spec.label} must have a value.`;
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    if (!Number.isFinite(value)) return `${spec.label} must be a number.`;
+    if (spec.kind === 'int' && !Number.isInteger(value)) {
+      return `${spec.label} must be a whole number.`;
+    }
+    if (spec.lower !== null && value < spec.lower) {
+      return `${spec.label} must be at least ${spec.lower}.`;
+    }
+    if (spec.upper !== null && value > spec.upper) {
+      return `${spec.label} must be at most ${spec.upper}.`;
+    }
+    return null;
+  }
+  if (spec.kind === 'str') {
+    // Counted in code points, the way Python counts them. A JavaScript string's
+    // length is UTF-16 code units, so an emoji counts twice here and once
+    // there — and the two would disagree about a value near the cap.
+    const points = [...value].length;
+    if (spec.max_length && points > spec.max_length) {
+      return `${spec.label} is too long at ${points} characters, `
+        + `the limit is ${spec.max_length}.`;
+    }
+    // The same rule settings.py applies: a newline is content only where the
+    // registry says so, and nothing invisible is content anywhere. The allowed
+    // set has to be exempt from *every* test below, not just the whitespace
+    // one — a newline is also a control character, and checking that
+    // separately is how this rejected the very field it had just permitted.
+    const allowed = isLong(spec) ? ' \n' : ' ';
+    // Python's str.isprintable() is the rule on the other side, and it rejects
+    // every Unicode category the regex below names — the format characters
+    // (Cf) that a narrower list of "zero-width" code points kept missing, such
+    // as the soft hyphen and the word joiner.
+    const bad = [...value].some((ch) =>
+      !allowed.includes(ch) && (/\s/u.test(ch) || /[\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u.test(ch)));
+    if (bad) return `${spec.label} must not contain control or invisible characters.`;
+  }
+  return null;
+}
+
+function render() {
+  const blocks = [];
+  const known = new Set(GROUPS.map((g) => g.prefix));
+  const extras = [...new Set(fields.map((f) => groupOf(f.key)))].filter((p) => !known.has(p));
+  const order = [...GROUPS, ...extras.map((p) => ({ prefix: p, title: p, intro: '' }))];
+
+  for (const group of order) {
+    const mine = fields.filter((f) => groupOf(f.key) === group.prefix);
+    if (!mine.length) continue;
+    // The connection group is the wizard's other shell: the same Manufacturer →
+    // Model → Connection picker the first-run wizard shows, mounted from
+    // /api/setup so the two cannot drift. It replaces the loose registry
+    // controls entirely, and only when the payload is in hand — a build whose
+    // /api/setup could not be read falls through to the controls below.
+    if (group.prefix === 'connection' && setupPayload) {
+      blocks.push(`<section class="p grp">
+          <div class="chead"><h2>${esc(group.title)}</h2></div>
+          ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
+          <div id="connHost"></div>
+        </section>`);
+      continue;
+    }
+    const controls = mine.map((spec) => {
+      // The bounds are not written out. A number box already carries min and
+      // max, so the browser refuses an out-of-range value and the spinner
+      // stops at the ends — printing the same range as prose says it twice,
+      // in the place where it reads least like an instruction.
+      const help = [spec.help];
+      // The unit is the registry's word for what the number means, and it goes
+      // beside the box — except on a paragraph field, where "beside" is half a
+      // screen away from anything, so it joins the help line instead.
+      const unit = String(spec.unit || '');
+      if (unit && isLong(spec)) help.push(`In ${unit}.`);
+      const body = unit && !isLong(spec)
+        ? `<div class="ctl">${control(spec, saved[spec.key])}<span class="u">${esc(unit)}</span></div>`
+        : control(spec, saved[spec.key]);
+      return `<div class="f${isLong(spec) ? ' wide' : ''}" data-for="${esc(spec.key)}">
+          <label class="lbl" for="f_${esc(spec.key.replace(/\W/g, '_'))}">${esc(spec.label)}</label>
+          ${body}
+          <span class="help">${esc(help.filter(Boolean).join(' '))}</span>
+          <span class="err" hidden></span>
+        </div>`;
+    }).join('');
+    blocks.push(`<section class="p grp">
+        <div class="chead"><h2>${esc(group.title)}</h2></div>
+        ${group.intro ? `<p class="intro">${esc(group.intro)}</p>` : ''}
+        <div class="fields">${controls}</div>
+      </section>`);
+  }
+  $('form').innerHTML = blocks.join('');
+  for (const el of $('form').querySelectorAll('[data-key]')) {
+    el.addEventListener('input', dirtyCheck);
+    el.addEventListener('change', dirtyCheck);
+  }
+  // The two places a bare control is not enough, mounted over the controls
+  // already rendered rather than instead of them: each keeps the registry's
+  // own field in the DOM and only writes into it.
+  mountExtras();
+  // The connection picker mounts after the form's own controls, into the host
+  // the group left for it. Its Save is its own — a connection change only takes
+  // effect on restart — so it is separate from the page's Save, which never
+  // touches these fields (the picker's controls carry no data-key for pending).
+  if (setupPayload && $('connHost')) {
+    mountSetup($('connHost'), setupPayload, { mode: 'settings', onApply: applyConnection });
+  }
+  dirtyCheck();
+
+  const secret = fields.filter((f) => f.secret).map((f) => f.label);
+  $('about').textContent = 'These are held in the service’s own database rather than in a '
+    + 'file beside it, so they survive a reinstall and are the same for every browser that '
+    + 'opens the installation. The collector reads them at startup, which is why changing how '
+    + 'it connects needs a restart.'
+    + (secret.length
+      ? ` ${secret.join(' and ')} come back from the service with their middles replaced. `
+        + 'Leave a masked value alone and it is left alone; retype it in full to change it.'
+      : '');
+}
+
+// ---------------------------------------------------------------------------
+// The rate bands, as controls instead of as a line of syntax.
+//
+// The stored setting is unchanged: the same "name | price | hours | months"
+// text, still validated by parse_bands on the service and by nothing else.
+// This is an editor over that string — it composes it and reads it back for
+// display — and the distinction is the whole design. The Costs page once
+// carried a second implementation of this grammar and the two disagreed within
+// a day: the browser refused the seasonal syntax the parser accepts, so a real
+// tariff priced nothing, and in the older syntax it did accept it had no notion
+// of a season and charged a January evening at the summer peak rate.
+//
+// So four rules hold everything below together.
+//
+// *Nothing here decides whether a tariff is valid.* The reader is allowed to
+// fail — and when it does the entry keeps its own text, in a box, exactly as
+// written. Every judgement about whether that text is a tariff is still made
+// once, on the service, and its message still lands on this field.
+//
+// *An entry nobody edited keeps its own text.* Only an entry actually edited
+// is recomposed; the rest hand back the string they were read from. While
+// nothing at all has changed the original is returned character for character.
+// Once anything has, the untouched entries are given back trimmed and rejoined
+// with one separator, so surrounding space and a mixed set of semicolons and
+// newlines do not survive — but nothing *inside* an entry is reinterpreted.
+// Losing a band is losing money, and so is silently reformatting one into
+// something that means slightly less.
+//
+// *A control that cannot offer a bad value does not offer one.* The clock is a
+// list of times rather than free text, the months are twelve toggles, and the
+// separators are stripped out of a band's name. Two things here are still free
+// enough to compose something the service refuses — the rate is typed, and the
+// two ends of a range can be set to the same time — so both are marked on the
+// page as they are made. Neither is blocked: the service is the only judge of
+// whether a tariff is a tariff, and its message still lands on this field.
+//
+// *A tariff the service accepts can still be wrong, and the page may say so.*
+// parse_bands is first-match-wins, so a band whose hours are already taken by
+// one above it is priced at nothing while reading exactly like a rate in
+// force. That is a warning and never a block; see shadowedBands.
+// ---------------------------------------------------------------------------
+
+const BANDS_KEY = 'tariff.bands';
+
+const MONTH_ABBR = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Every spelling tariff.py's _MONTH_NAMES accepts, so a season written any of
+// the ways the service takes is still shown as controls. This is a reader and
+// never a gate: a name missing from it means the entry is shown as text, not
+// that the entry is wrong.
+//
+// With no prototype, because it is looked up by whatever the owner typed. An
+// ordinary object answers "constructor" and "__proto__" with something truthy,
+// so a season written "constructor" read as a month, and the entry was then
+// recomposed with its season quietly dropped instead of being kept as the text
+// the service is about to refuse.
+const MONTH_NUMBER = Object.assign(Object.create(null), {
+  jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+  may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
+  sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11,
+  dec: 12, december: 12,
+});
+
+// Minutes past midnight, with 1440 kept distinct from 0. Both are the same
+// instant and tariff.py reads them as the same time, but 24:00 is how the end
+// of a day is written and 00:00-24:00 is how these controls say "all day": a
+// range whose ends coincide is refused unless the end is written 24:00.
+// Collapsing the two would turn every all-day band into one the service
+// rejects.
+const DAY_END = 1440;
+const HHMM = (m) => (m >= DAY_END ? '24:00'
+  : `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`);
+
+// One end of a range. Deliberately stricter than _parse_clock, which accepts
+// anything Python's int() does: what this refuses is shown as text instead,
+// which is the safe direction. Claiming to understand "+16" and re-emitting it
+// as something else is not.
+function readClock(token) {
+  const m = /^(\d{1,2})(?::(\d{1,2}))?$/.exec(String(token).trim());
+  if (!m) return null;
+  const hour = Number(m[1]);
+  const minute = m[2] === undefined ? 0 : Number(m[2]);
+  if (hour === 24 && minute === 0) return DAY_END;
+  if (hour > 23 || minute > 59) return null;
+  return hour * 60 + minute;
+}
+
+// The comma-separated ranges of one band, or null if any of them will not read.
+//
+// A range whose two ends coincide is refused here as well, because _parse_hours
+// refuses it: 16:00-16:00 is a person having written something they did not
+// mean, and the only spelling of a whole day the service takes is 00:00-24:00.
+// Showing it as controls would offer the owner a repaired-looking band the
+// service will not store, and the box they have to fix would no longer hold
+// what they wrote.
+function readHours(text) {
+  const ranges = [];
+  for (const chunk of String(text).split(',')) {
+    const span = chunk.trim();
+    if (!span) continue;
+    const cut = span.indexOf('-');
+    if (cut < 0) return null;
+    const start = readClock(span.slice(0, cut));
+    const end = readClock(span.slice(cut + 1));
+    if (start === null || end === null || start === DAY_END) return null;
+    if (start === end) return null;
+    ranges.push({ s: start, e: end });
+  }
+  return ranges.length ? ranges : null;
+}
+
+// The season, as a set of month numbers: null for every month, false when the
+// text will not read. The two are different answers and the caller treats them
+// differently — "all year" is a season and "I cannot show this" is not.
+function readMonths(text) {
+  const trimmed = String(text).trim();
+  if (!trimmed) return null;
+  const months = new Set();
+  for (const piece of trimmed.split(',')) {
+    const part = piece.trim().toLowerCase();
+    if (!part) continue;
+    if (part.includes('-')) {
+      const cut = part.indexOf('-');
+      const first = MONTH_NUMBER[part.slice(0, cut).trim()];
+      const last = MONTH_NUMBER[part.slice(cut + 1).trim()];
+      if (!first || !last) return false;
+      // A season may wrap the year end, and a winter one always does.
+      if (first <= last) for (let m = first; m <= last; m += 1) months.add(m);
+      else {
+        for (let m = first; m <= 12; m += 1) months.add(m);
+        for (let m = 1; m <= last; m += 1) months.add(m);
+      }
+    } else {
+      if (!MONTH_NUMBER[part]) return false;
+      months.add(MONTH_NUMBER[part]);
+    }
+  }
+  return months.size ? months : null;
+}
+
+// One entry as controls, or null to leave it as text.
+//
+// It reads less than the service accepts and never more: a shape it refuses is
+// shown as text, so the box the owner fixes is the one holding what they wrote.
+// Refusing an entry the service would too — an empty name, a price that is not
+// a plain decimal, a range whose ends coincide — is part of that, since
+// controls for it would present a rejected tariff as an edited one.
+//
+// One refusal it cannot see is a repeated band name, which is a fact about two
+// entries and this reads one at a time. The service catches it and says so.
+function readBand(entry) {
+  const parts = entry.split('|').map((p) => p.trim());
+  if (parts.length < 3 || parts.length > 4) return null;
+  const [name, price, hours] = parts;
+  if (!name) return null;
+  // A plain decimal. Exponents and the infinities read as numbers to
+  // JavaScript, and re-emitting one in a form the service reads differently is
+  // exactly the drift this editor exists to avoid.
+  if (!/^\d+(\.\d*)?$|^\.\d+$/.test(price)) return null;
+  const ranges = readHours(hours);
+  if (!ranges) return null;
+  const months = parts.length === 4 ? readMonths(parts[3]) : null;
+  if (months === false) return null;
+  return { name, price, ranges, months };
+}
+
+// The season written back. A run of consecutive months becomes the range it
+// was almost certainly typed as — including one wrapping the year — and
+// anything else becomes the list. Every month selected is no season at all, so
+// the field is left off entirely rather than spelled out twelve times.
+function writeMonths(months) {
+  if (!months || months.size === 0 || months.size === 12) return '';
+  const has = (m) => months.has(m < 1 ? 12 : m > 12 ? 1 : m);
+  const opens = [];
+  for (let m = 1; m <= 12; m += 1) if (has(m) && !has(m - 1)) opens.push(m);
+  if (opens.length === 1) {
+    let end = opens[0];
+    while (has(end + 1)) end = end === 12 ? 1 : end + 1;
+    return end === opens[0] ? MONTH_ABBR[opens[0] - 1]
+      : `${MONTH_ABBR[opens[0] - 1]}-${MONTH_ABBR[end - 1]}`;
+  }
+  return [...months].sort((a, b) => a - b).map((m) => MONTH_ABBR[m - 1]).join(',');
+}
+
+// Characters that mean something to the format itself: a pipe separates the
+// fields of a band and a semicolon or a newline separates one band from the
+// next. A name holding any of them does not produce a band with a funny name —
+// it produces a DIFFERENT SET OF BANDS. Naming a band "Cheap | 0.10 |
+// 00:00-16:00; Peak" composes text the service reads as two bands, one of them
+// priced at a rate the owner never typed, while this editor goes on showing one.
+// The service cannot catch it: the result is a perfectly valid tariff.
+//
+// So they are dropped here, at the point of serialisation, and said out loud
+// beside the name. This is not the page judging whether a tariff is valid —
+// that is still the service's alone. It is the page refusing to corrupt its own
+// serialisation, which is the one thing the service has no way to check.
+const DELIMITERS = /[|;\n\r]/g;
+
+const nameHasDelimiter = (name) => /[|;\n\r]/.test(name);
+
+function writeBand(band) {
+  const hours = band.ranges.map((r) => `${HHMM(r.s)}-${HHMM(r.e)}`).join(', ');
+  const season = writeMonths(band.months);
+  const name = band.name.replace(DELIMITERS, ' ').replace(/\s+/g, ' ').trim();
+  return [name, band.price, hours].concat(season ? [season] : []).join(' | ');
+}
+
+// A range the two dropdowns can be set to and the service will not take. The
+// end list has to hold every time the start list does — a band ending at four
+// is as ordinary as one starting there — so this is caught by saying so beside
+// the range rather than by leaving the time out of the list.
+const emptyRange = (range) => range.e === range.s;
+
+// What a range covers, in words. Read off the same two numbers the service
+// reads, so a band that runs through midnight says so before it is saved
+// rather than after a month of the overnight rate landing nowhere.
+function spanWords(range) {
+  if (emptyRange(range)) return 'no hours at all, and the service will refuse it';
+  const mins = range.e > range.s ? range.e - range.s : DAY_END - range.s + range.e;
+  if (mins === DAY_END) return 'all day';
+  const hours = Math.floor(mins / 60);
+  const rest = mins % 60;
+  const words = [hours ? `${hours} hour${hours === 1 ? '' : 's'}` : '', rest ? `${rest} min` : '']
+    .filter(Boolean).join(' ');
+  return range.e > range.s ? words : `${words}, through midnight`;
+}
+
+// State of the editor. `original` is the text it was mounted on, and while
+// nothing has been touched that exact string is what gets written back.
+let bandState = null;
+
+function bandItems(text) {
+  const items = [];
+  // Semicolons and newlines both separate entries, exactly as parse_bands has
+  // it, and a blank entry is ignored by both.
+  for (const raw of String(text || '').replace(/\n/g, ';').split(';')) {
+    const entry = raw.trim();
+    if (!entry) continue;
+    const band = readBand(entry);
+    items.push(band ? Object.assign({ type: 'band', raw: entry, dirty: false }, band)
+      : { type: 'raw', raw: entry, dirty: false });
+  }
+  return items;
+}
+
+// The text the service will be given. Untouched entries hand back the string
+// they were read from; only the ones actually edited are composed, and while
+// nothing at all has changed the whole original is returned character for
+// character — a load-edit-save cycle that changed nothing stores what was
+// already there.
+function composeBands() {
+  const st = bandState;
+  if (!st) return '';
+  if (!st.changed) return st.original;
+  // A band added here has no string it came from, so it is composed whatever
+  // its dirty flag says — the flag answers "has this been edited", and there is
+  // nothing to fall back to when the answer is no.
+  const parts = st.items.map((item) => (item.type === 'raw' ? item.raw.trim()
+    : (item.dirty || item.raw === null ? writeBand(item) : item.raw))).filter(Boolean);
+  // One band per line, which is how the help text describes the format and how
+  // a tariff of three bands reads. A tariff written on one line with
+  // semicolons keeps that shape.
+  const sep = st.original.includes('\n') || !st.original.includes(';') ? '\n' : '; ';
+  return parts.join(sep);
+}
+
+// How long a range added by the button covers, and where it starts: at the end
+// of the hours already chosen, so the second range on a band picks up where the
+// first left off and an owner adding an evening to an afternoon is one dropdown
+// away from what they meant.
+//
+// What it must never be is the whole day. parse_bands is first-match-wins, so a
+// range of 00:00-24:00 on any band but the last takes every hour from every band
+// below it — and the result is a *valid* tariff, so nothing is refused, nothing
+// is null, and nothing on any page says a word. One click on the peak band of
+// "Peak | 0.34 | 16:00-21:00; Off | 0.11 | 21:00-16:00" moved 500 kWh of January
+// from $78.96 to $170.00, with the off-peak band still sitting there in the
+// editor reading 0.11.
+const NEW_RANGE_MINUTES = 60;
+
+function nextRange(ranges) {
+  const last = ranges.length ? ranges[ranges.length - 1] : null;
+  // Midnight at the end of a day is the same instant as midnight at the start
+  // of one, and only the second can open a range.
+  const start = last === null || last.e >= DAY_END ? 0 : last.e;
+  return { s: start, e: Math.min(start + NEW_RANGE_MINUTES, DAY_END) };
+}
+
+// A band with nothing in it yet.
+//
+// No name and no rate: a price nobody typed is a price this page invented, and
+// the whole tariff exists so that no figure on the Costs page was invented here.
+//
+// Its hours *are* the whole day, which an added range must never be, and the
+// difference is position. A new band goes on the end, and first-match-wins
+// means the last band takes only what the ones above it left — so all day here
+// changes the price of nothing and closes the hours no band claims. A second
+// range on a band already in the list is the one that steals.
+function newBand() {
+  return {
+    type: 'band', raw: null, dirty: true, name: '', price: '',
+    ranges: [{ s: 0, e: DAY_END }], months: null,
+  };
+}
+
+// Whether a month's button shows as pressed. A band with no season applies in
+// every month, so every one of them is pressed.
+//
+// Rendering "no season" as twelve unpressed buttons drew a band that applies
+// all year identically to one that applies in no month at all, made the same
+// tariff written "| Jan-Dec" look like a different tariff, and told a screen
+// reader that every month was off for a band covering all of them. It also made
+// the first click a trap: pressing January on an all-year band removed January,
+// and January's was the one button whose state did not appear to change.
+const monthOn = (months, month) => months === null || months.has(month);
+
+// The season after a month button is pressed, as a set or null for all year.
+//
+// "Every month" is stored as no season at all, so switching one off has to
+// start from the full twelve rather than from nothing — otherwise turning
+// January off would leave a band that applies in January alone. Switching the
+// last one off lands back on null, because the format has no way to write a
+// band that applies in no month, and the strip says "All year" again.
+function toggleMonth(months, month) {
+  const next = months === null ? new Set(MONTH_ABBR.map((_, i) => i + 1)) : new Set(months);
+  if (next.has(month)) next.delete(month); else next.add(month);
+  return next.size ? next : null;
+}
+
+// Whether a band covers one minute of one month, by the same rule TimeRange
+// applies: a range that runs backwards wraps midnight rather than being empty.
+function bandCovers(item, month, minute) {
+  if (!monthOn(item.months, month)) return false;
+  return item.ranges.some((r) => (r.s < r.e ? minute >= r.s && minute < r.e
+    : minute >= r.s || minute < r.e));
+}
+
+// The indices of bands that price nothing at all, because the bands above them
+// take every minute they cover.
+//
+// The service warns about the opposite — hours no band claims, which the Costs
+// page reports as unpriced minutes — but a band shadowed by a wider one above
+// it is silent in a way the owner cannot see: the tariff is valid, the rate sits
+// there in the editor looking like the rate in force, and the energy is priced
+// at the band above's. So this is a warning and only a warning; nothing here
+// refuses to store anything.
+//
+// An entry shown as text is opaque — nobody here knows what hours it claims —
+// so one anywhere in the list means nothing is reported rather than something
+// untrue. Bands with no name yet are counted in the coverage and never
+// reported, since a band being written is not a band being shadowed.
+function shadowedBands(items) {
+  if (items.some((item) => item.type !== 'band')) return new Set();
+  const used = new Set();
+  for (let month = 1; month <= 12; month += 1) {
+    for (let minute = 0; minute < DAY_END; minute += 1) {
+      const winner = items.findIndex((item) => bandCovers(item, month, minute));
+      if (winner >= 0) used.add(winner);
+    }
+  }
+  const dead = new Set();
+  items.forEach((item, i) => { if (!used.has(i) && item.name.trim()) dead.add(i); });
+  return dead;
+}
+
+function pushBands() {
+  const box = document.querySelector(`[data-key="${CSS.escape(BANDS_KEY)}"]`);
+  if (!box) return;
+  box.value = composeBands();
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function touch(item) {
+  item.dirty = true;
+  bandState.changed = true;
+  pushBands();
+  markShadowed();
+}
+
+function clockOptions(selected, isEnd) {
+  const values = [];
+  for (let m = 0; m < DAY_END; m += 30) values.push(m);
+  if (isEnd) values.push(DAY_END);
+  // A tariff on a quarter hour is not this list's business to round off.
+  if (!values.includes(selected)) values.push(selected);
+  values.sort((a, b) => a - b);
+  return values.map((m) =>
+    `<option value="${m}"${m === selected ? ' selected' : ''}>${HHMM(m)}</option>`).join('');
+}
+
+function bandMarkup(item, index) {
+  if (item.type === 'raw') {
+    return `<div class="band" data-i="${index}">
+      <div>
+        <span class="cap">Kept exactly as written</span>
+        <input type="text" class="rawline" data-role="raw" value="${esc(item.raw)}">
+      </div>
+      <p class="bandnote keep">This entry is not in a shape these controls can show, so it is
+        left as text and stored exactly as it reads. The service still checks it.</p>
+      <div class="bandacts">
+        <button type="button" class="iconbtn" data-role="drop">Remove this band</button>
+      </div>
+    </div>`;
+  }
+  const spans = item.ranges.map((range, r) => `<div class="span" data-r="${r}">
+      <select data-role="start" aria-label="Start of range ${r + 1}">
+        ${clockOptions(range.s, false)}</select>
+      <span class="to">to</span>
+      <select data-role="end" aria-label="End of range ${r + 1}">
+        ${clockOptions(range.e, true)}</select>
+      <span class="hint${emptyRange(range) ? ' warn' : ''}">${esc(spanWords(range))}</span>
+      ${item.ranges.length > 1
+        ? `<button type="button" class="iconbtn" data-role="droprange">Remove</button>` : ''}
+    </div>`).join('');
+  const months = MONTH_ABBR.map((name, m) => {
+    const on = monthOn(item.months, m + 1);
+    return `<button type="button" data-role="month" data-m="${m + 1}" `
+      + `aria-pressed="${on}">${esc(name)}</button>`;
+  }).join('');
+  return `<div class="band" data-i="${index}">
+    <div class="top">
+      <div class="who">
+        <span class="cap">Band name</span>
+        <input type="text" data-role="name" value="${esc(item.name)}"
+          aria-label="Band name" spellcheck="false">
+      </div>
+      <div class="rate">
+        <span class="cap">Rate</span>
+        <div class="box"><span>${esc(currencyNow())}</span>
+          <input type="text" data-role="price" value="${esc(item.price)}"
+            inputmode="decimal" aria-label="Rate per kWh"><span>per kWh</span></div>
+      </div>
+    </div>
+    <div>
+      <span class="cap">Hours it applies to</span>
+      ${spans}
+      <div class="bandacts">
+        <button type="button" class="iconbtn" data-role="addrange">Add another time range</button>
+      </div>
+    </div>
+    <div>
+      <span class="cap">Months</span>
+      <div class="mons">${months}
+        <span class="season">${esc(writeMonths(item.months) || 'All year')}</span></div>
+    </div>
+    <p class="bandnote warn" data-role="dead" hidden>Every hour this band covers is already
+      taken by a band above it, so nothing is ever priced at this rate. The bands are read in
+      order and the first one that matches wins. This will still be saved.</p>
+    <p class="bandnote warn" data-role="delim" hidden>A band name cannot hold
+      <code>|</code>, <code>;</code> or a line break: those are what separate one band from
+      the next and one field from the next, so a name containing them would be stored as a
+      different set of bands than the one shown here. They are dropped from the name when it
+      is saved.</p>
+    <div class="bandacts">
+      <button type="button" class="iconbtn" data-role="drop">Remove this band</button>
+    </div>
+  </div>`;
+}
+
+// The currency is a setting like any other, read from the control beside this
+// one so a symbol changed in the same visit is the symbol shown here. Nothing
+// is stored: it only labels the rate box.
+function currencyNow() {
+  const el = document.querySelector('[data-key="tariff.currency"]');
+  const value = el ? el.value : saved['tariff.currency'];
+  return String(value || '$');
+}
+
+// Show or hide the "never priced" note on each band. Recomputed rather than
+// remembered, and called after every edit, because which band is shadowed is a
+// fact about all of them together: a range added three bands up can silence one
+// down here without anything in this band having been touched.
+function markShadowed() {
+  const host = $('bandEditor');
+  if (!host) return;
+  const dead = shadowedBands(bandState.items);
+  host.querySelectorAll('.band').forEach((el) => {
+    const note = el.querySelector('[data-role="dead"]');
+    if (note) note.hidden = !dead.has(Number(el.dataset.i));
+    // Said where the name is typed rather than after a save, because what is
+    // stored differs from what is on screen and nothing downstream can tell.
+    const delim = el.querySelector('[data-role="delim"]');
+    const item = bandState.items[Number(el.dataset.i)];
+    if (delim) {
+      delim.hidden = !(item && item.type !== 'raw' && nameHasDelimiter(item.name));
+    }
+  });
+}
+
+function drawBands() {
+  const host = $('bandEditor');
+  if (!host) return;
+  const kept = bandState.items.filter((i) => i.type === 'raw').length;
+  host.innerHTML = bandState.items.map((item, i) => bandMarkup(item, i)).join('')
+    + `<div class="bandacts">
+         <button type="button" class="iconbtn" id="bandAdd">Add a band</button>
+       </div>`
+    + (bandState.items.length ? '' : '<p class="bandnote">No bands yet, so nothing is priced '
+      + 'anywhere. Add one, or write the tariff as text.</p>')
+    + (kept ? `<p class="bandnote keep">${kept} entr${kept === 1 ? 'y is' : 'ies are'} shown as `
+      + 'text above, and will be stored exactly as written.</p>' : '');
+  wireBands(host);
+  markShadowed();
+}
+
+function wireBands(host) {
+  const itemAt = (el) => bandState.items[Number(el.closest('.band').dataset.i)];
+  const rangeAt = (el) => itemAt(el).ranges[Number(el.closest('.span').dataset.r)];
+
+  host.querySelectorAll('[data-role="name"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      // The three characters that separate one thing from another in this
+      // format. A band called "Peak | night" would be read back as a different
+      // band with a different price, so they never reach the value at all.
+      const clean = el.value.replace(/[|;\n]/g, '');
+      if (clean !== el.value) el.value = clean;
+      const item = itemAt(el);
+      item.name = clean;
+      touch(item);
+    });
+  });
+  host.querySelectorAll('[data-role="price"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      const item = itemAt(el);
+      item.price = el.value.trim();
+      touch(item);
+    });
+  });
+  host.querySelectorAll('[data-role="raw"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      const item = itemAt(el);
+      item.raw = el.value;
+      touch(item);
+    });
+  });
+  host.querySelectorAll('[data-role="start"],[data-role="end"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      const range = rangeAt(el);
+      range[el.dataset.role === 'start' ? 's' : 'e'] = Number(el.value);
+      const hint = el.closest('.span').querySelector('.hint');
+      hint.textContent = spanWords(range);
+      // Both ends on the same time is the one thing these two lists can build
+      // that the service will not store, so it is marked here rather than
+      // discovered as a rejected save.
+      hint.className = `hint${emptyRange(range) ? ' warn' : ''}`;
+      touch(itemAt(el));
+    });
+  });
+  host.querySelectorAll('[data-role="month"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const item = itemAt(el);
+      item.months = toggleMonth(item.months, Number(el.dataset.m));
+      const strip = el.closest('.mons');
+      strip.querySelectorAll('[data-role="month"]').forEach((b) => {
+        b.setAttribute('aria-pressed', String(monthOn(item.months, Number(b.dataset.m))));
+      });
+      strip.querySelector('.season').textContent = writeMonths(item.months) || 'All year';
+      touch(item);
+    });
+  });
+  host.querySelectorAll('[data-role="addrange"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const item = itemAt(el);
+      item.ranges.push(nextRange(item.ranges));
+      touch(item);
+      drawBands();
+    });
+  });
+  host.querySelectorAll('[data-role="droprange"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const item = itemAt(el);
+      item.ranges.splice(Number(el.closest('.span').dataset.r), 1);
+      touch(item);
+      drawBands();
+    });
+  });
+  host.querySelectorAll('[data-role="drop"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      bandState.items.splice(Number(el.closest('.band').dataset.i), 1);
+      bandState.changed = true;
+      pushBands();
+      drawBands();
+    });
+  });
+  const add = $('bandAdd');
+  if (add) {
+    add.addEventListener('click', () => {
+      bandState.items.push(newBand());
+      bandState.changed = true;
+      pushBands();
+      drawBands();
+      const boxes = $('bandEditor').querySelectorAll('[data-role="name"]');
+      if (boxes.length) boxes[boxes.length - 1].focus();
+    });
+  }
+}
+
+// The editor is mounted over the registry's own textarea rather than in place
+// of it: the textarea keeps holding the value, so currentValue, pending, save
+// and the server's own error message all still work on the field they always
+// worked on, and switching to text is switching which of the two is visible.
+function mountBandEditor(spec) {
+  const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
+  if (!box) return;
+  const area = box.querySelector('[data-key]');
+  if (!area) return;
+  bandState = { original: area.value, items: bandItems(area.value), changed: false };
+
+  const shell = document.createElement('div');
+  shell.className = 'bands';
+  shell.id = 'bandEditor';
+  const bar = document.createElement('div');
+  bar.className = 'bandacts';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'iconbtn';
+  toggle.textContent = 'Edit as text';
+  bar.appendChild(toggle);
+  area.parentNode.insertBefore(shell, area);
+  area.parentNode.insertBefore(bar, area.nextSibling);
+  area.hidden = true;
+
+  toggle.addEventListener('click', () => {
+    if (area.hidden) {
+      area.hidden = false;
+      shell.hidden = true;
+      toggle.textContent = 'Back to the editor';
+      area.focus();
+    } else {
+      // Whatever was typed becomes the new starting point, so a hand-edited
+      // tariff the controls can show is shown, and one they cannot keeps its
+      // text. Nothing is normalised on the way through.
+      bandState = { original: area.value, items: bandItems(area.value), changed: false };
+      area.hidden = true;
+      shell.hidden = false;
+      toggle.textContent = 'Edit as text';
+      drawBands();
+    }
+  });
+
+  // The rate boxes are labelled with the currency symbol, which is a control on
+  // this same page. Without this the label kept whatever symbol was in force
+  // when the editor was drawn, so a tariff entered in the same visit as the
+  // symbol it is priced in read in the old one until something else redrew.
+  const symbol = document.querySelector('[data-key="tariff.currency"]');
+  if (symbol) symbol.addEventListener('input', () => { if (!shell.hidden) drawBands(); });
+
+  drawBands();
+}
+
+// ---------------------------------------------------------------------------
+// The string editor — panels compose the grammar the way the band editor
+// composes the tariff: the browser builds the text, only Python reads it.
+// One editor above one textarea, with the same "edit as text" fallback and the
+// same rule: the browser never judges whether a config is valid, because a
+// second parser that disagrees is the bug this shape exists to prevent.
+// ---------------------------------------------------------------------------
+
+const PANELS_KEY = 'panels.strings';
+
+// Defaults the server applies, mirrored from panels.py::_FLOAT_DEFAULTS and
+// _DEFAULT_MOUNTING. Shown as greyed placeholder text for fields the owner has
+// left empty, so a blank box reads as the assumption rather than a mystery.
+// The test at tests/test_settings_panels_editor.py pins these against the
+// actual parser by round-tripping through composeStringLine.
+const PANEL_DEFAULTS = {
+  temp_coeff: -0.35,
+  noct: 45.0,
+  mounting: 'open_rack',
+  bifacial: 0.0,
+  degradation: 0.5,
+};
+
+const MOUNTINGS = ['open_rack', 'close_roof', 'ground'];
+
+// One grammar line from a row object. Advanced fields whose value is empty are
+// left off — the server applies its own default — except note, which is only
+// included when non-empty so an unset note is not stored as the empty string.
+function composeStringLine(row) {
+  const parts = [
+    String(row.name || '').trim(),
+    row.mppt,
+    row.panels,
+    row.watts,
+    row.tilt,
+    row.azimuth,
+  ];
+  const adv = row.advanced || {};
+  for (const [key, value] of Object.entries(adv)) {
+    if (value === '' || value === null || value === undefined) continue;
+    // Quoted so a note with spaces stays as one token.
+    if (key === 'note') {
+      // Escaped the way panels.py unescapes: backslashes first, then quotes,
+      // so a note that quotes something survives the round trip instead of
+      // being refused at the door.
+      const safe = String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      parts.push(`note="${safe}"`);
+    } else {
+      parts.push(`${key}=${value}`);
+    }
+  }
+  return parts.join(' | ');
+}
+
+// Every row joined, one string per line.
+function composeStrings(rows) {
+  return rows.map((r) => composeStringLine(r)).join('\n');
+}
+
+// Read one line back into a row object for populating the editor from stored
+// text. Permissive on purpose — the server re-validates — but must round-trip
+// everything composeStringLine emits. Comments and blanks are the caller's to
+// skip; this reads a single line.
+function splitStringLine(line) {
+  const parts = line.split('|').map((p) => p.trim());
+  const row = {
+    name: parts[0] || '',
+    mppt: parts[1] || '',
+    panels: parts[2] || '',
+    watts: parts[3] || '',
+    tilt: parts[4] || '',
+    azimuth: parts[5] || '',
+    advanced: {},
+  };
+  // The tail is rejoined before its tokens are read, exactly as panels.py
+  // rejoins it: a quoted note may contain the separator, and splitting the
+  // whole line on "|" would tear such a note in half — the editor would then
+  // show a truncated value for a config the server reads correctly.
+  const tail = parts.slice(6).join(' | ');
+  const token = /(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))/g;
+  let m = token.exec(tail);
+  while (m !== null) {
+    const raw = m[2] !== undefined
+      ? m[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\')
+      : m[3];
+    row.advanced[m[1]] = raw;
+    m = token.exec(tail);
+  }
+  return row;
+}
+
+// Terminal marker for the node-test extraction harness. This empty function
+// is the stable end-of-slice sentinel and is never called.
+function panelsEditorEnd() {}
+
+// State of the string editor. Same shape as bandState: holds what was
+// originally in the textarea, and while nothing is touched that exact string
+// goes back.
+let panelState = null;
+
+// The default placeholder text for an advanced key, or the empty string when
+// the server has no default for it.
+function panelDefault(key) {
+  return String(key in PANEL_DEFAULTS ? PANEL_DEFAULTS[key] : '');
+}
+
+// One row as controls. The six positional fields always show; the rest live
+// inside an Advanced disclosure so the common case — name, MPPT, count,
+// rating, tilt, azimuth — is the visible one and the uncommon case is two
+// clicks away.
+function panelMarkup(row, i) {
+  const adv = row.advanced || {};
+  const ph = (key) => {
+    const d = panelDefault(key);
+    return d ? ` placeholder="${esc(d)}"` : '';
+  };
+  const val = (key) => esc(adv[key] || '');
+
+  const advRows = [
+    `<div class="span">
+       <span class="cap">Temp coefficient</span>
+       <input type="text" data-role="adv" data-key="temp_coeff"
+         value="${val('temp_coeff')}"${ph('temp_coeff')}
+         inputmode="decimal" aria-label="Temperature coefficient %/°C">
+       <span class="u">%/°C</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">NOCT</span>
+       <input type="text" data-role="adv" data-key="noct"
+         value="${val('noct')}"${ph('noct')}
+         inputmode="decimal" aria-label="NOCT °C">
+       <span class="u">°C</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Mounting</span>
+       <select data-role="adv" data-key="mounting" aria-label="Mounting">
+         ${MOUNTINGS.map((m) => `<option value="${m}"${adv.mounting === m ? ' selected' : ''}>${m.replace(/_/g, ' ')}</option>`).join('')}
+       </select>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Bifacial</span>
+       <input type="text" data-role="adv" data-key="bifacial"
+         value="${val('bifacial')}"${ph('bifacial')}
+         inputmode="decimal" aria-label="Bifacial percentage">
+       <span class="u">%</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Installed</span>
+       <input type="text" data-role="adv" data-key="installed"
+         value="${val('installed')}"
+         placeholder="YYYY-MM" aria-label="Installed date">
+     </div>`,
+    `<div class="span">
+       <span class="cap">Degradation</span>
+       <input type="text" data-role="adv" data-key="degradation"
+         value="${val('degradation')}"${ph('degradation')}
+         inputmode="decimal" aria-label="Degradation %/yr">
+       <span class="u">%/yr</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Vmp</span>
+       <input type="text" data-role="adv" data-key="vmp"
+         value="${val('vmp')}"
+         inputmode="decimal" aria-label="Vmp volts">
+       <span class="u">V</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Voc</span>
+       <input type="text" data-role="adv" data-key="voc"
+         value="${val('voc')}"
+         inputmode="decimal" aria-label="Voc volts">
+       <span class="u">V</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Wire gauge</span>
+       <input type="text" data-role="adv" data-key="wire_awg"
+         value="${val('wire_awg')}"
+         inputmode="numeric" aria-label="DC wire gauge, AWG">
+       <span class="u">AWG</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Wire run</span>
+       <input type="text" data-role="adv" data-key="wire_run_ft"
+         value="${val('wire_run_ft')}"
+         inputmode="decimal" aria-label="One-way DC run length in feet">
+       <span class="u">ft one way</span>
+     </div>`,
+    `<div class="span">
+       <span class="cap">Note</span>
+       <input type="text" data-role="adv" data-key="note"
+         value="${val('note')}"
+         aria-label="Note">
+     </div>`,
+  ].join('');
+
+  return `<div class="band" data-i="${i}">
+    <div class="top">
+      <div class="who">
+        <span class="cap">String name</span>
+        <input type="text" data-role="name" value="${esc(row.name)}"
+          aria-label="String name" spellcheck="false">
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div><span class="cap">MPPT</span>
+          <input type="text" data-role="mppt" value="${esc(row.mppt)}"
+            inputmode="numeric" aria-label="MPPT number" style="width:5ch"></div>
+        <div><span class="cap">Panels</span>
+          <input type="text" data-role="panels" value="${esc(row.panels)}"
+            inputmode="numeric" aria-label="Number of panels" style="width:5ch"></div>
+        <div><span class="cap">Watts each</span>
+          <input type="text" data-role="watts" value="${esc(row.watts)}"
+            inputmode="decimal" aria-label="Watts per panel" style="width:7ch"></div>
+      </div>
+    </div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><span class="cap">Tilt °</span>
+        <input type="text" data-role="tilt" value="${esc(row.tilt)}"
+          inputmode="decimal" aria-label="Tilt degrees" style="width:6ch"></div>
+      <div><span class="cap">Azimuth °</span>
+        <input type="text" data-role="azimuth" value="${esc(row.azimuth)}"
+          inputmode="decimal" aria-label="Azimuth degrees" style="width:6ch"></div>
+    </div>
+    <details>
+      <summary><span style="font-size:11px;color:var(--ink3)">Advanced</span></summary>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">${advRows}</div>
+    </details>
+    <div class="bandacts">
+      <button type="button" class="iconbtn" data-role="drop">Remove this string</button>
+    </div>
+  </div>`;
+}
+
+// Push the composed text into the registry's textarea so the save path, the
+// dirty check and error reporting all work on the field they always worked on.
+function pushPanels() {
+  const box = document.querySelector(`[data-key="${CSS.escape(PANELS_KEY)}"]`);
+  if (!box) return;
+  box.value = composeStrings(panelState.rows);
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+// Mark a row as touched so composeStrings emits it rather than handing back
+// the original text unchanged.
+function touchPanel() {
+  panelState.changed = true;
+  pushPanels();
+}
+
+// An empty row, seeded from the defaults so the owner fills in the six
+// required fields and the advanced ones already read as the assumption.
+function newPanelRow() {
+  return {
+    name: '', mppt: '', panels: '', watts: '', tilt: '', azimuth: '',
+    advanced: {},
+  };
+}
+
+function drawPanels() {
+  const host = $('panelEditor');
+  if (!host) return;
+  const rows = panelState.rows;
+  host.innerHTML = rows.map((row, i) => panelMarkup(row, i)).join('')
+    + `<div class="bandacts">
+         <button type="button" class="iconbtn" id="panelAdd">Add a string</button>
+       </div>`
+    + (rows.length ? '' : '<p class="bandnote">No strings yet. Add one, or write the array as '
+      + 'text.</p>');
+  wirePanels(host);
+}
+
+function wirePanels(host) {
+  const rowAt = (el) => panelState.rows[Number(el.closest('.band').dataset.i)];
+
+  host.querySelectorAll('[data-role="name"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      // Pipe is the field separator in this grammar. A name containing one
+      // produces a different config than the one shown on screen — the service
+      // reads what was stored, and what was stored has an extra field.
+      const clean = el.value.replace(/[|\n]/g, '');
+      if (clean !== el.value) el.value = clean;
+      rowAt(el).name = clean;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="mppt"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).mppt = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="panels"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).panels = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="watts"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).watts = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="tilt"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).tilt = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="azimuth"]').forEach((el) => {
+    el.addEventListener('input', () => { rowAt(el).azimuth = el.value.trim(); touchPanel(); });
+  });
+  host.querySelectorAll('[data-role="adv"]').forEach((el) => {
+    el.addEventListener('input', () => {
+      rowAt(el).advanced[el.dataset.key] = el.value;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="adv"][data-key="mounting"]').forEach((el) => {
+    el.addEventListener('change', () => {
+      rowAt(el).advanced.mounting = el.value;
+      touchPanel();
+    });
+  });
+  host.querySelectorAll('[data-role="drop"]').forEach((el) => {
+    el.addEventListener('click', () => {
+      panelState.rows.splice(Number(el.closest('.band').dataset.i), 1);
+      panelState.changed = true;
+      pushPanels();
+      drawPanels();
+    });
+  });
+  const add = $('panelAdd');
+  if (add) {
+    add.addEventListener('click', () => {
+      panelState.rows.push(newPanelRow());
+      panelState.changed = true;
+      pushPanels();
+      drawPanels();
+      const boxes = $('panelEditor').querySelectorAll('[data-role="name"]');
+      if (boxes.length) boxes[boxes.length - 1].focus();
+    });
+  }
+}
+
+function mountPanelsEditor(spec) {
+  const box = document.querySelector(`.f[data-for="${CSS.escape(spec.key)}"]`);
+  if (!box) return;
+  const area = box.querySelector('[data-key]');
+  if (!area) return;
+
+  const rows = [];
+  if (area.value.trim()) {
+    for (const raw of area.value.split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('#')) continue;
+      rows.push(splitStringLine(line));
+    }
+  }
+  panelState = { original: area.value, rows, changed: false };
+
+  const shell = document.createElement('div');
+  shell.className = 'bands';
+  shell.id = 'panelEditor';
+  const bar = document.createElement('div');
+  bar.className = 'bandacts';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'iconbtn';
+  toggle.textContent = 'Edit as text';
+  bar.appendChild(toggle);
+  area.parentNode.insertBefore(shell, area);
+  area.parentNode.insertBefore(bar, area.nextSibling);
+  area.hidden = true;
+
+  toggle.addEventListener('click', () => {
+    if (area.hidden) {
+      area.hidden = false;
+      shell.hidden = true;
+      toggle.textContent = 'Back to the editor';
+      area.focus();
+    } else {
+      const lines = [];
+      for (const raw of area.value.split('\n')) {
+        const line = raw.trim();
+        if (!line || line.startsWith('#')) continue;
+        lines.push(splitStringLine(line));
+      }
+      panelState = { original: area.value, rows: lines, changed: false };
+      area.hidden = true;
+      shell.hidden = false;
+      toggle.textContent = 'Edit as text';
+      drawPanels();
+    }
+  });
+
+  drawPanels();
+}
+
+// ---------------------------------------------------------------------------
+// Filling the coordinates from the device.
+//
+// The one per-key affordance on this page, and it earns it: a latitude typed
+// by hand is five digits nobody can check. It is keyed on the two settings
+// existing and reads its bounds and labels from them like everything else, so
+// a registry that drops them drops this with no change here.
+//
+// Geolocation is a secure-context API, and this service is reached over plain
+// http at an address on the LAN. What that actually does, measured rather than
+// assumed, in Chrome 149 with the page served over plain http at a private
+// LAN address: navigator.geolocation is still there, `'geolocation' in
+// navigator` is true,
+// and getCurrentPosition calls the error callback immediately with code 1 and
+// "Only secure origins are allowed". No prompt is shown and the owner is never
+// asked anything.
+//
+// So the presence of the API is not the test; window.isSecureContext is, and
+// it reads false at exactly those origins. A button gated on the API existing
+// would be a button that appears, is pressed, and reports a refusal nobody
+// made — which is why the control is replaced by a sentence saying where the
+// page has to be opened from instead.
+// ---------------------------------------------------------------------------
+
+const SITE_LAT = 'site.latitude';
+const SITE_LON = 'site.longitude';
+
+function mountLocation() {
+  const lat = fields.find((f) => f.key === SITE_LAT);
+  const lon = fields.find((f) => f.key === SITE_LON);
+  if (!lat || !lon) return;
+  const anchor = document.querySelector(`.f[data-for="${CSS.escape(SITE_LON)}"]`);
+  if (!anchor || !anchor.parentNode) return;
+
+  // Its own row across the grid, and deliberately not a `.f` — that class
+  // means "a control for one setting", and everything which walks the form
+  // looking for a label, a value and an error line would then find a box with
+  // none of the three.
+  const geo = document.createElement('div');
+  geo.className = 'wide geo';
+  const note = document.createElement('span');
+  note.className = 'said';
+  anchor.parentNode.insertBefore(geo, anchor.nextSibling);
+
+  const usable = window.isSecureContext && navigator.geolocation;
+  if (!usable) {
+    note.className = 'said';
+    note.textContent = 'A browser only shares a location with a page served over HTTPS or '
+      + `opened at localhost. This one is at ${location.origin}, where it refuses without `
+      + `asking, so ${lat.label.toLowerCase()} and ${lon.label.toLowerCase()} have to be `
+      + 'typed in — or the page opened from the machine the service runs on.';
+    geo.appendChild(note);
+    return;
+  }
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'iconbtn';
+  button.textContent = 'Use this device’s location';
+  geo.appendChild(button);
+  geo.appendChild(note);
+
+  const put = (key, value) => {
+    const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (!el) return;
+    // Five decimal places is about a metre, and the browser's own figure
+    // carries a dozen digits of arithmetic noise past the point its accuracy
+    // supports. Rounding it is not losing anything that was ever measured.
+    el.value = String(Number(value.toFixed(5)));
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  button.addEventListener('click', () => {
+    button.disabled = true;
+    note.className = 'said';
+    note.textContent = 'Asking the browser…';
+    navigator.geolocation.getCurrentPosition((position) => {
+      button.disabled = false;
+      put(SITE_LAT, position.coords.latitude);
+      put(SITE_LON, position.coords.longitude);
+      const metres = Number(position.coords.accuracy);
+      note.className = 'said ok';
+      note.textContent = 'Filled in from this device'
+        + (Number.isFinite(metres) ? `, accurate to about ${Math.round(metres)} m.` : '.')
+        + ' Nothing is saved until Save changes.';
+    }, (err) => {
+      button.disabled = false;
+      note.className = 'said warn';
+      // Reported rather than swallowed, and with the browser's own words: a
+      // refusal, a device with no fix and a timeout call for three different
+      // reactions, and the settings page is not the place to guess which.
+      const why = err && err.code === 1 ? 'The browser refused to share a location'
+        : err && err.code === 2 ? 'The device could not work out where it is'
+        : err && err.code === 3 ? 'The browser took too long to answer'
+        : 'The browser would not share a location';
+      const said = err && err.message ? ` (${err.message})` : '';
+      note.textContent = `${why}${said}. Type the coordinates in instead.`;
+    }, { timeout: 15000, maximumAge: 60000 });
+  });
+}
+
+function mountExtras() {
+  const bands = fields.find((f) => f.key === BANDS_KEY);
+  if (bands) mountBandEditor(bands);
+  const panels = fields.find((f) => f.key === PANELS_KEY);
+  if (panels) mountPanelsEditor(panels);
+  mountLocation();
+}
+
+// ---------------------------------------------------------------------------
+// Reading the form back.
+// ---------------------------------------------------------------------------
+
+// What a control currently holds, typed as the registry says it should be. A
+// number left blank is absent rather than zero, and is not submitted at all —
+// clearing a box is not the same as asking for nought watts.
+//
+// Unless the registry says the setting may be absent, in which case an empty
+// box is a value: null, meaning "not set", sent as such so the service can
+// clear it. That distinction is the whole reason a coordinate is optional —
+// zero is a real latitude, so "cleared" has to travel as something other than
+// a number, on the wire as well as on the page.
+function currentValue(spec) {
+  const el = document.querySelector(`[data-key="${CSS.escape(spec.key)}"]`);
+  if (!el) return undefined;
+  const text = el.value;
+  if (spec.kind === 'int' || spec.kind === 'float') {
+    if (String(text).trim() === '') return isOptional(spec) ? null : undefined;
+    const n = Number(text);
+    return Number.isFinite(n) ? n : undefined;
+  }
+  return text;
+}
+
+// How a value reads for the purpose of "did this change". Null and undefined
+// are both the empty string here and nothing else is, so clearing an optional
+// field registers as a change while an already-empty one does not — and
+// String(null) never reaches the comparison as the four letters "null".
+const asText = (v) => (v === null || v === undefined ? '' : String(v));
+
+// Only what actually differs from what the service holds. Posting the whole
+// form back would rewrite the masked serials with their masks, and the service
+// discards those — but it would also make every save look like a change to
+// settings the collector has to restart for.
+function pending() {
+  const out = {};
+  for (const spec of fields) {
+    const now = currentValue(spec);
+    if (now === undefined) continue;
+    if (asText(now) !== asText(saved[spec.key])) out[spec.key] = now;
+  }
+  return out;
+}
+
+function dirtyCheck() {
+  const count = Object.keys(pending()).length;
+  $('save').disabled = count === 0;
+  $('revert').disabled = count === 0;
+  $('save').textContent = count === 0 ? 'Save changes'
+    : `Save ${count} change${count === 1 ? '' : 's'}`;
+}
+
+// ---------------------------------------------------------------------------
+// Talking to the service.
+// ---------------------------------------------------------------------------
+
+function say(text, kind) {
+  const el = $('said');
+  el.textContent = text || '';
+  el.className = `said${kind ? ` ${kind}` : ''}`;
+}
+
+function pageNote(text) {
+  const box = $('pnote');
+  box.textContent = text || '';
+  box.hidden = !text;
+}
+
+function clearErrors() {
+  for (const box of $('form').querySelectorAll('.f')) {
+    box.classList.remove('bad');
+    const err = box.querySelector('.err');
+    err.textContent = '';
+    err.hidden = true;
+  }
+}
+
+// Put a message on the control that caused it. A single banner saying
+// "invalid" leaves the reader hunting ten fields for the one at fault.
+function markFault(key, message) {
+  const box = document.querySelector(`.f[data-for="${CSS.escape(key)}"]`);
+  if (!box) return false;
+  box.classList.add('bad');
+  const err = box.querySelector('.err');
+  err.textContent = message;
+  err.hidden = false;
+  return true;
+}
+
+// Put the cursor on the control that was rejected — or, where the registry's
+// own control is not the one on screen, on the first control that is.
+//
+// The rate bands are the case: the textarea still holds the value and still
+// takes the error message, but the editor is mounted over it and hides it, and
+// focusing a hidden element does nothing at all. A rejected tariff left focus
+// on the document body, so the reader was told which field was wrong and then
+// dropped at the top of the page to find it themselves.
+function focusField(key) {
+  const el = document.querySelector(`[data-key="${CSS.escape(key)}"]`);
+  if (!el) return;
+  if (el.hidden || el.offsetParent === null) {
+    const box = document.querySelector(`.f[data-for="${CSS.escape(key)}"]`);
+    const shown = box && box.querySelector('input:not([hidden]), select, button');
+    if (shown) {
+      shown.focus();
+      return;
+    }
+  }
+  el.focus();
+}
+
+// The service names the offending setting in its message. Finding it there and
+// marking that control beats a banner the reader has to match up by hand — and
+// when no key is recognisable the message still gets shown, in full, rather
+// than swallowed for not fitting the shape this expects.
+function showRejection(detail) {
+  clearErrors();
+  const hit = fields.find((f) => detail.includes(f.key));
+  if (hit && markFault(hit.key, detail)) {
+    focusField(hit.key);
+    say(`${hit.label} was not accepted. Nothing was saved.`, 'bad');
+    return;
+  }
+  say(`Not saved: ${detail}`, 'bad');
+}
+
+async function save() {
+  const changes = pending();
+  if (!Object.keys(changes).length) return;
+
+  // Nothing is sent until every changed value would be accepted. The server
+  // validates the whole batch before writing any of it, so one bad field
+  // means none of the others were saved either — and a reader who fixed ten
+  // settings and mistyped the eleventh deserves to be told which.
+  clearErrors();
+  const faults = fields
+    .filter((spec) => spec.key in changes)
+    .map((spec) => [spec, fault(spec, changes[spec.key])])
+    .filter(([, message]) => message);
+  if (faults.length) {
+    for (const [spec, message] of faults) markFault(spec.key, message);
+    const [[first, message]] = faults;
+    say(faults.length === 1 ? message
+      : `${message} ${faults.length - 1} other field`
+        + `${faults.length === 2 ? '' : 's'} also need attention. Nothing was sent.`, 'bad');
+    focusField(first.key);
+    dirtyCheck();
+    return;
+  }
+
+  $('save').disabled = true;
+  say('Saving…', '');
+  let response;
+  try {
+    response = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(changes),
+    });
+  } catch (e) {
+    say(`Could not reach the service: ${e.message}. Nothing was saved.`, 'bad');
+    dirtyCheck();
+    return;
+  }
+
+  let body = null;
+  try { body = await response.json(); } catch (e) { body = null; }
+  if (!response.ok) {
+    // The service validates every value before writing any of them, so a
+    // rejection means nothing at all was stored. Saying so matters: a reader
+    // told only "invalid" reasonably assumes the other nine went through.
+    showRejection((body && body.detail) || `the service answered ${response.status}`);
+    dirtyCheck();
+    return;
+  }
+
+  clearErrors();
+  saved = (body && body.values) || saved;
+  const changed = (body && body.changed) || [];
+  render();
+  applyDisplay(saved);
+  if (!changed.length) {
+    say('Nothing to change — those were already the stored values.', '');
+  } else if (body.restart_required) {
+    say(`Saved ${changed.length} change${changed.length === 1 ? '' : 's'}. `
+      + 'Restart the collector for the connection and collection settings to take effect.', 'warn');
+  } else {
+    say(`Saved ${changed.length} change${changed.length === 1 ? '' : 's'}.`, 'ok');
+  }
+  stamp();
+}
+
+// A display default reaches this browser immediately rather than at the next
+// reload, but never over a choice this device made for itself: the dashboard's
+// own toggle is a per-device override and setting an installation default must
+// not silently undo it.
+function applyDisplay(values) {
+  if (localStorage.getItem('as.tempUnit') === null) {
+    const unit = values['display.temperature_unit'];
+    if (unit === 'F' || unit === 'C') settings.tempUnit = unit;
+  }
+  if (localStorage.getItem('as.refreshSecs') === null) {
+    const secs = Number(values['display.refresh_seconds']);
+    if (Number.isFinite(secs) && secs > 0) settings.refreshSecs = secs;
+  }
+}
+
+// The connection picker's Save. Unlike the page's own Save, which PUTs the
+// changed settings and leaves the collector running, a connection change is only
+// read at startup — so this writes the overlay through /api/setup/apply, which
+// restarts the collector, and reflects that honestly. A rejected apply keeps its
+// reason on the form; a successful one refreshes the page once the service is
+// back, so the redacted current values show what was just set.
+async function applyConnection(body, ui) {
+  ui.status('Saving and restarting the collector…', 'busy');
+  try {
+    const r = await fetchTimeout('/api/setup/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }, 20000);
+    const reply = await r.json().catch(() => ({}));
+    if (!r.ok) { ui.status(problemText(reply.detail) || `Not accepted (${r.status}).`, 'bad'); ui.reenable(); return; }
+  } catch (e) {
+    ui.status('The service could not be reached.', 'bad'); ui.reenable(); return;
+  }
+  // The collector restarts, so /api/status goes quiet and comes back; refresh
+  // only once it has, rather than after a blind delay that could land on the
+  // outage. If it never reports ready, the form comes back rather than a reload
+  // onto a connection-error page.
+  ui.status('Saved. The collector is restarting; the page refreshes when it is back.', 'ok');
+  watchRestart(
+    () => location.reload(),
+    () => { ui.status('Saved, but the collector did not report ready. Reload to check its state.', 'warn'); ui.reenable(); },
+  );
+}
+
+async function load() {
+  try {
+    const response = await fetch('/api/settings');
+    if (!response.ok) throw new Error(`the service answered ${response.status}`);
+    const body = await response.json();
+    fields = (body && body.fields) || [];
+    saved = (body && body.values) || {};
+  } catch (e) {
+    pageNote(`Settings could not be read: ${e.message}. Nothing can be changed until the `
+      + 'service answers.');
+    return;
+  }
+  // Best-effort: the Connection group renders through the wizard picker when the
+  // payload is in hand, and falls back to loose controls when it is not, so a
+  // failure here degrades the group rather than the whole page.
+  try {
+    const r = await fetch('/api/setup');
+    setupPayload = r.ok ? await r.json() : null;
+  } catch (e) {
+    setupPayload = null;
+  }
+  pageNote('');
+  render();
+  applyDisplay(saved);
+  stamp();
+}
+
+function stamp() {
+  $('stamp').textContent = `read ${new Date().toLocaleTimeString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// About: what is actually running, and what it says it can read.
+//
+// Not settings, and deliberately not editable — the version is a fact about the
+// process and the capabilities are what the driver declares the hardware to be.
+// They are here because this is the page somebody opens when something is
+// wrong, and "which version is this" is the first question asked.
+//
+// Two rules carry over from the readings. A capability nobody declared reads as
+// "not declared" and never as "no": a bare source that names its device but
+// carries no declaration answers null to every flag, and rendering that as
+// "no backup panel" would be the same lie as drawing a missing reading as a
+// zero. And the device serial is not shown at all, on a page that goes to
+// lengths to mask the same serial three fields above.
+// ---------------------------------------------------------------------------
+
+const factRow = (label, value) =>
+  `<div class="row"><u>${esc(label)}</u><b>${value}</b></div>`;
+
+// A declared flag as words. Null is the third state and gets its own.
+const flagWords = (v) => (v === true ? 'Yes' : v === false ? 'No'
+  : `<span class="muted">not declared</span>`);
+
+const countWords = (list) => (Array.isArray(list) ? String(list.length)
+  : `<span class="muted">not declared</span>`);
+
+function drawFacts(status, caps) {
+  const rows = [];
+  rows.push(factRow('Version', status && status.version
+    ? esc(String(status.version)) : '<span class="muted">unknown</span>'));
+
+  const devices = caps && Array.isArray(caps.devices) ? caps.devices : [];
+  if (!devices.length) {
+    rows.push(factRow('Inverter', '<span class="muted">nothing declares itself</span>'));
+  }
+  devices.forEach((d, i) => {
+    const prefix = devices.length > 1 ? `Inverter ${i + 1} ` : '';
+    rows.push(factRow(`${prefix}driver`, d.driver
+      ? esc(String(d.driver)) : '<span class="muted">not declared</span>'));
+    rows.push(factRow(`${prefix}model`, d.model
+      ? esc(String(d.model)) : '<span class="muted">not declared</span>'));
+    // The flag with teeth. Every kWh this project shows is read off a counter
+    // the inverter keeps itself; a family without those counters could only
+    // have its energy integrated from power, and a page has to be able to tell
+    // a meter reading from an estimate.
+    rows.push(factRow(`${prefix}energy figures`,
+      d.energy === 'counted' ? 'read from the inverter’s own counters'
+        : d.energy === 'estimated' ? 'estimated from power'
+        : '<span class="muted">not declared</span>'));
+    rows.push(factRow(`${prefix}PV strings`, Number.isFinite(d.pv_strings)
+      ? String(d.pv_strings) : '<span class="muted">not declared</span>'));
+    rows.push(factRow(`${prefix}backup output`, flagWords(d.backup_output)));
+    rows.push(factRow(`${prefix}generator input`, flagWords(d.generator_input)));
+    rows.push(factRow(`${prefix}split phase`, flagWords(d.split_phase)));
+    rows.push(factRow(`${prefix}three phase`, flagWords(d.three_phase)));
+    rows.push(factRow(`${prefix}parallel capable`, flagWords(d.parallel_capable)));
+    rows.push(factRow(`${prefix}per-module battery`, flagWords(d.per_module_battery)));
+    rows.push(factRow(`${prefix}metrics produced`, countWords(d.metrics)));
+    rows.push(factRow(`${prefix}per-module metrics`, countWords(d.battery_module_metrics)));
+  });
+  $('facts').innerHTML = rows.join('');
+}
+
+async function readJson(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  return response.json();
+}
+
+async function loadFacts() {
+  const [status, caps] = await Promise.all([
+    readJson('/api/status').catch(() => null),
+    readJson('/api/capabilities').catch(() => null),
+  ]);
+  drawFacts(status, caps);
+  $('factnote').textContent = status === null || caps === null
+    ? 'Some of this could not be read from the service, and is shown as unknown rather than '
+      + 'guessed at.'
+    : 'What the driver declares the hardware to be, rather than what it has reported. A '
+      + 'capability nothing declared is shown as undeclared, not as absent.';
+}
+
+// Boot. Everything above is definitions; nothing runs until here. This page
+// does not poll: settings change when somebody changes them, and a background
+// refresh would overwrite a half-typed form.
+drawNav('settings');
+$('save').onclick = save;
+$('revert').onclick = () => { render(); clearErrors(); say('', ''); };
+// The form is never submitted: every write goes through save() as JSON. Enter
+// in a text box would otherwise navigate away from a half-filled page, which
+// is a way to lose a tariff nobody would report as a bug.
+$('form').addEventListener('submit', (e) => e.preventDefault());
+load();
+loadFacts();
+</script>
+</body>
+</html>

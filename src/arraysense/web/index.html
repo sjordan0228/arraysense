@@ -33,6 +33,16 @@
      lets the track win instead, and the card is then made to cope with the
      width it is given. */
   .flow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}
+  /* Three columns is right on a desktop and unreadable on a phone. At 390 CSS
+     pixels each card is left about 83px of content once the gaps and padding
+     are taken, which is not enough for "7.51 kW" at 19px — so the figure broke
+     away from its unit and every card read as two ragged lines. The battery
+     card was worst, because its level icon and gap take another 35px from the
+     same row, leaving the number less space than the rest and pushing "kW"
+     underneath it beside a stranded icon. One column gives each card the width
+     the hero above it already has, and the icon sits beside the figure the way
+     it was drawn to. */
+  @media(max-width:560px){.flow{grid-template-columns:1fr}}
   .flow b{font-size:19px;font-weight:400;margin-top:3px;display:block}
   /* The second line under each flow. Deliberately quieter than the number it
      sits beneath: today's total is context for the reading, not a rival to it. */
@@ -259,6 +269,11 @@
        independent, so each needs its own box rather than the two sharing one
        and the second render overwriting the first. Same shape, same tone. -->
   <div class="p cal" id="modelCal" hidden></div>
+  <!-- The house-draw warning, drawn through the same .cal box as the two above
+       rather than through a third banner mechanism. Not dismissible: unlike a
+       drifted counter it clears itself the moment the draw drops, so a dismiss
+       button would only be a way to stop being told about the next one. -->
+  <div class="p cal" id="usageCal" hidden></div>
 
   <div class="p" id="settings" hidden>
     <!-- Two of these three also exist as installation settings on the service.
@@ -422,7 +437,10 @@
     <div class="chart" id="socWrap" role="img" aria-label="Battery state of charge over the selected range"></div>
   </section>
 
-  <section class="p">
+  <!-- Hidden whole on a device whose driver declares no per-module battery: the
+       header, the agreement panel and the grid are one card and leave together.
+       drawModules decides, from capHasModules. -->
+  <section class="p" id="modsCard">
     <div class="chead"><h2>Battery modules</h2>
       <span class="legend muted">per module, live
         <button class="iconbtn" id="modMore" aria-pressed="false">Show more</button></span></div>
@@ -724,6 +742,9 @@ async function loadLive() {
     // The model warning rides the status poll already made above, so this needs
     // no second request.
     renderModelCheck(status);
+    // The verdict is the endpoint's, not this page's: a threshold compared in
+    // two places is two thresholds the day one of them moves.
+    renderHighUsage(live.alert);
     // Packs that stopped answering keep their last reading forever in
     // latest_modules, so they are dropped before anything compares them.
     const packs = reporting(live.modules);
@@ -845,6 +866,43 @@ function renderModelCheck(status) {
   box.hidden = false;
 }
 
+// What the warning says, and — the part that matters — how carefully it says
+// it. Naming circuits that account for a third of the draw as though they were
+// the cause is the completeness mistake this project has already paid for with
+// money on the Costs page, so the wording changes with `complete` rather than
+// the list being trimmed or the doubt being left out.
+function highUsageHtml(alert) {
+  const names = alert.contributors.map((c) => `${esc(c.name)} ${wStr(numOrNull(c.watts))}`);
+  // `body` is assembled from already-escaped names and text this file wrote,
+  // so it is interpolated raw. Escaping it again would turn an ampersand in a
+  // circuit name into a visible &amp; — the names are the owner's and one of
+  // them will contain one.
+  let body;
+  if (!names.length) {
+    // Either no Emporia module, or nothing it watches reported. Both are "we
+    // cannot say", and neither is "nothing is drawing".
+    body = 'No circuit readings, so nothing can be named.';
+  } else if (alert.complete) {
+    body = `Mostly ${names.join(', ')}.`;
+  } else {
+    const share = alert.accounted_w === null ? null
+      : Math.round(alert.accounted_w / alert.load_w * 100);
+    body = `${names.join(', ')}` +
+      (share === null ? '' : ` — which is ${share}% of the draw, so the rest is elsewhere.`);
+  }
+  return `<div class="calmark">●</div>
+    <div class="calbody"><h2>Drawing ${wStr(alert.load_w)}</h2>
+    <p>Above the ${wStr(alert.threshold_w)} you asked to be told about. ${body}</p></div>`;
+}
+
+function renderHighUsage(alert) {
+  const box = $('usageCal');
+  if (!alert) { box.hidden = true; box.className = 'p cal'; return; }
+  box.className = 'p cal sev-warning';
+  box.innerHTML = highUsageHtml(alert);
+  box.hidden = false;
+}
+
 function setSpread(id, value, unit, full, tone) {
   $(id).innerHTML = value === null ? '—' : `${trim(value)}<span>${unit}</span>`;
   const bar = $(id + 'Bar');
@@ -883,6 +941,14 @@ function reporting(mods) {
 }
 
 function drawModules(mods) {
+  // No packs to draw and no packs to be missing. The advisory below tells the
+  // owner to check a CAN link, which is the right thing to say to a bank that
+  // has stopped answering and a wild goose chase on a machine that was never
+  // going to answer, so the card goes rather than the grid emptying. Unknown
+  // keeps it: capHasModules answers yes until a driver has said otherwise.
+  const card = $('modsCard');
+  if (card) card.hidden = !capHasModules(caps);
+  if (card && card.hidden) return;
   if (!mods.length) {
     $('mods').innerHTML = '<div class="p muted" style="grid-column:1/-1">No per-module data. '
       + 'The battery block is populated over CAN — check the packs are in closed loop.</div>';
@@ -2144,7 +2210,7 @@ function showWizard(payload) {
            service cannot reconstruct on its own — the weather poller
            records nothing without it, and recovery needs an explicit
            backfill — so it is worth offering before the first start. -->
-      <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
+      <div id="wizLocation" style="margin-top:20px;padding-top:16px;border-top:1px solid var(--panel-b)">
         <div style="font-size:14px;font-weight:600;margin-bottom:8px">Where is this installation?</div>
         <p style="font-size:11px;color:var(--ink3);margin:0 0 10px;max-width:65ch">
           Enter a postcode or place name so the weather service knows which sky
@@ -2176,6 +2242,19 @@ function showWizard(payload) {
     return _wizOriginalApply(body, ui);
   }
   const setupShell = mountSetup($('wizardHost'), payload, { mode: 'wizard', onApply: wizApply });
+  // Seat the location block just above the button — fields, then location,
+  // then "Set up and start" — instead of below it. mountSetup refills the
+  // host whenever the model or connection changes, so a one-time move would
+  // drop the block on the first refill (typed postcode and all); the observer
+  // puts it back after every rebuild.
+  const locHost = $('wizardHost');
+  const locBlock = $('wizLocation');
+  function seatLocation() {
+    const actions = locHost.querySelector('.actions');
+    if (actions && locBlock.parentNode !== locHost) locHost.insertBefore(locBlock, actions);
+  }
+  seatLocation();
+  new MutationObserver(seatLocation).observe(locHost, { childList: true });
   // The postcode lookup. Reads nothing and writes nothing — it only resolves
   // a name to coordinates, and the apply carries them. The decision is made
   // by the shared geocodeOutcome in common.js, so the wizard and the settings

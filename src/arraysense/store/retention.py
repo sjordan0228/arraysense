@@ -83,7 +83,12 @@ class _PruneTable:
     days: int
     destinations: tuple[_Destination, ...]
     has_error: bool
-    has_module: bool = False
+    # What identifies a row besides its time. Coverage is checked against the
+    # destination's exact primary key, so this has to be the rest of that key:
+    # the device for an inverter tier, the device and the module for a pack,
+    # the circuit alone for a circuit reading — which carries no device at all,
+    # because a Vue monitor is not an inverter.
+    key_columns: tuple[str, ...] = ("device",)
     has_pending_hours: bool = False
 
 
@@ -147,6 +152,10 @@ def run_retention(
         return RetentionReport(dry_run, False, backup_reason, ())
     assert backup_mtime is not None
 
+    # Order matters twice over. Each source's cutoff is clamped against what
+    # earlier ones left behind, so a destination that is itself pruned must
+    # come after the source that depends on it — and tests/test_retention.py
+    # indexes this tuple by position, so append rather than insert.
     tables = (
         _PruneTable(
             "inverter_raw",
@@ -163,13 +172,25 @@ def run_retention(
             policy.raw_days,
             (_Destination("module_hourly", 3600),),
             has_error=False,
-            has_module=True,
+            key_columns=("device", "module_id"),
         ),
         _PruneTable(
             "inverter_minute",
             policy.minute_days,
             (_Destination("inverter_hourly", 3600),),
             has_error=True,
+        ),
+        # Circuits are core storage even though only an optional module writes
+        # them, so they are pruned here rather than by the module: an
+        # installation that switched Emporia off must still have its readings
+        # aged out, and the backup check that guards every deletion above is
+        # the one thing this table must not do without.
+        _PruneTable(
+            "circuit_reading",
+            policy.raw_days,
+            (_Destination("circuit_hourly", 3600),),
+            has_error=False,
+            key_columns=("circuit_id",),
         ),
     )
     results: list[_PruneResult] = []
@@ -448,11 +469,10 @@ def _uncovered_count(
 ) -> int:
     """Count source buckets that lack this destination's exact primary key."""
     bucket = bucket_sql("timestamp", destination.period)
-    columns = f"{bucket} AS bucket, device"
-    lookup = "d.timestamp = src.bucket AND d.device = src.device"
-    if source.has_module:
-        columns += ", module_id"
-        lookup += " AND d.module_id = src.module_id"
+    columns = ", ".join((f"{bucket} AS bucket", *source.key_columns))
+    lookup = " AND ".join(
+        ("d.timestamp = src.bucket", *(f"d.{name} = src.{name}" for name in source.key_columns))
+    )
     coverage_filter = ""
     parameters: tuple[int, ...] = (floor, boundary)
     if coverage_start is not None:

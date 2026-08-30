@@ -38,6 +38,8 @@ from arraysense.collector.weather import WeatherPoller
 from arraysense.config import DEFAULT_PATH, Config, effective, load
 from arraysense.drivers.base import find_model, resolve_model
 from arraysense.metrics import SITE_METRICS
+from arraysense.modules.emporia.guard import InverterGuard
+from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.settings import SettingsStore
 from arraysense.store.migrate import migrate_devices, needs_device_migration
 from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
@@ -222,16 +224,26 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         interval=config.poll_interval,
     )
     weather = WeatherPoller(store)
+    # The optional Emporia module. Constructed always and started always,
+    # because a tick on a disabled module reads a setting and returns: that
+    # is what lets the owner switch it on without a restart. It makes no
+    # call and writes no row until they do.
+    emporia = EmporiaPoller(store, token_path=config.emporia_token_file)
+    guard = InverterGuard(emporia, store)
     # The file config, not the effective one, is what a write path needs to
     # predict the next boot: clearing an overlay field reverts to the file
     # value, and only this base can see it.
     app = create_app(store=store, service=service, config=config, file_config=file_config)
     app.state.weather = weather
+    app.state.emporia = emporia
+    app.state.emporia_guard = guard
 
     @contextlib.asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await service.start()
         await weather.start()
+        await emporia.start()
+        await guard.start()
         watchdog = asyncio.create_task(_watch(service))
         try:
             yield
@@ -243,6 +255,10 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
             # goes away, or the next start finds it occupied — the dongle's one
             # TCP slot, which the vendor's app also wants, or the serial port,
             # which is opened exclusively.
+            # Before the collector, for no reason but symmetry with start:
+            # this poller holds nothing the inverter wants.
+            await guard.stop()
+            await emporia.stop()
             await weather.stop()
             await service.stop()
             store.close()

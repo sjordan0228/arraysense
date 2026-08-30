@@ -49,6 +49,12 @@ const LIGHT_TOKENS = `
          dark crosshair where the dark theme's is white. */
       --tip:rgba(255,255,255,.96);
       --tip-shadow:0 6px 22px rgba(0,0,0,.18);
+      /* --tip with its transparency taken off, for the one place a canvas
+         needs it: the band names on the Circuits stack are stroked with it
+         before they are filled. A tooltip is meant to sit slightly over what
+         it covers, so --tip keeps its alpha; a halo that lets 4% of the band
+         through is not a halo, so this one does not. */
+      --label-halo:#fff;
       --cursor-x:rgba(0,0,0,.34);
       /* The same walk through the same hues, lightened: dawn rather than dusk.
          Keeping the shape means the page still reads as this installation's
@@ -149,6 +155,8 @@ const BASE_CSS = `
        are the originals these replaced, unchanged. */
     --tip:rgba(6,8,18,.94);
     --tip-shadow:0 6px 22px rgba(0,0,0,.45);
+    /* --tip at full opacity; see the light theme's note. */
+    --label-halo:#060812;
     --cursor-x:rgba(255,255,255,.34);
     /* The page itself. Left as a literal, a light theme put light panels and
        dark text on a dark page: the headings sat on their own background and
@@ -529,7 +537,7 @@ const numOrNull = (v) => typeof v === 'number' && isFinite(v) ? v : null;
 // never as a broken layout or a thrown error.
 // ---------------------------------------------------------------------------
 
-const ICON_SPRITE_URL = '/vendor/phosphor.svg';
+const ICON_SPRITE_URL = '/vendor/phosphor-2.svg';
 let iconSpriteLoading = null;
 
 function mountIconSprite() {
@@ -826,6 +834,22 @@ function capParts(caps, parts) {
 function capHasModuleMetric(caps, metric) {
   if (!caps || !Array.isArray(caps.battery_module_metrics)) return true;
   return caps.battery_module_metrics.includes(metric);
+}
+
+// Whether the per-pack views exist for this device at all — the dashboard's
+// Battery modules card and the Graphs page's Packs section. capHasModuleMetric
+// above answers which readings a pack relays; this answers whether there are
+// packs to relay them, which is the question the whole card turns on.
+//
+// Only an explicit no suppresses, the same rule as capHasMetric: a device that
+// has not declared keeps both views. The distinction matters because the card
+// carries an advisory — "the battery block is populated over CAN, check the
+// packs are in closed loop" — that is a real fault on a machine with packs and
+// a wild goose chase on a machine without them. tourHasModules asks the same
+// field and demands an explicit yes instead, because a tour that describes a
+// card the reader cannot find is worse than a tour that skips a step.
+function capHasModules(caps) {
+  return !caps || caps.per_module_battery !== false;
 }
 // <<< caps-logic
 
@@ -1184,6 +1208,60 @@ function drawWaterfall(host, segments) {
 // Called again whenever the current view changes, not only at boot: on the
 // dashboard the marker moves between two entries without the document
 // reloading, and a marker left behind is worse than none.
+// An optional module is not a page every installation has, so its entry is not
+// in NAV: a permanent tab leading to a page about hardware the owner does not
+// own is the same fault as an empty card, one level up. The entry is appended
+// after the fact, only once the module says it is switched on, and a build
+// without the endpoint — or a fetch that fails — leaves the nav exactly as it
+// was drawn. Nothing on the page waits for this.
+// Each entry names the endpoint that decides whether it exists, and the
+// question to ask of the answer. Two different questions already: the module
+// being switched on, and a charger actually being present on the account —
+// most people who enable this have no EV charger at all, and a tab for one is
+// as wrong as an empty card.
+const MODULE_NAV = [
+  {
+    key: 'emporia',
+    label: 'Circuits',
+    href: '/emporia',
+    status: '/api/emporia/status',
+    shows: (body) => body.enabled === true,
+  },
+  {
+    key: 'charger',
+    label: 'Charger',
+    href: '/charger',
+    status: '/api/emporia/charger',
+    // Two facts, and the tab needs both. "Does this account have a charger",
+    // because most people who switch the module on have no EV charger at all —
+    // and "is the module actually on", which this asked for a long time by
+    // asking neither: the poller kept the last charger it read for the life of
+    // the process, so switching the module off left the tab in place over a
+    // page of live controls.
+    shows: (body) => body.enabled === true && !!body.charger,
+  },
+];
+
+async function revealModuleNav(current) {
+  const el = $('nav');
+  if (!el) return;
+  for (const mod of MODULE_NAV) {
+    try {
+      const r = await fetch(mod.status);
+      if (!r.ok) continue;
+      if (!mod.shows(await r.json())) continue;
+    } catch (e) {
+      continue;
+    }
+    if (el.querySelector(`a[href="${mod.href}"]`)) continue;
+    const a = document.createElement('a');
+    a.href = mod.href;
+    a.textContent = mod.label;
+    if (mod.key === current) a.setAttribute('aria-current', 'page');
+    el.appendChild(a);
+  }
+}
+
 function drawNav(current) {
   const el = $('nav');
   if (!el) return;
@@ -1194,6 +1272,9 @@ function drawNav(current) {
     (n.icon ? `<svg class="ic" aria-hidden="true"><use href="#${n.icon}"/></svg>` : '') +
     `${esc(n.label)}</a>`
   ).join('');
+  // After the nav exists, never before: this appends to what was just written,
+  // and an append that raced the assignment would be wiped by it.
+  revealModuleNav(current);
 }
 
 // ---------------------------------------------------------------------------
@@ -1986,6 +2067,7 @@ const INK_FALLBACK = {
   // Reached only when there is no computed style at all, which is the dark
   // theme's case by definition — with a stylesheet the media query answers.
   '--theme':'dark', '--zero-rule':'rgba(255,255,255,.28)', '--wash-rgb':'255,255,255',
+  '--label-halo':'#060812',
   // No stylesheet means no look, and the wash belongs to a look. Zero draws the
   // charts the way they were drawn before it existed.
   '--series-wash':'0',
@@ -2911,6 +2993,35 @@ function paint(id, spec, data) {
     // moment the container has one.
     const width = Math.max(Math.floor(wrap.clientWidth), 320);
     const u = new uPlot(Object.assign({ width, height: spec.height }, spec.opts), data, wrap);
+    // uPlot ranges a new chart's x scale on a later tick rather than during
+    // construction, and on a first page load that commit does not always land:
+    // the chart ends up holding all its data at the right size with
+    // `scales.x.min` still null, which draws the axes and not one series. It is
+    // the blank-chart state of #159 reached by a different route, and the reason
+    // it survived that fix is that it cannot be seen from a rebuild — tearing
+    // the charts down and painting them again always ranges them, so a test that
+    // does so passes while the page is still broken. Ranging here from the data
+    // just handed over makes the commit part of building the chart instead of
+    // something owed to it on a tick that may never come.
+    // uPlot ranges a new chart's x scale on a later tick, never during
+    // construction, and on a first page load that commit lands for the first
+    // chart built and for none of the others: they end up holding all their
+    // data at the right size with `scales.x.min` still null, which draws the
+    // axes and not one series. It is the blank-chart state of #159 by another
+    // route, and nothing already on the page rescues them — measured on the
+    // reference installation, the ResizeObserver never fires and fit() never
+    // resizes, because the container is its final width before the chart is
+    // ever built.
+    //
+    // So the scale is claimed back after that tick has passed. setData with the
+    // scales reset is the one operation measured to repair a chart stuck this
+    // way — setSize and redraw() both leave it blank — and it is the same call
+    // a refresh makes. The guard means it runs only for a chart that really did
+    // fail to range, so a page that never had the problem does no extra work.
+    setTimeout(() => {
+      if (CHARTS[id] && CHARTS[id].u === u && u.scales.x.min === null
+          && data[0] && data[0].length) u.setData(data, true);
+    }, 0);
     held = CHARTS[id] = { u, ro: null };
     if (typeof ResizeObserver === 'function') {
       held.ro = new ResizeObserver((entries) => {

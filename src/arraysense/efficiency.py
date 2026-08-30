@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta, tzinfo
 from typing import TYPE_CHECKING
 
@@ -33,6 +33,7 @@ from arraysense.curtailment import (
 )
 from arraysense.panels import StringSpec
 from arraysense.settings import (
+    CONFIG_VALID_FROM_KEY,
     CONFIG_VERSION_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -41,7 +42,15 @@ from arraysense.settings import (
 
 # Re-exported: the key is a setting and settings.py owns it, but the
 # efficiency module is where a reader looks for it.
-__all__ = ["CONFIG_VERSION_KEY", "EfficiencyRow", "compute_day"]
+__all__ = [
+    "CONFIG_VALID_FROM_KEY",
+    "CONFIG_VERSION_KEY",
+    "EfficiencyRow",
+    "TiltBenefit",
+    "compute_day",
+    "rows_are_current",
+    "tilt_benefit",
+]
 from arraysense.solar import cell_temperature, expected_watts, poa_irradiance, solar_position
 
 if TYPE_CHECKING:
@@ -343,6 +352,121 @@ class HourEfficiency:
         return max(0.0, self.expected_kwh - self.actual_kwh - self.curtailed_kwh)
 
 
+@dataclass(frozen=True)
+class TiltBenefit:
+    """What moving the mount was worth over a range, against never moving it.
+
+    ``unadjusted_kwh`` is a counterfactual and can only ever be modelled: the
+    road not taken has no meter on it. ``scheduled_kwh`` is modelled too, and
+    deliberately so — comparing a model against a measurement would attribute
+    every cloud and every soiled panel to the owner's decision. Both sides run
+    the same chain over the same hours, so what is left between them is the
+    geometry and nothing else.
+
+    ``hours`` is the honesty figure. A verdict drawn from four hours of a flat
+    afternoon is not a verdict, and a caller showing the difference without
+    showing its coverage is presenting a partial figure as a complete one.
+    """
+
+    scheduled_kwh: float
+    unadjusted_kwh: float
+    hours: int
+    adjustments: int
+
+    @property
+    def gain_kwh(self) -> float:
+        """How much the adjusting is modelled to have won, which may be negative."""
+        return self.scheduled_kwh - self.unadjusted_kwh
+
+
+def _never_adjusted(strings: Sequence[StringSpec]) -> tuple[StringSpec, ...]:
+    """The same array with every mount left at the angle it started on."""
+    return tuple(
+        replace(spec, tilt_schedule=(spec.tilt_schedule[0],)) if spec.tilt_schedule else spec
+        for spec in strings
+    )
+
+
+def tilt_benefit(
+    store: SqliteStore,
+    settings: SettingsStore,
+    start: datetime,
+    end: datetime,
+    strings: Sequence[StringSpec],
+) -> TiltBenefit | None:
+    """Answer the question an adjustable mount is bought to answer.
+
+    Nothing to compare on a fixed array, and None says so rather than a zero —
+    a zero would read as "adjusting gained you nothing" to somebody who has
+    never adjusted anything. The same is true of a range that falls entirely
+    inside one tilt period: the schedule exists, but no adjustment happened
+    here, so there is no difference to attribute to one.
+
+    Scored twice over identical hours, which is what makes the subtraction
+    mean something. Both runs read the same weather and skip the same gaps, so
+    an outage removes an hour from both sides and cannot flatter either.
+    """
+    if not any(len(spec.tilt_schedule) > 1 for spec in strings):
+        return None
+    scheduled = compute_hours(store, settings, start, end, strings)
+    if not scheduled:
+        return None
+    unadjusted = compute_hours(store, settings, start, end, _never_adjusted(strings))
+    # Nothing in the hour-skipping rules reads tilt today, so the two runs cover
+    # the same hours and the subtraction is a difference in geometry alone. That
+    # is an invariant of another function rather than of this one, so it is
+    # checked instead of assumed: if the two ever diverge, the difference stops
+    # meaning anything and the honest answer becomes no answer.
+    if len(unadjusted) != len(scheduled):
+        logger.warning(
+            "tilt comparison covered %d hours against %d; refusing to subtract them",
+            len(scheduled),
+            len(unadjusted),
+        )
+        return None
+    zone = start.tzinfo or UTC
+    # Half-open on the owner's own calendar, matching the range itself: an
+    # adjustment made on the opening day counts, one made on the day the range
+    # ends does not. Written first with strict inequalities, which reported no
+    # adjustments at all for a single-day range — the commonest way anybody
+    # will ask this question, and silently the wrong answer.
+    opened = start.astimezone(zone).date()
+    closed = end.astimezone(zone).date()
+    moves = sum(
+        1
+        for spec in strings
+        for entry in spec.tilt_schedule
+        if entry.effective_from is not None and opened <= entry.effective_from < closed
+    )
+    return TiltBenefit(
+        scheduled_kwh=sum(hour.expected_kwh for hour in scheduled),
+        unadjusted_kwh=sum(hour.expected_kwh for hour in unadjusted),
+        hours=len(scheduled),
+        adjustments=moves,
+    )
+
+
+def rows_are_current(rows: Sequence[EfficiencyRow], config_version: int, valid_from: int) -> bool:
+    """Whether stored rows for one day can be served without rescoring it.
+
+    Two ways to qualify, and the second is the whole of #131. A row scored under
+    the current version is obviously current. A row scored under an older one is
+    *also* current when its day falls before ``valid_from``, because the change
+    that moved the version did not reach back that far — appending next
+    October's tilt adjustment says nothing whatever about last March.
+
+    Written once and read by the maintenance pass, the backfill and the API,
+    because a staleness rule that disagrees with itself between the page and the
+    scorer shows the owner one number and stores another.
+    """
+    if not rows:
+        return False
+    return all(
+        row.config_version == config_version or int(row.day.timestamp()) < valid_from
+        for row in rows
+    )
+
+
 def compute_hours(
     store: SqliteStore,
     settings: SettingsStore,
@@ -444,7 +568,11 @@ def compute_hours(
                     dhi,
                     elevation,
                     sun_azimuth,
-                    string.tilt,
+                    # ``when`` is the owner's own clock, which is the calendar a
+                    # mount is adjusted against. Handing this the UTC instant
+                    # would move the tilt on the wrong day at both ends of the
+                    # zone offset.
+                    string.tilt_at(when.date()),
                     string.azimuth,
                     day_of_year,
                 )

@@ -31,12 +31,14 @@ import re
 import sqlite3
 import tempfile
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import available_timezones
 
 from arraysense.auth import AUTH_PASSWORD_KEY
-from arraysense.panels import EXAMPLE_STRINGS, parse_strings
+from arraysense.energy import resolve_zone
+from arraysense.panels import EXAMPLE_STRINGS, StringSpec, parse_strings
 from arraysense.store.schema import INVERTER_TIERS, MODULE_TIERS, Tier
 from arraysense.tariff import EXAMPLE_ADJUSTMENTS, parse_adjustments, parse_bands
 
@@ -52,6 +54,74 @@ Kind = Literal["str", "int", "float", "bool", "choice"]
 # typed by hand in one place and mistyped in another reads as an unset setting
 # rather than as an error.
 CONFIG_VERSION_KEY = "efficiency.config_version"
+CONFIG_VALID_FROM_KEY = "efficiency.config_valid_from"
+
+
+# Everything about a string except when it was pointed where. Named from the
+# dataclass rather than listed by hand so a field added to the grammar joins the
+# comparison automatically — one forgotten here is a change that silently fails
+# to invalidate the history it invalidates. Deliberately not built by replacing
+# the schedule with an empty tuple: that produces a StringSpec whose ``tilt_at``
+# raises IndexError, and a throwaway object that cannot answer the question the
+# type promises to answer is a trap left lying about for the next reader.
+_GEOMETRY_FIELDS: tuple[str, ...] = tuple(
+    f.name for f in fields(StringSpec) if f.name != "tilt_schedule"
+)
+
+
+def _schedule_reach(before: str, after: str) -> date | None:
+    """How far back a change to the array description reaches.
+
+    ``None`` when nothing a stored day was scored against moved. ``date.min``
+    when the change reaches the whole history — a panel count, an azimuth, a
+    string added or removed, or a tilt that was already in force being altered.
+    Any other date is the first day the two descriptions disagree, and every day
+    before it keeps the score it already has.
+
+    That last case is the one the seasonal mount needs. Appending "40@2027-10-01"
+    to a string says nothing whatever about 2026, so 2026 must not be rescored —
+    and rescoring it is what threw away the yearly comparison that would have
+    told the owner whether adjusting the mount was worth doing.
+
+    Anything unparseable reaches everywhere. A description that cannot be read
+    cannot be shown to have left the past alone, and guessing in the generous
+    direction here would keep stale scores on the page.
+    """
+    try:
+        old = {s.name: s for s in parse_strings(before)}
+        new = {s.name: s for s in parse_strings(after)}
+    except ValueError:
+        return date.min
+    if set(old) != set(new):
+        return date.min
+
+    earliest: date | None = None
+    for name, new_spec in new.items():
+        old_spec = old[name]
+        if any(getattr(old_spec, f) != getattr(new_spec, f) for f in _GEOMETRY_FIELDS):
+            return date.min
+        if old_spec.tilt_schedule == new_spec.tilt_schedule:
+            continue
+        # Both are step functions, so they can only part company at a step. If
+        # they already differ before the first one, the change is retrospective
+        # and reaches everything.
+        if old_spec.tilt_schedule[0].degrees != new_spec.tilt_schedule[0].degrees:
+            return date.min
+        steps = sorted(
+            {
+                entry.effective_from
+                for schedule in (old_spec.tilt_schedule, new_spec.tilt_schedule)
+                for entry in schedule
+                if entry.effective_from is not None
+            }
+        )
+        for step in steps:
+            if old_spec.tilt_at(step) != new_spec.tilt_at(step):
+                earliest = step if earliest is None else min(earliest, step)
+                break
+    return earliest
+
+
 _EFFICIENCY_SCORER_REVISION_KEY = "efficiency.scorer_revision"
 PANELS_STRINGS_KEY = "panels.strings"
 SETTING_TIMEZONE = "site.timezone"
@@ -59,6 +129,30 @@ SETTING_LATITUDE = "site.latitude"
 SETTING_LONGITUDE = "site.longitude"
 SETTING_CONTACT_EMAIL = "site.contact_email"
 WEATHER_INTERVAL_KEY = "collector.weather_interval"
+# The optional Emporia module's enable. Named here beside the other feature keys
+# rather than inside the module, because the settings registry is what renders
+# the page and validates a write; a module holding its own flag would be a
+# second answer to the same question.
+EMPORIA_ENABLED_KEY = "emporia.enabled"
+EMPORIA_INTERVAL_KEY = "emporia.interval"
+# Charger control. How much autonomy the module has is the owner's choice;
+# the floor, the ceiling and the audit are not, because a charge rate
+# persists for ever once set and nothing at Emporia's end will put it back.
+CHARGER_AUTHORITY_KEY = "emporia.charger_authority"
+CHARGE_FLOOR_KEY = "emporia.charge_floor_a"
+CHARGE_CEILING_KEY = "emporia.charge_ceiling_a"
+CHARGE_DEFAULT_KEY = "emporia.charge_default_a"
+CHARGE_OVERRIDE_MINUTES_KEY = "emporia.charge_override_minutes"
+INVERTER_LIMIT_KEY = "emporia.inverter_limit_w"
+# When the current manual override lapses, as a unix epoch. Written by the
+# service rather than chosen, like the efficiency rescore floor: it has to
+# survive a restart, because an owner who set a rate by hand ten minutes ago
+# should not have the module take the wheel back because the process bounced.
+CHARGE_OVERRIDE_UNTIL_KEY = "emporia.charge_override_until"
+# The house-draw warning. Not an Emporia setting: the threshold is compared
+# against the inverter's own load figure, so it works on an installation that
+# has never heard of Emporia — which only supplies the names of the culprits.
+HIGH_USAGE_WATTS_KEY = "alerts.high_usage_watts"
 # The daily backup, which used to be compiled into manage.py and overridden only
 # by flags nobody types twice. manage.py cannot import this module — it runs on
 # the distribution's Python 3.8 while the package needs 3.12 — so it reads these
@@ -864,6 +958,12 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "azimuth° — then optional key=value pairs (temp_coeff, noct, "
             "mounting, bifacial, installed, degradation, vmp, voc, wire_awg, "
             "wire_run_ft, note). "
+            "An adjustable mount can give tilt as a schedule instead of one "
+            "angle: 25,40@2027-10-01 means 25° until 1 October 2027 and 40° "
+            "from it. Dates must run forwards, only the first angle may omit "
+            "one, and every hour is scored against the angle the array really "
+            "stood at — so adjusting the mount no longer discards the "
+            "performance history. "
             "For example: " + EXAMPLE_STRINGS.replace("\n", "  •  ")
         ),
         check=parse_strings,
@@ -994,12 +1094,187 @@ SETTINGS: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key="efficiency.config_valid_from",
+        kind="int",
+        default=0,
+        lower=0,
+        upper=253402300799,
+        label="Efficiency rescore floor (day epoch)",
+        help=(
+            "The earliest day still bound to the current config version. Days "
+            "before it keep the score they already have, because the change "
+            "that moved the version did not reach back that far. Leave it "
+            "alone — it is not a setting to choose."
+        ),
+    ),
+    SettingSpec(
         key="battery.installed",
         kind="str",
         default="",
         max_length=7,
         label="Bank installed (YYYY-MM)",
         help="For future capacity-fade context; empty is fine.",
+    ),
+    # --- Alerts -------------------------------------------------------------
+    SettingSpec(
+        key=HIGH_USAGE_WATTS_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=100000,
+        unit="W",
+        label="Warn when the house draws more than",
+        help=(
+            "Show a warning when the house is drawing more than this. Zero is "
+            "off, which is the default — a threshold nobody chose would warn "
+            "about a kettle. The figure compared against it is the inverter's "
+            "own load reading, which arrives every eleven seconds, so the "
+            "warning does not wait on anything else. If the Emporia module is "
+            "on, the warning also names the circuits responsible; without it "
+            "the warning still appears and simply cannot say what caused it."
+        ),
+    ),
+    # --- Modules ------------------------------------------------------------
+    SettingSpec(
+        key=CHARGER_AUTHORITY_KEY,
+        kind="choice",
+        choices=("app", "advisory", "limited", "full"),
+        default="app",
+        label="Who controls the EV charger",
+        help=(
+            "app leaves it to the Emporia app and this service never writes to "
+            "the charger — the default, because installing this is not the same "
+            "as asking it to take over your car charger. advisory lets it "
+            "propose a rate and change nothing. limited lets it set a rate "
+            "between your floor and ceiling. full also lets it stop and start "
+            "charging. Whichever you pick, the floor, the ceiling, the audit "
+            "trail and the restore on startup all still apply — those are not "
+            "settings, because a charge rate persists for ever once set and "
+            "nothing at Emporia's end will ever put it back. Only one "
+            "controller should have the charger: Emporia ships four of its own, "
+            "and the Charger page says which are switched on."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_FLOOR_KEY,
+        kind="int",
+        default=6,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Never charge below",
+        help=(
+            "The least current the module will ever command. Six amps is the "
+            "usual minimum a car will accept at all; below it some simply stop "
+            "charging rather than charge slowly."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_CEILING_KEY,
+        kind="int",
+        default=32,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Never charge above",
+        help=(
+            "The most current the module will ever command. Your charger's own "
+            "maximum still wins if it is lower — a command it cannot honour is "
+            "a command whose effect nobody can predict."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_DEFAULT_KEY,
+        kind="int",
+        default=32,
+        lower=1,
+        upper=80,
+        unit="A",
+        label="Put the charger back to",
+        help=(
+            "Where the rate is returned to when the module has no reason to "
+            "hold it anywhere else — including after a restart. This is what "
+            "stops a service that died mid-throttle leaving a car at the floor "
+            "all night. It only ever restores a rate it set itself; one you "
+            "moved by hand is left alone."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_OVERRIDE_UNTIL_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=253402300799,
+        label="Manual override lapses at (epoch)",
+        help=(
+            "Set by the service when you change the charge rate yourself, so "
+            "the override survives a restart. Leave it alone — it is not a "
+            "setting to choose."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_OVERRIDE_MINUTES_KEY,
+        kind="int",
+        default=120,
+        lower=1,
+        upper=1440,
+        unit="minutes",
+        label="A manual change holds for",
+        help=(
+            "How long the module keeps its hands off after you set a rate "
+            "yourself. Somebody standing at the car knows something this "
+            "service does not."
+        ),
+    ),
+    SettingSpec(
+        key=INVERTER_LIMIT_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=30000,
+        unit="W",
+        label="Back the car off when the inverter supplies more than",
+        help=(
+            "Zero is off, which is the default. When set, this moves only the "
+            "EV charger's rate — it never stops charging — to keep the inverter "
+            "under the limit. The figure compared is what the inverter itself "
+            "supplies: the house load with grid import taken out, so nothing "
+            "happens when the grid is carrying the house. Reaction takes about "
+            "twenty to thirty seconds, not instant: the inverter row lands every "
+            "~12 s, the guard ticks every 10 s, and the charger settles within "
+            "about 8 s of a write."
+        ),
+    ),
+    SettingSpec(
+        key=EMPORIA_INTERVAL_KEY,
+        kind="int",
+        default=60,
+        lower=10,
+        upper=3600,
+        unit="seconds",
+        label="Emporia poll interval",
+        help=(
+            "How often to read circuit power from Emporia. Sixty seconds by "
+            "default, which is what Emporia's own Home Assistant integration "
+            "uses. The round trip was measured at 133-206 ms, so this is not "
+            "limited by speed: Emporia publishes no rate limit, and a shorter "
+            "interval means more calls against a quota nobody can see. Lower it "
+            "by measurement rather than by hope."
+        ),
+    ),
+    SettingSpec(
+        key=EMPORIA_ENABLED_KEY,
+        kind="bool",
+        default=False,
+        label="Emporia circuit monitoring",
+        help=(
+            "Read circuit-level power from Emporia Vue monitors and an Emporia "
+            "EV charger. Off by default. This is the one part of the service "
+            "that needs the internet: Emporia offers no local access, so every "
+            "circuit reading crosses their cloud. Solar collection is never "
+            "affected — an unreachable Emporia costs the inverter nothing, and "
+            "turning this off stops all of it within one poll interval."
+        ),
     ),
 )
 
@@ -1078,17 +1353,37 @@ class SettingsStore:
     # against a different sky than the one the array was under.
     _VERSIONED_KEYS = (SETTING_LATITUDE, SETTING_LONGITUDE, SETTING_TIMEZONE)
 
-    def _bump_config_version(self, keys: Iterable[str]) -> None:
+    def _bump_config_version(self, keys: Iterable[str], previous: str | None = None) -> None:
         """Advance the efficiency config version if any of ``keys`` describes the array.
 
         Called inside the caller's transaction, so a write that fails validation
         leaves the version alone and days scored under it stay valid.
+
+        ``previous`` is the text ``panels.strings`` held before this write, and
+        it is what lets a tilt schedule be appended to without discarding the
+        history. Without it every edit is a change of unknown reach and the only
+        safe answer is to rescore everything — which is what punished an owner
+        for adjusting a mount they were sold the ability to adjust.
         """
         touched = list(keys)
         if not any(
             k.startswith(self._VERSIONED_PREFIXES) or k in self._VERSIONED_KEYS for k in touched
         ):
             return
+
+        # How far back this change reaches. date.min means "all of it"; a later
+        # date means the days before it were scored against a description that
+        # still describes them, and must be left exactly as they are.
+        reach = date.min
+        if touched == [PANELS_STRINGS_KEY] and previous is not None:
+            current_text = self.get(PANELS_STRINGS_KEY)
+            reach_or_none = _schedule_reach(
+                previous, current_text if isinstance(current_text, str) else ""
+            )
+            if reach_or_none is None:
+                # Nothing that any stored day was scored against actually moved.
+                return
+            reach = reach_or_none
         row = self._conn.execute(
             "SELECT value FROM settings WHERE key = ?", (CONFIG_VERSION_KEY,)
         ).fetchone()
@@ -1106,7 +1401,103 @@ class SettingsStore:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (CONFIG_VERSION_KEY, str(current + 1)),
         )
-        logger.info("array configuration changed; efficiency version now %d", current + 1)
+        self._move_valid_from(reach, current)
+        logger.info(
+            "array configuration changed; efficiency version now %d, rescoring from %s",
+            current + 1,
+            "the beginning" if reach == date.min else reach.isoformat(),
+        )
+
+    def _move_valid_from(self, reach: date, settled_version: int) -> None:
+        """Record how far back the version just written has to be believed.
+
+        The floor may be *raised* only when every stored day already agrees with
+        the version being superseded — that is, when nothing is queued for a
+        rescore. Then no score is at risk and a change confined to next October
+        can leave the whole history alone, which is the entire point of a tilt
+        schedule.
+
+        When days are still queued the floor is lowered to whichever reaches
+        back further, never raised. A change confined to October cannot
+        un-invalidate what last week's correction already queued, and stepping
+        over it would bless a score computed against a description somebody went
+        to the trouble of correcting.
+        """
+        floor = 0 if reach == date.min else self._local_midnight(reach)
+        standing = self._standing_floor()
+        if not self._efficiency_settled(settled_version, standing):
+            floor = min(floor, standing)
+        self._conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (CONFIG_VALID_FROM_KEY, str(floor)),
+        )
+
+    def _local_midnight(self, day: date) -> int:
+        """The epoch an efficiency row for ``day`` is keyed by.
+
+        Rows are stamped at midnight on the owner's own clock, so the floor they
+        are compared against has to be built the same way. Reading it as UTC
+        midnight instead puts the two up to fourteen hours apart, and the sign
+        of that gap follows the site's offset: east of Greenwich the very first
+        day of a new tilt sorts below the floor and quietly keeps the score it
+        was given under the old geometry — the one day of the year the change
+        was made to fix.
+        """
+        configured = self.get(SETTING_TIMEZONE)
+        zone = resolve_zone(None, configured if isinstance(configured, str) else None)
+        return int(datetime(day.year, day.month, day.day, tzinfo=zone).timestamp())
+
+    def _standing_floor(self) -> int:
+        """The floor as it stands, or zero when none has been recorded or it is unreadable.
+
+        Zero is the conservative answer in both cases: it claims the whole
+        history for the current version, which costs a rescore and never blesses
+        a score that should have been recomputed.
+        """
+        row = self._conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (CONFIG_VALID_FROM_KEY,)
+        ).fetchone()
+        if not row or not row[0]:
+            return 0
+        try:
+            return int(row[0])
+        except ValueError:
+            logger.warning("efficiency rescore floor unreadable; claiming the whole history")
+            return 0
+
+    def _efficiency_settled(self, version: int, floor: int) -> bool:
+        """True when no stored efficiency day is still waiting to be rescored.
+
+        ``floor`` is what the current version already claims, and rows below it
+        are excluded from the question. They carry an older version legitimately
+        — that is the whole point of the floor — so counting them as outstanding
+        would make the answer permanently no. The floor could then never rise
+        again, and the second seasonal adjustment an owner ever made would
+        rescore everything back to the first one, which is the behaviour this
+        was built to remove.
+
+        Reaches into the efficiency table from the settings writer, which bends
+        the usual one-way flow and is worth naming rather than hiding. The
+        alternative is worse: without knowing whether a rescore is outstanding
+        the floor can only ever be lowered, and a fresh installation — whose
+        floor starts at zero — would rescore its whole history the first time an
+        owner scheduled a future adjustment, which is the bug this exists to
+        remove. The two live in one SQLite file and one transaction, so the
+        question costs a single indexed read.
+
+        A database with no efficiency table at all is settled by definition:
+        there are no scores to protect.
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM efficiency_day WHERE string_name = '' AND config_version <> ? "
+                "AND day >= ? LIMIT 1",
+                (version, floor),
+            ).fetchone()
+        except sqlite3.Error:
+            return True
+        return row is None
 
     def ensure_efficiency_scorer_revision(self, revision: int) -> bool:
         """Apply a scorer migration once, then invalidate every stored score.
@@ -1174,6 +1565,7 @@ class SettingsStore:
             else:
                 stored = "1" if valid is True else "0" if valid is False else str(valid)
             checked.append((key, stored))
+        previous = self._array_text() if PANELS_STRINGS_KEY in values else None
         with self._conn:
             for key, stored in checked:
                 self._conn.execute(
@@ -1181,7 +1573,7 @@ class SettingsStore:
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     (key, stored),
                 )
-            self._bump_config_version(k for k, _ in checked)
+            self._bump_config_version((k for k, _ in checked), previous)
 
     def set(self, key: str, value: object) -> None:
         """Validate ``value`` against its spec and store it.
@@ -1200,14 +1592,26 @@ class SettingsStore:
             stored = ""
         else:
             stored = "1" if checked is True else "0" if checked is False else str(checked)
+        previous = self._array_text() if key == PANELS_STRINGS_KEY else None
         with self._conn:
             self._conn.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, stored),
             )
-            self._bump_config_version((key,))
+            self._bump_config_version((key,), previous)
         logger.info("setting %s changed", key)
+
+    def _array_text(self) -> str:
+        """The array description as it stands before this write overwrites it.
+
+        Captured by the writer rather than read back afterwards, because the
+        reach of a change is a question about the difference between two
+        descriptions and one of them stops existing the moment the row is
+        updated.
+        """
+        stored = self.get(PANELS_STRINGS_KEY)
+        return stored if isinstance(stored, str) else ""
 
     def clear(self, key: str) -> None:
         """Forget any stored value for ``key`` so it reads its default again."""
@@ -1305,6 +1709,37 @@ class SettingsStore:
             # a page would render as a configured value.
             out[spec.key] = _mask(value) if spec.secret and isinstance(value, str) else value
         return out
+
+
+def emporia_interval_seconds(settings: SettingsStore) -> int:
+    """How often circuits are read, as a whole number of seconds.
+
+    Three callers need this and none of them may disagree about it: the poller
+    that spaces its reads by it, the rollup that measures an hour's coverage
+    against it, and the endpoint that picks a tier and reads a raw window back.
+    A second copy of the fallback is a second answer to "what does one reading
+    cover", and that question decides an energy figure.
+
+    A stored value the registry would not accept falls back to the registered
+    default rather than propagating. Settings are decoded on read but not
+    checked against their bounds, so a database written by another build — or
+    edited by hand — can hand this a string, a zero, or an hour and a second.
+
+    Checked through the spec's own ``validate`` rather than against a bound
+    written out here. The registry is where a setting's limits live, and a
+    reader that hard-codes them drifts from the page and the API the moment
+    either limit moves — which is the same rule ``settings.html`` renders
+    itself by. The lower bound is what matters most: this figure is a divisor
+    and a multiplier both, and one second would credit a reading with a
+    sixtieth of what it covers.
+    """
+    spec = lookup_setting(EMPORIA_INTERVAL_KEY)
+    try:
+        value = spec.validate(settings.get(EMPORIA_INTERVAL_KEY))
+    except ValueError:
+        logger.warning("%s is out of range; falling back to the default", EMPORIA_INTERVAL_KEY)
+        value = spec.default
+    return value if isinstance(value, int) and not isinstance(value, bool) else 60
 
 
 def _mask(value: str) -> str:

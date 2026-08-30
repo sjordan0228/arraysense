@@ -117,12 +117,33 @@ MODULE_TIERS: tuple[Tier, ...] = (
     Tier("hourly", "module_hourly", None),
 )
 
+# The optional Emporia module's tiers. Raw and hourly only, for the reason the
+# module tiers have no minute tier and the opposite reason besides: a circuit
+# is polled once a minute already, so a minute tier would be a copy of the raw
+# one under another name. Named here with the other two so tier selection reads
+# one list rather than keeping a third copy of the table names in step by hand.
+#
+# ``keep_days`` describes the retention that is already running — the raw tier
+# is pruned into the hourly one by store.retention, and the hourly tier appears
+# in no prune table of its own, which is what None means here and why a
+# thirteen-month circuit history is readable.
+CIRCUIT_TIERS: tuple[Tier, ...] = (
+    Tier("full", "circuit_reading", 30),
+    Tier("hourly", "circuit_hourly", None),
+)
+
 SERIALS_TABLE = "serials"
 INVALID_TABLE = "invalid_readings"
 SETTINGS_TABLE = "settings"
 FORECAST_TABLE = "forecast"
 EFFICIENCY_TABLE = "efficiency_day"
 PENDING_TABLE = "rollup_pending"
+# The optional Emporia module's tables. Named here with the rest so the DDL
+# builders, the dispatch and the startup schema all spell them once.
+CIRCUIT_TABLE = "circuit"
+CIRCUIT_READING_TABLE = "circuit_reading"
+CIRCUIT_HOURLY_TABLE = "circuit_hourly"
+CHARGER_CHANGE_TABLE = "charger_change"
 
 _MODULE_PREFIX = re.compile(r"^battery_module\d+_")
 
@@ -141,6 +162,14 @@ SAMPLE_COUNT = "sample_count"
 # rowid, which would otherwise let a NULL timestamp be silently assigned one.
 # Neither is enforced by SQLite's defaults; both are needed together.
 _TABLE_OPTIONS = "STRICT, WITHOUT ROWID"
+
+# STRICT alone, for the one shape that cannot have the other half. A table whose
+# key is a surrogate id needs SQLite to generate that id, and generating it is
+# exactly the rowid aliasing WITHOUT ROWID removes: an insert that omits the id
+# fails outright with "NOT NULL constraint failed" rather than counting up.
+# Measured, not assumed — the circuit table was written with both options and
+# refused its first row. Everything with a natural key keeps _TABLE_OPTIONS.
+_TABLE_OPTIONS_ROWID = "STRICT"
 
 # SQLite disables foreign keys on every new connection. The module tables'
 # reference into the serials table is decorative until a connection turns this
@@ -273,6 +302,162 @@ def _settings_ddl(as_name: str) -> str:
         "    key TEXT NOT NULL PRIMARY KEY,\n"
         "    value TEXT NOT NULL\n"
         f") {_TABLE_OPTIONS}"
+    )
+
+
+def _circuit_ddl(as_name: str) -> str:
+    """One row per thing Emporia can report power for.
+
+    Circuits are rows rather than columns, unlike battery modules, because they
+    have no natural ceiling: the reference home has 32 across two monitors, an
+    apartment might have 8, and a third monitor would make 48. A fixed slot
+    count would need a migration the day somebody added a monitor.
+
+    The unique key is the device and channel, never the name. The name belongs
+    to the owner and they will change it; keying on it would orphan a year of
+    history the first time somebody fixed a typo — the same reasoning that keys
+    battery modules by serial rather than by slot.
+
+    This is the one table without WITHOUT ROWID, and it has to be: its key is a
+    surrogate id SQLite generates, and generating it *is* the rowid aliasing
+    that option removes. With both, the first insert fails outright.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    id INTEGER PRIMARY KEY,\n"
+        "    device_gid INTEGER NOT NULL,\n"
+        "    channel_num TEXT NOT NULL,\n"
+        "    name TEXT NOT NULL,\n"
+        "    multiplier REAL NOT NULL DEFAULT 1.0,\n"
+        "    kind TEXT NOT NULL DEFAULT 'circuit',\n"
+        # The owner's own category for the circuit, from Emporia's app. Nullable
+        # because a clamp nobody has set up has none, and a zero here would be a
+        # category rather than the absence of one.
+        "    type_gid INTEGER,\n"
+        # What contains this circuit, as Emporia's device record states it.
+        # Nullable, and the null is the meaningful value: a device nothing else
+        # contains is the only kind that may be added to a total. Without it a
+        # subpanel's branches, a charger and a smart plug are summed on top of
+        # the main-panel clamps already measuring them (#212, #219).
+        "    parent_device_gid INTEGER,\n"
+        "    parent_channel_num TEXT,\n"
+        "    first_seen INTEGER NOT NULL,\n"
+        "    last_seen INTEGER NOT NULL,\n"
+        "    UNIQUE (device_gid, channel_num)\n"
+        f") {_TABLE_OPTIONS_ROWID}"
+    )
+
+
+def _circuit_reading_ddl(as_name: str) -> str:
+    """One circuit's power at one moment.
+
+    ``watts`` is nullable and stays NULL when Emporia reported null, which an
+    offline device does. Zero would be a claim that the circuit drew nothing,
+    and that is a different statement from not having heard.
+
+    The time column is ``timestamp`` like every other table's, and that is not
+    only tidiness: the retention engine reads that name directly, so a table
+    that spelled it otherwise could not be pruned by the machinery that prunes
+    everything else — and this one grows by 56,000 rows a day on a house with
+    two monitors.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    timestamp INTEGER NOT NULL,\n"
+        "    circuit_id INTEGER NOT NULL,\n"
+        "    watts INTEGER,\n"
+        "    PRIMARY KEY (timestamp, circuit_id)\n"
+        f") {_TABLE_OPTIONS}"
+    )
+
+
+def _circuit_hourly_ddl(as_name: str) -> str:
+    """One circuit's average power over one hour.
+
+    The coarse tier the raw readings are pruned into, and the reason they can be
+    pruned at all: the retention engine refuses to delete a bucket this table
+    does not already cover. A year of raw readings for 39 circuits is around 20
+    million rows; the same year here is about 340,000.
+
+    ``watts`` is nullable for the same reason it is in the raw tier — an hour in
+    which a circuit reported nothing averages to nothing, and zero would be a
+    claim. ``sample_count`` counts *readings*, not rows: an hour built from two
+    readings and an hour built from sixty are different figures, and the second
+    stage that prices a circuit has to be able to tell them apart. That differs
+    deliberately from the module tier, which counts rows because a failed poll
+    writes none there.
+
+    ``covered_seconds`` is how much of the hour those readings actually account
+    for, and it is the one figure a reader cannot derive. A sample count means
+    nothing until something says what one sample covers, and the only moment
+    anything knows that is the rollup — which runs on the hourly clock, minutes
+    after the readings it summarises, while the poll interval that produced them
+    is still the one in force. Read back later under an interval the owner has
+    since changed, the same count says something else entirely: 180 samples is
+    half an hour at ten seconds and a whole one at sixty, so raising the setting
+    doubled the energy of every hour already stored. Measuring once, here, is
+    what stops a setting from rewriting history.
+
+    Nullable, and NULL means one specific thing: a row written before this
+    column existed. Those cannot be repaired — their raw readings are pruned
+    after thirty days, so for most of them the evidence is gone — and a reader
+    falls back to the old guess for them, visibly. An hour genuinely holding no
+    readings stores 0 rather than NULL, so the two are never confused.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    timestamp INTEGER NOT NULL,\n"
+        "    circuit_id INTEGER NOT NULL,\n"
+        "    watts INTEGER,\n"
+        "    sample_count INTEGER NOT NULL,\n"
+        "    covered_seconds INTEGER,\n"
+        "    PRIMARY KEY (timestamp, circuit_id)\n"
+        f") {_TABLE_OPTIONS}"
+    )
+
+
+def _charger_change_ddl(as_name: str) -> str:
+    """Every change this service made to a charge rate, and every one it refused.
+
+    The audit exists because the rate persists. A car found at 6 A in the
+    morning is a number with no history attached, and the question that matters
+    — did this service do that, and what for — cannot be answered from the
+    charger, which remembers only its current value.
+
+    Refused changes are recorded too. "Asked for 40 A, held at the 32 A ceiling"
+    and "would have set 20 A, advisory so did not" are both things somebody
+    debugging an unexpected rate needs to see; a log of successes only makes a
+    module that never acted look identical to one that was never asked.
+
+    ``from_a`` is nullable: the first write after a restart may find a charger
+    whose previous rate this service never read. Zero there would be a claim
+    that it had been off.
+
+    The key is a surrogate id rather than the timestamp, because an audit has no
+    natural key and must never lose a row. Keyed on (timestamp, device_gid) it
+    did: stopping and starting a charger within the same second left one line
+    where there had been two, which is precisely the record somebody would be
+    reading to find out what happened.
+
+    ``source`` is who decided, and it is not a refinement of ``applied``. The
+    owner moving the slider is applied — it really did reach the charger — so a
+    query asking only what was last applied answered with the owner's own
+    number, and restore-on-startup concluded the rate was its own work and undid
+    it. Nullable, because a row written before the column existed says who moved
+    the rate no more than it says why, and an unknown provenance is not a
+    showing that the rate was this service's.
+    """
+    return (
+        f"CREATE TABLE IF NOT EXISTS {as_name} (\n"
+        "    id INTEGER PRIMARY KEY,\n"
+        "    timestamp INTEGER NOT NULL,\n"
+        "    device_gid INTEGER NOT NULL,\n"
+        "    from_a INTEGER,\n"
+        "    to_a INTEGER,\n"
+        "    reason TEXT NOT NULL,\n"
+        "    applied INTEGER NOT NULL,\n"
+        "    source TEXT\n"
+        f") {_TABLE_OPTIONS_ROWID}"
     )
 
 
@@ -442,6 +627,14 @@ def ddl_for(table: str, as_name: str | None = None, declared: Iterable[str] | No
         return _efficiency_day_ddl(name)
     if table == PENDING_TABLE:
         return _rollup_pending_ddl(name)
+    if table == CIRCUIT_TABLE:
+        return _circuit_ddl(name)
+    if table == CIRCUIT_READING_TABLE:
+        return _circuit_reading_ddl(name)
+    if table == CIRCUIT_HOURLY_TABLE:
+        return _circuit_hourly_ddl(name)
+    if table == CHARGER_CHANGE_TABLE:
+        return _charger_change_ddl(name)
     if table == SERIALS_TABLE:
         return _serials_ddl(name)
     if table == INVALID_TABLE:
@@ -464,6 +657,12 @@ def indexes_for(table: str) -> tuple[str, ...]:
     slowly enough that nobody would connect it to a migration run months
     earlier.
     """
+    if table in (CIRCUIT_READING_TABLE, CIRCUIT_HOURLY_TABLE):
+        # Every read this module makes is "this circuit, over this window".
+        # The primary key leads with timestamp, which serves a time range across
+        # all circuits; this reverses it for the per-circuit history the page and
+        # the later cost work both ask for.
+        return (_index_ddl(table, "circuit_id, timestamp"),)
     if table == INVALID_TABLE:
         # Appending clears a timestamp's stale flags before rewriting them.
         # Without this index that delete scans the whole table, so a sustained
@@ -566,6 +765,49 @@ def migration_ddl(
     return tuple(statements)
 
 
+# Columns added to a fixed-shape table after that table first shipped, in the
+# order they were added. ``CREATE TABLE IF NOT EXISTS`` is idempotent only while
+# the shape is unchanged, so against a database that already has the table it
+# does nothing at all and the first write fails with "no such column" — the same
+# gap ``migration_ddl`` closes for the metric tiers, which cannot be listed here
+# because their columns come from the registry rather than from a literal.
+#
+# Every one has to be nullable or carry a default: SQLite refuses to add a NOT
+# NULL column to a table that already has rows.
+LATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    CHARGER_CHANGE_TABLE: (("source", "TEXT"),),
+    # How much of each hour the readings behind it account for. Added after the
+    # tier shipped, so an installation that has been recording circuits since
+    # 1.1.0 has hours without one; those keep NULL and are read with the old
+    # guess, because their raw readings are pruned at thirty days and the
+    # measurement cannot be made after the fact.
+    CIRCUIT_HOURLY_TABLE: (("covered_seconds", "INTEGER"),),
+    # Added after the table shipped, so an installation recording circuits since
+    # 1.1.0 has rows with neither. They stay NULL until the next sync, which
+    # runs every poll and rewrites every circuit it is told about — so the gap
+    # closes on its own within one interval rather than needing a migration.
+    CIRCUIT_TABLE: (("parent_device_gid", "INTEGER"), ("parent_channel_num", "TEXT")),
+}
+
+
+def late_column_ddl(existing: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
+    """Return ALTER statements giving a live database the columns it is missing.
+
+    The counterpart to ``migration_ddl`` for the tables whose shape is written
+    out by hand rather than derived from the metric registry. A database already
+    current yields nothing to run.
+    """
+    statements: list[str] = []
+    for table, columns in LATE_COLUMNS.items():
+        have = set(existing.get(table, ()))
+        statements.extend(
+            f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}"
+            for name, sql_type in columns
+            if name not in have
+        )
+    return tuple(statements)
+
+
 def schema_ddl(declared: Iterable[str] | None = None) -> str:
     """Return the complete storage schema as executable SQL text.
 
@@ -591,6 +833,17 @@ def schema_ddl(declared: Iterable[str] | None = None) -> str:
         ddl_for(FORECAST_TABLE),
         ddl_for(EFFICIENCY_TABLE),
         ddl_for(PENDING_TABLE),
+        # The Emporia module's tables are created whether or not the module is
+        # enabled. An empty table costs nothing and writes nothing, and the
+        # alternative is DDL on a request path the first time somebody turns
+        # the module on — which is the mistake the settings table already
+        # documents here.
+        ddl_for(CIRCUIT_TABLE),
+        ddl_for(CIRCUIT_READING_TABLE),
+        *indexes_for(CIRCUIT_READING_TABLE),
+        ddl_for(CIRCUIT_HOURLY_TABLE),
+        *indexes_for(CIRCUIT_HOURLY_TABLE),
+        ddl_for(CHARGER_CHANGE_TABLE),
     ]
     for table in DEVICED_TABLES:
         statements.append(ddl_for(table, declared=declared))

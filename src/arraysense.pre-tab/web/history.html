@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>History · Solar ArraySense</title>
+<!-- uPlot is vendored and served from this app, never fetched from a CDN. The
+     collector runs on a home network that may have no route to the internet at
+     all, and a chart library that silently fails to load is a blank panel with
+     nothing on screen to say why. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<script src="/vendor/uPlot.iife.min.js"></script>
+<!-- The shared front end — palette, formatters, nav and the chart factory. It
+     injects the base stylesheet as it runs, so it has to load above this page's
+     own <style>: the page's rules then come second in the cascade and win. -->
+<script src="/common.js"></script>
+<style>
+  /* Eight columns do not fit a phone. They scroll sideways inside the panel
+     rather than being dropped or stacked: every one of them is a quantity the
+     owner came here to read, and a column hidden below a breakpoint is a column
+     nobody knows exists. */
+  .tablewrap{overflow-x:auto}
+  #hist{min-width:790px}
+  #hist td{font-variant-numeric:tabular-nums}
+  /* Money is the one column here that is not kilowatt-hours, so it is set
+     apart by weight and a rule rather than by a colour the owner cannot see. */
+  #hist td.cost,#hist th.cost{border-left:1px solid var(--panel-b);font-weight:600}
+  /* A money figure that is not the whole period carries a dot, the same mark
+     the Costs page uses. It is the money's own flag: a day can be complete in
+     energy — the counters span a mid-day gap exactly — while its cost is
+     short by every peak hour inside that gap, so the energy badge cannot
+     stand in for this. The title says what the figure covers. */
+  #hist td.part{position:relative;cursor:help}
+  #hist td.part::after{content:'·';position:absolute;right:1px;top:2px;color:var(--warn)}
+  /* A bucket nothing was recorded for is drawn dim and dashed, never as a row
+     of zeros. A month the house used nothing did not happen; a month we were
+     not collecting did, and the two must not look alike. */
+  #hist tbody tr.absent td{color:var(--ink3)}
+  #hist tfoot td{border-bottom:none;border-top:1px solid var(--panel-b);font-weight:600}
+  #hist tfoot .sub{display:block;margin-top:3px;font-weight:400;font-size:9.5px;
+    letter-spacing:.09em;text-transform:uppercase;color:var(--ink3)}
+  /* Says what the number in the row is, not how big it is. Borrowed from the
+     dashboard's estimate badge so the two pages mark a qualified reading the
+     same way. */
+  .tag{margin-left:8px;font-size:9px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;
+    color:var(--ink);background:var(--tint-3);border-radius:5px;padding:2px 6px;
+    vertical-align:1px;white-space:nowrap;cursor:help}
+  .tag.none{color:var(--ink3);background:transparent;box-shadow:inset 0 0 0 1px var(--panel-b)}
+  .chead .legend .swatch{display:inline-block;width:15px;height:0;margin-right:6px;vertical-align:4px;
+    border-top:2px dashed var(--grid)}
+</style>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>History</h1>
+    <div class="conn" id="conn">loading…</div>
+  </header>
+
+  <!-- Filled by drawNav(). Same place on every page, so the lit entry is always
+       the answer to "where am I". -->
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <div class="chartbar">
+    <span class="note" id="chartNote" hidden></span>
+    <button id="zoomReset" hidden>Reset zoom</button>
+    <span class="zoomhint">drag across the chart to zoom</span>
+  </div>
+
+  <section class="p">
+    <div class="chead">
+      <h2 id="chartTitle">Energy, last 30 days</h2>
+      <div class="legend">
+        <span><span class="sq" style="background:var(--pv)"></span>Solar</span>
+        <span><span class="sq" style="background:var(--load)"></span>Home</span>
+        <span><span class="swatch"></span>Grid — used above the line, exported below</span>
+        <span class="muted">shaded = partial</span>
+      </div>
+      <div class="rng" id="ranges"></div>
+    </div>
+    <div class="chart" id="energyWrap" role="img"
+         aria-label="Energy made and used per calendar bucket over the selected range"></div>
+  </section>
+
+  <section class="p">
+    <div class="chead">
+      <h2 id="tableTitle">Day by day</h2>
+      <span class="legend muted" id="tableNote"></span>
+    </div>
+    <div class="tablewrap">
+      <!-- Grid used and grid exported are two columns and never one signed
+           number: the hardware counts them separately and the owner reads them
+           separately, because one is a bill and the other is a credit. Battery
+           charged and discharged likewise — the difference between them is
+           round-trip loss, which is worth being able to see.
+           There is deliberately no EPS column. On the reference system
+           eps_energy_today read 58.1 kWh on a day load_energy_today read 95.3,
+           with every instantaneous register saying the whole house runs through
+           the backup panel. Until that is explained it is not a number to put
+           in front of anyone. -->
+      <table id="hist">
+        <!-- The header is written by drawTable from the same list the body
+             loops over, so a column added to one cannot go missing from the
+             other and leave the table labelling the wrong number. -->
+        <thead><tr id="headRow"></tr></thead>
+        <tbody></tbody>
+        <tfoot></tfoot>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+// Everything shared with the other pages — $, esc, numOrNull, DASH, gnum, the
+// palette resolver, drawNav and the chart factory — comes from /common.js,
+// which is loaded above. This file is only what is particular to History.
+//
+// Every number on this page comes from /api/energy, which reads the inverter's
+// own lifetime kWh counters. Nothing here integrates stored power: integration
+// agrees with the inverter on a clean day and quietly undercounts after any gap
+// in collection, and the total that comes out still looks entirely plausible.
+
+// The two spans this page answers. Not the shared RANGES — those are hours and
+// days against a power chart, and these are calendars: thirty of the owner's
+// days, or thirteen of their months. Thirteen rather than twelve so the month
+// in progress has the same month last year to be read against.
+const SPANS = [
+  {
+    key: '30d', label: '30 days', period: 'day', count: 30,
+    chartTitle: 'Energy, last 30 days', tableTitle: 'Day by day',
+    whenHeading: 'Day', unitName: 'days',
+    tableNote: 'kWh · newest first',
+    costNote: 'cost includes each day’s share of the monthly connection charge',
+  },
+  {
+    key: '13m', label: '13 months', period: 'month', count: 13,
+    chartTitle: 'Energy, last 13 months', tableTitle: 'Month by month',
+    whenHeading: 'Month', unitName: 'months',
+    tableNote: 'kWh past 13 months',
+    // Nothing appended here. The daily view says the standing charge is shared
+    // across its rows because that is surprising; on a month it simply falls
+    // where it is billed, and saying so is noise.
+    costNote: '',
+  },
+];
+
+// The table, left to right, and which field of a bucket answers each column.
+// One list rather than a header row and a body loop that have to be kept in
+// step: a column added to one and not the other is a table that lies about
+// which number is which.
+const COLUMNS = [
+  { key: 'load_kwh', label: 'Load' },
+  { key: 'solar_kwh', label: 'Solar PV' },
+  { key: 'battery_charged_kwh', label: 'Battery charged' },
+  { key: 'battery_discharged_kwh', label: 'Battery discharged' },
+  { key: 'grid_imported_kwh', label: 'Grid used' },
+  { key: 'grid_exported_kwh', label: 'Grid exported' },
+];
+
+// How long a bucket total may be before a tenth of a kWh stops carrying
+// information. A month runs to thousands, where the decimal is noise; a quiet
+// day runs to fractions, where it is the reading.
+const WHOLE_NUMBER_ABOVE = 100;
+
+// What the service says about money, from the last reply. Nothing on this page
+// prices anything: the endpoint is handed the same buckets it reports energy
+// for and sends back what each one cost, already in the owner's currency. The
+// Costs page once carried its own copy of the tariff grammar and the two
+// disagreed within a day — a real seasonal tariff priced nothing at all, and
+// the syntax the browser did accept charged a January evening at the summer
+// peak rate. A second implementation of money is not worth a round trip.
+//
+// `configured` false means no tariff has been entered, and then the column is
+// not drawn at all. Not a column of dashes, and certainly not zeroes: there is
+// nothing to say about money on an install that has never entered a rate.
+//
+// `totals` is the footer's row, priced by the service over the same buckets it
+// sent. It is not the sum of the column above it and must not be replaced by
+// one: the cells are rounded to the cent they are read at, and thirty-one
+// shares of a $15.00 connection charge shown as $0.48 add up to $14.88.
+let priced = { configured: false, currency: null, totals: null };
+
+// Which span is on screen. Module scope rather than passed around because the
+// chart is built once and updated in place — uPlot keeps the axis formatters
+// and plugins it was constructed with, so anything of theirs that closes over
+// the span would still be formatting days after the switch to months.
+let current = SPANS[0];
+
+// The buckets the canvas is currently showing, in the same order as its data.
+// The readout renders from these rather than from u.data because the chart
+// plots exported energy below the zero line, and the sign belongs to the
+// drawing and not to the number: nobody exported minus twelve kilowatt-hours.
+let shown = [];
+
+// ---------------------------------------------------------------------------
+// The calendar the page renders. Built here rather than taken from the reply,
+// because the reply only contains buckets that had something in them — a day
+// the collector was down is simply not there, and a table drawn from the reply
+// alone would skip it silently instead of showing it as a day we cannot answer
+// for.
+// ---------------------------------------------------------------------------
+
+// One more boundary than there are buckets: bucket i runs from starts[i] to
+// starts[i + 1]. The arithmetic is on calendar fields, so the Date constructor
+// resolves the daylight saving days for us — a 23-hour day is 23 hours and the
+// boundary after it is still midnight, which is exactly what stepping by 86400
+// seconds gets wrong.
+//
+// ``today`` is the date on the *site's* calendar, from civilNow(siteZone()),
+// and not this browser's. Reading it off the browser is how the last row came
+// to be a day the site has not reached — drawn blank while the bucket for the
+// day before the first row was dropped on the floor, its energy still inside
+// the footer's total.
+function calendarStarts(span, today) {
+  const out = [];
+  if (span.period === 'month') {
+    const first = today.month - (span.count - 1);
+    for (let i = 0; i <= span.count; i++) out.push(civilDay(today.year, first + i, 1));
+  } else {
+    const first = today.day - (span.count - 1);
+    for (let i = 0; i <= span.count; i++) out.push(civilDay(today.year, today.month, first + i));
+  }
+  return out;
+}
+
+// Buckets are matched to calendar slots by their local date, read straight off
+// the front of the server's ISO string. The string already carries the offset
+// midnight was cut at, so the first ten characters are the owner's date with no
+// parsing and no chance of a timezone round trip moving it a day.
+const keyLength = (period) => (period === 'month' ? 7 : 10);
+
+const keyOf = (d, period) => (period === 'month'
+  ? `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`
+  : `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`);
+
+const labelOf = (d, period) => (period === 'month'
+  ? d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
+  : d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }));
+
+// One row per calendar slot, whether or not the inverter had anything to say
+// about it. Three states, and collapsing any two of them is the bug this whole
+// project exists to prevent: reported and whole, reported but partial, and
+// absent. A partial bucket holds a real number that is not the whole period,
+// and an absent one holds no number at all — neither is a low total.
+function buildRows(span, buckets, starts) {
+  const cut = keyLength(span.period);
+  const byKey = new Map();
+  for (const b of (buckets || [])) {
+    if (b && typeof b.start === 'string') byKey.set(b.start.slice(0, cut), b);
+  }
+  const rows = [];
+  for (let i = 0; i < starts.length - 1; i++) {
+    const start = starts[i];
+    const got = byKey.get(keyOf(start, span.period));
+    const totals = {};
+    for (const c of COLUMNS) totals[c.key] = got ? numOrNull(got[c.key]) : null;
+    const reported = COLUMNS.some((c) => totals[c.key] !== null);
+    rows.push({
+      key: keyOf(start, span.period),
+      label: labelOf(start, span.period),
+      // uPlot's time scale counts in seconds, not milliseconds.
+      xs: Math.round(start.getTime() / 1000),
+      endXs: Math.round(starts[i + 1].getTime() / 1000),
+      reported,
+      // Completeness is only claimed when the server says so. A reply without
+      // the flag is treated as partial rather than whole: the cost of marking a
+      // good day partial is a word on screen, and the cost of the reverse is a
+      // half-collected day read as a quiet one.
+      partial: reported && got.complete !== true,
+      totals,
+      // Straight off the bucket, never worked out here. A bucket the service
+      // priced carries a number; one whose bands it could not measure carries
+      // null, which is a different thing from a cheap day and has to stay that
+      // way all the way to the cell.
+      cost: got ? numOrNull(got.cost) : null,
+      saved: got ? numOrNull(got.saved) : null,
+      // The money's own qualification, separate from `partial` above: that
+      // one answers whether the energy totals cover the period, this one
+      // whether the money does, and issue #23 is the proof they diverge.
+      costShort: got ? got.cost_short === true : false,
+      savedShort: got ? got.saved_short === true : false,
+      shortfall: got && got.shortfall && typeof got.shortfall === 'object' ? got.shortfall : null,
+    });
+  }
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
+// The table.
+// ---------------------------------------------------------------------------
+
+// One digit count for the whole table, so a column does not change width from
+// row to row. Chosen from the largest value present rather than from the span,
+// because the first week of a new installation is a handful of kWh whichever
+// bucket it is filed under.
+function decimals(rows) {
+  // One digit count per COLUMN, not one for the whole table. A single count
+  // taken from the largest value anywhere rounds a real 0.4 kWh of export down
+  // to a bare "0" — visually identical to a month that exported nothing, on a
+  // page whose whole premise is that those two must never look alike. The
+  // reference system has exported 4.7 kWh in its life, so every month of it
+  // was reading zero.
+  const places = {};
+  for (const c of COLUMNS) {
+    let biggest = 0;
+    for (const r of rows) {
+      const v = r.totals[c.key];
+      if (v !== null && v !== undefined) biggest = Math.max(biggest, Math.abs(v));
+    }
+    places[c.key] = biggest >= WHOLE_NUMBER_ABOVE ? 0 : 1;
+  }
+  return places;
+}
+
+const cell = (v, places) => (v === null
+  ? `<td class="muted">${DASH}</td>`
+  : `<td>${esc(gnum(v, places))}</td>`);
+
+// A footer cell, which can be a dash for a reason worth telling: the column
+// held numbers and could still not be totalled. The body's dash means nobody
+// recorded the figure, and these two must not read alike.
+const totalCell = (v, places, why) => (v === null
+  ? `<td class="muted"${why ? ` title="${esc(why)}"` : ''}>${DASH}</td>`
+  : `<td>${esc(gnum(v, places))}</td>`);
+
+// The money cell. A bucket the service could not price is a dash and never a
+// zero — a day whose peak hours nobody recorded did not cost nothing, it cost
+// an amount no one can state — and the currency comes from the reply rather
+// than from anything written here. A figure the service says is short gets
+// the dot and a title saying what it covers, never a bare number (#23).
+const costCell = (v, short, why) => `<td class="cost${v === null ? ' muted' : ''}`
+  + `${short ? ' part' : ''}"${short ? ` title="${esc(why)}"` : ''}>`
+  + `${esc(money(v, priced.currency))}</td>`;
+
+// What a short money figure covers, worded from the bucket's own accounting.
+// A counted amount is named per counter; an unknowable one claims no number
+// and no direction — a counter that stepped backwards inflates rather than
+// loses. The saved figure subtracts one partial from another, so it names
+// both sides and asserts no direction of its own: missing import overstates
+// it while missing load understates it, and the cell is too small to argue.
+function shortWhy(shortfall, kind) {
+  const counted = (name, label) => {
+    const entry = shortfall ? shortfall[name] : null;
+    const known = entry ? numOrNull(entry.unattributed_kwh) : null;
+    return known !== null && known > 0.05 ? `${gnum(known, 1)} kWh of ${label}` : null;
+  };
+  const parts = [counted('grid_import', 'grid import')];
+  if (kind === 'saved') parts.push(counted('load', 'house load'));
+  const named = parts.filter((p) => p !== null);
+  if (named.length) {
+    return `${named.join(' and ')} passed the meter but could not be placed in a rate band, `
+      + 'so this figure is not the whole story.';
+  }
+  return 'Part of what the meter counted could not be fully read, so this figure may not '
+    + 'be exact.';
+}
+
+function drawTable(span, rows) {
+  const places = decimals(rows);
+  $('headRow').innerHTML = `<th>${esc(span.whenHeading)}</th>`
+    + COLUMNS.map((c) => `<th>${esc(c.label)}</th>`).join('')
+    + (priced.configured ? '<th class="cost">Cost</th><th class="cost">Saved</th>' : '');
+  // Newest first: the row the owner came to look at is today's, and it should
+  // not be thirty rows down. The chart runs the other way because time reads
+  // left to right; the table reads top down.
+  $('hist').querySelector('tbody').innerHTML = rows.slice().reverse().map((r) => {
+    const tag = !r.reported
+      ? `<span class="tag none" title="Nothing was recorded for this ${span.whenHeading.toLowerCase()}">no data</span>`
+      : r.partial
+        ? '<span class="tag" title="Only part of this period was collected, so these totals are not the whole of it">partial</span>'
+        : '';
+    return `<tr${r.reported ? '' : ' class="absent"'}><td>${esc(r.label)}${tag}</td>`
+      + COLUMNS.map((c) => cell(r.totals[c.key], places[c.key])).join('')
+      + (priced.configured
+          ? costCell(r.cost, r.costShort, shortWhy(r.shortfall, 'cost'))
+            + costCell(r.saved, r.savedShort, shortWhy(r.shortfall, 'saved'))
+          : '')
+      + '</tr>';
+  }).join('');
+  drawTotals(span, rows, places);
+}
+
+// One column's total across the periods the footer covers, and whether any of
+// them had nothing to contribute to it.
+//
+// A row counts as reported when *any* of its columns holds a number, so a day
+// whose load counter never arrived is still one of the days the footer says it
+// covers. Adding the columns that did arrive and stepping over that null makes
+// a thirty-day load total out of twenty-nine days of load, and the figure that
+// comes out looks exactly like a quiet month. Absent is not zero, and it is not
+// "leave it out of the sum" either: a column short of even one period counted
+// here has no total, and says so.
+function columnTotal(rows, key) {
+  let sum = null;
+  let missing = false;
+  for (const r of rows) {
+    const v = r.totals[key];
+    if (v === null) { missing = true; continue; }
+    // Counters carry one decimal, so every total is a whole number of tenths.
+    // Rounding to that clears the float noise a month of additions leaves.
+    sum = Math.round(((sum === null ? 0 : sum) + v) * 10) / 10;
+  }
+  // Two different dashes. `held` is a column that has numbers above it and
+  // still cannot be added up, which needs explaining; a column no period
+  // reported at all is the ordinary absence the body already draws.
+  return { value: missing ? null : sum, held: missing && sum !== null };
+}
+
+// The totals row, and what it covers said in those words. A figure labelled
+// "30 days" that quietly adds up twenty-seven of them is the same lie as a
+// missing day rendered as zero, so the count, the holes, the partials and any
+// column that could not be added are spelled out beside it.
+//
+// The kilowatt-hour columns are added up here and the money columns are not.
+// Counters carry one decimal, so a column of tenths adds to a tenth and the
+// only thing lost is float noise; money is rounded to the cent it is read at,
+// and adding a rounded column is how a total drifts from the bill it is a view
+// of.
+function drawTotals(span, rows, places) {
+  const reported = rows.filter((r) => r.reported);
+  if (!reported.length) { $('hist').querySelector('tfoot').innerHTML = ''; return; }
+  const unit = span.whenHeading.toLowerCase();
+  let held = 0;
+  const cells = COLUMNS.map((c) => {
+    const total = columnTotal(reported, c.key);
+    if (total.held) held += 1;
+    return totalCell(total.value, places[c.key], total.held
+      ? `Not every ${unit} counted below reported ${c.label.toLowerCase()}, so this column `
+        + 'cannot be totalled. The periods that did report it are in the rows above.'
+      : '');
+  }).join('');
+  const missing = rows.length - reported.length;
+  const partial = reported.filter((r) => r.partial).length;
+  const notes = [`${reported.length} of ${rows.length} ${span.unitName}`];
+  if (missing) notes.push(`${missing} with no data`);
+  if (partial) notes.push(`${partial} partial`);
+  if (held) notes.push(`${held} column${held === 1 ? '' : 's'} not totalled`);
+  const unpriced = priced.configured ? reported.filter((r) => r.cost === null).length : 0;
+  if (unpriced) notes.push(`${unpriced} not priced`);
+  // Counted separately from `partial`, which is about the energy: these are
+  // the rows whose money the service flagged, and a footer over a short row
+  // is short too — the flag on its own cells comes from the reply.
+  const short = priced.configured
+    ? reported.filter((r) => r.costShort || r.savedShort).length : 0;
+  if (short) notes.push(`money short on ${short}`);
+  // Priced by the service over these same buckets, from the kilowatt-hours
+  // behind them: a cell reads $0.48 because that is a cent-rounded thirty-first
+  // of the connection charge, and thirty-one of those come to $14.88 against
+  // the $15.00 billed. A bucket it could not price is out of the total for the
+  // same reason it is a dash in the column, and the note above says how many.
+  const total = priced.totals || {};
+  $('hist').querySelector('tfoot').innerHTML =
+    `<tr><td>Total<span class="sub">${esc(notes.join(' · '))}</span></td>${cells}`
+    + (priced.configured
+        ? costCell(numOrNull(total.cost), total.cost_short === true,
+            shortWhy(total.shortfall, 'cost'))
+          + costCell(numOrNull(total.saved), total.saved_short === true,
+            shortWhy(total.shortfall, 'saved'))
+        : '') + '</tr>';
+}
+
+// ---------------------------------------------------------------------------
+// The chart.
+// ---------------------------------------------------------------------------
+
+// Exported energy is drawn below the zero line so the grid reads as one
+// quantity with a direction, which is the same idiom the battery chart uses for
+// charge and discharge. The sign
+// exists only on the canvas: the table, the totals and the readout all carry
+// the positive number the inverter actually counted.
+function column(rows, key, sign) {
+  return rows.map((r) => {
+    const v = r.totals[key];
+    if (v === null) return null;
+    // Negative zero would put a minus sign in front of a genuine reading of
+    // nothing, so the sign is only applied to something that has one.
+    return sign < 0 && v !== 0 ? -v : v;
+  });
+}
+
+function chartData(rows) {
+  const data = [
+    rows.map((r) => r.xs),
+    column(rows, 'solar_kwh', 1),
+    column(rows, 'grid_imported_kwh', 1),
+    column(rows, 'grid_exported_kwh', -1),
+    column(rows, 'load_kwh', 1),
+    column(rows, 'battery_charged_kwh', 1),
+    column(rows, 'battery_discharged_kwh', 1),
+  ];
+  // Each point sits at the start of the bucket it stands for, so the canvas
+  // would otherwise end at the beginning of today and the shading over today
+  // would have no width to be drawn in. One more x at the closing boundary, with
+  // nothing plotted on it, gives the last bucket its full span.
+  if (rows.length) {
+    data[0] = data[0].concat(rows[rows.length - 1].endXs);
+    for (let s = 1; s < data.length; s++) data[s] = data[s].concat(null);
+  }
+  return data;
+}
+
+// Kilowatt-hours, so the shared kW helpers do not apply. Headroom above the
+// biggest bucket and below the deepest export, with a floor so a week of cloud
+// is not drawn as a dramatic range of noise. Null bounds mean nothing was read
+// at all, which is not a range of zero.
+function kwhRange(u, min, max) {
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return [0, 10];
+  const hi = Math.max(1, max);
+  const lo = Math.min(0, min);
+  const pad = (hi - lo) * 0.08 || 1;
+  return [lo - pad, hi + pad];
+}
+
+// One digit count across the whole axis for the same reason the table has one:
+// ticks reading 4, 4.5, 5 are three widths in a column that should be one.
+function kwhTicks(u, splits) {
+  const big = splits.some((v) => Math.abs(v) >= 10);
+  return splits.map((v) => gnum(big ? Math.round(v) : Math.round(v * 10) / 10, big ? 0 : 1));
+}
+
+// Ticks land on bucket boundaries rather than wherever uPlot's own time
+// increments fall. These are calendar buckets: a tick three days into a month
+// labels nothing that exists, and on the monthly chart it would name a month
+// whose column is somewhere else.
+function bucketSplits(u, axisIdx, min, max) {
+  const xs = shown.map((r) => r.xs).filter((t) => t >= min && t <= max);
+  if (!xs.length) return [];
+  const ratio = (typeof uPlot !== 'undefined' && uPlot.pxRatio) || 1;
+  const room = Math.max(1, Math.floor((u.bbox.width / ratio) / 64));
+  const step = Math.max(1, Math.ceil(xs.length / room));
+  return xs.filter((_, i) => i % step === 0);
+}
+
+function bucketTicks(u, splits) {
+  const fmt = current.period === 'month'
+    ? { month: 'short', year: '2-digit' }
+    : { month: 'short', day: 'numeric' };
+  return splits.map((t) => new Date(t * 1000).toLocaleDateString(undefined, fmt));
+}
+
+// A bucket the collector did not see the whole of is shaded rather than left to
+// pass as a normal one. The number in it is real and it is not the whole
+// period — today at nine in the morning is not a quiet Tuesday — and shading
+// says so on the chart in the same breath the table's badge says it in words.
+function partialBands() {
+  return {
+    hooks: {
+      drawAxes: (u) => {
+        const { left, top, width, height } = u.bbox;
+        const ctx = u.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(left, top, width, height);
+        ctx.clip();
+        // The same wash the tariff shading uses, and inverted for the same
+        // reason: white over a light panel is nothing at all.
+        ctx.fillStyle = `rgba(${ink('--wash-rgb')},.055)`;
+        for (const r of shown) {
+          if (!r.reported || !r.partial) continue;
+          const x0 = Math.max(left, u.valToPos(r.xs, 'x', true));
+          const x1 = Math.min(left + width, u.valToPos(r.endXs, 'x', true));
+          if (x1 > x0) ctx.fillRect(x0, top, x1 - x0, height);
+        }
+        ctx.restore();
+      },
+    },
+  };
+}
+
+// The page's own readout rather than the shared one. The shared one names the
+// instant under the pointer, and every point here stands for a whole day or a
+// whole month — "8/1/2026, 12:00:00 AM" is not when a monthly total happened.
+// It renders the bucket's own row, so the chart carries the table with it.
+function bucketReadout() {
+  let tip = null;
+  return {
+    hooks: {
+      init: (u) => {
+        tip = document.createElement('div');
+        tip.className = 'tip';
+        u.over.appendChild(tip);
+        u.over.addEventListener('mouseleave', () => tip.classList.remove('on'));
+      },
+      setCursor: (u) => {
+        if (!tip) return;
+        const idx = u.cursor.idx;
+        // The trailing boundary point belongs to the last bucket's span rather
+        // than to a bucket of its own, so the pointer landing on it reads the
+        // bucket it closes instead of falling off the end.
+        const at = (idx === null || idx === undefined) ? -1 : Math.min(idx, shown.length - 1);
+        const row = at >= 0 ? shown[at] : null;
+        if (!row || !row.reported) { tip.classList.remove('on'); return; }
+        // Absent stays absent in the readout too. A dash is a reading nobody
+        // took and a zero is a reading of nothing, and on a page whose whole
+        // argument is that difference they cannot be allowed to look alike.
+        // The hover shows the same money the cells do, so it carries the same
+        // qualification — the energy-level "partial" tag cannot stand in for
+        // it, since a day can be complete in energy and short in money (#23).
+        // The counted amount rides along where there is one; an unknowable
+        // loss claims neither a number nor a direction.
+        const missing = row.shortfall && row.shortfall.grid_import
+          ? numOrNull(row.shortfall.grid_import.unattributed_kwh) : null;
+        const shortMark = (flag) => (flag
+          ? (missing !== null && missing > 0.05
+            ? ` · short ${gnum(missing, 1)} kWh` : ' · may not be exact')
+          : '');
+        const body = COLUMNS.map((c) => {
+          const v = row.totals[c.key];
+          const text = v === null
+            ? DASH : `${gnum(v, v >= WHOLE_NUMBER_ABOVE ? 0 : 1)} kWh`;
+          return `<div class="row"><u>${esc(c.label)}</u><b>${esc(text)}</b></div>`;
+        }).join('')
+          + (priced.configured
+            ? `<div class="row"><u>Cost</u><b>${esc(money(row.cost, priced.currency)
+                + shortMark(row.costShort))}</b></div>`
+              + `<div class="row"><u>Saved</u><b>${esc(money(row.saved, priced.currency)
+                + shortMark(row.savedShort))}</b></div>`
+            : '');
+        tip.innerHTML = `<div class="when">${esc(row.label)}${row.partial ? ' · partial' : ''}</div>${body}`;
+        tip.classList.add('on');
+        // Kept inside the plot rather than allowed to push the page sideways —
+        // a wall tablet has no horizontal scrollbar to rescue it.
+        const room = u.over.clientWidth || 0;
+        const wide = tip.offsetWidth || 190;
+        tip.style.left =
+          `${Math.max(2, Math.min(Math.max(room - wide - 2, 2), u.cursor.left + 12))}px`;
+        tip.style.top = '6px';
+      },
+      destroy: () => { tip = null; },
+    },
+  };
+}
+
+function drawChart(rows) {
+  shown = rows;
+  if (!rows.some((r) => r.reported)) {
+    chartMessage('energy', 'no energy counters recorded in this range');
+    return;
+  }
+  paint('energy', {
+    height: 260,
+    unit: 'kWh',
+    opts: chartBase({
+      scales: { x: { time: true }, y: { range: kwhRange } },
+      axes: [
+        axis({ size: 26, splits: bucketSplits, values: bucketTicks }),
+        axis({ size: 52, gap: 6, values: kwhTicks }),
+      ],
+      // Four quantities and three of the palette's hues, so identity is
+      // carried by form as much as by colour: solar a filled area because it is
+      // volume the array harvested, home the heaviest line because it is the
+      // one the owner acts on, grid used a thin dashed trace above the line,
+      // grid exported the same hue filled below it. Ordered so the solar fill
+      // lies under the grid dashes and home is drawn over both — it is the line
+      // that must never be the one obscured. Battery charge and discharge are
+      // carried for the readout only: a sixth and seventh line would crowd out
+      // the four the chart is for, and both are a column in the table.
+      series: [
+        {},
+        trace('Solar', '--pv', 1.6, { fill: pvFill, fillTo: () => 0 }),
+        trace('Grid used', '--grid', 1.3, { dash: [4, 3] }),
+        trace('Grid exported', '--grid', 1.3, { fill: exportFill, fillTo: () => 0 }),
+        trace('Home', '--load', 2.1),
+        carried(),
+        carried(),
+      ],
+      plugins: [partialBands(), zeroRule(), bucketReadout()],
+    }),
+  }, chartData(rows));
+}
+
+// Exported energy has the space below the zero line to itself, so unlike grid
+// import it can be filled without muddying anything. The hue is the palette's
+// grid; only the opacity differs, which is the distinction that survives every
+// form of colour blindness.
+function exportFill(u) {
+  const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
+  grad.addColorStop(0, fade('--grid', .03));
+  grad.addColorStop(1, fade('--grid', .42));
+  return grad;
+}
+
+// ---------------------------------------------------------------------------
+// Loading.
+// ---------------------------------------------------------------------------
+
+// A browser zone the server's tz database does not know is answered with a 400.
+// The owner's own calendar cut a little differently beats an empty page, so the
+// request goes again without it and the reply says which zone it used instead.
+async function fetchEnergy(base, zone) {
+  let r = await fetch(zone ? `${base}&tz=${encodeURIComponent(zone)}` : base);
+  if (!r.ok && zone) r = await fetch(base);
+  if (!r.ok) throw new Error(`energy request failed: ${r.status}`);
+  return r.json();
+}
+
+// Which calendar the rows were cut on, and when they were read. The zone is not
+// decoration: a total labelled "August 5" depends entirely on where midnight
+// was put, and on a page of calendar totals that is the one thing a reader
+// cannot infer from the numbers.
+function stamp(body) {
+  const zone = body && typeof body.timezone === 'string' ? body.timezone : '';
+  const parts = [];
+  if (zone) parts.push(`${current.unitName} in ${zoneWords(zone)} time`);
+  parts.push(`read ${new Date().toLocaleTimeString()}`);
+  $('conn').textContent = parts.join(' · ');
+}
+
+async function load() {
+  const span = current;
+  // The calendar the service will answer on, so the rows below are the same
+  // days its buckets are cut into. Both halves matter: which dates the rows are
+  // for, and — through the naive start below — which midnights the service
+  // measures between.
+  const starts = calendarStarts(span, civilNow(await siteZone()));
+  // priced=1 asks the service to price each bucket as well as total it. The
+  // money rides on the bucket it belongs to rather than arriving from a second
+  // request, so there are never two lists of buckets here to line up by date —
+  // and each reply omits the buckets it had nothing to report for, so lining
+  // two of them up by position is exactly how energy ends up in the wrong row.
+  //
+  // The start is sent as a bare wall-clock date, which the service reads in the
+  // zone it resolved; the end is a true instant, which needs no zone and must
+  // stay one, since it is also what says how much of the bucket in progress has
+  // actually happened.
+  const base = `/api/energy?start=${encodeURIComponent(naiveStamp(starts[0]))}`
+    + `&end=${encodeURIComponent(new Date().toISOString())}&period=${span.period}&priced=1`;
+  try {
+    const body = await fetchEnergy(base, browserZone());
+    // The owner can switch span while this is in flight, and painting the reply
+    // for the span they left would put thirteen months of buckets in a table
+    // headed Day.
+    if (span !== current) return;
+    priced = {
+      configured: body.configured === true,
+      currency: typeof body.currency === 'string' ? body.currency : null,
+      totals: (body.totals && typeof body.totals === 'object') ? body.totals : null,
+    };
+    // The note below the table depends on whether there is a cost column, and
+    // that is not known until the first reply arrives.
+    applyTitles();
+    const rows = buildRows(span, body.buckets, starts);
+    drawChart(rows);
+    drawTable(span, rows);
+    stamp(body);
+    note('');
+    rangeChanged = false;
+    refreshZoomState();
+  } catch (err) {
+    // A transient failure must not tear the page down. Destroying the chart
+    // takes the owner's zoom with it, and the totals already on screen are
+    // still the last ones the inverter gave us — better a stale table with a
+    // note than a blank panel every time the network hiccups.
+    note('history unavailable — showing the last successful read');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wiring.
+// ---------------------------------------------------------------------------
+
+function applyTitles() {
+  $('chartTitle').textContent = current.chartTitle;
+  $('tableTitle').textContent = current.tableTitle;
+  // The standing charge is spread over the month it belongs to, so a daily row
+  // carries a thirty-first of it. Saying so is the difference between a reader
+  // trusting the column and one wondering why a day with no import still cost
+  // half a dollar.
+  $('tableNote').textContent = current.tableNote
+    + (priced.configured && current.costNote ? ` · ${current.costNote}` : '');
+}
+
+// Drawn as .rng buttons so the switch looks like the range picker on every
+// other page, but built here rather than by drawRanges(): the shared ranges are
+// spans of hours against a power chart, and these two are calendars.
+function showSpans() {
+  const el = $('ranges');
+  el.innerHTML = SPANS.map((s) =>
+    `<button data-k="${s.key}" aria-pressed="${s.key === current.key}">${esc(s.label)}</button>`
+  ).join('');
+  el.querySelectorAll('button').forEach((b) => {
+    b.onclick = () => {
+      const picked = SPANS.find((s) => s.key === b.dataset.k);
+      if (!picked || picked === current) return;
+      current = picked;
+      // Thirty days and thirteen months share no x window at all, so a zoom
+      // held over from the other span would leave the canvas showing nothing.
+      rangeChanged = true;
+      localStorage.setItem('as.histSpan', current.key);
+      showSpans();
+      applyTitles();
+      load();
+    };
+  });
+}
+
+// Boot. Everything above is definitions; nothing runs until here.
+async function boot() {
+  await syncDisplayDefaults();
+  drawNav('history');
+  current = SPANS.find((s) => s.key === localStorage.getItem('as.histSpan')) || SPANS[0];
+  $('zoomReset').onclick = resetZoom;
+  setInterval(refreshZoomState, 900);
+  showSpans();
+  applyTitles();
+  load();
+}
+
+boot();
+// Energy counters move slowly and a bucket only closes at midnight, so five
+// minutes is ample. Polling this as often as the live page would re-read a
+// month of stored rows to watch one number creep.
+setInterval(load, 300000);
+</script>
+</body>
+</html>

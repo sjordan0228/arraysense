@@ -24,13 +24,25 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from arraysense.collector.source import InverterSource
 from arraysense.drivers.base import SampleBuildError
-from arraysense.efficiency import CONFIG_VERSION_KEY, EfficiencyRow, compute_day
+from arraysense.efficiency import (
+    CONFIG_VERSION_KEY,
+    EfficiencyRow,
+    compute_day,
+    rows_are_current,
+)
 from arraysense.models import Sample
 from arraysense.panels import StringSpec, parse_strings
-from arraysense.settings import PANELS_STRINGS_KEY, SETTING_TIMEZONE, SettingsStore
+from arraysense.settings import (
+    CONFIG_VALID_FROM_KEY,
+    PANELS_STRINGS_KEY,
+    SETTING_TIMEZONE,
+    SettingsStore,
+    emporia_interval_seconds,
+)
 from arraysense.store.retention import RetentionReport, policy_from_settings, run_retention
 from arraysense.store.rollup import (
     promote_pending_hours,
+    rebuild_circuit_hourly,
     rebuild_inverter_hourly,
     rebuild_inverter_minute,
     rebuild_module_hourly,
@@ -344,37 +356,69 @@ class CollectorService:
         a connection owned by the event loop means a cancellation can close it
         from underneath a statement still running — which blocks the loop on
         SQLite's own mutex, exactly the stall this change exists to remove.
+
+        The Emporia interval is read here, on the event loop, and handed to the
+        circuit rebuild. This pass runs minutes after the readings it
+        summarises, so the interval it reads is the one that produced them —
+        which is the whole reason the coverage is measured at rollup time and
+        stored. A reader arriving a month later has only the interval in force
+        then, and that is a different number the moment the owner edits the
+        setting.
+
+        The window reaches three hours back, though, so the interval read here
+        is *not* the one that produced the two oldest hours in it if the owner
+        has just changed the setting. That is why the rebuild only ever raises
+        an hour's coverage and never lowers it, and why the row it writes moves
+        as one piece: watts measured at the new interval beside coverage
+        measured at the old one is a product that means nothing. See
+        ``rebuild_circuit_hourly``.
         """
         moment = now or datetime.now(tz=UTC)
         end = int(moment.timestamp()) + 60
 
-        def _rebuild_all(conn: sqlite3.Connection) -> None:
+        def _rebuild_all(conn: sqlite3.Connection, circuit_cadence: int) -> None:
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            # Circuits are core storage rather than part of the optional
+            # module: their tables exist whether or not anybody enabled it,
+            # and this collector never imports anything from modules/. On an
+            # installation that never switched it on there are no rows and
+            # the rebuild is a no-op; on one that switched it off, the last
+            # hour still gets covered, which is what lets retention prune
+            # the raw readings afterwards instead of blocking on them for
+            # ever.
+            rebuild_circuit_hourly(
+                conn, end - HOURLY_REBUILD_WINDOW, end, cadence_seconds=circuit_cadence
+            )
             # Hours written outside that window — the archive backfill's, one
             # per past hour — are queued by the store as it writes them and
             # brought forward here. Nothing else promotes them, and the
             # efficiency engine reads irradiance from the hourly tier alone.
             promote_pending_hours(conn)
 
-        def _rebuild_on_own_connection() -> None:
+        def _rebuild_on_own_connection(circuit_cadence: int) -> None:
             conn = self._store.maintenance_connection()
             try:
-                _rebuild_all(conn)
+                _rebuild_all(conn, circuit_cadence)
             finally:
                 conn.close()
 
         try:
+            # Inside the guard, because it is a read of the primary connection
+            # and a pass racing shutdown finds that closed. This is housekeeping
+            # either way, and a settings read that failed outside the guard
+            # would take down the poll loop the guard exists to protect.
+            cadence = emporia_interval_seconds(SettingsStore(self._store))
             if self._store.is_memory_backed:
                 # A second connection to ":memory:" is a *different*, empty
                 # database, so a threaded pass would rebuild nothing and report
                 # success — the tiers would sit empty with no error anywhere.
                 # An in-memory store is a test fixture and costs microseconds,
                 # so it runs inline rather than silently doing nothing.
-                _rebuild_all(self._store._conn)
+                _rebuild_all(self._store._conn, cadence)
             else:
-                await asyncio.to_thread(_rebuild_on_own_connection)
+                await asyncio.to_thread(_rebuild_on_own_connection, cadence)
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
 
@@ -405,7 +449,7 @@ class CollectorService:
         except sqlite3.Error as exc:
             logger.warning("retention maintenance failed, will retry: %s", exc)
 
-    def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int] | None:
+    def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int, int] | None:
         """Return what scoring a day needs, or None when the installation is unconfigured.
 
         An installation with no timezone or no array described cannot be told
@@ -446,7 +490,9 @@ class CollectorService:
 
         raw_version = settings.get(CONFIG_VERSION_KEY)
         config_version = raw_version if isinstance(raw_version, int) else 0
-        return tz, strings, config_version
+        raw_floor = settings.get(CONFIG_VALID_FROM_KEY)
+        valid_from = raw_floor if isinstance(raw_floor, int) else 0
+        return tz, strings, config_version, valid_from
 
     async def maintain_efficiency(self, now: datetime | None = None) -> None:
         """Score yesterday and today once the hourly tier they read is current.
@@ -466,7 +512,7 @@ class CollectorService:
         config = self._efficiency_config()
         if config is None:
             return
-        tz, strings, config_version = config
+        tz, strings, config_version, valid_from = config
         settings = SettingsStore(self._store)
 
         # A code change that alters how scores are computed makes every stored
@@ -480,6 +526,9 @@ class CollectorService:
             # and never recompute.
             raw_version = settings.get(CONFIG_VERSION_KEY)
             config_version = raw_version if isinstance(raw_version, int) else 0
+            # A scorer change reaches the whole history, so the floor an
+            # owner's future tilt adjustment may have raised goes back down.
+            valid_from = 0
 
         local_now = (now or datetime.now(tz=UTC)).astimezone(tz)
         for days_back in (0, 1):
@@ -500,7 +549,7 @@ class CollectorService:
                     # read is a reason to recompute, never a reason to stop.
                     logger.warning("could not read stored efficiency; recomputing: %s", exc)
                     scored = []
-                if scored and all(r.config_version == config_version for r in scored):
+                if rows_are_current(scored, config_version, valid_from):
                     continue
 
             try:
@@ -564,7 +613,7 @@ class CollectorService:
         config = self._efficiency_config()
         if config is None:
             return
-        tz, strings, config_version = config
+        tz, strings, config_version, valid_from = config
 
         try:
             span = self._store.hourly_span()
@@ -589,7 +638,7 @@ class CollectorService:
             date += timedelta(days=1)
 
         try:
-            scored = self._store.scored_days(config_version)
+            scored = self._store.scored_days(config_version, valid_from)
         except sqlite3.Error as exc:
             logger.warning("efficiency backfill: could not read scored days: %s", exc)
             return

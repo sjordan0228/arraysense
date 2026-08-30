@@ -794,21 +794,31 @@ def _int_reading(source: object, attribute: str) -> int | None:
 def _measured_soh(source: object, attribute: str) -> float | None:
     """Read a state of health, refusing only the value that is always absence.
 
-    pylxpweb turns a reported 0 into 100 on every path that produces SOH — in
-    0.9.38, ``transports/data.py:635-636`` on the runtime object, ``:1292`` per
-    module, ``:1705-1707`` on the bank, and ``:1048`` once more in
+    Stock pylxpweb turns a reported 0 into 100 on every path that produces SOH —
+    in 0.9.38, ``transports/data.py:635-636`` on the runtime object, ``:1292``
+    per module, ``:1705-1707`` on the bank, and ``:1048`` once more in
     ``BatteryData.__post_init__``. Zero is what a BMS that is not answering
     reports, so the rewrite substitutes the most reassuring number there is in
     precisely the case where nothing is known.
 
-    This function used to refuse the literal 100 on those grounds — a stored 100
-    could be either a healthy bank or one that answered nothing. It cannot: the
-    fabrication is excluded upstream, because every caller runs
-    ``_bms_is_answering`` on the same block before this filter sees it, and a
-    100 that survives that gate is a measurement. The double guard cost a week
-    of dash on the reference installation — four healthy packs showing no health
-    at all from 8 to 14 August — and the refusal was removed. One helper still
-    serves all three objects: the runtime and bank paths both decode
+    This function used to refuse the literal 100 on those grounds, since a
+    stored 100 could be a healthy bank or one that answered nothing. It cost a
+    week of dash on the reference installation — four healthy packs showing no
+    health at all — and the refusal is gone, because the ambiguity is gone: the
+    library is pinned to a commit that returns None for an unreported state of
+    health rather than 100 (``pyproject.toml``, upstream #286/#309). Under that
+    pin a 100 arriving here is a measurement.
+
+    **The pin is what makes this correct, and nothing else does.** It is
+    tempting to credit ``_bms_is_answering``, which every caller runs on the
+    same block first — but that gate is all-or-nothing per block and says so in
+    its own docstring: a BMS answering some registers and zero-filling the rest
+    passes the witness and writes the zeros. A fabricated 100 sitting beside
+    live cell voltages survives it. That reasoning was tried and disproved by
+    execution. On a stock library this function is wrong, so if the pin is ever
+    dropped the refusal has to come back with it.
+
+    One helper serves all three objects: the runtime and bank paths both decode
     ``soc_soh_packed``, register 5, high byte, while a module's comes from
     offset 8 of its own register block.
 
