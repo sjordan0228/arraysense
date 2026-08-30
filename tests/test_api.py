@@ -133,6 +133,94 @@ def test_status_answers_even_when_the_caller_names_a_zone_it_does_not_know(clien
     assert r.json()["timezone"] == client.get("/api/status").json()["timezone"]
 
 
+# --- the database facts (#32) --------------------------------------------------
+#
+# The About panel asks the service the two questions ``arraysense status`` has
+# always answered, and the route answers them by calling the very function the
+# CLI calls. These pin both halves of that: the answer a support conversation
+# needs, and the promise that the page and the CLI cannot disagree because
+# there is one function and not two.
+
+
+def test_the_database_route_measures_the_file_behind_the_store(client: Any, tmp_path: Path) -> None:
+    r = client.get("/api/database")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"bytes", "first", "last", "readable", "reason"}
+    assert body["readable"] is True
+    assert body["reason"] is None
+    assert body["bytes"] == (tmp_path / "api.db").stat().st_size
+    # The fixture's three readings sit two minutes apart, too close to straddle
+    # a midnight in any zone, so the two ends name one local day — and the
+    # shape is a local date, not a UTC timestamp, because every calendar day
+    # this project shows is cut in the installation's own zone.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", body["first"])
+    assert body["first"] == body["last"]
+
+
+def test_the_endpoint_and_the_cli_answer_from_the_same_function(
+    client: Any, tmp_path: Path, monkeypatch: Any
+) -> None:
+    # One question, one answer: the route calls ``manage.database_facts`` on
+    # the path the service has open and hands the answer back unedited. A
+    # sentinel through the route's own name proves both halves — that the call
+    # happens on the configured path, and that nothing recomputes or reshapes
+    # it on the way out. Comparing two live calls would also pass for a route
+    # that reimplemented the function and happened to agree today.
+    from arraysense.api import routes
+
+    sentinel = {"bytes": 1, "first": "s", "last": "s", "readable": True, "reason": "sentinel"}
+    calls: list[str] = []
+
+    def spy(path: str) -> dict[str, Any]:
+        calls.append(path)
+        return sentinel
+
+    monkeypatch.setattr(routes, "database_facts", spy)
+    assert client.get("/api/database").json() == sentinel
+    assert calls == [str(tmp_path / "api.db")]
+
+
+def test_an_empty_database_is_readable_and_has_no_range(empty_client: Any) -> None:
+    # A service that has never polled has a real file that opened, measured,
+    # and holds no rows. That is a measured absence — the file proves it —
+    # and must not arrive in the shape a file nothing could open answers in.
+    r = empty_client.get("/api/database")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["readable"] is True
+    assert body["reason"] is None
+    assert body["bytes"] > 0
+    assert body["first"] is None
+    assert body["last"] is None
+
+
+def test_a_database_that_cannot_be_opened_is_never_reported_as_empty(
+    client: Any, tmp_path: Path
+) -> None:
+    # The reference install's real fault: the SSD unmounted while the service
+    # stayed up, and an ordinary user was told 668 days of history were gone.
+    # A swapped config path stands in for the missing file, because Config is
+    # frozen and replacing it on the app state is how a running app moves its
+    # database. An unmeasured size stays None — a 0 for a file nothing stat'ed
+    # is the same lie as an "empty" for a file nothing opened.
+    client.app.state.config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "unmounted.db"),
+        poll_interval=10.0,
+    )
+    r = client.get("/api/database")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["readable"] is False
+    assert body["bytes"] is None
+    assert body["first"] is None
+    assert body["last"] is None
+    assert "unmounted.db" in body["reason"]
+
+
 # --- the staleness verdict -------------------------------------------------
 #
 # The banner used to reach these conclusions in the browser, from a copy of the
