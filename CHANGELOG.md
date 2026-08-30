@@ -2,6 +2,36 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.2.1 — 30 August 2026
+
+The battery library moves from this project's fork to upstream, which now
+carries the state-of-health fix complete. No code changes; one dependency.
+
+### Changed
+
+- **pylxpweb is pinned to upstream v0.10.0b5, the release carrying the
+  unreported-SoH fix.** This project reported the fabricated-100 defect
+  (upstream issue #309) and fixed it with a three-line PR (#286) that the
+  fork pin carried. Upstream merged that commit as the base of their PR
+  #316 — authorship preserved — and completed the fix, because the three
+  lines alone were not the whole bug: `BatteryData`'s own post-init rewrote
+  the `None` straight back to 100, which was reproduced against the fork
+  pin before this bump, so per-battery SoH has still been fabricated in
+  production. Their branch also keeps `is_corrupt()` from raising on the
+  `None` canary, keeps the bank's min/max from raising over a `None`, fixes
+  the master/slave protocol decoders and the cloud path, and adds sixteen
+  regression tests.
+
+  The pin stays a git pin because PyPI's newest stable (0.9.40) predates the
+  fix; it names the upstream tag and moves to a plain PyPI spec once 0.10.0
+  goes stable. The 0.9.38-to-0.10.0 jump crosses the serial transport and
+  the battery registers, so the deploy that carries this release probed the
+  real RS485 bus with the new library while the collector was stopped, and
+  compared the battery readings against the previous release's before
+  starting the service. Consequence worth knowing: a battery module whose
+  BMS never reports a state of health now reads as unreported rather than
+  as a fabricated 100 — that is the fix working, not a regression.
+
 ## 1.2.0 — 30 August 2026
 
 The dashboard takes a date range the owner types, and the settings page
