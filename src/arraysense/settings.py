@@ -143,6 +143,7 @@ CHARGE_FLOOR_KEY = "emporia.charge_floor_a"
 CHARGE_CEILING_KEY = "emporia.charge_ceiling_a"
 CHARGE_DEFAULT_KEY = "emporia.charge_default_a"
 CHARGE_OVERRIDE_MINUTES_KEY = "emporia.charge_override_minutes"
+INVERTER_LIMIT_KEY = "emporia.inverter_limit_w"
 # When the current manual override lapses, as a unix epoch. Written by the
 # service rather than chosen, like the efficiency rescore floor: it has to
 # survive a restart, because an owner who set a rate by hand ten minutes ago
@@ -1226,6 +1227,25 @@ SETTINGS: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key=INVERTER_LIMIT_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=30000,
+        unit="W",
+        label="Back the car off when the inverter supplies more than",
+        help=(
+            "Zero is off, which is the default. When set, this moves only the "
+            "EV charger's rate — it never stops charging — to keep the inverter "
+            "under the limit. The figure compared is what the inverter itself "
+            "supplies: the house load with grid import taken out, so nothing "
+            "happens when the grid is carrying the house. Reaction takes about "
+            "twenty to thirty seconds, not instant: the inverter row lands every "
+            "~12 s, the guard ticks every 10 s, and the charger settles within "
+            "about 8 s of a write."
+        ),
+    ),
+    SettingSpec(
         key=EMPORIA_INTERVAL_KEY,
         kind="int",
         default=60,
@@ -1302,6 +1322,11 @@ class SettingsStore:
     def get(self, key: str) -> object:
         """Return the stored value for ``key``, or its registered default.
 
+        A cell the registry cannot read — NULL, a BLOB, anything not text —
+        answers as absence. Absence already has a defined answer here, and the
+        alternative was a 500: ``float(None)`` raises TypeError, which the
+        ValueError guard below does not catch, and the page blanks (#223).
+
         Raises:
             KeyError: no setting is registered under that key.
         """
@@ -1309,13 +1334,23 @@ class SettingsStore:
         row = self._conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         if row is None:
             return spec.default
+        stored = row[0]
+        # The check is a type test above decode, not a None test inside it,
+        # for two reasons. An optional setting's empty text decodes to None as
+        # a real answer — "not configured" — and that None must not be
+        # conflated with the absence of a cell. And a BLOB the old,
+        # non-STRICT schema could hold would sail through a None test only to
+        # be coerced by the numeric decoders into a number nobody stored.
+        if not isinstance(stored, str):
+            logger.warning("setting %s holds non-text %r; using the default", key, stored)
+            return spec.default
         try:
-            return spec.decode(row[0])
+            return spec.decode(stored)
         except ValueError:
             # A value that no longer decodes means the setting's type changed
             # under a database that still holds the old shape. The default is a
             # working answer; refusing to start is not.
-            logger.warning("setting %s holds undecodable %r; using the default", key, row[0])
+            logger.warning("setting %s holds undecodable %r; using the default", key, stored)
             return spec.default
 
     # A change to either of these changes what the array is expected to produce,
@@ -1612,6 +1647,13 @@ class SettingsStore:
         out: dict[str, object] = {}
         for key, raw in rows:
             if key in (CONFIG_VERSION_KEY, _EFFICIENCY_SCORER_REVISION_KEY, AUTH_PASSWORD_KEY):
+                continue
+            if not isinstance(raw, str):
+                # The same unreadable cell ``get`` sends to its default: no
+                # spec decodes a NULL or a BLOB, so this key is unusable in
+                # exactly the sense the clause below already means — and a
+                # TypeError here would take down a start instead of a page.
+                logger.warning("ignoring unusable stored setting %r", key)
                 continue
             try:
                 out[key] = lookup_setting(key).decode(raw)

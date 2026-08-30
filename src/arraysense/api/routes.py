@@ -101,6 +101,7 @@ from arraysense.modules.emporia.client import (
     EmporiaUnreachableError,
 )
 from arraysense.modules.emporia.control import clamp_rate
+from arraysense.modules.emporia.guard import InverterGuard
 from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
@@ -127,7 +128,7 @@ from arraysense.settings import (
     lookup_setting,
 )
 from arraysense.setup import describe_setup
-from arraysense.spend import top_spenders
+from arraysense.spend import grid_share_by_band, top_spenders
 from arraysense.store.schema import inverter_metric_columns, module_metric_columns
 from arraysense.store.sqlite_store import SqliteStore
 from arraysense.store.tiers import select_tier
@@ -739,12 +740,12 @@ def live(request: Request, store: _ReadStore, device: str | None = None) -> dict
         # it is decided from the same inverter reading already in hand, and a
         # wall display should not have to ask twice to be told its house is
         # drawing hard. Null when the threshold is off or the house is under it.
-        "alert": _high_usage_alert(request, inverter),
+        "alert": _high_usage_alert(store, request, inverter),
     }
 
 
 def _high_usage_alert(
-    request: Request, inverter: Mapping[str, Any] | None
+    store: SqliteStore, request: Request, inverter: Mapping[str, Any] | None
 ) -> dict[str, Any] | None:
     """Whether the house is drawing more than the owner asked to hear about.
 
@@ -755,8 +756,15 @@ def _high_usage_alert(
     Attribution is the Emporia module's, and only if it is running. Without it
     the warning still fires and names nobody, which is the difference between
     "your house is drawing 11 kW" and silence.
+
+    The threshold is read from the caller's own store, never
+    ``app.state.store``. This runs inside a plain ``def`` handler, which
+    FastAPI serves on its threadpool, and the primary connection belongs to
+    the event loop: one ``sqlite3.Connection`` has one statement cache, and a
+    second thread stepping it does not read slowly, it reads wrongly. See
+    ``_read_store`` for the view this is handed, and #223 for what it cost.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     threshold = settings.get(HIGH_USAGE_WATTS_KEY)
     if not isinstance(threshold, int) or threshold <= 0:
         return None
@@ -764,9 +772,13 @@ def _high_usage_alert(
     poller = _emporia(request)
     contributors: tuple[Contributor, ...] = ()
     if poller is not None:
+        # Through this request's own view, not ``poller.repository``, which
+        # holds the primary connection. That it reads one row per circuit is
+        # not the question: a cheap read on a connection another thread is
+        # stepping is a *wrong* read, not a slow one.
         contributors = tuple(
             Contributor(circuit.name, circuit.watts, circuit.kind, circuit.parent_device_gid)
-            for circuit in poller.repository.latest()
+            for circuit in CircuitRepository(store).latest()
         )
     verdict = high_usage(
         int(load) if isinstance(load, int | float) else None, threshold, contributors
@@ -1148,15 +1160,18 @@ def _is_mask(key: str, value: object) -> bool:
 
 
 @router.get("/auth")
-def auth_status(request: Request) -> dict[str, Any]:
+def auth_status(request: Request, store: _ReadStore) -> dict[str, Any]:
     """Whether authentication is on, and whether this client holds a session.
 
     A read and deliberately open: the login form has to know whether to render
     at all, and this reveals only that a password is set — not the password,
     and not any other setting. That fact is not secret; every write endpoint
     already answers it, by answering 401 or not.
+
+    Read through the per-request view, since this is a threadpool handler and
+    the primary connection is the event loop's — #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     token = request.cookies.get(_SESSION_COOKIE)
     authenticated = token is not None and request.app.state.sessions.valid(token)
     return {"required": password_is_set(settings), "authenticated": authenticated}
@@ -1169,7 +1184,9 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/auth/login")
-def login(request: Request, response: Response, body: LoginRequest) -> dict[str, Any]:
+def login(
+    request: Request, response: Response, body: LoginRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Start a session in exchange for the password.
 
     The cookie is HttpOnly so the page's own script cannot read it,
@@ -1179,6 +1196,10 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
     lifetime. Deliberately not Secure: this is plain HTTP on a LAN, and a
     Secure cookie would simply never be sent, so setting it would leave the
     owner unable to log in and nothing on the page to say why.
+
+    The stored hash is read through the per-request view: this is a threadpool
+    handler, and a password check that reads the primary connection alongside
+    the event loop can read it wrongly rather than merely slowly — #223.
     """
     key = request.client.host if request.client else "unknown"
     now = time.time()
@@ -1187,7 +1208,7 @@ def login(request: Request, response: Response, body: LoginRequest) -> dict[str,
             status_code=429,
             detail="too many failed attempts; try again shortly",
         )
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is None:
         # Nothing to guess yet, so nothing is counted. Counting here let a
@@ -1238,7 +1259,9 @@ class PasswordRequest(BaseModel):
 
 
 @router.post("/auth/password")
-def change_password(request: Request, response: Response, body: PasswordRequest) -> dict[str, Any]:
+def change_password(
+    request: Request, response: Response, body: PasswordRequest, store: _ReadStore
+) -> dict[str, Any]:
     """Set, change or clear the password.
 
     Setting the first password needs no credential — there is none yet, and
@@ -1257,8 +1280,14 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
     counting would let a stranger fill the throttle the owner is going to need.
     A consequence worth naming: five wrong guesses here also block login from
     that address for a minute, which is right, since it is one secret.
+
+    Neither the read nor the write touches ``app.state.store``. This is a
+    threadpool handler, and that connection is the event loop's: the read
+    comes from the per-request view, and the write takes a connection of its
+    own, which is what ``write_connection`` exists for. A password verified
+    against a corrupted read is the worst version of #223.
     """
-    settings = SettingsStore(request.app.state.store)
+    settings = SettingsStore(store)
     stored = password_hash(settings)
     if stored is not None:
         key = request.client.host if request.client else "unknown"
@@ -1273,18 +1302,90 @@ def change_password(request: Request, response: Response, body: PasswordRequest)
             request.app.state.throttle.record_failure(key, now)
             raise HTTPException(status_code=401, detail="current password is required")
         request.app.state.throttle.record_success(key)
-    if body.new_password:
-        if len(body.new_password) < MIN_PASSWORD_LENGTH:
-            raise HTTPException(
-                status_code=400,
-                detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
-            )
-        set_password(settings, body.new_password)
-    else:
-        clear_password(settings)
-        request.app.state.sessions.revoke_all()
-        response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
+    with request.app.state.store.write_connection() as writer:
+        writable = SettingsStore(writer)
+        if body.new_password:
+            if len(body.new_password) < MIN_PASSWORD_LENGTH:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"password must be at least {MIN_PASSWORD_LENGTH} characters",
+                )
+            set_password(writable, body.new_password)
+        else:
+            clear_password(writable)
+            request.app.state.sessions.revoke_all()
+            response.delete_cookie(_SESSION_COOKIE, path="/", httponly=True, samesite="strict")
     return {"ok": True}
+
+
+def _counter_rows(
+    store: SqliteStore, start: datetime, end: datetime
+) -> tuple[list[dict[str, Any]], str]:
+    """The lifetime-counter rows a period must be priced from, and their tier.
+
+    Two endpoints need exactly these rows and exactly this fallback chain: the
+    Costs page's own totals, and the per-circuit grid split beside them. A
+    second copy would drift, and the comments below are the record of four
+    separate defects already fixed in this search — a second copy is four
+    defects waiting to be found again.
+    """
+    # Read back before the period starts so its first interval has a reading to
+    # be measured *from*, rather than starting at whatever row happens to fall
+    # inside it. Without the lead, the first stretch of every month is short by
+    # however long it took the first sample to arrive.
+    with _inside_the_calendar():
+        lead = start - COUNTER_LEAD
+    # Minute first, then coarser, then raw. Hourly has to be in the chain and
+    # not just as a last resort: the minute tier is kept for a year, so a month
+    # older than that has nothing there while the hourly tier holds it back to
+    # the beginning. Falling straight from minute to raw — which is kept thirty
+    # days — found nothing and priced August 2025 as unknown, while the History
+    # page read the same month out of the hourly tier and showed $87.65.
+    #
+    # A candidate is only taken outright if its earliest row actually reaches
+    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
+    # the minute tier from its oldest end, so a month straddling that cutoff
+    # still gets *some* minute rows back: the stretch after the cutoff. The old
+    # "if rows: break" took them anyway, and the stretch before the cutoff,
+    # having no rows at all, priced as though it had never happened rather
+    # than falling to the hourly tier, which is kept indefinitely and always
+    # reaches back this far.
+    #
+    # A month whose collection genuinely began after ``lead`` — a fresh
+    # install, or one old enough that even the tier which does hold it starts
+    # partway through — fails that bracket check on *every* candidate, and
+    # nothing ever breaks the loop. Every remaining candidate then has to be
+    # judged on how far back its own earliest row reaches, because the loop
+    # order (minute, hourly, full) is not an order of coverage — it is the
+    # order resolution gets coarser. Each tier is pruned from its own oldest
+    # end on its own schedule, so "full" is not reliably empty by the time the
+    # loop reaches it: thirty days of retention can still leave it holding the
+    # tail of an old month, later and worse than what hourly already found.
+    # Keeping whichever candidate merely happened to be nonempty and tried
+    # last picked exactly that tail once, silently discarding the earlier,
+    # more complete rows hourly was already holding — the same loss the
+    # bracket check exists to prevent, reached by a different door. So
+    # ``rows`` is only replaced here when a candidate both has rows and
+    # reaches further back than whatever is already kept, never merely for
+    # being nonempty and later in the loop; the first candidate to bracket
+    # ``lead`` is by definition as good as this gets, so it still stops the
+    # search rather than being compared against tiers coarser than it needs.
+    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
+    # this only stops a labelled partial from being thrown away in favour of
+    # a worse one that happened to be tried last.
+    rows: list[dict[str, Any]] = []
+    tier = "minute"
+    earliest: datetime | None = None
+    for candidate in ("minute", "hourly", "full"):
+        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
+        if not candidate_rows:
+            continue
+        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
+        if earliest is None or candidate_earliest < earliest:
+            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
+        if candidate_earliest - lead <= MAX_EDGE_GAP:
+            break
+    return rows, tier
 
 
 @router.get("/costs")
@@ -1348,62 +1449,7 @@ def costs(
     # as midnight wherever the service happens to be installed.
     start, end = with_zone(start, zone), with_zone(end, zone)
 
-    # Read back before the period starts so its first interval has a reading to
-    # be measured *from*, rather than starting at whatever row happens to fall
-    # inside it. Without the lead, the first stretch of every month is short by
-    # however long it took the first sample to arrive.
-    with _inside_the_calendar():
-        lead = start - COUNTER_LEAD
-    # Minute first, then coarser, then raw. Hourly has to be in the chain and
-    # not just as a last resort: the minute tier is kept for a year, so a month
-    # older than that has nothing there while the hourly tier holds it back to
-    # the beginning. Falling straight from minute to raw — which is kept thirty
-    # days — found nothing and priced August 2025 as unknown, while the History
-    # page read the same month out of the hourly tier and showed $87.65.
-    #
-    # A candidate is only taken outright if its earliest row actually reaches
-    # back to ``lead`` — merely being non-empty is not enough. Retention prunes
-    # the minute tier from its oldest end, so a month straddling that cutoff
-    # still gets *some* minute rows back: the stretch after the cutoff. The old
-    # "if rows: break" took them anyway, and the stretch before the cutoff,
-    # having no rows at all, priced as though it had never happened rather
-    # than falling to the hourly tier, which is kept indefinitely and always
-    # reaches back this far.
-    #
-    # A month whose collection genuinely began after ``lead`` — a fresh
-    # install, or one old enough that even the tier which does hold it starts
-    # partway through — fails that bracket check on *every* candidate, and
-    # nothing ever breaks the loop. Every remaining candidate then has to be
-    # judged on how far back its own earliest row reaches, because the loop
-    # order (minute, hourly, full) is not an order of coverage — it is the
-    # order resolution gets coarser. Each tier is pruned from its own oldest
-    # end on its own schedule, so "full" is not reliably empty by the time the
-    # loop reaches it: thirty days of retention can still leave it holding the
-    # tail of an old month, later and worse than what hourly already found.
-    # Keeping whichever candidate merely happened to be nonempty and tried
-    # last picked exactly that tail once, silently discarding the earlier,
-    # more complete rows hourly was already holding — the same loss the
-    # bracket check exists to prevent, reached by a different door. So
-    # ``rows`` is only replaced here when a candidate both has rows and
-    # reaches further back than whatever is already kept, never merely for
-    # being nonempty and later in the loop; the first candidate to bracket
-    # ``lead`` is by definition as good as this gets, so it still stops the
-    # search rather than being compared against tiers coarser than it needs.
-    # ``period_energy`` still flags the gap before ``lead`` as unmeasured —
-    # this only stops a labelled partial from being thrown away in favour of
-    # a worse one that happened to be tried last.
-    rows: list[dict[str, Any]] = []
-    tier = "minute"
-    earliest: datetime | None = None
-    for candidate in ("minute", "hourly", "full"):
-        candidate_rows = store.query(list(ENERGY_FIELDS.values()), lead, end, tier=candidate)
-        if not candidate_rows:
-            continue
-        candidate_earliest = cast(datetime, candidate_rows[0]["timestamp"])
-        if earliest is None or candidate_earliest < earliest:
-            rows, tier, earliest = candidate_rows, candidate, candidate_earliest
-        if candidate_earliest - lead <= MAX_EDGE_GAP:
-            break
+    rows, tier = _counter_rows(store, start, end)
     with _inside_the_calendar():
         energy = period_energy(tariff, rows, start, end, zone)
 
@@ -1613,7 +1659,7 @@ def costs_circuits(
     if tariff is None or poller is None:
         return empty
 
-    cadence = _emporia_cadence_seconds(request)
+    cadence = _emporia_cadence_seconds(store)
     with _inside_the_calendar():
         intervals = [
             (interval.start, interval.end, interval.band)
@@ -1669,10 +1715,32 @@ def costs_circuits(
         or tariff.bands_in_effect(start, end)
         or tariff.bands
     )
+    # The house's own grid-versus-self split, per band, from the same counter
+    # rows and the same fallback chain the Costs totals are priced from.
+    # Nothing meters a single circuit's supply, so this ratio is what the
+    # per-circuit grid figure is shared out from.
+    with _inside_the_calendar():
+        house = period_energy(tariff, _counter_rows(store, start, end)[0], start, end, zone)
+    shares = grid_share_by_band(house.grid_import_kwh, house.load_kwh, bands)
+    # A band the house's own counters covered only part of still reports — as a
+    # sum over the stretch that was measured — so its share is a ratio over
+    # those hours applied to the circuit's whole band energy. The figure stands
+    # and carries a label, which is the owner's settled reading of #23; thrown
+    # away here, it would be an extrapolation rendered as a reading. Both
+    # counters are read from the same rows, so a gap takes both and the union
+    # is the honest set.
+    entries = house.shortfall or {}
+    short = _short_bands(entries, "grid_import") | _short_bands(entries, "load")
     # The same PCRF/SCRF rider compute_cost charges the house's own total —
     # resolved once here, the way bands is, rather than inside top_spenders,
     # which has no business knowing what a tariff's adjustment table is.
-    ranked = top_spenders(energies, bands, adjustment=tariff.adjustment_at(start, end))
+    ranked = top_spenders(
+        energies,
+        bands,
+        adjustment=tariff.adjustment_at(start, end),
+        grid_share=shares,
+        grid_short=short,
+    )
     return {
         "configured": True,
         "currency": tariff.currency,
@@ -1687,6 +1755,19 @@ def costs_circuits(
                 # any band below it — a page summing the bands alone would
                 # come up short of cost with nothing explaining the gap.
                 "rider": None if c.rider is None else round(c.rider, 2),
+                # What the meter actually charged for this circuit, as opposed
+                # to what its energy would have cost had all of it been bought.
+                # None when any band it was priced in had no knowable house
+                # split — a partial grid figure is indistinguishable from a
+                # circuit that genuinely ran on solar.
+                "grid_kwh": None if c.grid_kwh is None else round(c.grid_kwh, 3),
+                "grid_cost": None if c.grid_cost is None else round(c.grid_cost, 2),
+                # The house counters, not this circuit's, were short over a
+                # band it spent in — so the grid figures beside it are an
+                # extrapolation from the hours that did report. A different
+                # absence from "partial" above, and it needs its own flag or
+                # the page marks the wrong figure.
+                "grid_partial": c.grid_partial,
                 "bands": [
                     {
                         "band": b.band,
@@ -3330,6 +3411,12 @@ def _emporia(request: Request) -> EmporiaPoller | None:
     return poller if isinstance(poller, EmporiaPoller) else None
 
 
+def _emporia_guard(request: Request) -> InverterGuard | None:
+    """The running guard, or None when this build is not running one."""
+    guard = getattr(request.app.state, "emporia_guard", None)
+    return guard if isinstance(guard, InverterGuard) else None
+
+
 # How far the house's own window may fall short of the circuits' before the two
 # stop describing the same span. Five minutes is the floor, and it is sized on
 # what the store can actually answer rather than chosen: the driver reads the
@@ -3425,7 +3512,7 @@ def _parse_circuit_ids(ids: str | None) -> list[int] | None:
         raise HTTPException(status_code=400, detail=f"bad circuit ids: {ids!r}") from exc
 
 
-def _emporia_cadence_seconds(request: Request) -> int:
+def _emporia_cadence_seconds(store: SqliteStore) -> int:
     """The Emporia poll interval, which is the circuit raw tier's resolution.
 
     Not the inverter's. Scored at eleven seconds a seven-day circuit range comes
@@ -3439,8 +3526,12 @@ def _emporia_cadence_seconds(request: Request) -> int:
     was still in force, and handing this figure to rows recorded under another
     one is the defect that doubled every stored hour's energy the day the bench
     interval was raised.
+
+    Read from the caller's store rather than ``app.state.store``: both callers
+    are threadpool handlers, and the primary connection is the event loop's.
+    See ``_read_store`` and #223.
     """
-    return emporia_interval_seconds(SettingsStore(request.app.state.store))
+    return emporia_interval_seconds(SettingsStore(store))
 
 
 def _coverage_end(
@@ -3719,7 +3810,7 @@ def emporia_history(
         }
 
     wanted = _parse_circuit_ids(ids)
-    cadence = _emporia_cadence_seconds(request)
+    cadence = _emporia_cadence_seconds(store)
     tier = select_tier(span, width_px=width, cadence_seconds=cadence, circuit=True)
     with _inside_the_calendar():
         # Read through the injected view, not through ``poller.repository``.
@@ -3729,8 +3820,12 @@ def emporia_history(
         # of rows. Running it there is the shape ``_read_store`` was written to
         # end, and its own docstring names the cost, measured at 1.6 to 3.2
         # seconds a response while issue #63 was chased through the rollup.
-        # ``latest()`` stays on the poller's connection because it reads one row
-        # per circuit and is not worth a second handle.
+        # Every caller on a threadpool reads through its own view, ``latest()``
+        # included. An earlier note here excused it on the grounds that one row
+        # per circuit is not worth a second handle, which weighed the cost and
+        # missed the correctness: two threads on one connection do not read
+        # slowly, they read wrongly. ``emporia_circuits`` keeps the poller's
+        # repository because it is ``async`` and runs on the loop.
         history = CircuitRepository(store).history(
             start, end, tier=tier, circuit_ids=wanted, cadence_seconds=cadence
         )
@@ -3849,7 +3944,7 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
     enabled = bool(settings.get(EMPORIA_ENABLED_KEY))
     poller = _emporia(request)
     if poller is None or poller.charger is None or not enabled:
-        return {"charger": None, "changes": [], "enabled": enabled}
+        return {"charger": None, "changes": [], "enabled": enabled, "guard": None}
     state = poller.charger
     return {
         "enabled": enabled,
@@ -3882,6 +3977,27 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
             }
             for change in poller.audit.recent_changes()
         ],
+        "guard": _emporia_guard_payload(request),
+    }
+
+
+def _emporia_guard_payload(request: Request) -> dict[str, object] | None:
+    """The guard's newest plan and allowance, or None when there is none."""
+    guard = _emporia_guard(request)
+    if guard is None or guard.last_plan is None:
+        return None
+    allowance = guard.last_allowance
+    plan = guard.last_plan
+    if allowance is None:
+        return None
+    return {
+        "limit_w": allowance.limit_w,
+        "supplied_w": allowance.supplied_w,
+        "charger_w": allowance.charger_w,
+        "allowance_a": allowance.amps,
+        "amps": plan.amps,
+        "kind": plan.kind,
+        "reason": plan.reason,
     }
 
 

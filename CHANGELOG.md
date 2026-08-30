@@ -7,6 +7,142 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.1.9 — 29 August 2026
+
+The car's charge rate answers an inverter limit for the first time, the
+Costs panel tells the grid's money from the array's, and a page that failed
+outright a few times a week stops failing.
+
+### Added
+
+- **An owner-set limit now moves the car's charge rate to hold the inverter
+  under its output.** The charger had hands but no brain — nothing set a rate
+  automatically except restore-on-startup. The guard watches what the
+  inverter itself supplies, house load with grid import taken out, and cuts
+  the charger when that crosses `emporia.inverter_limit_w`. The subtraction
+  is the design: across 46 days of reference history total draw passed 12 kW
+  on 1,572 rows, but the inverter carried it on only 926 of them — the other
+  41% were the grid, where slowing the car would achieve nothing. A cut
+  lands on the first reading over the limit; the guard then holds still for
+  ninety seconds while the car's own ramp catches up, and an absent reading
+  holds rather than guesses. It lowers a rate and never raises one: a rate
+  somebody moved by hand is theirs, and a release path that lifted a 6 A set
+  in Emporia's own app toward 32 would have made this service the second
+  controller every other page warns about. A cut therefore stays until a
+  person raises it, or a restart puts back what the guard can prove it set.
+  Commands go through `control.decide()`, so floor, ceiling, authority and
+  manual override still win, and the limit ships at 0 — an installation that
+  never sets it behaves exactly as before.
+
+- **Each Costs row now prices the grid's kilowatt-hours apart from the
+  array's.** The panel priced every kilowatt-hour a circuit used at the
+  tariff rate, solar-supplied energy included, so on a sunny month its
+  largest figure could belong to a circuit whose energy never reached the
+  meter. A second money column and a grid-versus-self-supplied bar answer
+  the larger question band by band, where the money is exact, and battery
+  discharge counts as self-supplied — that energy was already billed as
+  import on the way in. The house's own metered ratio does the apportioning,
+  and its limits are shown rather than smoothed: a band with no knowable
+  share blanks both figures, a partly unread band keeps a dot beside the
+  figure it can support, and a circuit measured at zero draws an empty
+  track, never the hatch that means nobody heard from it.
+
+### Changed
+
+- **pylxpweb is pinned to a fork commit that reports nothing when a battery
+  reported nothing.** Stock pylxpweb rewrites an unreported state of health
+  into 100 — the same number a healthy bank reports — and the reference
+  installation had been hand-patching around it inside its venv, one
+  `uv sync` away from silent destruction and with the patch itself already
+  lost to a `/tmp` cleanup. The pin is byte-identical to what that venv
+  already ran, so a deploy stops being a tripwire. Library upgrades are
+  separate work: 0.9.38 to 0.9.40 is fifty-nine commits across the serial
+  transport and the battery registers, and only a live inverter can say they
+  still read.
+
+### Fixed
+
+- **A settings read taken from a threadpool thread could come back wrong, and
+  the request died with it.** On the reference installation this returned four
+  500s in three days — `/api/live` twice, `/api/settings` and
+  `/api/emporia/history` once each. The page blanked for one load and recovered
+  on the next, which is why it was never reported: it reads as a flaky
+  dashboard rather than as a fault.
+
+  Two shapes, one cause. Twice `sqlite3.InterfaceError: bad parameter or other
+  API misuse` straight from the read; twice a stored value that came back
+  `None` and reached `float()`, which raises `TypeError` and is not caught by
+  the `ValueError` guard beside it.
+
+  `_read_store` gives every plain `def` handler its own connection precisely so
+  a threadpool thread never shares the collector's, and its docstring has said
+  why since #63. The settings reads went around it — they were built on
+  `app.state.store`, the primary connection — inside six handlers FastAPI
+  serves on its threadpool. One `sqlite3.Connection` has one statement cache
+  however serialised the SQLite build underneath it is, so a second thread
+  stepping it does not read slowly, it reads wrongly. Measured directly rather
+  than inferred: six threads reading one connection for eight seconds produced
+  75 `InterfaceError`s and 104 reads that came back `None` or empty for keys
+  that were certainly there.
+
+  Six sites now read through the connection their own request owns, and
+  `change_password` takes a connection of its own to write on — a credential
+  verified against a corrupted read being the worst form this could take. No
+  new locking, and no change to the collector.
+
+  One of the six is not a settings read at all. The high-usage alert listed the
+  circuits drawing power through the Emporia poller's own repository, which
+  holds the primary connection, and a comment beside a second caller excused
+  exactly that on the grounds that one row per circuit is not worth a separate
+  handle. That weighed the cost and missed the point: a cheap read on a
+  connection another thread is stepping is a wrong read, not a slow one. It was
+  found because a review pointed out the new test could not fail — the guard
+  had no Emporia module, no alert threshold and a zero-width window, so three
+  of the paths it claimed to cover returned before reaching them.
+
+  **The absent-looking value is deliberately not defaulted away.** A `None`
+  here was never a setting that had not been set; it was a corrupted read of a
+  value that is really there, and answering it with the registry default would
+  hide a wrong read behind a plausible number. The rule this project is built
+  on cuts the other way: the read is fixed, and a value that genuinely cannot
+  be decoded still says so.
+
+  Guarded by a test that watches which threads touch the primary connection
+  while requests are served, and names the offending query and thread when one
+  does — the invariant asserted, rather than a race run and hoped over.
+
+- **A healthy bank reporting 100 is stored again.** The refusal of a literal
+  100 was a reasonable answer to a library that invented them: a stored 100
+  could be a healthy bank or one that answered nothing, so nothing stored it,
+  and the reference installation lost a week of dash on four healthy packs
+  while the bank was fine. The pin above removes the ambiguity at its source,
+  so a 100 arriving here is a measurement. Zero is still refused — a bank
+  reporting 0% is a BMS that said nothing rather than one with no health
+  left — and the pin is what makes this correct: drop it and the refusal has
+  to return with it. The witness gate in the driver is not the guard here; it
+  is all-or-nothing per block, a fabricated 100 beside live cell voltages
+  survives it, and that was tried and disproved by execution.
+
+- **A settings cell holding something that is not text blanked a page with a
+  500 instead of answering with the default.** The connection fix took away
+  the bad reads; this was the second shape's own bug. A database written
+  before the settings column became `TEXT NOT NULL` in a STRICT table can
+  hold the NULL, and a hand edit can hold a BLOB; either went raw into the
+  numeric decoders, whose `TypeError` is not caught by the `ValueError` guard
+  beside them — and on the start path it took the whole service down, not one
+  page. A type test above the decode answers absence the way absence is
+  already answered, an optional setting's empty text still decodes to its real
+  answer of not-configured, and a `TypeError` from genuine code still raises.
+
+- **The tour button no longer sits in the header promising a tour it cannot
+  give.** It mounted before anything was checked, so a browser that refuses
+  localStorage, a stopped collector, a first run the setup wizard owns, and a
+  tour with no passing step each left a control that answered no click. It
+  mounts only where the tour could actually run now, and it stays after a
+  finished or dismissed tour, where pressing it restarts from the first
+  passing step — the way back. Every row of that decision is pinned by the
+  node suite.
+
 ## 1.1.8 — 18 August 2026
 
 Per-circuit energy is right for a window whose edges do not land on the hour.

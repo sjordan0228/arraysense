@@ -1062,6 +1062,83 @@ def test_costs_circuits_refuses_a_period_too_long_to_price(tmp_path: Path) -> No
     assert "days" in response.json()["detail"]
 
 
+def _seed_house_split(store: SqliteStore, hour: datetime) -> None:
+    """The house's own counters across the spend hour: 24 kWh imported of 30 used.
+
+    Both counters, a minute apart, because a share needs both sides of the
+    ratio and ``_seed_counters`` above writes only the load side. The per-minute
+    steps are 0.4 and 0.5 kWh — multiples of the 0.1 kWh the metric's scale of
+    ten can hold, so nothing is lost rounding through storage — which puts the
+    hour's grid share at exactly 24/30, and an implementation that mixed up
+    numerator and denominator would land on 1.25 and clamp to 1.0 rather than
+    quietly passing at 0.8.
+
+    Five minutes of lead so a reading brackets the window's start outright
+    rather than landing exactly on it. A counter delta is only knowable where
+    readings bracket both bounds, and a test that depends on an edge-tolerance
+    rule is testing the tolerance rather than the share.
+    """
+    for step in range(-5, 61):
+        store.append(
+            Sample(
+                timestamp=hour + timedelta(minutes=step),
+                readings={
+                    "grid_import_energy_total_kwh": 100.0 + 0.4 * step,
+                    "load_energy_total_kwh": 200.0 + 0.5 * step,
+                },
+            )
+        )
+
+
+def test_costs_circuits_reports_what_the_grid_actually_charged(tmp_path: Path) -> None:
+    """The panel's second money column. Nothing meters one circuit's supply, so
+    the figure is the house's own grid share applied to the circuit's energy —
+    and the ratio has to be the one the counters describe, not a guess.
+
+    The house imported 24 kWh of the 30 it used, so 0.8. The dryer's 3 kWh
+    therefore cost 3 * 0.20 = 0.60 in full and 3 * 0.8 * 0.20 = 0.48 on the
+    meter. The fridge's 0.5 kWh gives 0.10 and 0.08, which is a different
+    ratio of figures from the dryer's only because the share is applied to
+    energy rather than bolted on as a flat discount.
+    """
+    app, store = _spend_app(tmp_path)
+    _seed_house_split(store, SPEND_HOUR)
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        body = c.get("/api/costs/circuits", params=_spend_window()).json()
+    store.close()
+
+    dryer = next(e for e in body["circuits"] if e["name"] == "Dryer")
+    assert dryer["cost"] == pytest.approx(0.60)
+    assert dryer["grid_kwh"] == pytest.approx(2.4)
+    assert dryer["grid_cost"] == pytest.approx(0.48)
+
+    fridge = next(e for e in body["circuits"] if e["name"] == "Fridge")
+    assert fridge["grid_kwh"] == pytest.approx(0.4)
+    assert fridge["grid_cost"] == pytest.approx(0.08)
+
+
+def test_costs_circuits_dashes_the_grid_figure_when_the_house_split_is_unread(
+    tmp_path: Path,
+) -> None:
+    """An inverter that reported no energy counter over the window makes the
+    grid share unknowable, and unknowable is a dash rather than a zero — a zero
+    would claim every circuit ran wholly on solar. The circuit's own cost is a
+    separate reading and survives: two different absences, and folding them
+    together would withhold a figure that was measured perfectly well.
+    """
+    app, store = _spend_app(tmp_path)  # circuits seeded, house counters not
+    with TestClient(app) as c:
+        c.put("/api/settings", json=FLAT_TARIFF)
+        body = c.get("/api/costs/circuits", params=_spend_window()).json()
+    store.close()
+
+    dryer = next(e for e in body["circuits"] if e["name"] == "Dryer")
+    assert dryer["grid_kwh"] is None
+    assert dryer["grid_cost"] is None
+    assert dryer["cost"] == pytest.approx(0.60)
+
+
 # --- the charger ----------------------------------------------------------
 
 

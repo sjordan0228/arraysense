@@ -791,52 +791,45 @@ def _int_reading(source: object, attribute: str) -> int | None:
     return None if value is None else round(value)
 
 
-# The state of health the library will invent, and the only one it invents:
-# every rewrite named in _measured_soh assigns this literal.
-_FABRICATED_SOH = 100.0
-
-
 def _measured_soh(source: object, attribute: str) -> float | None:
-    """Read a state of health, refusing the one value the library fabricates.
+    """Read a state of health, refusing only the value that is always absence.
 
-    pylxpweb turns a reported 0 into 100 on every path that produces SOH. In
-    0.9.38: ``transports/data.py:635-636`` on the runtime object, ``:1292`` per
-    module, ``:1705-1707`` on the bank, and ``:1048`` once more in
-    ``BatteryData.__post_init__``, where ``_clamp_percentage(...) or 100``
-    converts any 0 that got that far. Two of the four say why in a comment —
-    "Default to 100% if not reported" and "0 is invalid, assume healthy".
+    Stock pylxpweb turns a reported 0 into 100 on every path that produces SOH —
+    in 0.9.38, ``transports/data.py:635-636`` on the runtime object, ``:1292``
+    per module, ``:1705-1707`` on the bank, and ``:1048`` once more in
+    ``BatteryData.__post_init__``. Zero is what a BMS that is not answering
+    reports, so the rewrite substitutes the most reassuring number there is in
+    precisely the case where nothing is known.
 
-    Zero is what a BMS that is not answering reports, so the rewrite fires in
-    precisely the case where nothing is known and substitutes the most
-    reassuring number available. On the one column whose job is to warn about a
-    degrading bank, that is this project's central rule inverted.
+    This function used to refuse the literal 100 on those grounds, since a
+    stored 100 could be a healthy bank or one that answered nothing. It cost a
+    week of dash on the reference installation — four healthy packs showing no
+    health at all — and the refusal is gone, because the ambiguity is gone: the
+    library is pinned to a commit that returns None for an unreported state of
+    health rather than 100 (``pyproject.toml``, upstream #286/#309). Under that
+    pin a 100 arriving here is a measurement.
 
-    It cannot be undone downstream — the fabrication is a 100 and a healthy bank
-    is also a 100 — so the value is refused rather than reconstructed. Every
-    other reading is kept, because the rewrite only ever assigns the literal
-    100. That leaves a column where anything stored is a measurement, and where
-    the falling figure the column exists for still arrives.
+    **The pin is what makes this correct, and nothing else does.** It is
+    tempting to credit ``_bms_is_answering``, which every caller runs on the
+    same block first — but that gate is all-or-nothing per block and says so in
+    its own docstring: a BMS answering some registers and zero-filling the rest
+    passes the witness and writes the zeros. A fabricated 100 sitting beside
+    live cell voltages survives it. That reasoning was tried and disproved by
+    execution. On a stock library this function is wrong, so if the pin is ever
+    dropped the refusal has to come back with it.
 
-    What it costs is real and worth stating plainly: a bank whose BMS genuinely
-    reports 100% stores NULL and the page shows a dash. The alternative is a
-    column reading 100 whether the packs are new or the CAN link is down, and a
-    dash meaning "not established" is the honest one of the two.
+    One helper serves all three objects: the runtime and bank paths both decode
+    ``soc_soh_packed``, register 5, high byte, while a module's comes from
+    offset 8 of its own register block.
 
-    Zero is refused at this end too, and for the same reason rather than a
-    different one. The rewrite is what turns most zeros into 100, but not every
-    path applies it, so a raw 0 still arrives sometimes — and a bank reporting
-    0% state of health is the reading that means the BMS said nothing, not a
-    bank with no health left. Storing it would be the original error wearing the
-    opposite number: refusing 100 while keeping 0 rejects the reassuring
-    fabrication and keeps the alarming one.
-
-    One helper serves all three objects, but not because they share a register.
-    The runtime and bank paths do — both decode ``soc_soh_packed``, register 5,
-    high byte — while a module's comes from offset 8 of its own register block.
-    What they share is the rewrite.
+    Zero is refused at this end and the reason is unchanged. Not every library
+    path applies the rewrite, so a raw 0 still arrives sometimes, and a bank
+    reporting 0% state of health is the reading that means the BMS said nothing,
+    not a bank with no health left. A genuine 0 is unrecoverable regardless —
+    the library has already rewritten it before this project ever sees it.
     """
     soh = _reading(source, attribute)
-    if soh is None or soh == _FABRICATED_SOH or soh <= 0.0:
+    if soh is None or soh <= 0.0:
         return None
     return soh
 

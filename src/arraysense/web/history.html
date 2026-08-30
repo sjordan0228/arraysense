@@ -703,8 +703,10 @@ function drawChart(rows) {
 
 // Exported energy has the space below the zero line to itself, so unlike grid
 // import it can be filled without muddying anything. The hue is the palette's
-// grid; only the opacity differs, which is the distinction that survives every
-// form of colour blindness.
+// grid; only the opacity differs, so the distinction rides on lightness rather
+// than on a hue pair — the validator measures hue pairs, and only under
+// protanopia, deuteranopia and tritanopia, those three rather than every form
+// of colour blindness, because that is what it actually runs.
 function exportFill(u) {
   const grad = u.ctx.createLinearGradient(0, u.bbox.top, 0, u.bbox.top + u.bbox.height);
   grad.addColorStop(0, fade('--grid', .03));

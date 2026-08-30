@@ -3912,6 +3912,10 @@ function sankeyClear(svg) {
 // visitor who waved the offer away once would be asked again.
 const TOUR_DONE = 'done';
 
+// tourRead's answer when localStorage refuses outright. The mount gate reads
+// stored states, so the sentinel lives beside the gate that must recognise it.
+const TOUR_UNSUPPORTED = '\u0000unsupported';
+
 // Every step in tour order. `page` is one of the NAV keys — the hash views
 // (now, flow, inverter) are one document, the rest are separate documents.
 // `selector` anchors the popover to an element present in the page's static
@@ -4044,6 +4048,20 @@ function tourSuppressed(status) {
   const verdict = status.staleness && status.staleness.verdict;
   return verdict === 'not_running';
 }
+
+// Whether the header button mounts. It mounts only where the tour could
+// actually run: a browser that refuses localStorage has nowhere to keep its
+// place, a stopped collector has nothing to walk through, a first run belongs
+// to the setup wizard, and with no passing step there is nothing to point
+// at — a button in any of those states stands in the header inert.
+// A finished or dismissed tour keeps it: pressing it restarts from the first
+// passing step, so it is the way back for a visitor who wants it again.
+function tourButtonVisible(stored, status, firstRun, passingCount) {
+  if (stored === TOUR_UNSUPPORTED) return false;
+  if (tourSuppressed(status)) return false;
+  if (firstRun) return false;
+  return passingCount > 0;
+}
 // <<< tour-logic
 
 // ---------------------------------------------------------------------------
@@ -4053,7 +4071,6 @@ function tourSuppressed(status) {
 
 const TOUR_KEY = 'as.tourStep';
 const TOUR_INDEX_KEYS = ['now', 'flow', 'inverter'];
-const TOUR_UNSUPPORTED = '\u0000unsupported';
 
 // The popover reuses the hover readout's --tip / --tip-shadow tokens, so it
 // inherits the palette's validated light/dark contrast without introducing a
@@ -4405,10 +4422,18 @@ async function tourStart() {
 }
 
 async function tourBoot() {
-  mountTourButton();
   const stored = tourRead();
-  if (stored === TOUR_UNSUPPORTED || stored === TOUR_DONE) return;
+  if (stored === TOUR_UNSUPPORTED) return;
   const data = await tourEnsureData();
+  // One pass over the gates feeds both the button's mount decision and the
+  // resume walk below, so the two can never disagree about this installation.
+  const runnable = !!data && !data.firstRun && !tourSuppressed(data.status);
+  const eff = runnable
+    ? tourPassingSteps(data.caps, data.status, data.settings)
+    : [];
+  if (tourButtonVisible(stored, data && data.status, !data || data.firstRun, eff.length)) {
+    mountTourButton();
+  }
   if (!data || data.firstRun) return;
   if (tourSuppressed(data.status)) return;
   const page = tourCurrentPage();
@@ -4416,11 +4441,13 @@ async function tourBoot() {
     if (tourIsIndexDocument()) showOffer();
     return;
   }
+  // A finished tour resumes nothing; the button mounted above is its
+  // successor, and tourStart restarts from the first passing step.
+  if (stored === TOUR_DONE) return;
   // Resume from the stored step: walk the tour in order to the first step that
   // still passes its gate, and show it if this is its page. A step whose gate
   // no longer passes is silently skipped, and if nothing after the stored step
   // passes any more the tour is over.
-  const eff = tourPassingSteps(data.caps, data.status, data.settings);
   const start = TOUR_STEPS.findIndex((s) => s.id === stored);
   if (start === -1) return;
   for (let i = start; i < TOUR_STEPS.length; i++) {
