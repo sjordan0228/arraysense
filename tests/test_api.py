@@ -23,7 +23,6 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from arraysense import manage
 from arraysense.api.app import (
     PAGES,
     SHARED_SCRIPT,
@@ -160,12 +159,26 @@ def test_the_database_route_measures_the_file_behind_the_store(client: Any, tmp_
 
 
 def test_the_endpoint_and_the_cli_answer_from_the_same_function(
-    client: Any, tmp_path: Path
+    client: Any, tmp_path: Path, monkeypatch: Any
 ) -> None:
     # One question, one answer: the route calls ``manage.database_facts`` on
-    # the path the service has open, the same call the CLI makes. This assert
-    # fails the day either surface grows a calculation of its own.
-    assert client.get("/api/database").json() == manage.database_facts(str(tmp_path / "api.db"))
+    # the path the service has open and hands the answer back unedited. A
+    # sentinel through the route's own name proves both halves — that the call
+    # happens on the configured path, and that nothing recomputes or reshapes
+    # it on the way out. Comparing two live calls would also pass for a route
+    # that reimplemented the function and happened to agree today.
+    from arraysense.api import routes
+
+    sentinel = {"bytes": 1, "first": "s", "last": "s", "readable": True, "reason": "sentinel"}
+    calls: list[str] = []
+
+    def spy(path: str) -> dict[str, Any]:
+        calls.append(path)
+        return sentinel
+
+    monkeypatch.setattr(routes, "database_facts", spy)
+    assert client.get("/api/database").json() == sentinel
+    assert calls == [str(tmp_path / "api.db")]
 
 
 def test_an_empty_database_is_readable_and_has_no_range(empty_client: Any) -> None:

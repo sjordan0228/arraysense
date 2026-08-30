@@ -693,9 +693,10 @@ def database(request: Request) -> dict[str, Any]:
     The reply is ``database_facts``' contract unedited, because the
     distinctions it carries are the ones that must survive to the page:
     ``bytes`` null means nothing measured the file, and ``readable`` false
-    means nothing opened it — neither is an empty database, and neither may
-    be drawn as one. ``reason`` names the failing step for whoever can act on
-    it; a page shows the distinction, not the filesystem error behind it.
+    means the file could not be read — never opened, or opened and refusing
+    the query. Neither is an empty database, and neither may be drawn as one.
+    ``reason`` names the failing step for whoever can act on it; a page shows
+    the distinction, not the filesystem error behind it.
     """
     return database_facts(request.app.state.config.database_path)
 

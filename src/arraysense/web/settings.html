@@ -2575,9 +2575,10 @@ function stamp() {
 // About: what is actually running, and what it says it can read.
 //
 // Not settings, and deliberately not editable — the version is a fact about the
-// process and the capabilities are what the driver declares the hardware to be.
-// They are here because this is the page somebody opens when something is
-// wrong, and "which version is this" is the first question asked.
+// process, the capabilities are what the driver declares the hardware to be,
+// and the database rows say how big the recorded history is and how far back
+// it goes. They are here because this is the page somebody opens when something
+// is wrong, and "which version is this" is the first question asked.
 //
 // Two rules carry over from the readings. A capability nobody declared reads as
 // "not declared" and never as "no": a bare source that names its device but
@@ -2614,11 +2615,15 @@ const sizeWords = (bytes) => {
 // installation's own zone, and a re-cut here would be a second calendar, the
 // shape of every disagreement this codebase has had. A database that opened
 // and holds no rows and a file that never opened are different facts with
-// different remedies, so they never share words, and a null row value is
-// muted the way an undeclared capability is.
+// different remedies, so they never share words. The muted span is for what
+// could not be learned — unmeasured, unreadable, or a page that failed to ask
+// — never for a measured absence like a database with no readings yet.
 const rangeWords = (db) => {
   if (db.readable !== true) return '<span class="muted">could not be read</span>';
-  if (db.first === null) return 'no readings yet';
+  // == null covers undefined too: a body missing the field is a body the
+  // service did not send, and it takes the honest empty answer rather than
+  // printing the word "undefined" as a date.
+  if (db.first == null) return 'no readings yet';
   return `${esc(String(db.first))} through ${esc(String(db.last))}`;
 };
 
@@ -2633,9 +2638,11 @@ function drawFacts(status, caps, db) {
   // means this page failed to ask at all, which is neither of the endpoint's
   // two absences and so is the plain unknown again.
   rows.push(factRow('Database size',
-    db === null || db.bytes === null
-      ? `<span class="muted">${db === null ? 'unknown' : 'could not be measured'}</span>`
-      : sizeWords(db.bytes)));
+    db === null
+      ? '<span class="muted">unknown</span>'
+      : db.bytes == null
+        ? '<span class="muted">could not be measured</span>'
+        : sizeWords(db.bytes)));
   rows.push(factRow('Readings from',
     db === null ? '<span class="muted">unknown</span>' : rangeWords(db)));
 

@@ -175,6 +175,32 @@ def test_a_failed_fetch_shows_unknown_on_both_rows() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_body_missing_its_fields_is_not_drawn_as_data() -> None:
+    # A 200 that is not the shape the endpoint sends — a proxy's error page,
+    # a truncated reply — must fall back to the muted words, never to "NaN"
+    # printed as a size or the string "undefined" dressed up as a date.
+    lines = _draw("{}")
+    assert lines[0] == '<span class="muted">could not be measured</span>'
+    assert lines[1] == '<span class="muted">could not be read</span>'
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_measured_zero_is_a_measurement_and_prints() -> None:
+    # A file stat'ed at zero bytes is a real measurement, not an absence —
+    # the lie would be printing 0.0 KB for a file nothing stat'ed, which is
+    # the distinct null case pinned above.
+    assert _draw(_db(bytes=0, readable=True))[0] == "0.0 KB"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_dates_are_escaped_like_every_other_value() -> None:
+    # The dates arrive as strings and go into innerHTML, so whatever the
+    # service sent must reach the page as text, never as markup the row renders.
+    value = _draw(_db(bytes=4096, first="<b>2024-11-03</b>", last="2026-08-30", readable=True))[1]
+    assert value == "&lt;b&gt;2024-11-03&lt;/b&gt; through 2026-08-30"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_the_failure_reason_stays_off_the_page() -> None:
     # ``reason`` names the failing step for the CLI, where the remedy differs
     # per cause. On a settings page it would leak a filesystem path to
