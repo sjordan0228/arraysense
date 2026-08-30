@@ -320,8 +320,8 @@
   </section>
 
   <!-- Not a setting: what the process running behind this page actually is.
-       It is read from /api/status and /api/capabilities and nothing here can
-       be typed into, which is why it sits outside the form. -->
+       It is read from /api/status, /api/capabilities and /api/database and
+       nothing here can be typed into, which is why it sits outside the form. -->
   <section class="p" id="aboutSec">
     <div class="chead"><h2>About this installation</h2></div>
     <div class="facts" id="facts"></div>
@@ -2587,6 +2587,7 @@ function stamp() {
 // lengths to mask the same serial three fields above.
 // ---------------------------------------------------------------------------
 
+// >>> about-facts
 const factRow = (label, value) =>
   `<div class="row"><u>${esc(label)}</u><b>${value}</b></div>`;
 
@@ -2597,10 +2598,46 @@ const flagWords = (v) => (v === true ? 'Yes' : v === false ? 'No'
 const countWords = (list) => (Array.isArray(list) ? String(list.length)
   : `<span class="muted">not declared</span>`);
 
-function drawFacts(status, caps) {
+// Bytes as one decimal in the unit that keeps the number short — nobody
+// answers "how big is it" out loud with "697947033 bytes". One decimal
+// throughout, so the rows of a long-lived install line up.
+const sizeWords = (bytes) => {
+  const MB = 1024 * 1024;
+  const GB = 1024 * MB;
+  if (bytes < MB) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < GB) return `${(bytes / MB).toFixed(1)} MB`;
+  return `${(bytes / GB).toFixed(1)} GB`;
+};
+
+// The range keeps the three answers /api/database sends as three answers.
+// Dates print as the service sent them — it cuts every calendar day in the
+// installation's own zone, and a re-cut here would be a second calendar, the
+// shape of every disagreement this codebase has had. A database that opened
+// and holds no rows and a file that never opened are different facts with
+// different remedies, so they never share words, and a null row value is
+// muted the way an undeclared capability is.
+const rangeWords = (db) => {
+  if (db.readable !== true) return '<span class="muted">could not be read</span>';
+  if (db.first === null) return 'no readings yet';
+  return `${esc(String(db.first))} through ${esc(String(db.last))}`;
+};
+
+function drawFacts(status, caps, db) {
   const rows = [];
   rows.push(factRow('Version', status && status.version
     ? esc(String(status.version)) : '<span class="muted">unknown</span>'));
+
+  // The two facts a support conversation opens with. They come from
+  // /api/database, which answers from the very function the CLI prints, so
+  // the page and the terminal cannot answer the question differently; a null
+  // means this page failed to ask at all, which is neither of the endpoint's
+  // two absences and so is the plain unknown again.
+  rows.push(factRow('Database size',
+    db === null || db.bytes === null
+      ? `<span class="muted">${db === null ? 'unknown' : 'could not be measured'}</span>`
+      : sizeWords(db.bytes)));
+  rows.push(factRow('Readings from',
+    db === null ? '<span class="muted">unknown</span>' : rangeWords(db)));
 
   const devices = caps && Array.isArray(caps.devices) ? caps.devices : [];
   if (!devices.length) {
@@ -2660,6 +2697,7 @@ function drawFacts(status, caps) {
   });
   $('facts').innerHTML = rows.join('');
 }
+// <<< about-facts
 
 async function readJson(url) {
   const response = await fetch(url);
@@ -2668,12 +2706,13 @@ async function readJson(url) {
 }
 
 async function loadFacts() {
-  const [status, caps] = await Promise.all([
+  const [status, caps, db] = await Promise.all([
     readJson('/api/status').catch(() => null),
     readJson('/api/capabilities').catch(() => null),
+    readJson('/api/database').catch(() => null),
   ]);
-  drawFacts(status, caps);
-  $('factnote').textContent = status === null || caps === null
+  drawFacts(status, caps, db);
+  $('factnote').textContent = status === null || caps === null || db === null
     ? 'Some of this could not be read from the service, and is shown as unknown rather than '
       + 'guessed at.'
     : 'What the driver declares the hardware to be, rather than what it has reported. A '
