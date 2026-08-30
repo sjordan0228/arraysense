@@ -227,10 +227,13 @@ def test_a_token_that_was_never_issued_is_refused(client: Any) -> None:
 
 def test_reads_are_never_refused(client: Any) -> None:
     # The wall display only ever reads, so protecting reads would log it out on
-    # every restart. Password or not, the reads stay open.
+    # every restart. Password or not, the reads stay open — /api/database
+    # included, because a fact the About panel shows to whoever can already see
+    # the page is not a fact worth a login wall of its own.
     set_password(_settings(client), PASSWORD)
     assert client.get("/api/status").status_code == 200
     assert client.get("/api/live").status_code == 200
+    assert client.get("/api/database").status_code == 200
     assert client.get("/").status_code == 200
 
 

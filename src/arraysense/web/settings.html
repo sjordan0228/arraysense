@@ -320,8 +320,9 @@
   </section>
 
   <!-- Not a setting: what the process running behind this page actually is.
-       It is read from /api/status and /api/capabilities and nothing here can
-       be typed into, which is why it sits outside the form. -->
+       It is read from /api/status, /api/capabilities, /api/database and the
+       repository's release tags, and nothing here can be typed into, which is
+       why it sits outside the form. -->
   <section class="p" id="aboutSec">
     <div class="chead"><h2>About this installation</h2></div>
     <div class="facts" id="facts"></div>
@@ -2575,9 +2576,11 @@ function stamp() {
 // About: what is actually running, and what it says it can read.
 //
 // Not settings, and deliberately not editable — the version is a fact about the
-// process and the capabilities are what the driver declares the hardware to be.
-// They are here because this is the page somebody opens when something is
-// wrong, and "which version is this" is the first question asked.
+// process, the capabilities are what the driver declares the hardware to be, the
+// database rows say how big the recorded history is and how far back it goes, and
+// the release row says whether a newer release exists at all. They are here
+// because this is the page somebody opens when something is wrong, and "which
+// version is this" is the first question asked.
 //
 // Two rules carry over from the readings. A capability nobody declared reads as
 // "not declared" and never as "no": a bare source that names its device but
@@ -2587,6 +2590,7 @@ function stamp() {
 // lengths to mask the same serial three fields above.
 // ---------------------------------------------------------------------------
 
+// >>> about-facts
 const factRow = (label, value) =>
   `<div class="row"><u>${esc(label)}</u><b>${value}</b></div>`;
 
@@ -2597,10 +2601,56 @@ const flagWords = (v) => (v === true ? 'Yes' : v === false ? 'No'
 const countWords = (list) => (Array.isArray(list) ? String(list.length)
   : `<span class="muted">not declared</span>`);
 
-function drawFacts(status, caps) {
+// Bytes as one decimal in the unit that keeps the number short — nobody
+// answers "how big is it" out loud with "697947033 bytes". One decimal
+// throughout, so the rows of a long-lived install line up.
+const sizeWords = (bytes) => {
+  const MB = 1024 * 1024;
+  const GB = 1024 * MB;
+  if (bytes < MB) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < GB) return `${(bytes / MB).toFixed(1)} MB`;
+  return `${(bytes / GB).toFixed(1)} GB`;
+};
+
+// The range keeps the three answers /api/database sends as three answers.
+// Dates print as the service sent them — it cuts every calendar day in the
+// installation's own zone, and a re-cut here would be a second calendar, the
+// shape of every disagreement this codebase has had. A database that opened
+// and holds no rows and a file that never opened are different facts with
+// different remedies, so they never share words. The muted span is for what
+// could not be learned — unmeasured, unreadable, or a page that failed to ask
+// — never for a measured absence like a database with no readings yet.
+const rangeWords = (db) => {
+  if (db.readable !== true) return '<span class="muted">could not be read</span>';
+  // == null covers undefined too: a body missing the field is a body the
+  // service did not send, and it takes the honest empty answer rather than
+  // printing the word "undefined" as a date.
+  if (db.first == null) return 'no readings yet';
+  return `${esc(String(db.first))} through ${esc(String(db.last))}`;
+};
+
+function drawFacts(status, caps, db, tags) {
   const rows = [];
   rows.push(factRow('Version', status && status.version
     ? esc(String(status.version)) : '<span class="muted">unknown</span>'));
+
+  // The two facts a support conversation opens with. They come from
+  // /api/database, which answers from the very function the CLI prints, so
+  // the page and the terminal cannot answer the question differently; a null
+  // means this page failed to ask at all, which is neither of the endpoint's
+  // two absences and so is the plain unknown again.
+  rows.push(factRow('Database size',
+    db === null
+      ? '<span class="muted">unknown</span>'
+      : db.bytes == null
+        ? '<span class="muted">could not be measured</span>'
+        : sizeWords(db.bytes)));
+  rows.push(factRow('Readings from',
+    db === null ? '<span class="muted">unknown</span>' : rangeWords(db)));
+  // The fourth fetch answers from outside this service, so its words live in
+  // the release-check slice below; it is drawn here because the answer belongs
+  // beside the version it compares against and not behind the hardware rows.
+  rows.push(factRow('Latest release', releaseWords(status, tags)));
 
   const devices = caps && Array.isArray(caps.devices) ? caps.devices : [];
   if (!devices.length) {
@@ -2660,25 +2710,133 @@ function drawFacts(status, caps) {
   });
   $('facts').innerHTML = rows.join('');
 }
+// <<< about-facts
 
-async function readJson(url) {
-  const response = await fetch(url);
+// ---------------------------------------------------------------------------
+// The release check: what the repository's tags say about the version this
+// process is running.
+//
+// One unauthenticated GET per page load and nothing else — api.github.com
+// answers 60 of them an hour per address, and the page is opened by hand when
+// something is wrong rather than left polling. This half of #32 stops at the
+// answer. The upgrade command it prints is text for an owner to copy, because
+// running it from the page is #34's work and #34 is not done.
+// ---------------------------------------------------------------------------
+
+// >>> release-check
+// The three numbers of a version, or null for anything that is not three
+// dot-separated integers. A tag name brings a leading "v" and the running
+// version does not — /api/status answers "1.1.9" straight from __version__ —
+// so the two patterns differ by that one prefix rather than by stripping. The
+// parts become BigInt because Number quietly folds every integer past 2^53
+// onto a value it has already used, and a tag name is third-party input the
+// pattern does not bound.
+const asTriple = (text, pattern) => {
+  const parts = String(text ?? '').match(pattern);
+  return parts === null ? null : [BigInt(parts[1]), BigInt(parts[2]), BigInt(parts[3])];
+};
+
+// Part by part, because as text "1.10.0" sorts below "1.9.9" and a page that
+// compared the strings would tell an owner on 1.9.9 that nothing is newer.
+const compareTriples = (a, b) => {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+};
+
+// The newest release in the answer by its numbers, not by the order the
+// endpoint sent it: that order is a convenience of commit dates, and a
+// force-push or a re-sort moves it without moving what the newest release
+// is. A name that is not v<triple>
+// takes no part in the comparison, since a tag list carries prereleases and
+// branch tags beside releases, and an answer with no usable name in it has
+// told us no more than no answer at all.
+const newestTag = (tags) => {
+  if (!Array.isArray(tags)) return null;
+  let newest = null;
+  for (const tag of tags) {
+    const name = tag && typeof tag.name === 'string' ? tag.name : '';
+    const triple = asTriple(name, /^v(\d+)\.(\d+)\.(\d+)$/);
+    if (triple !== null && (newest === null || compareTriples(triple, newest.triple) > 0)) {
+      newest = { name, triple };
+    }
+  }
+  return newest;
+};
+
+// A check that could not run — no network, a rate limit, an answer with no
+// release in it — says it could not check and never "up to date", because "up
+// to date" is the one answer an owner acts on by doing nothing. Undefined tags
+// is the first drawing, before the outside answer exists, and it is a
+// different word from the null that means the check came back with nothing:
+// "could not check" shown for a check still in flight is the all-clear's
+// mirror image. A version that
+// is not three integers has nothing to compare against, so it takes the same
+// plain unknown the rest of the panel uses. An install ahead of the newest tag
+// is a local build rather than a fault, so it gets no muted span.
+const releaseWords = (status, tags) => {
+  if (tags === undefined) return '<span class="muted">checking</span>';
+  const running = status == null || status.version == null
+    ? null
+    : asTriple(status.version, /^(\d+)\.(\d+)\.(\d+)$/);
+  if (running === null) return '<span class="muted">unknown</span>';
+  const newest = newestTag(tags);
+  if (newest === null) return '<span class="muted">could not check</span>';
+  const away = compareTriples(newest.triple, running);
+  if (away > 0) return `${esc(newest.name)} available — <code>sudo arraysense upgrade</code>`;
+  return away === 0 ? 'this install is current' : 'this install is newer than the latest tag';
+};
+// <<< release-check
+
+// >>> release-fetch
+// readJson is here because loadFacts below is its only caller on this page.
+async function readJson(url, init) {
+  const response = await fetch(url, init);
   if (!response.ok) throw new Error(`${url} answered ${response.status}`);
   return response.json();
 }
 
+// The one address this page asks outside the house. One page of a hundred is
+// far more than the tag list holds today, and the answer's newest release is
+// decided by the numbers, not by the order the page arrives in — but a newest
+// tag that ever fell outside that first page would be invisible here, and the
+// row would call an older release current. Revisit this before tag one
+// hundred and one exists, not after.
+const RELEASE_TAGS_URL = 'https://api.github.com/repos/sjordan0228/arraysense/tags?per_page=100';
+
 async function loadFacts() {
-  const [status, caps] = await Promise.all([
+  // The three facts this service answers are drawn as soon as they arrive.
+  // The release check rides on its own clock: a GitHub that is slow, rate
+  // limited or simply unreachable must not hold the version, the database
+  // rows and the capabilities hostage, so the panel renders without it, the
+  // row says the check is running, and the drawing happens again when the
+  // check settles — with the answer, or with the words for not having been
+  // able to ask. The check arms a ten-second abort of its own so a GitHub
+  // that never answers ends in "could not check" instead of leaving a row
+  // that says checking for as long as the browser tolerates the connection.
+  const [status, caps, db] = await Promise.all([
     readJson('/api/status').catch(() => null),
     readJson('/api/capabilities').catch(() => null),
+    readJson('/api/database').catch(() => null),
   ]);
-  drawFacts(status, caps);
-  $('factnote').textContent = status === null || caps === null
+  drawFacts(status, caps, db, undefined);
+  $('factnote').textContent = status === null || caps === null || db === null
     ? 'Some of this could not be read from the service, and is shown as unknown rather than '
       + 'guessed at.'
     : 'What the driver declares the hardware to be, rather than what it has reported. A '
       + 'capability nothing declared is shown as undeclared, not as absent.';
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 10000);
+  try {
+    const tags = await readJson(RELEASE_TAGS_URL, { signal: controller.signal })
+      .catch(() => null);
+    drawFacts(status, caps, db, tags);
+  } finally {
+    clearTimeout(timer);
+  }
 }
+// <<< release-fetch
 
 // ---------------------------------------------------------------------------
 // Theme: the two choices on this page the registry knows nothing about.

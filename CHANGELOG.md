@@ -1,11 +1,65 @@
-# Changelog
-
-What changed, and why it mattered. Entries are written for somebody deciding
-whether to upgrade, so a fix says what was wrong rather than what was touched.
-
 Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
+
+## 1.2.0 — 30 August 2026
+
+The dashboard takes a date range the owner types, and the settings page
+answers the two questions an upgrade decision starts from: what is running,
+and is there anything newer.
+
+### Added
+
+- **A fifth, Custom button joins the range bar.** The presets answer "how
+  wide"; a custom window answers "which hours", and the two are different
+  questions. From and To fields open in place on the dashboard and the Graphs
+  page, and a valid pair is drawn exactly as picked — the polls re-read the
+  same two instants instead of sliding with the clock, while every preset
+  request stays byte-identical to before. A window ending in the future is
+  clamped to now; a reversed, empty or unparseable window is refused where it
+  is typed, with an inline error naming the rule it broke on the input that
+  broke it, and the editor reopens holding the window it would edit. Nothing
+  persists — a reload returns each page to its own preset.
+
+- **The About panel now carries the database's size and date range.** "How
+  big is it and how far back does it go" is most of what a support
+  conversation needs, and the terminal had the answer while the page did not.
+  A new read-only `/api/database` answers from the very function the CLI
+  prints, so the page and the terminal cannot disagree: a size printed as
+  `could not be measured` was never measured, a range that says `could not be
+  read` belongs to a file that would not open — which is not an empty
+  database, and the two absences never share words. The failure reason stays
+  off the page, because it names filesystem paths.
+
+- **The About panel now says whether a newer release exists.** One
+  unauthenticated call to the repository's tags per page load, on a clock of
+  its own so the panel never waits on GitHub: the local facts render first,
+  the row says the check is running, and the drawing happens again when the
+  check settles or its own ten-second abort ends it. A newer release shows
+  `sudo arraysense upgrade` as text to copy and nothing that runs — the page
+  does the part that needs the network and the human does the part that runs
+  code, which is the whole of what this release can offer while the settings
+  page has no authentication. The newest release is the maximum by numeric
+  triple, never the order the endpoint happened to send, and a check that
+  could not run says so rather than reading as up to date.
+
+### Fixed
+
+- **A refused date range now says which rule it broke, on the input that broke
+  it.** An empty end, an unparseable stamp or a start the clamp to now leaves
+  no room behind had answered with silence and a no-op Apply. The refusal
+  appears beside the fields as it is typed, marks the offending input, and
+  clears the moment the pair becomes acceptable.
+
+- **Opening the range editor no longer slides the preset buttons** — every
+  line of the range bar packs right, and the fields take a wrapped line of
+  their own, verified at identical button positions open and closed.
+
+- **The advisory strip fills its panel.** "State of charge maybe drifting"
+  packed its text and Dismiss button at the strip's left and stranded the
+  panel's right half as dead space; the message takes the width now and the
+  dismiss control lands on the panel's far edge, with the narrow-viewport
+  wrapping kept.
 
 ## 1.1.9 — 29 August 2026
 

@@ -267,10 +267,28 @@ const BASE_CSS = `
   .chead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;flex-wrap:wrap;gap:8px}
   .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
-  .rng{display:flex;gap:6px}
+  /* Every line of the range bar packs right, whatever its width: a line
+     packed left would slide the preset buttons when the editor's wrapped
+     line widens the bar under a right-anchored parent. */
+  .rng{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}
   .rng button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
   .rng button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
+  /* The custom window's fields sit inside the same pill as the presets and
+     take a wrapped line of their own: a full flex-basis is what forces the
+     wrap, and the line packs right so the fields sit under the buttons they
+     edit. The [hidden] rule is not redundant: the row's own display beats
+     the UA rule the attribute leans on, exactly as .setup .err[hidden]
+     does below. */
+  .rng .rngfields{display:flex;flex-wrap:wrap;justify-content:flex-end;flex-basis:100%;gap:4px;align-items:center;font-size:11px;color:var(--ink2)}
+  .rng .rngfields[hidden]{display:none}
+  .rng .rngfields input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
+    border-radius:7px;padding:2px 6px;font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
+  /* The refusal beside the fields wears the setup page's inline-error look,
+     and it hides by declaration rather than by the attribute alone, exactly
+     as the fields' row hides by its own rule above. */
+  .rng .rngerr{font-size:11px;color:var(--bad);line-height:1.5}
+  .rng .rngerr[hidden]{display:none}
   svg{display:block;width:100%;height:auto;overflow:visible}
   /* Navigation. Five views of one installation, so the marker is a state of the
      nav rather than a heading each page repeats — landing anywhere, the lit
@@ -1967,6 +1985,7 @@ if (document.readyState === 'loading') {
 // page that plots against time.
 // ---------------------------------------------------------------------------
 
+// >>> ranges-custom
 const RANGES = [
   { key:'6h',  label:'6h',  seconds:6*3600 },
   { key:'24h', label:'24h', seconds:24*3600 },
@@ -1974,18 +1993,207 @@ const RANGES = [
   { key:'30d', label:'30d', seconds:30*86400 },
 ];
 
+// Month names spelled out rather than run through toLocaleDateString: the
+// button label is compared against literal words in the tests, and a label
+// that changed shape with the browser's locale would change shape on the
+// owner's screen too. Times are local 24-hour, which is how a datetime-local
+// field showed them to whoever typed them.
+const MONTHS3 = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function rangeSpanLabel(start, end) {
+  const day = (d) => `${MONTHS3[d.getMonth()]} ${d.getDate()}`;
+  const clock = (d) => `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  if (start.getFullYear() === end.getFullYear()
+      && start.getMonth() === end.getMonth()
+      && start.getDate() === end.getDate()) {
+    // Two ends on one calendar day are not one window until the hours say
+    // which window of that day it was.
+    return `${day(start)} ${clock(start)} – ${clock(end)}`;
+  }
+  const years = start.getFullYear() !== end.getFullYear();
+  const stamp = (d) => day(d) + (years ? ` ${d.getFullYear()}` : '');
+  return `${stamp(start)} – ${stamp(end)}`;
+}
+
+// The owner-typed window, answered as the presets answer — the same two Dates
+// a request is made between, and the span in seconds so widthFor and its
+// siblings keep pricing the ask without knowing which kind of range it is.
+// Both ends must parse and the window must move forward: _check_range answers
+// end <= start with a 400, so a reversed or instant window is refused here
+// rather than asked for. An end in the future is clamped to now rather than
+// refused, because the store cannot answer for an hour that has not happened
+// and "up to now" survives the clamp intact.
+function customWindow(fromValue, toValue, now) {
+  if (!fromValue || !toValue) return null;
+  const start = new Date(fromValue);
+  let end = new Date(toValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return null;
+  if (end.getTime() > now.getTime()) end = new Date(now.getTime());
+  if (end.getTime() <= start.getTime()) return null;
+  return {
+    key: 'custom',
+    start,
+    end,
+    seconds: Math.round((end.getTime() - start.getTime()) / 1000),
+    label: rangeSpanLabel(start, end),
+  };
+}
+
+// A refusal has one message per pair, naming the first rule the pair breaks
+// in customWindow's own check order: empty ends, ends that are not dates, a
+// window that does not move forward, and a start the clamp to now leaves no
+// room behind. The clamp's own case is not a refusal: a future end over a
+// past start is a real window once the clamp pulls it back, and refusing
+// what customWindow accepts would order the owner to fix a pair that applies.
+const RANGE_EMPTY = 'Enter a start and an end.';
+const RANGE_UNPARSEABLE = 'Enter a valid date and time.';
+
+function rangeRefusal(fromValue, toValue, now) {
+  if (!fromValue || !toValue) return RANGE_EMPTY;
+  const start = new Date(fromValue);
+  const end = new Date(toValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return RANGE_UNPARSEABLE;
+  }
+  if (end.getTime() <= start.getTime()) return 'The start must come before the end.';
+  if (start.getTime() >= now.getTime() && end.getTime() > now.getTime()) {
+    return 'The start must be in the past.';
+  }
+  return null;
+}
+
+// The datetime-local fields hold local calendar parts, so a stored instant
+// goes back into a field through the same local getters the label builder
+// reads. That shape has a known limit the field type itself imposes: during
+// a fall-back hour one wall-clock time names two instants, so replaying a
+// stored end through the field can settle an ambiguous stamp on the other
+// side of the transition — an hour of drift on a reopen-and-reapply, which
+// no offset-free field can express away.
+function localInputValue(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    + `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// The editor edits the window the page already shows, so opening it fills
+// the ends from the current range: a custom range replays its stored stamps
+// — which is what makes a clamp from the last Apply visible on reopening —
+// a preset measures back from the moment of opening, and anything else
+// starts blank.
+function prefillFor(current, now) {
+  if (current.key === 'custom' && current.start && current.end) {
+    return { from: localInputValue(current.start), to: localInputValue(current.end) };
+  }
+  if (current.seconds) {
+    return {
+      from: localInputValue(new Date(now.getTime() - current.seconds * 1000)),
+      to: localInputValue(now),
+    };
+  }
+  return { from: '', to: '' };
+}
+
 // The caller owns which range is current and what to do when it changes, and
 // redraws to move the pressed state. Holding that here would mean holding it
 // once for pages that have two independent range pickers.
+//
+// The fifth button opens two datetime-local fields, filled with the window
+// they would edit, instead of picking — only Apply picks, so Cancel can undo
+// the whole detour without the caller ever knowing it happened. A valid Apply
+// hands the picked window to the caller, whose redraw rebuilds this row from
+// the new current: Custom pressed and wearing the span as its label, the
+// fields rebuilt closed. Nothing about the open fields survives a redraw,
+// which is also why a preset pressed after a custom needs no unwinding — the
+// redraw says the new current and nothing else.
 function drawRanges(el, current, onPick) {
   if (!el) return;
+  const custom = current.key === 'custom';
   el.innerHTML = RANGES.map((r) =>
     `<button data-k="${r.key}" aria-pressed="${r.key === current.key}">${esc(r.label)}</button>`
-  ).join('');
+  ).join('') +
+    `<button data-k="custom" aria-pressed="${custom}">` +
+    `${esc(custom ? current.label : 'Custom')}</button>` +
+    `<span class="rngfields" hidden>` +
+    `<label>From <input type="datetime-local" data-k="from"></label>` +
+    `<label>To <input type="datetime-local" data-k="to"></label>` +
+    `<button data-k="apply">Apply</button>` +
+    `<button data-k="cancel">Cancel</button>` +
+    `<span class="rngerr" role="alert" hidden></span>` +
+    `</span>`;
+  const fields = el.querySelector('.rngfields');
+  const from = el.querySelector('[data-k="from"]');
+  const to = el.querySelector('[data-k="to"]');
+  const err = el.querySelector('.rngerr');
+  // One writer for the refusal, shared by Apply and the keystroke handler:
+  // which rule the pair breaks and which input must move are properties of
+  // the pair, so a correction that walks from one refusal to another reads
+  // the new one rather than keeping the old message on the row. The span
+  // enters the accessibility tree before the text lands in it, so the alert
+  // always has a node to speak.
+  const showRefusal = (why) => {
+    err.hidden = false;
+    err.textContent = why;
+    if (why === RANGE_EMPTY) {
+      from.ariaInvalid = from.value ? null : 'true';
+      to.ariaInvalid = to.value ? null : 'true';
+    } else {
+      from.ariaInvalid = 'true';
+      to.ariaInvalid = why === RANGE_UNPARSEABLE ? 'true' : null;
+    }
+  };
+  const clearRefusal = () => {
+    err.hidden = true;
+    err.textContent = '';
+    from.ariaInvalid = null;
+    to.ariaInvalid = null;
+  };
+  // Typing recomputes a refusal that is already on the row, so a correction
+  // walking from one broken rule to another reads the rule it now breaks
+  // rather than a stale sentence. Silence stays silent: a pair that was
+  // accepted learns of a fresh refusal from the next Apply, not mid-keystroke.
+  const recheck = () => {
+    if (err.hidden) return;
+    const why = rangeRefusal(from.value, to.value, new Date());
+    if (why) showRefusal(why);
+    else clearRefusal();
+  };
+  from.oninput = recheck;
+  to.oninput = recheck;
   el.querySelectorAll('button').forEach((b) => {
-    b.onclick = () => onPick(RANGES.find((r) => r.key === b.dataset.k));
+    if (b.dataset.k === 'custom') {
+      b.onclick = () => {
+        const pre = prefillFor(current, new Date());
+        from.value = pre.from;
+        to.value = pre.to;
+        clearRefusal();
+        fields.hidden = false;
+      };
+    } else if (b.dataset.k === 'apply') {
+      b.onclick = () => {
+        const now = new Date();
+        const w = customWindow(from.value, to.value, now);
+        if (w) {
+          clearRefusal();
+          onPick(w);
+          return;
+        }
+        // A refused window picks nothing and leaves the fields open for the
+        // correction; the row says which rule the pair broke and the inputs
+        // that broke it wear the mark, so the correction starts from an
+        // answer instead of a silent button.
+        showRefusal(rangeRefusal(from.value, to.value, now));
+      };
+    } else if (b.dataset.k === 'cancel') {
+      b.onclick = () => {
+        clearRefusal();
+        fields.hidden = true;
+      };
+    } else {
+      b.onclick = () => onPick(RANGES.find((r) => r.key === b.dataset.k));
+    }
   });
 }
+// <<< ranges-custom
 
 // ---------------------------------------------------------------------------
 // Charts. uPlot rather than hand-written SVG, for the two things that version

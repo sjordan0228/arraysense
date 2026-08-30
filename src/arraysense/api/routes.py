@@ -93,6 +93,7 @@ from arraysense.energy import (
     resolve_zone,
     with_zone,
 )
+from arraysense.manage import database_facts
 from arraysense.metrics import INVERTER_METRICS, SITE_METRICS
 from arraysense.modules.emporia import tokens as emporia_tokens
 from arraysense.modules.emporia.client import (
@@ -674,6 +675,30 @@ async def status(request: Request, tz: str | None = None) -> dict[str, Any]:
         # the watchdog about whether the collector is running.
         "staleness": _staleness(service, request.app.state.store, datetime.now(tz=UTC)),
     }
+
+
+@router.get("/database")
+def database(request: Request) -> dict[str, Any]:
+    """Size and date range of the database the service has open.
+
+    "How big is it and how far back does it go" is what ``arraysense status``
+    answers, and the About panel now asks the same question. The route calls
+    the very function the CLI calls rather than asking the live connection its
+    page count: two surfaces answering one question from two implementations
+    is the shape of every disagreement this codebase has had.
+
+    A blocking sqlite read, so a plain ``def`` — FastAPI runs it off the event
+    loop the way it runs the store-reading routes.
+
+    The reply is ``database_facts``' contract unedited, because the
+    distinctions it carries are the ones that must survive to the page:
+    ``bytes`` null means nothing measured the file, and ``readable`` false
+    means the file could not be read — never opened, or opened and refusing
+    the query. Neither is an empty database, and neither may be drawn as one.
+    ``reason`` names the failing step for whoever can act on it; a page shows
+    the distinction, not the filesystem error behind it.
+    """
+    return database_facts(request.app.state.config.database_path)
 
 
 @router.get("/live")
