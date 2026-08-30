@@ -10,8 +10,10 @@ are:
 
 * ``drawRanges``/``customWindow``/``rangeSpanLabel``/``rangeRefusal``/
   ``prefillFor`` (common.js, marker ranges-custom) — the fifth button, the
-  fields behind it, the two rules Apply enforces (a window needs both ends,
-  and an end in the future is clamped to now rather than drawn past it), the
+  fields behind it, the refusals Apply names on the input that broke them (a
+  window needs both ends, both ends must parse, the window must move forward,
+  and a start the clamp to now leaves no room behind is its own refusal; an
+  end in the future over a past start is the clamp's, not a refusal), the
   one refusal message a broken pair gets instead of silence, and the ends
   the fields reopen on.
 * ``windowNow`` (graphs.html, marker custom-window) — the query every fetcher
@@ -614,14 +616,22 @@ def test_range_refusal_is_the_exact_contradiction_of_custom_window() -> None:
 
 def test_the_open_editor_takes_a_wrapped_line_of_its_own() -> None:
     # The preset buttons keep their place while the fields are typed into:
-    # the fields span forces a wrap and lines up under the right-aligned
-    # buttons, so opening the editor moves nothing. The rule is read with the
-    # comments stripped, the way the token gate reads declarations, and the
-    # old comment that claimed the opposite must be gone, not amended.
+    # the fields span forces a wrap and every line of the bar packs right, so
+    # the buttons keep their x however wide the editor's line makes the bar.
+    # No layout runs under node, so this pins the declarations that produce
+    # the geometry; the rig check measures the geometry itself. The rule is
+    # read with the comments stripped, the way the token gate reads
+    # declarations, and the old comment that claimed the opposite must be
+    # gone, not amended.
     text = COMMON.read_text(encoding="utf-8")
     stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
     stripped = "\n".join(
         line for line in stripped.splitlines() if not line.lstrip().startswith("//")
+    )
+    bar = re.findall(r"\.rng\{([^}]*)\}", stripped)
+    assert bar, "the bar rule still exists"
+    assert all("justify-content:flex-end" in rule for rule in bar), (
+        "every line of the bar packs right, or a widened bar slides the buttons left"
     )
     rules = re.findall(r"\.rng \.rngfields\{([^}]*)\}", stripped)
     assert rules, "the fields rule still exists"

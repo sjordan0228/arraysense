@@ -267,14 +267,16 @@ const BASE_CSS = `
   .chead{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;flex-wrap:wrap;gap:8px}
   .chead h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em}
   .legend{display:flex;gap:14px;font-size:11px;color:var(--ink2);flex-wrap:wrap}
-  .rng{display:flex;flex-wrap:wrap;gap:6px}
+  /* Every line of the range bar packs right, whatever its width: a line
+     packed left would slide the preset buttons when the editor's wrapped
+     line widens the bar under a right-anchored parent. */
+  .rng{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px}
   .rng button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
   .rng button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
   /* The custom window's fields sit inside the same pill as the presets and
      take a wrapped line of their own: a full flex-basis is what forces the
-     wrap, so opening the editor never moves the preset buttons, and
-     justify-content lines the fields up under the right-aligned buttons they
+     wrap, and the line packs right so the fields sit under the buttons they
      edit. The [hidden] rule is not redundant: the row's own display beats
      the UA rule the attribute leans on, exactly as .setup .err[hidden]
      does below. */
@@ -2063,7 +2065,11 @@ function rangeRefusal(fromValue, toValue, now) {
 
 // The datetime-local fields hold local calendar parts, so a stored instant
 // goes back into a field through the same local getters the label builder
-// reads.
+// reads. That shape has a known limit the field type itself imposes: during
+// a fall-back hour one wall-clock time names two instants, so replaying a
+// stored end through the field can settle an ambiguous stamp on the other
+// side of the transition — an hour of drift on a reopen-and-reapply, which
+// no offset-free field can express away.
 function localInputValue(d) {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
     + `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
@@ -2118,17 +2124,38 @@ function drawRanges(el, current, onPick) {
   const from = el.querySelector('[data-k="from"]');
   const to = el.querySelector('[data-k="to"]');
   const err = el.querySelector('.rngerr');
+  // One writer for the refusal, shared by Apply and the keystroke handler:
+  // which rule the pair breaks and which input must move are properties of
+  // the pair, so a correction that walks from one refusal to another reads
+  // the new one rather than keeping the old message on the row. The span
+  // enters the accessibility tree before the text lands in it, so the alert
+  // always has a node to speak.
+  const showRefusal = (why) => {
+    err.hidden = false;
+    err.textContent = why;
+    if (why === RANGE_EMPTY) {
+      from.ariaInvalid = from.value ? null : 'true';
+      to.ariaInvalid = to.value ? null : 'true';
+    } else {
+      from.ariaInvalid = 'true';
+      to.ariaInvalid = why === RANGE_UNPARSEABLE ? 'true' : null;
+    }
+  };
   const clearRefusal = () => {
     err.hidden = true;
     err.textContent = '';
     from.ariaInvalid = null;
     to.ariaInvalid = null;
   };
-  // Typing recomputes the refusal rather than clearing it: a pair that is
-  // still refused keeps its message, so an unfinished correction is never
-  // announced as one that already applies.
+  // Typing recomputes a refusal that is already on the row, so a correction
+  // walking from one broken rule to another reads the rule it now breaks
+  // rather than a stale sentence. Silence stays silent: a pair that was
+  // accepted learns of a fresh refusal from the next Apply, not mid-keystroke.
   const recheck = () => {
-    if (!rangeRefusal(from.value, to.value, new Date())) clearRefusal();
+    if (err.hidden) return;
+    const why = rangeRefusal(from.value, to.value, new Date());
+    if (why) showRefusal(why);
+    else clearRefusal();
   };
   from.oninput = recheck;
   to.oninput = recheck;
@@ -2154,16 +2181,7 @@ function drawRanges(el, current, onPick) {
         // correction; the row says which rule the pair broke and the inputs
         // that broke it wear the mark, so the correction starts from an
         // answer instead of a silent button.
-        const why = rangeRefusal(from.value, to.value, now);
-        err.textContent = why;
-        err.hidden = false;
-        if (why === RANGE_EMPTY) {
-          from.ariaInvalid = from.value ? null : 'true';
-          to.ariaInvalid = to.value ? null : 'true';
-        } else {
-          from.ariaInvalid = 'true';
-          to.ariaInvalid = why === RANGE_UNPARSEABLE ? 'true' : null;
-        }
+        showRefusal(rangeRefusal(from.value, to.value, now));
       };
     } else if (b.dataset.k === 'cancel') {
       b.onclick = () => {
