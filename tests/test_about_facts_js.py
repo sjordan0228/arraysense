@@ -62,6 +62,11 @@ def _run(body: str) -> str:
 _STUBS = r"""
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
   (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+// drawFacts reaches into the release-check slice below this one for the row it
+// pushes between the database rows and the device rows. It is stubbed for the
+// reason esc is: the slice under test here is the database rows, and the real
+// releaseWords is what test_release_check_js.py runs.
+const releaseWords = () => '<span class="muted">not this file</span>';
 const els = {};
 const $ = (id) => (els[id] ??= { innerHTML: '' });
 const factsMarkup = () => els['facts'].innerHTML;
