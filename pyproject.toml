@@ -7,19 +7,30 @@ requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
-    # Pinned to a fork commit, not to a PyPI version, and the distinction is the
-    # whole point. Stock pylxpweb rewrites an unreported battery state of health
-    # into 100, which is also a real reading, so a silent BMS is indistinguishable
-    # from a healthy bank (upstream issue #309, fix in PR #286).
+    # Pinned to an upstream pre-release tag, not to a PyPI version, and the
+    # distinction is the whole point. Stock pylxpweb rewrites an unreported
+    # battery state of health into 100, which is also a real reading, so a
+    # silent BMS is indistinguishable from a healthy bank (upstream issue
+    # #309). This project reported that as PR #286, a three-line change to
+    # the transport decoders; upstream merged it as the base of PR #316 and
+    # completed it, keeping our commit with authorship preserved. The
+    # completion mattered: with the three lines alone, BatteryData's own
+    # post-init rewrote the None straight back to 100 — empirically true of
+    # the fork commit this pin replaced, so per-battery SoH was still
+    # fabricated here in production. Their branch also carries what ours
+    # never reached: is_corrupt() tolerating the None canary, bank min/max
+    # over possibly-None values, the master/slave protocol decoders, and the
+    # cloud path's own or-100.
     #
-    # The commit is v0.9.38 plus that three-line change and nothing else, so this
-    # moves no version: it is the library the Pi already runs, with the fix in it.
-    # A plain `==0.9.38` would not do, because `uv sync` reinstalls stock over a
-    # hand-patched venv and the loss is silent. Upgrading the library is a separate
-    # job; 0.9.38 to 0.9.40 is 59 commits across the serial transport and the
-    # battery registers, and only the live inverter can tell you it worked.
-    # Move back to a PyPI spec once upstream releases the fix.
-    "pylxpweb @ git+https://github.com/sjordan0228/pylxpweb@c01ba5b12f8e9fdd8137be4801ad5480e5193b4d",
+    # The pin is upstream v0.10.0b5, the release carrying PR #316, and not
+    # PyPI's 0.9.40, which is the newest stable and predates the fix. A
+    # plain `==0.9.38` would not do either, because `uv sync` reinstalls
+    # stock over a hand-patched venv and the loss is silent. Move to a plain
+    # PyPI spec (and drop allow-direct-references with it) once 0.10.0 goes
+    # stable — the 0.9.38-to-0.10.0 jump crosses the serial transport and
+    # the battery registers, and only the live inverter can tell you it
+    # worked, so the first deploy after this one watches the battery panels.
+    "pylxpweb @ git+https://github.com/joyfulhouse/pylxpweb@v0.10.0b5",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pyserial>=3.5",

@@ -190,7 +190,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "pylxpweb", git = "https://github.com/sjordan0228/pylxpweb?rev=c01ba5b12f8e9fdd8137be4801ad5480e5193b4d" },
+    { name = "pylxpweb", git = "https://github.com/joyfulhouse/pylxpweb?rev=v0.10.0b5" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
@@ -1181,8 +1181,8 @@ wheels = [
 
 [[package]]
 name = "pylxpweb"
-version = "0.9.38"
-source = { git = "https://github.com/sjordan0228/pylxpweb?rev=c01ba5b12f8e9fdd8137be4801ad5480e5193b4d#c01ba5b12f8e9fdd8137be4801ad5480e5193b4d" }
+version = "0.10.0b5"
+source = { git = "https://github.com/joyfulhouse/pylxpweb?rev=v0.10.0b5#4505349da28ede281434eca953f1066419cfa61b" }
 dependencies = [
     { name = "aiohttp" },
     { name = "pydantic" },
