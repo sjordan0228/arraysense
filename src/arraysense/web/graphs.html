@@ -2396,11 +2396,19 @@ async function get(url) {
 // the moment it is asked. Shared so the circuits ask — which can happen on its
 // own, when its section first comes into view — builds the same window load()
 // would have built for it.
+// >>> custom-window
 function windowNow() {
+  // A custom range answers with the two instants it was picked for, on every
+  // ask and however late: "the hours I chose", not the hours since. A preset
+  // still measures back from now, because sliding is what a preset means.
+  if (range.key === 'custom') {
+    return `start=${range.start.toISOString()}&end=${range.end.toISOString()}`;
+  }
   const end = new Date();
   const start = new Date(end.getTime() - range.seconds * 1000);
   return `start=${start.toISOString()}&end=${end.toISOString()}`;
 }
+// <<< custom-window
 
 const tierPhrase = (body, raw) => (body.tier === 'full' ? raw : `${body.tier} rollup`);
 

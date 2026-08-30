@@ -2127,9 +2127,22 @@ async function loadForecast() {
   }
 }
 
+// >>> custom-window
+// The window one poll asks for. A preset is measured back from the moment of
+// asking — the dashboard polls, and sliding with the clock is what "last 24h"
+// means on the second poll as on the first. A custom range is the answer to a
+// different question: the hours the owner typed, so every later poll re-reads
+// those same hours rather than drifting forward off the window printed on the
+// range bar. Out as two Dates because the history ask and the bands ask below
+// already share the pair.
+function historyWindow(range, now) {
+  if (range.key === 'custom') return { start: range.start, end: range.end };
+  return { start: new Date(now.getTime() - range.seconds * 1000), end: now };
+}
+// <<< custom-window
+
 async function loadHistory() {
-  const end = new Date();
-  const start = new Date(end.getTime() - range.seconds*1000);
+  const { start, end } = historyWindow(range, new Date());
   const metrics = 'pv_total_power_w,load_power_w,battery_power_w,grid_power_w,battery_soc_pct';
   const width = Math.max(300, Math.min(4000, Math.round(document.body.clientWidth)));
   const url = `/api/history?start=${start.toISOString()}&end=${end.toISOString()}&metrics=${metrics}&width=${width}`;
