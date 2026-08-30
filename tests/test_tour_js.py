@@ -218,3 +218,35 @@ def test_bare_source_keeps_only_steps_an_unknown_may_keep() -> None:
         CAPS + STATUS + "console.log(tourPassingSteps(BARE, FRESH, null).map(s=>s.id).join(','));"
     )
     assert out == "now-live,inverter-legs,flow-sankey,graphs-bands"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_button_hides_wherever_the_tour_could_not_run() -> None:
+    # Each suppressing state on its own, every other input saying yes: a
+    # browser that refuses localStorage, a stopped collector, a first run and
+    # an installation with no passing step must each keep the button off, or
+    # it stands in the header doing nothing.
+    out = _run(
+        STATUS
+        + "console.log(JSON.stringify(["
+        + "tourButtonVisible(TOUR_UNSUPPORTED, FRESH, false, 7), "
+        + "tourButtonVisible(null, STOPPED, false, 7), "
+        + "tourButtonVisible(null, FRESH, true, 7), "
+        + "tourButtonVisible(null, FRESH, false, 0)]));"
+    )
+    assert out == "[false,false,false,false]"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_finished_and_midtour_states_keep_the_button() -> None:
+    # The button is the way back: it stays mounted mid-tour and after the
+    # tour is finished or dismissed (one stored state), because pressing it
+    # restarts from the first step that passes.
+    out = _run(
+        STATUS
+        + "console.log(JSON.stringify(["
+        + "tourButtonVisible(null, FRESH, false, 7), "
+        + 'tourButtonVisible("flow-sankey", FRESH, false, 4), '
+        + "tourButtonVisible(TOUR_DONE, FRESH, false, 7)]));"
+    )
+    assert out == "[true,true,true]"
