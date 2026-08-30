@@ -271,15 +271,22 @@ const BASE_CSS = `
   .rng button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
     border-radius:7px;padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
   .rng button[aria-pressed="true"]{background:var(--tint-3);color:var(--ink)}
-  /* The custom window's fields sit inside the same pill as the presets, and
-     the row takes its place in the pill's flex line rather than opening a row
-     of its own. The [hidden] rule is not redundant: the row's own display
-     beats the UA rule the attribute leans on, exactly as .setup .err[hidden]
+  /* The custom window's fields sit inside the same pill as the presets and
+     take a wrapped line of their own: a full flex-basis is what forces the
+     wrap, so opening the editor never moves the preset buttons, and
+     justify-content lines the fields up under the right-aligned buttons they
+     edit. The [hidden] rule is not redundant: the row's own display beats
+     the UA rule the attribute leans on, exactly as .setup .err[hidden]
      does below. */
-  .rng .rngfields{display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-size:11px;color:var(--ink2)}
+  .rng .rngfields{display:flex;flex-wrap:wrap;justify-content:flex-end;flex-basis:100%;gap:4px;align-items:center;font-size:11px;color:var(--ink2)}
   .rng .rngfields[hidden]{display:none}
   .rng .rngfields input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
     border-radius:7px;padding:2px 6px;font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
+  /* The refusal beside the fields wears the setup page's inline-error look,
+     and it hides by declaration rather than by the attribute alone, exactly
+     as the fields' row hides by its own rule above. */
+  .rng .rngerr{font-size:11px;color:var(--bad);line-height:1.5}
+  .rng .rngerr[hidden]{display:none}
   svg{display:block;width:100%;height:auto;overflow:visible}
   /* Navigation. Five views of one installation, so the marker is a state of the
      nav rather than a heading each page repeats — landing anywhere, the lit
@@ -2031,17 +2038,67 @@ function customWindow(fromValue, toValue, now) {
   };
 }
 
+// A refusal has one message per pair, naming the first rule the pair breaks
+// in customWindow's own check order: empty ends, ends that are not dates, a
+// window that does not move forward, and a start the clamp to now leaves no
+// room behind. The clamp's own case is not a refusal: a future end over a
+// past start is a real window once the clamp pulls it back, and refusing
+// what customWindow accepts would order the owner to fix a pair that applies.
+const RANGE_EMPTY = 'Enter a start and an end.';
+const RANGE_UNPARSEABLE = 'Enter a valid date and time.';
+
+function rangeRefusal(fromValue, toValue, now) {
+  if (!fromValue || !toValue) return RANGE_EMPTY;
+  const start = new Date(fromValue);
+  const end = new Date(toValue);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+    return RANGE_UNPARSEABLE;
+  }
+  if (end.getTime() <= start.getTime()) return 'The start must come before the end.';
+  if (start.getTime() >= now.getTime() && end.getTime() > now.getTime()) {
+    return 'The start must be in the past.';
+  }
+  return null;
+}
+
+// The datetime-local fields hold local calendar parts, so a stored instant
+// goes back into a field through the same local getters the label builder
+// reads.
+function localInputValue(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`
+    + `T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// The editor edits the window the page already shows, so opening it fills
+// the ends from the current range: a custom range replays its stored stamps
+// — which is what makes a clamp from the last Apply visible on reopening —
+// a preset measures back from the moment of opening, and anything else
+// starts blank.
+function prefillFor(current, now) {
+  if (current.key === 'custom' && current.start && current.end) {
+    return { from: localInputValue(current.start), to: localInputValue(current.end) };
+  }
+  if (current.seconds) {
+    return {
+      from: localInputValue(new Date(now.getTime() - current.seconds * 1000)),
+      to: localInputValue(now),
+    };
+  }
+  return { from: '', to: '' };
+}
+
 // The caller owns which range is current and what to do when it changes, and
 // redraws to move the pressed state. Holding that here would mean holding it
 // once for pages that have two independent range pickers.
 //
-// The fifth button opens two datetime-local fields instead of picking — only
-// Apply picks, so Cancel can undo the whole detour without the caller ever
-// knowing it happened. A valid Apply hands the picked window to the caller,
-// whose redraw rebuilds this row from the new current: Custom pressed and
-// wearing the span as its label, the fields rebuilt closed. Nothing about the
-// open fields survives a redraw, which is also why a preset pressed after a
-// custom needs no unwinding — the redraw says the new current and nothing else.
+// The fifth button opens two datetime-local fields, filled with the window
+// they would edit, instead of picking — only Apply picks, so Cancel can undo
+// the whole detour without the caller ever knowing it happened. A valid Apply
+// hands the picked window to the caller, whose redraw rebuilds this row from
+// the new current: Custom pressed and wearing the span as its label, the
+// fields rebuilt closed. Nothing about the open fields survives a redraw,
+// which is also why a preset pressed after a custom needs no unwinding — the
+// redraw says the new current and nothing else.
 function drawRanges(el, current, onPick) {
   if (!el) return;
   const custom = current.key === 'custom';
@@ -2055,22 +2112,64 @@ function drawRanges(el, current, onPick) {
     `<label>To <input type="datetime-local" data-k="to"></label>` +
     `<button data-k="apply">Apply</button>` +
     `<button data-k="cancel">Cancel</button>` +
+    `<span class="rngerr" role="alert" hidden></span>` +
     `</span>`;
   const fields = el.querySelector('.rngfields');
   const from = el.querySelector('[data-k="from"]');
   const to = el.querySelector('[data-k="to"]');
+  const err = el.querySelector('.rngerr');
+  const clearRefusal = () => {
+    err.hidden = true;
+    err.textContent = '';
+    from.ariaInvalid = null;
+    to.ariaInvalid = null;
+  };
+  // Typing recomputes the refusal rather than clearing it: a pair that is
+  // still refused keeps its message, so an unfinished correction is never
+  // announced as one that already applies.
+  const recheck = () => {
+    if (!rangeRefusal(from.value, to.value, new Date())) clearRefusal();
+  };
+  from.oninput = recheck;
+  to.oninput = recheck;
   el.querySelectorAll('button').forEach((b) => {
     if (b.dataset.k === 'custom') {
-      b.onclick = () => { fields.hidden = false; };
+      b.onclick = () => {
+        const pre = prefillFor(current, new Date());
+        from.value = pre.from;
+        to.value = pre.to;
+        clearRefusal();
+        fields.hidden = false;
+      };
     } else if (b.dataset.k === 'apply') {
       b.onclick = () => {
-        const w = customWindow(from.value, to.value, new Date());
-        // A refused window changes nothing at all: the current range keeps
-        // its press and the fields stay open for the correction.
-        if (w) onPick(w);
+        const now = new Date();
+        const w = customWindow(from.value, to.value, now);
+        if (w) {
+          clearRefusal();
+          onPick(w);
+          return;
+        }
+        // A refused window picks nothing and leaves the fields open for the
+        // correction; the row says which rule the pair broke and the inputs
+        // that broke it wear the mark, so the correction starts from an
+        // answer instead of a silent button.
+        const why = rangeRefusal(from.value, to.value, now);
+        err.textContent = why;
+        err.hidden = false;
+        if (why === RANGE_EMPTY) {
+          from.ariaInvalid = from.value ? null : 'true';
+          to.ariaInvalid = to.value ? null : 'true';
+        } else {
+          from.ariaInvalid = 'true';
+          to.ariaInvalid = why === RANGE_UNPARSEABLE ? 'true' : null;
+        }
       };
     } else if (b.dataset.k === 'cancel') {
-      b.onclick = () => { fields.hidden = true; };
+      b.onclick = () => {
+        clearRefusal();
+        fields.hidden = true;
+      };
     } else {
       b.onclick = () => onPick(RANGES.find((r) => r.key === b.dataset.k));
     }

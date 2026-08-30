@@ -8,10 +8,12 @@ Three pieces carry the feature and each has its own way of going quietly wrong,
 so each is sliced and run under node the way the caps and live-strip slices
 are:
 
-* ``drawRanges``/``customWindow``/``rangeSpanLabel`` (common.js, marker
-  ranges-custom) — the fifth button, the fields behind it, and the two rules
-  Apply enforces: a window needs both ends, and an end in the future is
-  clamped to now rather than drawn past it.
+* ``drawRanges``/``customWindow``/``rangeSpanLabel``/``rangeRefusal``/
+  ``prefillFor`` (common.js, marker ranges-custom) — the fifth button, the
+  fields behind it, the two rules Apply enforces (a window needs both ends,
+  and an end in the future is clamped to now rather than drawn past it), the
+  one refusal message a broken pair gets instead of silence, and the ends
+  the fields reopen on.
 * ``windowNow`` (graphs.html, marker custom-window) — the query every fetcher
   on that page shares. A preset must stay byte-identical to the old
   now-derived ask; a custom range must answer the stored stamps even as the
@@ -38,6 +40,7 @@ Skipped where node is not installed; loud if the extraction markers move.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -90,6 +93,9 @@ def _index(body: str) -> str:
 # the innerHTML the function just wrote — a test that presses '7d' presses the
 # button the page would show, and a markup change that drops aria-pressed or
 # data-k fails here rather than passing on a second implementation of the row.
+# The error span's hidden state is derived from the markup the redraw wrote,
+# exactly like the fields', and the inputs carry the aria-invalid IDL property
+# and the oninput handler because that is how the row wires them.
 STUB = """
 const esc = (s) => String(s ?? '');
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -100,16 +106,21 @@ globalThis.Date = class extends REAL_DATE {
 };
 const fakeRangesEl = () => {
   const fields = { hidden: null };
-  const from = { value: '' };
-  const to = { value: '' };
+  const from = { value: '', ariaInvalid: null, oninput: null };
+  const to = { value: '', ariaInvalid: null, oninput: null };
+  const err = { hidden: null, textContent: '' };
   const el = {
-    innerHTML: '', fields, from, to, buttons: [],
+    innerHTML: '', fields, from, to, err, buttons: [],
     querySelector: (sel) => {
       // The row's hidden is read off the markup the redraw just wrote —
       // "rebuilt closed" is an assertion about the markup, not a stub flag.
       if (sel === '.rngfields') {
         fields.hidden = el.innerHTML.includes('<span class="rngfields" hidden>');
         return fields;
+      }
+      if (sel === '.rngerr') {
+        err.hidden = el.innerHTML.includes('<span class="rngerr" role="alert" hidden>');
+        return err;
       }
       if (sel === '[data-k="from"]') return from;
       if (sel === '[data-k="to"]') return to;
@@ -129,6 +140,9 @@ const fakeRangesEl = () => {
   return el;
 };
 const press = (el, k) => el.buttons.find((b) => b.dataset.k === k).onclick();
+const type = (el, k, v) => { el[k].value = v; el[k].oninput(); };
+const invalid = (el) => ['from', 'to']
+  .filter((k) => el[k].ariaInvalid === 'true').join('+') || 'none';
 const rangeKeys = (el) => el.buttons
   .filter((b) => b.pressed !== undefined).map((b) => b.dataset.k).join(',');
 const pressedKeys = (el) => el.buttons
@@ -380,4 +394,247 @@ def test_the_dashboard_poll_rereads_a_custom_window_instead_of_sliding_it() -> N
     )
     assert results["custom"] == "2026-02-01T00:00:00.000Z|2026-02-08T12:34:56.000Z", (
         "a poll a century later asks the same two instants"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_refusal_names_its_reason_and_the_input_that_broke() -> None:
+    # Every window the same truth table refuses now says why, in one message
+    # at a time and on the input that has to move: an empty end names itself,
+    # an unparseable pair shares the sentence it broke, and a pair that parses
+    # but does not move forward is the start's fault alone. A refusal still
+    # picks nothing, and the fields stay open for the correction.
+    out = _common(
+        STUB
+        + "const picks = [];\n"
+        + "const el = fakeRangesEl();\n"
+        + "drawRanges(el, RANGES[0], (p) => picks.push(p));\n"
+        + "press(el, 'custom');\n"
+        + "const cases = [\n"
+        + "  ['', '2026-03-09T10:00'], ['2026-03-02T08:00', ''], ['', ''],\n"
+        + "  ['bogus', '2026-03-09T10:00'], ['2026-03-02T08:00', 'bogus'],\n"
+        + "  ['2026-03-05T00:00', '2026-03-02T00:00'],\n"
+        + "  ['2026-03-05T00:00', '2026-03-05T00:00'],\n"
+        + "  ['2026-03-09T18:00', '2026-03-10T10:00']];\n"
+        + "const want = ['Enter a start and an end.', 'Enter a start and an end.',\n"
+        + "  'Enter a start and an end.', 'Enter a valid date and time.',\n"
+        + "  'Enter a valid date and time.', 'The start must come before the end.',\n"
+        + "  'The start must come before the end.', 'The start must be in the past.'];\n"
+        + "const bad = ['from', 'to', 'from+to', 'from+to', 'from+to',\n"
+        + "  'from', 'from', 'from'];\n"
+        + "cases.forEach((c, i) => {\n"
+        + "  el.from.value = c[0]; el.to.value = c[1]; press(el, 'apply');\n"
+        + "  console.log('msg' + i + ':' + (want[i] === el.err.textContent));\n"
+        + "  console.log('shown' + i + ':' + (el.err.hidden === false));\n"
+        + "  console.log('bad' + i + ':' + (bad[i] === invalid(el)));\n"
+        + "  console.log('open' + i + ':' + (el.fields.hidden === false));\n"
+        + "});\n"
+        + "console.log('picks:' + picks.length);"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["picks"] == "0", "a refused window is still never handed over"
+    assert all(v == "true" for k, v in results.items() if k != "picks"), (
+        "every refused pair names its message, its input, and an open row"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_clamp_is_not_a_refusal_and_a_valid_apply_clears_the_error() -> None:
+    # A future end with a past start is the clamp's business, not a refusal:
+    # the pair must pick, and it must pick clean. The same Apply that succeeds
+    # after an earlier refusal wipes that refusal from the row and the inputs,
+    # because the complaint it answered is gone.
+    out = _common(
+        STUB
+        + "const picks = [];\n"
+        + "const el = fakeRangesEl();\n"
+        + "drawRanges(el, RANGES[0], (p) => picks.push(p));\n"
+        + "press(el, 'custom');\n"
+        + "el.from.value = ''; el.to.value = ''; press(el, 'apply');\n"
+        + "console.log('shown:' + el.err.hidden);\n"
+        + "el.from.value = '2026-03-09T08:00'; el.to.value = '2026-03-10T10:00';\n"
+        + "press(el, 'apply');\n"
+        + "console.log('picks:' + picks.length);\n"
+        + "console.log('end:' + picks[0].end.toISOString());\n"
+        + "console.log('hidden:' + el.err.hidden);\n"
+        + "console.log('text:' + (el.err.textContent === ''));\n"
+        + "console.log('invalid:' + invalid(el));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["shown"] == "false", "the empty pair is refused first"
+    assert results["picks"] == "1", "a clamped window is accepted, not refused"
+    assert results["end"] == "2026-03-09T18:00:00.000Z", "the clamp still clamps"
+    assert results["hidden"] == "true"
+    assert results["text"] == "true", "a cleared error holds no stale sentence"
+    assert results["invalid"] == "none"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_typing_clears_the_refusal_only_when_the_pair_becomes_acceptable() -> None:
+    # The keystroke handler recomputes instead of clearing: a user who fixes
+    # one of two bad ends is still holding a refused pair, and wiping the
+    # message there would say the window already works. Message and the mark
+    # the refused Apply placed stay until the refusal itself goes, on either
+    # field's input event.
+    out = _common(
+        STUB
+        + "const picks = [];\n"
+        + "const el = fakeRangesEl();\n"
+        + "drawRanges(el, RANGES[0], (p) => picks.push(p));\n"
+        + "press(el, 'custom');\n"
+        + "el.from.value = ''; el.to.value = '2026-03-02T00:00';\n"
+        + "press(el, 'apply');\n"
+        + "type(el, 'from', '2026-03-05T00:00');\n"
+        + "console.log('half:' + el.err.hidden + ':' + invalid(el));\n"
+        + "type(el, 'to', '2026-03-09T10:00');\n"
+        + "console.log('whole:' + el.err.hidden + ':' + invalid(el));\n"
+        + "type(el, 'to', 'bogus');\n"
+        + "console.log('broken:' + el.err.hidden);\n"
+        + "type(el, 'to', '2026-03-09T10:00');\n"
+        + "console.log('whole2:' + el.err.hidden + ':' + invalid(el));\n"
+        + "console.log('picks:' + picks.length);"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["half"] == "false:from", (
+        "a pair that is still refused keeps its message, and the start keeps "
+        "the mark the refused Apply put on it"
+    )
+    assert results["whole"] == "true:none", "an acceptable pair clears the row"
+    assert results["broken"] == "true", (
+        "breaking an accepted pair after the clear is the next Apply's news"
+    )
+    assert results["whole2"] == "true:none"
+    assert results["picks"] == "0", "typing picks nothing"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_opening_the_editor_fills_the_window_it_would_edit() -> None:
+    # Two empty fields make the owner retype the window the page already
+    # shows. A custom range replays its stored ends; a preset measures back
+    # from now, so reopening after a clamped Apply offers the clamped now in
+    # the To field instead of a blank.
+    out = _common(
+        STUB
+        + "const w = customWindow('2026-03-02T08:00', '2026-03-05T20:00', NOW);\n"
+        + "const a = fakeRangesEl();\n"
+        + "drawRanges(a, pickedCustom(w), () => {});\n"
+        + "press(a, 'custom');\n"
+        + "console.log('from:' + a.from.value);\n"
+        + "console.log('to:' + a.to.value);\n"
+        + "console.log('fmt:' + localInputValue(NOW));\n"
+        + "const b = fakeRangesEl();\n"
+        + "drawRanges(b, RANGES[1], () => {});\n"
+        + "press(b, 'custom');\n"
+        + "console.log('presetfrom:' + b.from.value);\n"
+        + "console.log('presetto:' + b.to.value);\n"
+        + "const c = fakeRangesEl();\n"
+        + "drawRanges(c, { key: 'none' }, () => {});\n"
+        + "press(c, 'custom');\n"
+        + "console.log('bare:' + (c.from.value === '') + ':' + (c.to.value === ''));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["from"] == "2026-03-02T08:00"
+    assert results["to"] == "2026-03-05T20:00", (
+        "the fields reopen on the ends the current custom window was drawn"
+    )
+    assert results["fmt"] == "2026-03-09T18:00", "the fields read local calendar parts"
+    assert results["presetfrom"] == "2026-03-08T18:00"
+    assert results["presetto"] == "2026-03-09T18:00", (
+        "a 24h preset measured back from the frozen now"
+    )
+    assert results["bare"] == "true:true"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_cancel_and_a_reopen_start_the_row_clean() -> None:
+    # A refused Apply followed by Cancel abandons the detour: the error and
+    # both aria-invalid marks go with it, and pressing Custom again opens a
+    # clean row filled from the current range.
+    out = _common(
+        STUB
+        + "const picks = [];\n"
+        + "const el = fakeRangesEl();\n"
+        + "drawRanges(el, RANGES[1], (p) => picks.push(p));\n"
+        + "press(el, 'custom');\n"
+        + "el.from.value = '2026-03-05T00:00'; el.to.value = '2026-03-02T00:00';\n"
+        + "press(el, 'apply');\n"
+        + "console.log('shown:' + el.err.hidden);\n"
+        + "press(el, 'cancel');\n"
+        + "console.log('cancelhidden:' + el.err.hidden);\n"
+        + "console.log('cancelinvalid:' + invalid(el));\n"
+        + "press(el, 'custom');\n"
+        + "console.log('reopenedhidden:' + el.err.hidden);\n"
+        + "console.log('reopenedinvalid:' + invalid(el));\n"
+        + "console.log('fields:' + el.fields.hidden);\n"
+        + "console.log('picks:' + picks.length);"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["shown"] == "false", "the refused pair shows its message first"
+    assert results["cancelhidden"] == "true"
+    assert results["cancelinvalid"] == "none", "Cancel abandons the complaint too"
+    assert results["reopenedhidden"] == "true"
+    assert results["reopenedinvalid"] == "none", "a fresh open starts clean"
+    assert results["fields"] == "false", "the reopened row is open"
+    assert results["picks"] == "0", "a detour still picked nothing"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_range_refusal_is_the_exact_contradiction_of_custom_window() -> None:
+    # The refusal and the window share one truth table between them: for every
+    # pair, rangeRefusal answers null exactly when customWindow answers a
+    # window. The clamped future pair sits on the hinge — accepted by both,
+    # because the clamp turns it into a real window.
+    out = _common(
+        STUB
+        + "const cases = [ ['', ''], ['', '2026-03-09T10:00'],\n"
+        + "  ['2026-03-02T08:00', 'bogus'], ['bogus', 'bogus'],\n"
+        + "  ['2026-03-05T00:00', '2026-03-02T00:00'],\n"
+        + "  ['2026-03-05T00:00', '2026-03-05T00:00'],\n"
+        + "  ['2026-03-05T00:00', '2026-03-09T18:00'],\n"
+        + "  ['2026-03-09T17:00', '2026-03-10T10:00'],\n"
+        + "  ['2026-03-09T18:00', '2026-03-10T10:00'],\n"
+        + "  ['2026-03-10T00:00', '2026-03-11T00:00'],\n"
+        + "  ['2026-03-02T08:00', '2026-03-05T20:00'] ];\n"
+        + "const exact = cases.every((c) =>\n"
+        + "  (rangeRefusal(c[0], c[1], NOW) === null)\n"
+        + "  === (customWindow(c[0], c[1], NOW) !== null));\n"
+        + "const named = cases.every((c) =>\n"
+        + "  (rangeRefusal(c[0], c[1], NOW) === null)\n"
+        + "  || typeof rangeRefusal(c[0], c[1], NOW) === 'string');\n"
+        + "console.log('exact:' + exact);\n"
+        + "console.log('named:' + named);\n"
+        + "console.log('clamped:' + rangeRefusal('2026-03-09T17:00', "
+        + "'2026-03-10T10:00', NOW));"
+    )
+    results = dict(ln.split(":", 1) for ln in out.split("\n"))
+    assert results["exact"] == "true", "one null exactly when the other is not, on every case"
+    assert results["named"] == "true", "every refusal is a message, never a bare no"
+    assert results["clamped"] == "null", "the clamp's own case is not a refusal"
+
+
+def test_the_open_editor_takes_a_wrapped_line_of_its_own() -> None:
+    # The preset buttons keep their place while the fields are typed into:
+    # the fields span forces a wrap and lines up under the right-aligned
+    # buttons, so opening the editor moves nothing. The rule is read with the
+    # comments stripped, the way the token gate reads declarations, and the
+    # old comment that claimed the opposite must be gone, not amended.
+    text = COMMON.read_text(encoding="utf-8")
+    stripped = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    stripped = "\n".join(
+        line for line in stripped.splitlines() if not line.lstrip().startswith("//")
+    )
+    rules = re.findall(r"\.rng \.rngfields\{([^}]*)\}", stripped)
+    assert rules, "the fields rule still exists"
+    assert all("flex-basis:100%" in rule for rule in rules), (
+        "a full basis is what forces the fields onto their own wrapped line"
+    )
+    assert all("justify-content:flex-end" in rule for rule in rules), (
+        "the fields sit under the right-aligned buttons they edit"
+    )
+    assert "rather than opening a row of its own" not in text, (
+        "the placement comment tells the new truth"
+    )
+    assert ".rng .rngerr{" in stripped, "the refusal wears the inline-error look"
+    assert ".rng .rngerr[hidden]{display:none}" in stripped, (
+        "the row's own display beats the UA rule the attribute leans on"
     )
