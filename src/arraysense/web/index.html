@@ -107,9 +107,12 @@
   .cal[hidden]{display:none}
   .cal h2{margin:0;font-size:14px;font-weight:600;letter-spacing:-.01em;color:var(--ink2)}
   .cal p{margin:5px 0 0;font-size:12px;line-height:1.5;color:var(--ink3);max-width:82ch}
-  .cal .calbody{min-width:0}
-  /* The dismiss control sits with the message rather than floating over it, so
-     it cannot land on the text at a narrow width. */
+  /* The body grows so the message takes the strip and the dismiss control
+     lands on the panel's far edge — without flex:1 the row packed every item
+     at content width and stranded the panel's right half as dead space. */
+  .cal .calbody{flex:1 1 auto;min-width:0}
+  /* flex:0 0 auto keeps the dismiss control full-sized against the grown
+     body, and align-self keeps it at the first line rather than stretched. */
   .cal .calhide{align-self:flex-start;flex:0 0 auto;background:var(--tint);
     border:1px solid var(--panel-b);color:var(--ink2);border-radius:7px;
     padding:3px 11px;font:inherit;font-size:11px;cursor:pointer}
