@@ -20,7 +20,7 @@ from typing import Any, ClassVar
 from zoneinfo import ZoneInfo
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from arraysense.api.app import (
@@ -29,6 +29,7 @@ from arraysense.api.app import (
     THEME_SHEETS,
     VENDORED,
     _file_route,
+    _page_route,
     create_app,
 )
 from arraysense.collector.service import CollectorService
@@ -1168,6 +1169,57 @@ def test_every_page_carries_the_default_look_and_settles_it_before_the_body() ->
         assert call > link.start(), f"{filename} settles the look before the link exists"
 
 
+APPEARANCE_LINK = '<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">'
+
+
+@pytest.mark.parametrize("route", sorted(PAGES))
+def test_a_classic_cookie_serves_a_page_without_the_default_link(client: Any, route: str) -> None:
+    # The look lives in a cookie the route reads, so a browser on Classic is
+    # sent a page with the glass link already taken out and never fetches a
+    # stylesheet it would only remove before the first paint. The settling
+    # script stays on the served page whatever the cookie says: it is what
+    # reconciles the navigation whose request carried no cookie yet.
+    r = client.get(route, cookies={"arraysense-appearance": "classic"})
+    assert r.status_code == 200
+    assert 'id="appearance-sheet"' not in r.text
+    assert "applyStoredAppearance()" in r.text
+
+
+@pytest.mark.parametrize("cookie", [None, "glass", "a-look-that-is-not-one"])
+def test_any_other_cookie_serves_the_default_look(client: Any, cookie: str | None) -> None:
+    # Absent and unrecognised both answer the default, because the server
+    # validates the cookie by membership in the look table rather than by
+    # recognizing the name of one look — it cannot guess a look the table
+    # does not name, and the default is the look the markup already carries.
+    cookies = {} if cookie is None else {"arraysense-appearance": cookie}
+    r = client.get("/", cookies=cookies)
+    assert r.status_code == 200
+    assert APPEARANCE_LINK in r.text
+
+
+def test_a_classic_cookie_removes_the_link_line_and_nothing_else(client: Any) -> None:
+    # The transform is one line and not a rewrite: everything else the page
+    # carries — the styles above the link, the settling script below it — goes
+    # out byte-identical, because the page source stays the Glass default and
+    # the only difference the cookie makes is this line.
+    glass = client.get("/", cookies={"arraysense-appearance": "glass"}).text
+    classic = client.get("/", cookies={"arraysense-appearance": "classic"}).text
+    assert glass != classic
+    kept = [line for line in glass.splitlines(keepends=True) if line.strip() != APPEARANCE_LINK]
+    assert classic == "".join(kept), "the classic page is the glass page minus the link line alone"
+
+
+def test_page_responses_vary_on_the_cookie_and_assets_do_not_need_to(client: Any) -> None:
+    # The handler answers differently for different cookies, and Vary writes
+    # that promise down for any cache that ever sits in front of the service.
+    # The shared script and the sheets are the same bytes for every browser,
+    # so they carry no such promise and no reason to key on a cookie.
+    for route in sorted(PAGES):
+        assert client.get(route).headers["vary"] == "Cookie", route
+    for asset in (f"/{SHARED_SCRIPT}", *(f"/{sheet}" for sheet in THEME_SHEETS), "/uPlot.LICENSE"):
+        assert "vary" not in client.get(asset).headers, asset
+
+
 def test_the_sheet_common_js_links_is_the_one_the_pages_and_the_app_name() -> None:
     # Three places name one file: the pages' <link>, the look's href in
     # common.js, and the routed set in app.py. A rename that touches two of them
@@ -1199,14 +1251,19 @@ def test_a_page_route_answers_rather_than_raising(client: Any, path: str) -> Non
 
 
 async def test_a_page_whose_file_is_missing_is_a_404(tmp_path: Path) -> None:
-    # Reached through the route builder rather than the client because the three
-    # new pages will exist soon and this contract has to keep being tested after
-    # they do. Starlette raises from inside the response for an absent file,
-    # which the browser sees as a 500; a page nobody has written yet is missing,
-    # not broken.
-    serve = _file_route(tmp_path / "not_written_yet.html", "text/html")
+    # Reached through the route builders rather than the client because the
+    # three new pages will exist soon and this contract has to keep being
+    # tested after they do. Starlette raises from inside the response for an
+    # absent file, which the browser sees as a 500; a page nobody has written
+    # yet is missing, not broken. The page renderer answers the same way the
+    # plain file route still does for the shared script and the sheets.
     with pytest.raises(HTTPException) as raised:
-        await serve()
+        request = Request({"type": "http", "headers": []})
+        await _page_route(tmp_path / "not_written_yet.html")(request)
+    assert raised.value.status_code == 404
+    assert raised.value.detail == "no file 'not_written_yet.html'"
+    with pytest.raises(HTTPException) as raised:
+        await _file_route(tmp_path / "no_sheet_yet.css", "text/css")()
     assert raised.value.status_code == 404
 
 
