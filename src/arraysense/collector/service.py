@@ -102,9 +102,9 @@ def _log_retention_blocks(report: RetentionReport) -> None:
 def _elapsed_ms(began: float) -> int:
     """Whole milliseconds since *began*, for the line each pass logs about itself.
 
-    The line answers which pass, and inside a rollup which stage, a stall
-    belongs to. It is not a benchmark, so rounding is the point: a pass that
-    finishes inside a millisecond reads as 0ms rather than 0.4ms.
+    The line helps correlate an observed stall with pass and stage durations;
+    it is not a benchmark, so rounding is the point: a pass that finishes
+    inside a millisecond reads as 0ms rather than 0.4ms.
     """
     return max(0, round((time.perf_counter() - began) * 1000))
 
@@ -426,7 +426,7 @@ class CollectorService:
             began = time.perf_counter()
             promote_pending_hours(conn)
             timings["promote"] = _elapsed_ms(began)
-            timings["total"] = _elapsed_ms(pass_began)
+            timings["stages_total"] = _elapsed_ms(pass_began)
             return timings
 
         def _rebuild_on_own_connection(circuit_cadence: int) -> dict[str, int]:
@@ -462,13 +462,13 @@ class CollectorService:
             # since a duration would describe work that never finished.
             logger.info(
                 "rollup pass: inverter_minute=%dms inverter_hourly=%dms module_hourly=%dms "
-                "circuit_hourly=%dms promote=%dms total=%dms",
+                "circuit_hourly=%dms promote=%dms stages_total=%dms",
                 timings["inverter_minute"],
                 timings["inverter_hourly"],
                 timings["module_hourly"],
                 timings["circuit_hourly"],
                 timings["promote"],
-                timings["total"],
+                timings["stages_total"],
             )
 
     async def maintain_retention(self, now: datetime | None = None) -> None:
@@ -482,36 +482,41 @@ class CollectorService:
         """
         moment = now or datetime.now(tz=UTC)
 
-        def _run_on_own_connection() -> RetentionReport:
+        def _run_on_own_connection() -> tuple[RetentionReport, int]:
             conn = self._store.maintenance_connection()
             try:
-                return run_retention(conn, policy, now=moment)
+                began = time.perf_counter()
+                report = run_retention(conn, policy, now=moment)
+                return report, _elapsed_ms(began)
             finally:
                 conn.close()
 
         try:
             policy = policy_from_settings(SettingsStore(self._store))
-            began = time.perf_counter()
             if self._store.is_memory_backed:
+                began = time.perf_counter()
                 report = run_retention(self._store._conn, policy, now=moment)
+                elapsed = _elapsed_ms(began)
             else:
-                report = await asyncio.to_thread(_run_on_own_connection)
+                report, elapsed = await asyncio.to_thread(_run_on_own_connection)
         except sqlite3.Error as exc:
             logger.warning("retention maintenance failed, will retry: %s", exc)
         else:
             # The worker returns its report instead of logging its blocks from
             # its own thread, so a pass writes both of its lines in one place.
             # That line is the rollup line's counterpart: the same level, the
-            # same whole milliseconds, timed around the pass rather than around
-            # the settings read in front of it. Its counts are the report's own,
-            # and the rows are rows this pass deleted, batch by batch, from the
-            # tables it walked. A pass that blocked before taking its first batch
-            # therefore says 0 rows, and one that stood down at the backup gate
-            # says no tables at all.
+            # same whole milliseconds, timed around the run itself — the
+            # settings read in front of it and the block warnings beside it are
+            # not retention work, and counting them would inflate exactly the
+            # blocked passes this line exists to diagnose. Its counts are the
+            # report's own, and the rows are rows this pass deleted, batch by
+            # batch, from the tables it walked. A pass that blocked before
+            # taking its first batch therefore says 0 rows, and one that stood
+            # down at the backup gate says no tables at all.
             _log_retention_blocks(report)
             logger.info(
-                "retention pass: %dms, %d rows in %d tables, %d blocked",
-                _elapsed_ms(began),
+                "retention pass: run=%dms, %d rows in %d tables, %d blocked",
+                elapsed,
                 sum(table.rows for table in report.tables),
                 len(report.tables),
                 sum(1 for table in report.tables if table.blocked is not None),

@@ -29,6 +29,7 @@ from arraysense.settings import (
     RETENTION_RAW_DAYS_KEY,
     SettingsStore,
 )
+from arraysense.store.retention import RetentionReport, TablePrune
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -520,9 +521,11 @@ async def test_changing_the_interval_does_not_rewrite_hours_already_measured(
 
 _ROLLUP_PASS = re.compile(
     r"rollup pass: inverter_minute=(\d+)ms inverter_hourly=(\d+)ms "
-    r"module_hourly=(\d+)ms circuit_hourly=(\d+)ms promote=(\d+)ms total=(\d+)ms"
+    r"module_hourly=(\d+)ms circuit_hourly=(\d+)ms promote=(\d+)ms stages_total=(\d+)ms"
 )
-_RETENTION_PASS = re.compile(r"retention pass: (\d+)ms, (\d+) rows in (\d+) tables, (\d+) blocked")
+_RETENTION_PASS = re.compile(
+    r"retention pass: run=(\d+)ms, (\d+) rows in (\d+) tables, (\d+) blocked"
+)
 
 
 def _pass_records(caplog: pytest.LogCaptureFixture, *prefixes: str) -> list[logging.LogRecord]:
@@ -663,4 +666,74 @@ async def test_a_pass_that_raises_logs_the_failure_not_a_duration(
     assert len(_pass_records(caplog, *prefixes)) == clean, (
         "a pass that raised reports the failure through its warning, not a duration"
     )
+    store.close()
+
+
+async def test_the_rollup_line_pins_each_stage_to_its_own_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Real timings are honest but unlabelled: a swapped pair of stage names or
+    # one stage's number pasted into two slots reads the same as a correct line
+    # when every value is whatever the machine felt like. Deterministic stages
+    # and a deterministic clock pin the label-to-argument mapping exactly.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    for name in (
+        "rebuild_inverter_minute",
+        "rebuild_inverter_hourly",
+        "rebuild_module_hourly",
+        "rebuild_circuit_hourly",
+        "promote_pending_hours",
+    ):
+        monkeypatch.setattr(service_module, name, lambda *args, **kwargs: None)
+    readings = iter([5, 3, 7, 2, 1, 18])
+    monkeypatch.setattr(service_module, "_elapsed_ms", lambda began: next(readings))
+
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_rollups(now=now)
+
+    records = _pass_records(caplog, "rollup pass:")
+    assert len(records) == 1
+    assert records[0].getMessage() == (
+        "rollup pass: inverter_minute=5ms inverter_hourly=3ms module_hourly=7ms "
+        "circuit_hourly=2ms promote=1ms stages_total=18ms"
+    )
+    store.close()
+
+
+async def test_the_retention_line_carries_the_report_it_was_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The line's counts are the report's own, so the mapping is pinned with a
+    # report this test constructed: rows are the per-table deletions summed,
+    # blocked is the count of blocked tables, and neither is re-derived from
+    # anything the pass looked at without deleting.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    def fabricated(conn: object, policy: object, now: datetime) -> RetentionReport:
+        return RetentionReport(
+            dry_run=False,
+            ran=True,
+            reason=None,
+            tables=(
+                TablePrune(table="inverter_raw", cutoff=now, rows=40, oldest=None, blocked=None),
+                TablePrune(
+                    table="inverter_minute", cutoff=now, rows=0, oldest=None, blocked="covered"
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(service_module, "run_retention", fabricated)
+    monkeypatch.setattr(service_module, "_elapsed_ms", lambda began: 33)
+
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_retention(now=now)
+
+    records = _pass_records(caplog, "retention pass:")
+    assert len(records) == 1
+    assert records[0].getMessage() == "retention pass: run=33ms, 40 rows in 2 tables, 1 blocked"
     store.close()
