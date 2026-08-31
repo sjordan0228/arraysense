@@ -2428,6 +2428,7 @@ applyStoredTheme();
 // it is the base styling with nothing layered over it: choosing it takes the
 // link back out, which is what makes Classic the appearance it has always been
 // rather than a re-creation of it.
+// >>> appearance-cookie
 const APPEARANCE_KEY = 'arraysense-appearance';
 const APPEARANCE_SHEET = { glass: '/theme-glass.css', classic: null };
 const APPEARANCE_DEFAULT = 'glass';
@@ -2441,21 +2442,92 @@ const APPEARANCE_NAMES = { glass: 'Glass', classic: 'Classic' };
 // page writes it, and a reload starts again from the document.
 const APPEARANCE_LINK_ID = 'appearance-sheet';
 
+// The look moved from localStorage to a cookie for one reason the theme does
+// not share: the page route reads the cookie before it sends the page, so a
+// browser whose cookie names a look with no sheet is served a page without
+// that look's <link> at all — and once a choice has reached its cookie, a
+// Classic browser never pays for a sheet it would only take back out.
+// localStorage is invisible to the server, and a
+// choice the server cannot see was the whole cost.
+//
+// document.cookie is one flat string of semicolon-separated pairs, so the
+// parse splits on the separators and cuts at the first '=' — the first,
+// because a cookie value may itself hold one. The name is compared after
+// trimming the pair, and the last pair naming the cookie wins: the server's
+// cookie parser trims the same way and answers the same last-wins, so a
+// browser carrying two same-name cookies is rendered by the page route from
+// the same value its script reads. A regex run against the whole string gets
+// all of this wrong: the day another cookie's name ends in this one, the
+// loose match reads somebody else's value as the look.
+function readCookie(name) {
+  let found = null;
+  for (const pair of document.cookie.split(';')) {
+    const eq = pair.indexOf('=');
+    if (eq !== -1 && pair.slice(0, eq).trim() === name) found = pair.slice(eq + 1).trim();
+  }
+  return found;
+}
+
+// The one place the cookie string is built, so the control's choice and the
+// migration below can never write it in different shapes. Path / because every
+// route serves a page and the choice belongs to all of them; a year of
+// Max-Age, because the choice outlives sessions but a browser that has not
+// opened this app in a year has no reason to carry it; SameSite=Lax keeps it
+// off most cross-site subrequests, though a top-level navigation to the site
+// still carries it — enough for a device that only ever opens this service.
+// No Secure, because the service runs on plain HTTP
+// over the LAN and a Secure cookie would not be sent at all; no Domain,
+// because host-only is the narrowest scope; no HttpOnly, because this script
+// reads the choice back to render the control.
+function writeCookie(name, value) {
+  document.cookie = `${name}=${value}; Path=/; Max-Age=31536000; SameSite=Lax`;
+}
+
 function appearanceChoice() {
-  let held = null;
+  // The cookie first, because it is the copy the page route already read: a
+  // cookie the look table does not name is answered the default rather than
+  // the legacy store, exactly as the page route answers it, and falling
+  // through past a present cookie would put the browser and the page it just
+  // received into different looks for the whole navigation.
+  const held = readCookie(APPEARANCE_KEY);
+  if (Object.hasOwn(APPEARANCE_SHEET, held)) return held;
+  if (held !== null) return APPEARANCE_DEFAULT;
+  // A browser from before the cookie still holds its choice in localStorage,
+  // so the read falls through once. Guarded for the reason themeChoice()
+  // gives, and guarded no wider than the read itself: private browsing
+  // refuses localStorage outright, while a programming error below this line
+  // should reach the console as a stack trace rather than come back as a
+  // plausible-looking default.
+  let legacy = null;
   try {
-    // Guarded for the reason themeChoice() gives, and guarded no wider: private
-    // browsing refuses localStorage outright, while a programming error below
-    // this line should reach the console as a stack trace rather than come back
-    // as a plausible-looking default.
-    held = localStorage.getItem(APPEARANCE_KEY);
+    legacy = localStorage.getItem(APPEARANCE_KEY);
   } catch (e) {
     return APPEARANCE_DEFAULT;
   }
-  // hasOwn rather than `in`: `in` walks the prototype chain, so a stored value
-  // of "toString" or "constructor" would answer yes and be handed on as a look.
-  return Object.hasOwn(APPEARANCE_SHEET, held) ? held : APPEARANCE_DEFAULT;
+  // A vetted value is then copied into the cookie, and the copy is verified by
+  // reading it back before the legacy entry is removed — that removal is what
+  // makes the migration one-time. A legacy entry left in place would come back
+  // for another year the day the cookie was cleared or evicted, answering with
+  // a look the browser may have switched away from since; with it gone, a
+  // cleared cookie is a cleared choice and the default answers, which is the
+  // honest reading. When the write was refused — a browser keeping no cookies
+  // assigns silently and reads back nothing — the legacy entry stays, because
+  // there it is the only copy of the choice: this script still applies it
+  // before the first paint on every load, and the server-side saving is simply
+  // lost to that browser. The read-back sits outside the guard for the same
+  // reason the write does: the guard answers the read's refusal, and a refused
+  // write must not answer for a choice already read.
+  if (Object.hasOwn(APPEARANCE_SHEET, legacy)) {
+    writeCookie(APPEARANCE_KEY, legacy);
+    if (readCookie(APPEARANCE_KEY) === legacy) localStorage.removeItem(APPEARANCE_KEY);
+    return legacy;
+  }
+  // hasOwn rather than `in` in both reads above: `in` walks the prototype
+  // chain, so a stored value of "toString" or "constructor" would answer yes
+  // and be handed on as a look.
+  return APPEARANCE_DEFAULT;
 }
+// <<< appearance-cookie
 
 // Point the document at the chosen look's sheet, or take the last one out.
 //
@@ -2475,15 +2547,16 @@ function appearanceChoice() {
 // carries the link finds it and changes nothing, which is the path that runs on
 // nearly every load.
 //
-// Classic pays for that and gets nothing back. The link is in the markup before
-// this script, so the sheet is requested whatever this browser has chosen, and
-// a synchronous script cannot run until the stylesheet ahead of it has loaded —
-// so a Classic browser downloads the whole file, waits for it, and then has it
-// removed. There is no revalidation to soften the second visit either: the app
-// sends no-cache and answers the browser's question with the whole file again.
-// The choice would have to live in a cookie for the server to render the right
-// link, which is a larger change than this costs on a home network, so the cost
-// was accepted and a separate issue carries the fix.
+// Classic does not pay for it either. The choice rides to the server in a
+// cookie, and the page route drops the link line from a page sent to a
+// browser whose cookie names a look with no sheet, so once a choice has
+// reached its cookie the sheet is fetched only by the browsers that will
+// paint with it. What this call settles now is
+// the drift the server could not see: the navigation whose request carried no
+// cookie yet — the first one after a choice is made, or after an upgrade puts
+// a stored look into one — and every load by a browser that keeps no cookies
+// at all. The removal still runs before the body exists and so before any
+// paint, which is what keeps even those loads from flashing the wrong look.
 function mountAppearanceSheet(choice) {
   // hasOwn for the reason appearanceChoice() gives, and here as much as there: a
   // bracket lookup walks the prototype chain, so a look named "toString" would
@@ -2511,9 +2584,11 @@ function mountAppearanceSheet(choice) {
 
 // The look this browser holds, settled at the earliest moment it can be: called
 // from the foot of the head, with no body parsed and so nothing painted yet.
-// Usually it agrees with the link the page already carries and does nothing;
-// on Classic it removes it, still before the first paint. Nothing is
-// invalidated here because nothing has been drawn from the palette yet.
+// Usually it agrees with the link the page route already sent for this
+// browser's cookie and does nothing; where the request carried no cookie the
+// route could read, it brings the page to the stored look — removing or
+// mounting the link, still before the first paint. Nothing is invalidated here
+// because nothing has been drawn from the palette yet.
 function applyStoredAppearance() {
   mountAppearanceSheet(appearanceChoice());
 }
@@ -2561,14 +2636,18 @@ function applyAppearance(choice) {
 // the same reason: the key has one writer, so the control that offers the look
 // and the resolver every page runs at load can never be reading and writing
 // different things.
+// >>> appearance-choose
 function chooseAppearance(choice) {
   try {
-    localStorage.setItem(APPEARANCE_KEY, choice);
+    writeCookie(APPEARANCE_KEY, choice);
   } catch (e) {
-    // Nothing to persist to; the look still applies for this page.
+    // Nothing to persist to; the look still applies for this page, and the
+    // next load's page route will not know it — the same shape as a refused
+    // read in appearanceChoice(), answered rather than thrown.
   }
   applyAppearance(choice);
 }
+// <<< appearance-choose
 
 // Whether the light theme is in force, read as a word the stylesheet declares
 // rather than inferred from a colour. Inferring it meant parsing --panel's rgba

@@ -12,8 +12,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, Response
 
 from arraysense import __version__
 from arraysense.api.routes import router
@@ -70,15 +70,14 @@ SHARED_SCRIPT = "common.js"
 # of its own from how long ago the file was last modified, and so to go on
 # using its copy without asking.
 #
-# A browser on Classic pays for this file and gets nothing for it. The <link>
-# is in the markup — it has to be, or the first paint is in the wrong look —
-# and the inline script that removes it comes after, where a synchronous script
-# cannot run until the stylesheet ahead of it has loaded. So Classic fetches
-# the whole sheet on every page load, waits for it, and throws it away, with no
-# 304 to soften it (see _file_route). That is accepted rather than overlooked:
-# it is a small file on a home network, and the complete fix is to keep the
-# choice in a cookie so the server can render the right link, which is a larger
-# change than the cost justifies. A separate issue carries it.
+# A browser on Classic no longer pays for this file. The look choice travels
+# in a cookie, and the page routes read it: a cookie naming a look with no
+# sheet loses the <link> line before the page is sent, so from the first
+# navigation after a choice reaches its cookie, the sheet is fetched only by
+# the browsers that will paint with it, and the no-304
+# cost below never falls on a browser that would only have thrown the sheet
+# away. The line stays in the page sources because only a stylesheet the
+# parser finds holds the first paint back for the browsers the sheet is for.
 THEME_SHEETS = ("theme-glass.css",)
 
 # Ask again rather than assume. The pages, the shared script and the theme
@@ -88,6 +87,20 @@ THEME_SHEETS = ("theme-glass.css",)
 # those files rather than editing them, so a browser may keep its copy for as
 # long as it likes.
 NO_CACHE = {"Cache-Control": "no-cache"}
+
+# The looks a page's cookie may name, in the table shape common.js keeps: a
+# look naming no sheet ships no link line, which is all Classic is.
+# Membership in this table decides the transform, never a comparison against
+# one look's name, so the server and the browser vet the cookie against the
+# same set. The scaffold test holds this and APPEARANCE_SHEET to the same keys.
+APPEARANCE_COOKIE = "arraysense-appearance"
+APPEARANCE_SHEET = {"glass": "theme-glass.css", "classic": None}
+
+# The default look's link, one line written identically into every page. The
+# transform drops this line and nothing else when the cookie names a look
+# with no sheet, so the exact string is the seam between the page sources and
+# the render.
+APPEARANCE_LINK = '<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">'
 
 # uPlot is vendored rather than fetched from a CDN. The service runs on a home
 # network that may have no route to the internet at all, and a chart library
@@ -165,9 +178,10 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     has written yet, or one left out of a deployment, is a missing page and not
     a broken server.
 
-    Every page, the shared script and each theme sheet are sent ``no-cache``,
-    which asks the browser to check with the service on every load rather than
-    forbidding it to store anything. Nothing here answers that check cheaply:
+    The shared script and each theme sheet served here, and the pages served
+    by ``_page_route``, all go out ``no-cache``, which asks the browser to
+    check with the service on every load rather than forbidding it to store
+    anything. Nothing here answers that check cheaply:
     Starlette's ``FileResponse`` sends an etag and a last-modified but reads
     neither ``If-None-Match`` nor ``If-Modified-Since``, so the reply is always
     the whole file and never a 304. That is still the right trade here, but it
@@ -185,6 +199,53 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
             logger.debug("no file at %s", path)
             raise HTTPException(status_code=404, detail=f"no file {path.name!r}")
         return FileResponse(path, media_type=media_type, headers=NO_CACHE)
+
+    return serve
+
+
+def _page_route(path: Path) -> Callable[[Request], Response]:
+    """Build a handler that renders one page for the browser asking for it.
+
+    Read from disk on each request rather than cached at import, the rule
+    ``_file_route`` states: editing a page during development should not need
+    a restart, and the read is a local one. The same existence check answers
+    a page nobody has written yet as a 404, with the detail the plain file
+    route gives, rather than as a 500 out of a response for a missing file.
+
+    The handler is a plain ``def``, not ``async``: it reads the page from disk,
+    and a read inside an ``async def`` runs on the event loop the dashboard and
+    the API share. A plain def lands in FastAPI's threadpool instead, the same
+    place the store-reading routes run, so a page load cannot hold back a poll
+    or an API answer while the file is read.
+
+    The request's cookie names the look this browser chose, and a look naming
+    no sheet loses the default look's ``<link>`` line from the served text —
+    the first line carrying it, and only that one, so a page whose content
+    happened to hold the same text keeps it. A cookie naming no known look,
+    and no cookie at all, answer the default: membership in
+    ``APPEARANCE_SHEET`` decides rather than a comparison against one look's
+    name, so server and browser vet the cookie against the same table.
+
+    ``Vary: Cookie`` is that difference written into the response: these bytes
+    vary with the request's cookie, and nothing may answer one browser's page
+    out of another browser's cache. Nothing caches in front of the service
+    today, so the header is the promise kept in writing for whatever does.
+    """
+
+    def serve(request: Request) -> Response:
+        if not path.is_file():
+            logger.debug("no file at %s", path)
+            raise HTTPException(status_code=404, detail=f"no file {path.name!r}")
+        text = path.read_text()
+        look = request.cookies.get(APPEARANCE_COOKIE)
+        if look in APPEARANCE_SHEET and APPEARANCE_SHEET[look] is None:
+            lines = text.splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if line.strip() == APPEARANCE_LINK:
+                    del lines[index]
+                    break
+            text = "".join(lines)
+        return Response(text, media_type="text/html", headers={**NO_CACHE, "Vary": "Cookie"})
 
     return serve
 
@@ -260,17 +321,15 @@ def install_text_guard(app: FastAPI) -> None:
 def mount_pages(app: FastAPI) -> None:
     """Attach the pages, shared script, theme sheets and vendored files to an app.
 
-    Split from create_app so first-run setup mode serves the same pages
-    byte-identically: a second page-mounting loop would drift from this one
-    the first time a page was added, and the wizard would 404 on exactly the
-    installation that needs it most.
+    Split from create_app so first-run setup mode serves the same pages by
+    the same routes and the same renderers: a second page-mounting loop would
+    drift from this one the first time a page was added, and the wizard would
+    404 on exactly the installation that needs it most.
     """
     web = Path(__file__).parent.parent / "web"
 
     for route, filename in PAGES.items():
-        app.get(route, include_in_schema=False, name=filename)(
-            _file_route(web / filename, "text/html")
-        )
+        app.get(route, include_in_schema=False, name=filename)(_page_route(web / filename))
 
     app.get(f"/{SHARED_SCRIPT}", include_in_schema=False, name=SHARED_SCRIPT)(
         _file_route(web / SHARED_SCRIPT, "text/javascript")
