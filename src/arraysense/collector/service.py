@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -96,6 +97,16 @@ def _log_retention_blocks(report: RetentionReport) -> None:
     for table in report.tables:
         if table.blocked is not None:
             logger.warning("retention blocked for %s: %s", table.table, table.blocked)
+
+
+def _elapsed_ms(began: float) -> int:
+    """Whole milliseconds since *began*, for the line each pass logs about itself.
+
+    The line helps correlate an observed stall with pass and stage durations;
+    it is not a benchmark, so rounding is the point: a pass that finishes
+    inside a millisecond reads as 0ms rather than 0.4ms.
+    """
+    return max(0, round((time.perf_counter() - began) * 1000))
 
 
 # How many of the missed days each backfill pass scores, newest first. Replayed
@@ -376,10 +387,25 @@ class CollectorService:
         moment = now or datetime.now(tz=UTC)
         end = int(moment.timestamp()) + 60
 
-        def _rebuild_all(conn: sqlite3.Connection, circuit_cadence: int) -> None:
+        def _rebuild_all(conn: sqlite3.Connection, circuit_cadence: int) -> dict[str, int]:
+            """Rebuild every stage and return what each one cost, in whole ms.
+
+            The clock runs around the five rebuilds and nothing else, on either
+            path: the pass is the work, so the total is what a stage is compared
+            against, and neither the thread handover nor opening the connection
+            belongs to either measurement.
+            """
+            timings: dict[str, int] = {}
+            pass_began = time.perf_counter()
+            began = time.perf_counter()
             rebuild_inverter_minute(conn, end - MINUTE_REBUILD_WINDOW, end)
+            timings["inverter_minute"] = _elapsed_ms(began)
+            began = time.perf_counter()
             rebuild_inverter_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            timings["inverter_hourly"] = _elapsed_ms(began)
+            began = time.perf_counter()
             rebuild_module_hourly(conn, end - HOURLY_REBUILD_WINDOW, end)
+            timings["module_hourly"] = _elapsed_ms(began)
             # Circuits are core storage rather than part of the optional
             # module: their tables exist whether or not anybody enabled it,
             # and this collector never imports anything from modules/. On an
@@ -388,19 +414,25 @@ class CollectorService:
             # hour still gets covered, which is what lets retention prune
             # the raw readings afterwards instead of blocking on them for
             # ever.
+            began = time.perf_counter()
             rebuild_circuit_hourly(
                 conn, end - HOURLY_REBUILD_WINDOW, end, cadence_seconds=circuit_cadence
             )
+            timings["circuit_hourly"] = _elapsed_ms(began)
             # Hours written outside that window — the archive backfill's, one
             # per past hour — are queued by the store as it writes them and
             # brought forward here. Nothing else promotes them, and the
             # efficiency engine reads irradiance from the hourly tier alone.
+            began = time.perf_counter()
             promote_pending_hours(conn)
+            timings["promote"] = _elapsed_ms(began)
+            timings["stages_total"] = _elapsed_ms(pass_began)
+            return timings
 
-        def _rebuild_on_own_connection(circuit_cadence: int) -> None:
+        def _rebuild_on_own_connection(circuit_cadence: int) -> dict[str, int]:
             conn = self._store.maintenance_connection()
             try:
-                _rebuild_all(conn, circuit_cadence)
+                return _rebuild_all(conn, circuit_cadence)
             finally:
                 conn.close()
 
@@ -416,11 +448,28 @@ class CollectorService:
                 # success — the tiers would sit empty with no error anywhere.
                 # An in-memory store is a test fixture and costs microseconds,
                 # so it runs inline rather than silently doing nothing.
-                _rebuild_all(self._store._conn, cadence)
+                timings = _rebuild_all(self._store._conn, cadence)
             else:
-                await asyncio.to_thread(_rebuild_on_own_connection, cadence)
+                timings = await asyncio.to_thread(_rebuild_on_own_connection, cadence)
         except sqlite3.Error as exc:
             logger.warning("rollup maintenance failed, will retry: %s", exc)
+        else:
+            # One line per pass, at INFO rather than DEBUG: these durations are
+            # what #63 asks for, and the level the service runs at is the only
+            # one a stall recorded last week can still be read back at. Named
+            # stage by stage because a total on its own names no suspect, and a
+            # pass that raised is already accounted for by the warning above,
+            # since a duration would describe work that never finished.
+            logger.info(
+                "rollup pass: inverter_minute=%dms inverter_hourly=%dms module_hourly=%dms "
+                "circuit_hourly=%dms promote=%dms stages_total=%dms",
+                timings["inverter_minute"],
+                timings["inverter_hourly"],
+                timings["module_hourly"],
+                timings["circuit_hourly"],
+                timings["promote"],
+                timings["stages_total"],
+            )
 
     async def maintain_retention(self, now: datetime | None = None) -> None:
         """Prune one safe retention pass without ever risking the poll loop.
@@ -433,21 +482,45 @@ class CollectorService:
         """
         moment = now or datetime.now(tz=UTC)
 
-        def _run_on_own_connection() -> None:
+        def _run_on_own_connection() -> tuple[RetentionReport, int]:
             conn = self._store.maintenance_connection()
             try:
-                _log_retention_blocks(run_retention(conn, policy, now=moment))
+                began = time.perf_counter()
+                report = run_retention(conn, policy, now=moment)
+                return report, _elapsed_ms(began)
             finally:
                 conn.close()
 
         try:
             policy = policy_from_settings(SettingsStore(self._store))
             if self._store.is_memory_backed:
-                _log_retention_blocks(run_retention(self._store._conn, policy, now=moment))
+                began = time.perf_counter()
+                report = run_retention(self._store._conn, policy, now=moment)
+                elapsed = _elapsed_ms(began)
             else:
-                await asyncio.to_thread(_run_on_own_connection)
+                report, elapsed = await asyncio.to_thread(_run_on_own_connection)
         except sqlite3.Error as exc:
             logger.warning("retention maintenance failed, will retry: %s", exc)
+        else:
+            # The worker returns its report instead of logging its blocks from
+            # its own thread, so a pass writes both of its lines in one place.
+            # That line is the rollup line's counterpart: the same level, the
+            # same whole milliseconds, timed around the run itself — the
+            # settings read in front of it and the block warnings beside it are
+            # not retention work, and counting them would inflate exactly the
+            # blocked passes this line exists to diagnose. Its counts are the
+            # report's own, and the rows are rows this pass deleted, batch by
+            # batch, from the tables it walked. A pass that blocked before
+            # taking its first batch therefore says 0 rows, and one that stood
+            # down at the backup gate says no tables at all.
+            _log_retention_blocks(report)
+            logger.info(
+                "retention pass: run=%dms, %d rows in %d tables, %d blocked",
+                elapsed,
+                sum(table.rows for table in report.tables),
+                len(report.tables),
+                sum(1 for table in report.tables if table.blocked is not None),
+            )
 
     def _efficiency_config(self) -> tuple[tzinfo, tuple[StringSpec, ...], int, int] | None:
         """Return what scoring a day needs, or None when the installation is unconfigured.
