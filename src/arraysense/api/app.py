@@ -72,8 +72,9 @@ SHARED_SCRIPT = "common.js"
 #
 # A browser on Classic no longer pays for this file. The look choice travels
 # in a cookie, and the page routes read it: a cookie naming a look with no
-# sheet loses the <link> line before the page is sent, so the sheet is
-# fetched by exactly the browsers that will paint with it, and the no-304
+# sheet loses the <link> line before the page is sent, so from the first
+# navigation after a choice reaches its cookie, the sheet is fetched only by
+# the browsers that will paint with it, and the no-304
 # cost below never falls on a browser that would only have thrown the sheet
 # away. The line stays in the page sources because only a stylesheet the
 # parser finds holds the first paint back for the browsers the sheet is for.
@@ -202,7 +203,7 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     return serve
 
 
-def _page_route(path: Path) -> Callable[[Request], Awaitable[Response]]:
+def _page_route(path: Path) -> Callable[[Request], Response]:
     """Build a handler that renders one page for the browser asking for it.
 
     Read from disk on each request rather than cached at import, the rule
@@ -211,14 +212,19 @@ def _page_route(path: Path) -> Callable[[Request], Awaitable[Response]]:
     a page nobody has written yet as a 404, with the detail the plain file
     route gives, rather than as a 500 out of a response for a missing file.
 
+    The handler is a plain ``def``, not ``async``: it reads the page from disk,
+    and a read inside an ``async def`` runs on the event loop the dashboard and
+    the API share. A plain def lands in FastAPI's threadpool instead, the same
+    place the store-reading routes run, so a page load cannot hold back a poll
+    or an API answer while the file is read.
+
     The request's cookie names the look this browser chose, and a look naming
     no sheet loses the default look's ``<link>`` line from the served text —
-    that one line and nothing else — so a browser on Classic never fetches
-    the stylesheet it would only take back out before the first paint. A
-    cookie naming no known look, and no cookie at all, answer the default:
-    membership in ``APPEARANCE_SHEET`` decides rather than a comparison
-    against one look's name, so server and browser vet the cookie against the
-    same table.
+    the first line carrying it, and only that one, so a page whose content
+    happened to hold the same text keeps it. A cookie naming no known look,
+    and no cookie at all, answer the default: membership in
+    ``APPEARANCE_SHEET`` decides rather than a comparison against one look's
+    name, so server and browser vet the cookie against the same table.
 
     ``Vary: Cookie`` is that difference written into the response: these bytes
     vary with the request's cookie, and nothing may answer one browser's page
@@ -226,16 +232,19 @@ def _page_route(path: Path) -> Callable[[Request], Awaitable[Response]]:
     today, so the header is the promise kept in writing for whatever does.
     """
 
-    async def serve(request: Request) -> Response:
+    def serve(request: Request) -> Response:
         if not path.is_file():
             logger.debug("no file at %s", path)
             raise HTTPException(status_code=404, detail=f"no file {path.name!r}")
         text = path.read_text()
         look = request.cookies.get(APPEARANCE_COOKIE)
         if look in APPEARANCE_SHEET and APPEARANCE_SHEET[look] is None:
-            text = "".join(
-                line for line in text.splitlines(keepends=True) if line.strip() != APPEARANCE_LINK
-            )
+            lines = text.splitlines(keepends=True)
+            for index, line in enumerate(lines):
+                if line.strip() == APPEARANCE_LINK:
+                    del lines[index]
+                    break
+            text = "".join(lines)
         return Response(text, media_type="text/html", headers={**NO_CACHE, "Vary": "Cookie"})
 
     return serve

@@ -1201,12 +1201,20 @@ def test_a_classic_cookie_removes_the_link_line_and_nothing_else(client: Any) ->
     # The transform is one line and not a rewrite: everything else the page
     # carries — the styles above the link, the settling script below it — goes
     # out byte-identical, because the page source stays the Glass default and
-    # the only difference the cookie makes is this line.
+    # the only difference the cookie makes is this line. Asserted structurally
+    # rather than by re-running the production filter, which a copy of the
+    # filter would pass whatever the handler actually removed: the served
+    # Classic page carries no occurrence of the link, the Glass page carries
+    # exactly one, and the Classic page is the Glass page with that single
+    # occurrence taken back out.
     glass = client.get("/", cookies={"arraysense-appearance": "glass"}).text
     classic = client.get("/", cookies={"arraysense-appearance": "classic"}).text
+    assert glass.count(APPEARANCE_LINK) == 1
+    assert classic.count(APPEARANCE_LINK) == 0
     assert glass != classic
-    kept = [line for line in glass.splitlines(keepends=True) if line.strip() != APPEARANCE_LINK]
-    assert classic == "".join(kept), "the classic page is the glass page minus the link line alone"
+    assert classic == glass.replace(APPEARANCE_LINK + "\n", "", 1), (
+        "the classic page is the glass page minus the link line alone"
+    )
 
 
 def test_page_responses_vary_on_the_cookie_and_assets_do_not_need_to(client: Any) -> None:
@@ -1259,7 +1267,7 @@ async def test_a_page_whose_file_is_missing_is_a_404(tmp_path: Path) -> None:
     # plain file route still does for the shared script and the sheets.
     with pytest.raises(HTTPException) as raised:
         request = Request({"type": "http", "headers": []})
-        await _page_route(tmp_path / "not_written_yet.html")(request)
+        _page_route(tmp_path / "not_written_yet.html")(request)
     assert raised.value.status_code == 404
     assert raised.value.detail == "no file 'not_written_yet.html'"
     with pytest.raises(HTTPException) as raised:

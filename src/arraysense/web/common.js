@@ -2445,22 +2445,27 @@ const APPEARANCE_LINK_ID = 'appearance-sheet';
 // The look moved from localStorage to a cookie for one reason the theme does
 // not share: the page route reads the cookie before it sends the page, so a
 // browser whose cookie names a look with no sheet is served a page without
-// that look's <link> at all, and a Classic browser never pays for a sheet it
-// would only take back out. localStorage is invisible to the server, and a
+// that look's <link> at all — and once a choice has reached its cookie, a
+// Classic browser never pays for a sheet it would only take back out.
+// localStorage is invisible to the server, and a
 // choice the server cannot see was the whole cost.
 //
 // document.cookie is one flat string of semicolon-separated pairs, so the
 // parse splits on the separators and cuts at the first '=' — the first,
-// because a cookie value may itself hold one. The name is compared against
-// exactly one pair, which is what a regex run against the whole string gets
-// wrong: the day another cookie's name ends in this one, the loose match
-// reads somebody else's value as the look.
+// because a cookie value may itself hold one. The name is compared after
+// trimming the pair, and the last pair naming the cookie wins: the server's
+// cookie parser trims the same way and answers the same last-wins, so a
+// browser carrying two same-name cookies is rendered by the page route from
+// the same value its script reads. A regex run against the whole string gets
+// all of this wrong: the day another cookie's name ends in this one, the
+// loose match reads somebody else's value as the look.
 function readCookie(name) {
-  for (const pair of document.cookie.split('; ')) {
+  let found = null;
+  for (const pair of document.cookie.split(';')) {
     const eq = pair.indexOf('=');
-    if (eq !== -1 && pair.slice(0, eq) === name) return pair.slice(eq + 1);
+    if (eq !== -1 && pair.slice(0, eq).trim() === name) found = pair.slice(eq + 1).trim();
   }
-  return null;
+  return found;
 }
 
 // The one place the cookie string is built, so the control's choice and the
@@ -2468,7 +2473,9 @@ function readCookie(name) {
 // route serves a page and the choice belongs to all of them; a year of
 // Max-Age, because the choice outlives sessions but a browser that has not
 // opened this app in a year has no reason to carry it; SameSite=Lax keeps it
-// off cross-site requests. No Secure, because the service runs on plain HTTP
+// off most cross-site subrequests, though a top-level navigation to the site
+// still carries it — enough for a device that only ever opens this service.
+// No Secure, because the service runs on plain HTTP
 // over the LAN and a Secure cookie would not be sent at all; no Domain,
 // because host-only is the narrowest scope; no HttpOnly, because this script
 // reads the choice back to render the control.
@@ -2497,14 +2504,22 @@ function appearanceChoice() {
   } catch (e) {
     return APPEARANCE_DEFAULT;
   }
-  // A vetted value is then copied into the cookie — that copy is the one-time
-  // migration, and it is what makes the next navigation arrive with the look
-  // the page route can render. The old entry stays: nothing reads it a second
-  // time, and a delete is a second write nobody asked for. The write sits
-  // outside the guard because the guard answers the read's refusal, and a
-  // refused write must not answer for a choice already read.
+  // A vetted value is then copied into the cookie, and the copy is verified by
+  // reading it back before the legacy entry is removed — that removal is what
+  // makes the migration one-time. A legacy entry left in place would come back
+  // for another year the day the cookie was cleared or evicted, answering with
+  // a look the browser may have switched away from since; with it gone, a
+  // cleared cookie is a cleared choice and the default answers, which is the
+  // honest reading. When the write was refused — a browser keeping no cookies
+  // assigns silently and reads back nothing — the legacy entry stays, because
+  // there it is the only copy of the choice: this script still applies it
+  // before the first paint on every load, and the server-side saving is simply
+  // lost to that browser. The read-back sits outside the guard for the same
+  // reason the write does: the guard answers the read's refusal, and a refused
+  // write must not answer for a choice already read.
   if (Object.hasOwn(APPEARANCE_SHEET, legacy)) {
     writeCookie(APPEARANCE_KEY, legacy);
+    if (readCookie(APPEARANCE_KEY) === legacy) localStorage.removeItem(APPEARANCE_KEY);
     return legacy;
   }
   // hasOwn rather than `in` in both reads above: `in` walks the prototype
@@ -2534,8 +2549,9 @@ function appearanceChoice() {
 //
 // Classic does not pay for it either. The choice rides to the server in a
 // cookie, and the page route drops the link line from a page sent to a
-// browser whose cookie names a look with no sheet, so the sheet is fetched
-// only by the browsers that will paint with it. What this call settles now is
+// browser whose cookie names a look with no sheet, so once a choice has
+// reached its cookie the sheet is fetched only by the browsers that will
+// paint with it. What this call settles now is
 // the drift the server could not see: the navigation whose request carried no
 // cookie yet — the first one after a choice is made, or after an upgrade puts
 // a stored look into one — and every load by a browser that keeps no cookies
@@ -2620,6 +2636,7 @@ function applyAppearance(choice) {
 // the same reason: the key has one writer, so the control that offers the look
 // and the resolver every page runs at load can never be reading and writing
 // different things.
+// >>> appearance-choose
 function chooseAppearance(choice) {
   try {
     writeCookie(APPEARANCE_KEY, choice);
@@ -2630,6 +2647,7 @@ function chooseAppearance(choice) {
   }
   applyAppearance(choice);
 }
+// <<< appearance-choose
 
 // Whether the light theme is in force, read as a word the stylesheet declares
 // rather than inferred from a colour. Inferring it meant parsing --panel's rgba

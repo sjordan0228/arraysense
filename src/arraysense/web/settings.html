@@ -224,8 +224,8 @@
      would show the wrong look and restyle under the reader. It sits at the foot
      of the head because it layers over everything above it. A browser whose
      cookie asks for Classic is served this page with the line below already
-     taken out, so the sheet is fetched only by the browsers that will paint
-     with it. The script still settles the look before the body exists and so
+     taken out, so once a choice has reached its cookie, the sheet is fetched
+     only by the browsers that will paint with it. The script still settles the look before the body exists and so
      before any paint, for the navigation whose request carried no cookie yet.
      common.js owns the rest, and says why there. -->
 <link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
