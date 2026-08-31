@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -505,3 +506,161 @@ async def test_changing_the_interval_does_not_rewrite_hours_already_measured(
     ).fetchone()
     store.close()
     assert again == (3600,), "600 is what the new setting says, not what was recorded"
+
+
+# --- what a pass cost, recorded ------------------------------------------------
+#
+# Issue #63 is a stall rather than a fault: roughly one run in three the API
+# stops answering for 100 to 160 ms near the start of the sixty-second cycle, and
+# the log holds nothing that can be read beside it. Timing the passes separately
+# is the issue's next step, so each one now records what it did and what it
+# cost. These tests pin those lines: at INFO, because that is the only level a
+# stall recorded last week is still readable at, and stage by stage for the
+# rollup, because a total on its own names no suspect.
+
+_ROLLUP_PASS = re.compile(
+    r"rollup pass: inverter_minute=(\d+)ms inverter_hourly=(\d+)ms "
+    r"module_hourly=(\d+)ms circuit_hourly=(\d+)ms promote=(\d+)ms total=(\d+)ms"
+)
+_RETENTION_PASS = re.compile(r"retention pass: (\d+)ms, (\d+) rows in (\d+) tables, (\d+) blocked")
+
+
+def _pass_records(caplog: pytest.LogCaptureFixture, *prefixes: str) -> list[logging.LogRecord]:
+    """The pass lines the collector service logged, and nothing else."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "arraysense.collector.service"
+        and any(record.getMessage().startswith(prefix) for prefix in prefixes)
+    ]
+
+
+async def test_a_rollup_pass_logs_what_each_stage_cost(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A file-backed store with rows in it, so the pass runs in its worker as it
+    # does on an installation, and every one of the five stages has work to time.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    for i in range(120):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(seconds=11 * i),
+                readings={"battery_voltage_v": 55.9, "pv_total_power_w": 4000.0},
+            )
+        )
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_rollups(now=now)
+
+    records = _pass_records(caplog, "rollup pass:")
+    assert records, "the rollup pass logged nothing about what it cost"
+    assert len(records) == 1, "one line per pass, not one line per stage"
+    assert records[0].levelno == logging.INFO, (
+        "a debug line is hidden at the level the service runs at, which is the"
+        " only moment the stall can still be read against it"
+    )
+    matched = _ROLLUP_PASS.fullmatch(records[0].getMessage())
+    assert matched is not None, f"the line names no stages: {records[0].getMessage()!r}"
+    costs = [int(value) for value in matched.groups()]
+    assert costs[-1] >= max(costs[:-1]), "the pass is shorter than one of its own stages"
+    store.close()
+
+
+async def test_the_inline_path_logs_the_same_rollup_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An in-memory store has no second connection, so its pass runs inline
+    # instead of in a worker. An instrument fitted to the threaded path alone
+    # goes quiet there, and it is the path every in-memory test takes.
+    store = SqliteStore(":memory:", device=TEST_DEVICE)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_rollups(now=datetime.now(tz=UTC))
+
+    records = _pass_records(caplog, "rollup pass:")
+    assert records, "the inline path logged no rollup pass line"
+    assert len(records) == 1
+    assert _ROLLUP_PASS.fullmatch(records[0].getMessage()) is not None
+    store.close()
+
+
+async def test_a_retention_pass_logs_what_it_removed_and_what_it_blocked(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The blocked case rather than a clean prune, because it is the shape the
+    # line has to carry: a pass that deleted nothing still says how long it spent
+    # finding that out, and the block keeps its own line as well.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    store.append(Sample(timestamp=now - timedelta(days=3), readings={"pv_total_power_w": 4000.0}))
+    SettingsStore(store).update(
+        {
+            RETENTION_ENABLED_KEY: True,
+            RETENTION_RAW_DAYS_KEY: 2,
+            BACKUP_DIRECTORY_KEY: str(tmp_path),
+        }
+    )
+    archive = tmp_path / "arraysense-current.db.gz"
+    archive.touch()
+    os.utime(archive, (now.timestamp(), now.timestamp()))
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_retention(now=now)
+
+    records = _pass_records(caplog, "retention pass:")
+    assert records, "the retention pass logged nothing about what it cost or removed"
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    matched = _RETENTION_PASS.fullmatch(records[0].getMessage())
+    assert matched is not None, f"the line carries no counts: {records[0].getMessage()!r}"
+    _cost, rows, tables, blocked = (int(value) for value in matched.groups())
+    # The three counts are the report's own, and the pass deleted nothing: the
+    # raw tier blocked before its first batch was taken, so rows are rows removed
+    # rather than rows looked at, and the four are the tables walked to find out.
+    assert (rows, tables, blocked) == (0, 4, 1)
+    blocks = [
+        record for record in caplog.records if record.getMessage().startswith("retention blocked")
+    ]
+    assert len(blocks) == blocked, "the count is the per-table blocks this pass logged"
+    assert (
+        "retention blocked for inverter_raw: inverter_minute does not cover every source bucket"
+        in caplog.text
+    )
+    store.close()
+
+
+async def test_a_pass_that_raises_logs_the_failure_not_a_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A duration beside a failure reads as a measurement of work that never
+    # finished. The warning already says the pass did not complete, so nothing
+    # is added to the log but that warning.
+    store = _store(tmp_path)
+    now = datetime.now(tz=UTC)
+    service = CollectorService(source=FakeSource(), store=store, interval=3600)
+
+    def locked(*args: object, **kwargs: object) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    prefixes = ("rollup pass:", "retention pass:")
+    with caplog.at_level(logging.INFO, logger="arraysense.collector.service"):
+        await service.maintain_rollups(now=now)
+        await service.maintain_retention(now=now)
+        clean = len(_pass_records(caplog, *prefixes))
+        assert clean == 2, "a clean pass of each kind logs one line"
+
+        monkeypatch.setattr(service_module, "rebuild_inverter_minute", locked)
+        monkeypatch.setattr(service_module, "run_retention", locked)
+        await service.maintain_rollups(now=now)
+        await service.maintain_retention(now=now)
+
+    assert "rollup maintenance failed, will retry" in caplog.text
+    assert "retention maintenance failed, will retry" in caplog.text
+    assert len(_pass_records(caplog, *prefixes)) == clean, (
+        "a pass that raised reports the failure through its warning, not a duration"
+    )
+    store.close()
