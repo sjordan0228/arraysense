@@ -61,30 +61,56 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
 ## Scenarios
 
 1. **Typical overnight use** — median per-step `load_power_w` across the last 7 nights,
-   aligned by local clock time. A night with too few answering steps is dropped from the
-   median, not filled with zeros; fewer than 3 usable nights ⇒ typical is unavailable and
-   the page says what is missing.
-2. **Essential loads** — Emporia circuit selection when the module is enabled (measured
-   histories for those circuits, unmonitored allowance added on top, flagged as an
-   assumption); without Emporia, a manual constant-watts entry. Both carry the same label:
-   **assumption, not measurement**.
-3. **Typical + scheduled load** — the scheduled load (start, duration, power or energy)
-   added *as a delta* on top of scenario 1. **Double-count rule**: when Emporia history
-   shows that circuit already drawing during the scheduled window on the baseline nights,
-   the baseline's overlapping contribution is stated in the result ("this window already
-   carries ~X W of this circuit on a typical night"), and the delta applies only beyond it.
-   Without Emporia the planner says plainly that it cannot know whether the load is already
-   in the baseline and adds the full amount with that caveat.
+   aligned by local clock time. The window is the last 7 **consecutive** local nights ending
+   with the most recent night that has any rows: a silent night sits inside the window and
+   makes itself unusable rather than letting the median reach back past it into older
+   history. A night is usable when it answers at least half of its **own** real steps —
+   288 normally, 300 across a fall-back, 276 across a spring-forward, walked from the
+   dates rather than assumed from a flat day — and fewer than 3 usable nights means typical
+   is unavailable and the page says what is missing. A step that did not answer is neither
+   filled with zeros nor read as no load: the last answered step carries forward across it.
+   Rows are bucketed by the real instant they were taken at, so a duplicated read is one
+   answer and the two passes through a fall-back clock minute average into one curve key.
+2. **Essential loads** - Emporia circuit selection when the module is enabled (measured
+   histories for those circuits, unmonitored allowance added on top); without Emporia, a
+   manual constant-watts entry. The label splits the two halves of the sum: a circuit curve
+   is a **measurement**, and the watts added on top at every measured step are a **stand-in
+   for load nobody meters**. It is not a statement that the whole sum was invented.
+3. **Typical + scheduled load** - the scheduled load (start, duration, power or energy)
+   added *as a delta* on top of scenario 1. **The delta is applied by instant, not by clock
+   key**: `scheduled_windows` turns a start and a duration into the real five-minute windows
+   the schedule covers, and the simulation charges a step when that step's own instant falls
+   inside one. A run whose clock hours sit inside a fall-back hour therefore pays for the
+   seconds it actually runs and not for both passes through the repeated hour, and a run
+   over a spring-forward gap steps over the hour that never happened. **Double-count rule**:
+   when Emporia history shows that circuit already drawing during the scheduled window on
+   the baseline nights, the baseline's overlapping contribution is stated in the result
+   ("this window already carries ~X W of this circuit on a typical night"), and the delta
+   applies only beyond it. Without Emporia the planner says plainly that it cannot know
+   whether the load is already in the baseline and adds the full amount with that caveat.
 
 ## Honesty rules (the acceptance criteria, made concrete)
 
-- **Drift**: calibration severity `warning` widens the SoC band (the result is a range
-  whose width includes the drift estimate); `elevated`/`alert` ⇒ the planner returns
+- **Drift**: calibration severity `warning` widens the SoC band only when a drift
+  magnitude comes with it. `build_plan` takes `drift_band_pct`, the largest state-of-charge
+  disagreement between the packs, and uses it as the width: the curve is reported as that
+  band around the estimate and the reserve range grows at both ends by the crossings that
+  belong to the two ends of the band. A widened range therefore rests on something measured
+  and names where it came from. A warning with no magnitude leaves the range at the spread
+  between nights and says the drift is missing from it. `elevated`/`alert` return
   `estimate_unavailable` with the reason, not a number.
-- **Unsupported capacity** (`full_capacity_ah` absent) ⇒ setup guidance, no projection.
+- **Unsupported capacity** (`full_capacity_ah` absent), an efficiency that is not a positive
+  number, a reserve floor at or above full charge, and a horizon shorter than one step are
+  all refusals, and `plan_status` knows them so the API slice can gate before simulating. A
+  projection that refuses for one of those reasons is propagated: the summary carries that
+  status and that reason, with no range and no scenarios derived from a curve that never ran.
 - **No point exhaustion times**: reserve crossing is reported as a **time range** whose
-  width comes from the consumption spread across the median's nights (p25–p75), until
-  slice 2's replay error distribution replaces it with something earned.
+  width is the p25 to the p75 of the per-night crossing times, interpolated linearly between
+  them, until slice 2's replay error distribution replaces it with something earned. Nights
+  that never reach the floor inside the horizon are censored rather than dropped: with more
+  than a quarter of them the range is reported open at the later end, and with all of them
+  there is no range at all.
+
 - **Probability language is forbidden** until the replay evidence supports it; the words
   are "range", "assumption", "estimate".
 - **Freshness**: SoC staleness and forecast age are surfaced per the existing staleness
