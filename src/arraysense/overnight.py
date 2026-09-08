@@ -910,17 +910,27 @@ def replay_nights(
         if not curves:
             continue
         start, end = _replay_window(night, zone)
+        # The battery state at the boundary must come from a reading at or
+        # before it: a later reading is information the 22:00 planner was
+        # never given, and starting from it would violate causality.
+        pre_boundary = sorted(
+            ((when, soc) for when, soc in soc_rows if _instant(when, zone) <= start),
+            key=lambda row: _instant(row[0], zone),
+        )
+        if not pre_boundary:
+            continue
+        starting_soc = pre_boundary[-1][1]
         window = sorted(
             ((when, soc) for when, soc in soc_rows if start <= _instant(when, zone) <= end),
             key=lambda row: _instant(row[0], zone),
         )
         if not window:
             continue
-        # The projection starts from the first recorded reading of the night,
-        # which is the state of charge the planner would have been handed at
-        # the moment the plan was made.
+        # The projection starts from the SoC the 22:00 planner was handed: the
+        # last reading at or before the boundary, not the first reading after
+        # it (which would borrow a future answer).
         result = simulate(
-            window[0][1],
+            starting_soc,
             usable_ah,
             min_soc_pct,
             efficiency,
@@ -938,12 +948,20 @@ def replay_nights(
         crossing = actual_crossing(window, min_soc_pct, zone)
         actual: datetime | None = None
         if crossing is not None:
-            witness = reading.get(crossing.astimezone(UTC) - _STEP)
-            if witness is not None and witness > min_soc_pct + _EPS:
+            # A crossing at the window's own start is witnessed by the
+            # boundary reading itself: the recorded SoC at that instant IS
+            # the evidence. The witness-above-floor check only guards
+            # crossings that happen after the window opens, where a hole
+            # in the record could have hidden the real reach.
+            if crossing == start:
                 actual = crossing
+            else:
+                witness = reading.get(crossing.astimezone(UTC) - _STEP)
+                if witness is not None and witness > min_soc_pct + _EPS:
+                    actual = crossing
         values = [point[1] for point in result.trajectory]
         projected_draw = sum(max(0.0, a - b) for a, b in pairwise(values))
-        actual_draw = window[0][1] - window[-1][1]
+        actual_draw = starting_soc - window[-1][1]
         replays.append(
             NightReplay(
                 night=night,
