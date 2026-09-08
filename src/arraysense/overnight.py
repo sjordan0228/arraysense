@@ -500,65 +500,60 @@ def simulate(
 
     keys = [_clock_key(instant, zone) for instant, _ in steps]
     reads = _carried_reads(keys, load_curve)
-    added: list[float] = []
-    for instant, _ in steps:
-        # The scheduled load is priced as energy: the seconds its window
-        # overlaps this step's *projected* span, times its watts. It is never
-        # re-weighted by the step's own projection fraction, which would
-        # discount a schedule twice when both it and the horizon clip the step.
-        projected_end = min(instant + _STEP, finish)
-        scheduled_wh = 0.0
-        for window_start, window_end, watts in scheduled_windows:
-            overlap = (min(projected_end, window_end) - max(instant, window_start)).total_seconds()
-            if overlap > 0:
-                scheduled_wh += watts * overlap / 3600.0
-        added.append(scheduled_wh)
 
     soc = min(max(soc_now_pct, min_soc_pct), 100.0)
     trajectory: list[tuple[datetime, float]] = [(steps[0][0].astimezone(zone), soc)]
     # At the floor before a single watt has moved is a crossing, not a hold: the
     # battery is already at reserve as the plan begins, and the household needs
     # the grid from the first second of it. Only something has to need it.
-    drawing = any(value > _EPS for value in reads) or any(value > 0 for value in added)
     crossing: datetime | None = None
-    if soc <= min_soc_pct + _EPS and drawing:
-        crossing = steps[0][0].astimezone(zone)
+    horizon_first = steps[0][0] if steps else start
+    schedule_draws = any(
+        min(finish.astimezone(UTC), window_end.astimezone(UTC))
+        > max(horizon_first.astimezone(UTC), window_start.astimezone(UTC))
+        for window_start, window_end, _watts in scheduled_windows
+    )
+    if soc <= min_soc_pct + _EPS and (any(value > _EPS for value in reads) or schedule_draws):
+        crossing = start.astimezone(zone)
     import_start: datetime | None = None
 
     for index, (instant, weight) in enumerate(steps):
-        projected_h = step_hours * weight
-        load = reads[index]
-        solar = 0.0 if solar_curve is None else solar_curve.get(keys[index], 0.0)
-        needs = (load - solar) / efficiency
-        sched_wh = added[index]
+        # The step's projected span: the first step begins at the projection
+        # start (which may sit mid-step), every span ends at the horizon at the
+        # latest. Everything below - house rate, scheduled overlap, limits -
+        # is priced against this span and nothing else.
+        span_start = start if index == 0 else instant
+        span_end = min(instant + _STEP, finish)
+        span_h = (span_end - span_start).total_seconds() / 3600.0
+        clock = _clock_key(instant, zone)
+        solar = 0.0 if solar_curve is None else solar_curve.get(clock, 0.0)
+
+        # The scheduled load is part of the step's load rate: it pays the same
+        # inverter losses and the same discharge cap as the house does, priced
+        # by the seconds its window overlaps this step's projected span.
+        span_s = (span_end - span_start).total_seconds()
+        sched_w = 0.0
+        for window_start, window_end, watts in scheduled_windows:
+            overlap = (min(span_end, window_end) - max(span_start, window_start)).total_seconds()
+            if overlap > 0:
+                sched_w += watts * overlap / span_s
+
+        needs = (reads[index] + sched_w - solar) / efficiency
         drawn = 0.0
         short = False
         if needs > _EPS:
-            wanted = min(needs, discharge_limit_w) * projected_h + sched_wh
+            wanted = min(needs, discharge_limit_w) * span_h
             available = (soc - min_soc_pct) * per_point
             if available > _EPS:
                 drawn = min(wanted, available)
             short = wanted > drawn + _EPS or needs > discharge_limit_w + _EPS
             soc = max(min_soc_pct, soc - drawn / per_point)
-        else:
-            surplus = min(-needs, charge_limit_w) * projected_h
-            deficit = sched_wh - surplus
-            if deficit > _EPS:
-                # A scheduled load bigger than the charging surplus drains the
-                # battery by the difference, and the shortfall beyond the
-                # reserve floor is what the grid covers.
-                available = (soc - min_soc_pct) * per_point
-                drawn = min(deficit, available) if available > _EPS else 0.0
-                soc = max(min_soc_pct, soc - drawn / per_point)
-                short = deficit > drawn + _EPS
-            else:
-                soc = min(
-                    100.0,
-                    soc + min(surplus - sched_wh, max(0.0, (100.0 - soc) * per_point)) / per_point,
-                )
+        elif needs < -_EPS:
+            charge = min(-needs, charge_limit_w) * span_h
+            soc = min(100.0, soc + charge / per_point)
         boundary = min(instant + _STEP, finish)
         if short and import_start is None:
-            import_start = instant.astimezone(zone)
+            import_start = span_start.astimezone(zone)
         if crossing is None and drawn > _EPS and soc <= min_soc_pct + _EPS:
             crossing = boundary.astimezone(zone)
         trajectory.append((boundary.astimezone(zone), soc))
