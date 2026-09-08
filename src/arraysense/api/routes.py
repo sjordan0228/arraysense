@@ -1073,38 +1073,59 @@ def overnight_plan(
     """
     now = datetime.now(tz=UTC)
     zone = _request_zone(store, tz)
+    settings = SettingsStore(store)
     horizon: datetime | None = None
     if end:
         try:
             horizon = datetime.fromisoformat(end)
         except ValueError:
-            horizon = None
+            raise HTTPException(status_code=422, detail=f"unparsable end: {end!r}") from None
+        if horizon.astimezone(UTC) > now + timedelta(days=7):
+            raise HTTPException(status_code=422, detail="end more than 7 days ahead")
+    if sched_duration_s < 0 or sched_duration_s > 86400:
+        raise HTTPException(status_code=422, detail="sched_duration_s must be 0-86400")
+    if sched_watts < 0 or sched_watts > 20000:
+        raise HTTPException(status_code=422, detail="sched_watts must be 0-20000")
+    if essential_allowance_w < 0 or essential_allowance_w > 10000:
+        raise HTTPException(status_code=422, detail="essential_allowance_w must be 0-10000")
     if horizon is None or horizon.astimezone(UTC) <= now:
-        # Default horizon: the next local 07:00, the same morning edge the
-        # replay walks to. An unparsable or already-past end falls back to it
-        # too -- a refusal over a typo would say less than the honest plan.
+        # The configurable end hour from the registry, read at request time so
+        # a changed setting takes effect on the next load without a restart.
         local_now = now.astimezone(zone)
-        horizon = datetime(local_now.year, local_now.month, local_now.day, 7, 0, tzinfo=zone)
+        end_hour = _plan_float(settings.get("overnight.end_hour"))
+        hour = int(end_hour) if end_hour is not None else 7
+        horizon = datetime(local_now.year, local_now.month, local_now.day, hour, 0, tzinfo=zone)
         if horizon.astimezone(UTC) <= now:
             horizon += timedelta(days=1)
-
-    settings = SettingsStore(store)
     min_soc = _plan_float(settings.get("battery.min_soc_pct"))
     efficiency_pct = _plan_float(settings.get("battery.round_trip_pct"))
     max_charge_a = _plan_float(settings.get("battery.max_charge_a"))
+    end_hour = _plan_float(settings.get("overnight.end_hour"))
     min_soc = 10.0 if min_soc is None else min_soc
     efficiency_pct = 91.4 if efficiency_pct is None else efficiency_pct
+    end_hour = 7.0 if end_hour is None else end_hour
     charge_limit_w = (0.0 if max_charge_a is None else max_charge_a) * overnight.NOMINAL_BUS_V
 
-    live = store.latest(["battery_soc_pct", "battery_power_w", "battery_full_capacity_ah"])
-    soc_now = _plan_float(live.get("battery_soc_pct")) if live else None
-    capacity_ah = _plan_float(live.get("battery_full_capacity_ah")) if live else None
+    # The SoC and the capacity are read independently: a single latest() call
+    # across both metrics returns the newest row carrying *any* of them, and a
+    # newer power-only row would erase an older but still-valid SoC reading.
+    # The capacity read is likewise independent, for the same reason.
+    soc_live = store.latest(["battery_soc_pct"])
+    soc_now = _plan_float(soc_live.get("battery_soc_pct")) if soc_live else None
+    soc_stamp = soc_live.get("timestamp") if soc_live else None
+    cap_live = store.latest(["battery_full_capacity_ah"])
+    capacity_ah = _plan_float(cap_live.get("battery_full_capacity_ah")) if cap_live else None
     stale = soc_now is None
-    if live is not None and not stale:
-        stamp = live.get("timestamp")
-        stale = not isinstance(stamp, datetime) or (now - stamp) > timedelta(
-            minutes=_SOC_STALE_MINUTES
-        )
+    if not stale and isinstance(soc_stamp, datetime):
+        stale = (now - soc_stamp) > timedelta(minutes=_SOC_STALE_MINUTES)
+    # The reserve floor is subtracted before the planner sees the capacity:
+    # the core's usable_ah spans only the window above the floor, and passing
+    # the full capacity would let it drain the reserve.
+    usable_ah = capacity_ah * (100.0 - min_soc) / 100.0 if capacity_ah is not None else None
+
+    if soc_now is None:
+        soc_now = min_soc  # the honest floor when nothing was ever recorded
+        stale = True
 
     history_start = now - timedelta(days=_REPLAY_WINDOW_DAYS)
     rows = store.query(
@@ -1127,13 +1148,24 @@ def overnight_plan(
         power = _plan_float(row.get("battery_power_w"))
         if power is not None and power < 0.0:
             discharges.append(-power)
-    # The discharge limit is observed, not assumed: the 95th percentile of
-    # the recorded discharge over the same nights the plan leans on, the way
-    # ``curtailment.window_max_limit`` reads a charge anchor. No discharge on
-    # record gives a limit of zero, which is silence, not a licence to drain.
+    # The discharge p95 uses the same seven-night window as the plan's load
+    # curve, not the wider replay read, so the limit's provenance matches the
+    # plan's assumption about its own history.
+    plan_history_start = now - timedelta(days=7)
+    plan_rows = store.query(
+        ["battery_power_w"],
+        plan_history_start,
+        now,
+        tier="minute",
+    )
+    plan_discharges: list[float] = []
+    for row in plan_rows:
+        power = _plan_float(row.get("battery_power_w"))
+        if power is not None and power < 0.0:
+            plan_discharges.append(-power)
     discharge_limit_w = 0.0
-    if discharges:
-        ordered = sorted(discharges)
+    if plan_discharges:
+        ordered = sorted(plan_discharges)
         discharge_limit_w = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
 
     # The drift question is answered by the same read /api/calibration gives
@@ -1144,23 +1176,11 @@ def overnight_plan(
     drift_band = _plan_float(calibration_state.get("soc_spread_pct"))
 
     curves = overnight.night_curves(load_pairs, zone)
-    essential_curve: dict[int, float] | None = None
-    if essential_allowance_w > 0:
-        circuit_watts = 0.0
-        if _emporia(request) is not None:
-            # The latest measured draw of the metered circuits stands in for
-            # per-circuit night curves for now: measured minutes carry their
-            # circuits' watts, unanswered minutes carry nobody's.
-            circuit_watts = sum(
-                circuit.watts
-                for circuit in CircuitRepository(store).latest()
-                if circuit.watts is not None and circuit.watts > 0
-            )
-        circuit_curves: list[dict[int, float]] | None = None
-        if circuit_watts > 0:
-            grid = range(0, 24 * 60, overnight.STEP_SECONDS // 60)
-            circuit_curves = [{minute: circuit_watts for minute in grid}]
-        essential_curve = overnight.essential_profile(circuit_curves, essential_allowance_w)
+    # The essential scenario uses the manual allowance alone. Emporia circuit
+    # selection, parent/child elimination and historical curves are a later
+    # slice: the feature must work without Emporia, and a broken integration
+    # that double-counts nested circuits is worse than an honest allowance.
+    essential_curve = overnight.essential_profile(None, essential_allowance_w)
 
     scheduled: tuple[datetime, int, float] | None = None
     if sched_start and sched_duration_s > 0 and sched_watts > 0:
@@ -1175,8 +1195,8 @@ def overnight_plan(
 
     efficiency = efficiency_pct / 100.0
     plan = overnight.build_plan(
-        0.0 if soc_now is None else soc_now,
-        capacity_ah,
+        soc_now,
+        usable_ah or 0.0,
         min_soc,
         efficiency,
         charge_limit_w,
@@ -1196,7 +1216,7 @@ def overnight_plan(
             load_pairs,
             soc_pairs,
             zone,
-            capacity_ah,
+            usable_ah or 0.0,
             min_soc,
             efficiency,
             charge_limit_w,
@@ -1232,16 +1252,35 @@ def overnight_plan(
         result = plan.scenarios.get(name)
         if name == "typical" and result is None:
             result = plan.central
-        scenarios[name] = None if result is None else asdict(result)
+        entry = None if result is None else asdict(result)
+        if entry is not None and plan.range_basis:
+            entry["reserve_window"] = (
+                None
+                if plan.reserve_window is None
+                else [
+                    None if plan.reserve_window[0] is None else plan.reserve_window[0].isoformat(),
+                    None if plan.reserve_window[1] is None else plan.reserve_window[1].isoformat(),
+                ]
+            )
+            entry["range_basis"] = plan.range_basis
+        scenarios[name] = entry
     if plan.status != "ok":
-        # A refusal surfaces at the summary level, and the default central
-        # result would otherwise reach the page as an "ok" curve with nothing
-        # in it -- the number that looks like an answer. The status and the
-        # reason travel outwards instead.
         refused = asdict(plan.central)
         refused["status"] = plan.status
         refused["reason"] = plan.reason
         scenarios["typical"] = refused
+
+    if soc_now is None:
+        guidance.append(
+            "No battery state of charge has been recorded: check the collector "
+            "and the BMS connection, and the planner will have something to "
+            "project from."
+        )
+    elif stale:
+        guidance.append(
+            f"The last state-of-charge reading is over {_SOC_STALE_MINUTES:.0f} "
+            "minutes old: the collector may have gone quiet."
+        )
 
     return {
         "scenarios": scenarios,
@@ -1270,7 +1309,7 @@ def overnight_plan(
         },
         "inputs": {
             "soc_now_pct": soc_now,
-            "usable_capacity_ah": capacity_ah,
+            "usable_capacity_ah": usable_ah,
             "min_soc_pct": min_soc,
             "efficiency_pct": efficiency_pct,
             "discharge_limit_w": discharge_limit_w,

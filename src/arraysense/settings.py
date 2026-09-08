@@ -1041,6 +1041,17 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help="0 means unstated.",
     ),
     SettingSpec(
+        key="overnight.end_hour",
+        kind="int",
+        default=7,
+        lower=0,
+        upper=12,
+        unit="h",
+        label="Overnight plan end hour",
+        help="The hour the overnight planner projects to, in the installation's "
+        "local time. A 7 means the plan runs to 07:00.",
+    ),
+    SettingSpec(
         key="battery.heater_w",
         kind="float",
         default=0.0,

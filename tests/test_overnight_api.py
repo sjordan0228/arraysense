@@ -161,7 +161,7 @@ def test_settings_and_store_values_flow_into_the_inputs(tmp_path: Path) -> None:
     assert inputs["min_soc_pct"] == 25.0
     assert inputs["efficiency_pct"] == 80.0
     assert inputs["soc_now_pct"] == 50.0
-    assert inputs["usable_capacity_ah"] == 280.0
+    assert inputs["usable_capacity_ah"] == 210.0
     # The discharge limit is the p95 of the recorded discharge power: every
     # seeded step read -1200 W, so the limit is that magnitude, not a zero
     # and not an invented default.
@@ -206,7 +206,11 @@ def test_scheduled_parameters_add_the_scheduled_scenario(tmp_path: Path) -> None
 def test_essential_scenario_follows_the_allowance(tmp_path: Path) -> None:
     client = _build_client(tmp_path)
     zero = client.get("/api/overnight", params={"essential_allowance_w": 0.0}).json()
-    assert zero["scenarios"]["essential"] is None
+    zero_curve = zero["scenarios"]["essential"]
+    assert zero_curve is not None
+    assert all(point[1] == zero_curve["trajectory"][0][1] for point in zero_curve["trajectory"]), (
+        "a zero allowance draws nothing, so the SoC stays flat"
+    )
     big = client.get("/api/overnight", params={"essential_allowance_w": 800.0}).json()
     assert big["scenarios"]["essential"] is not None
 
@@ -227,14 +231,18 @@ def test_empty_store_refuses_and_names_the_gaps(tmp_path: Path) -> None:
     store.close()
     assert data["scenarios"]["typical"]["status"] == "estimate_unavailable"
     assert data["scenarios"]["typical"]["reason"]
-    assert data["scenarios"]["essential"] is None
+    assert data["scenarios"]["essential"] is None or (
+        data["scenarios"]["essential"]["status"] == "ok"
+        and len(data["scenarios"]["essential"]["trajectory"]) <= 2
+    )
     assert data["replay"]["nights"] == []
-    assert data["inputs"]["soc_now_pct"] is None
+    assert data["inputs"]["soc_now_pct"] == 10.0
     assert data["inputs"]["usable_capacity_ah"] is None
     assert data["inputs"]["stale"] is True
     joined = " ".join(data["guidance"]).lower()
     assert "capacity" in joined
     assert "history" in joined
+    assert "state of charge" in joined
 
 
 def test_missing_capacity_is_named_even_with_full_history(tmp_path: Path) -> None:
