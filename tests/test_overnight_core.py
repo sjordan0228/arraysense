@@ -103,7 +103,7 @@ def sim(
     discharge_w: float = 5000.0,
     start: str = "2026-01-05T22:00",
     end: str = "2026-01-06T08:00",
-    windows: tuple[tuple[datetime, datetime, float, float], ...] = (),
+    windows: tuple[tuple[datetime, datetime, float], ...] = (),
 ) -> PlanResult:
     return simulate(
         soc,
@@ -414,28 +414,17 @@ def test_a_late_start_pays_only_for_the_time_the_plan_actually_runs() -> None:
 
 
 def test_a_scheduled_load_is_priced_by_instant_and_not_by_clock_time() -> None:
-    windows = scheduled_windows(at("2026-01-05T21:37"), 3600, NY)
-    assert len(windows) == 13
-    assert windows[0][0] == at("2026-01-05T21:35").astimezone(UTC)
-    assert windows[-1][1] == at("2026-01-05T22:40").astimezone(UTC)
-    assert all(
-        (finish - start).total_seconds() == STEP_SECONDS for start, finish, _seconds in windows
-    )
-    # The windows carry the exact seconds of schedule inside each step, and
-    # those add up to what the schedule actually runs for, not to a whole step
-    # more at the front.
-    assert sum(seconds for _start, _finish, seconds in windows) == 3600
-    assert windows[0][2] == 180.0
+    windows = tuple((s, f, 120.0) for s, f in scheduled_windows(at("2026-01-05T21:37"), 3600, NY))
+    assert len(windows) == 1
+    assert windows[0][0] == at("2026-01-05T21:37").astimezone(UTC)
+    assert windows[0][1] == at("2026-01-05T22:37").astimezone(UTC)
 
     # A run from 23:30 for an hour is twelve steps of real time that crosses
     # midnight as real time, not a lookup that has to remember the day changed.
     wrapped = scheduled_windows(at("2026-01-05T23:30"), 3600, NY)
-    keys = {
-        step.astimezone(NY).hour * 60 + step.astimezone(NY).minute
-        for step, _finish, _seconds in wrapped
-    }
-    assert len(wrapped) == 12
-    assert keys == set(range(1410, 1440, 5)) | set(range(0, 30, 5))
+    assert len(wrapped) == 1
+    assert wrapped[0][0] == at("2026-01-05T23:30").astimezone(UTC)
+    assert wrapped[0][1] == at("2026-01-06T00:30").astimezone(UTC)
 
 
 def test_an_unaligned_schedule_costs_exactly_its_seconds() -> None:
@@ -444,10 +433,7 @@ def test_an_unaligned_schedule_costs_exactly_its_seconds() -> None:
     # the last. Charging whole windows priced it at 65/60 of an hour of the
     # load; carrying the exact seconds prices exactly one hour, however the
     # grid falls.
-    windows = tuple(
-        (start, finish, 120.0, seconds)
-        for start, finish, seconds in scheduled_windows(at("2026-01-05T21:37"), 3600, NY)
-    )
+    windows = tuple((s, f, 120.0) for s, f in scheduled_windows(at("2026-01-05T21:37"), 3600, NY))
     result = sim({}, start="2026-01-05T21:30", end="2026-01-05T23:00", windows=windows)
     assert spent_wh(result) == pytest.approx(120.0)
 
@@ -463,19 +449,25 @@ def test_a_scheduled_window_is_not_charged_twice_across_the_repeated_hour() -> N
         ("2026-11-01T00:50", 3600),
         ("2026-11-01T01:00", 7200),
     ):
-        windows = tuple(
-            (window_start, window_end, 120.0, overlap_s)
-            for window_start, window_end, overlap_s in scheduled_windows(at(start), seconds, NY)
-        )
+        windows = tuple((s, f, 120.0) for s, f in scheduled_windows(at(start), seconds, NY))
         result = sim({}, start="2026-10-31T22:00", end="2026-11-01T07:00", windows=windows)
         assert spent_wh(result) == pytest.approx(120.0 * seconds / 3600.0, abs=1e-6)
 
 
 def test_a_scheduled_window_skips_a_clock_hour_that_never_happened() -> None:
+    # The window is one real hour of instants: on the spring-forward morning it
+    # starts in 01:xx EST and ends in 03:xx EDT, and the clock hour that never
+    # happened is simply never visited.
     windows = scheduled_windows(at("2026-03-08T01:50"), 3600, NY)
-    hours = {step.astimezone(NY).hour for step, _finish, _seconds in windows}
-    assert len(windows) == 12
-    assert 2 not in hours
+    assert len(windows) == 1
+    start, finish = windows[0]
+    assert (finish - start).total_seconds() == 3600, "one real hour of schedule"
+    hours = set()
+    step = start
+    while step < finish:
+        hours.add(step.astimezone(NY).hour)
+        step += timedelta(minutes=5)
+    assert 2 not in hours and 3 in hours
 
 
 def test_essential_profile_sums_circuits_and_adds_the_allowance() -> None:

@@ -329,8 +329,8 @@ _RANGE_BASIS_DRIFT = (
 
 def scheduled_windows(
     start: datetime, duration_s: int, zone: ZoneInfo
-) -> tuple[tuple[datetime, datetime, float], ...]:
-    """The real step-sized windows a schedule covers, oldest window first.
+) -> tuple[tuple[datetime, datetime], ...]:
+    """The real instants the schedule runs, as the windows ``simulate`` intersects.
 
     The windows are instants, not clock readings, which is the whole point of
     them. A schedule keyed by the clock that falls inside a fall-back hour gets
@@ -339,25 +339,16 @@ def scheduled_windows(
     exactly ``duration_s``. A spring-forward night is missing an hour of clock,
     and these windows step over it because they never name a clock time.
 
-    The first window starts at the step boundary below ``start``, and each
-    window carries the exact seconds the schedule runs inside it: a schedule
-    that starts mid-step covers only the part of that step it really runs
-    through, and the seconds add up to ``duration_s`` and not to a whole step
-    more at the front. ``simulate`` charges a step's watts by that fraction.
+    A plain schedule is one interval, so one window: ``simulate`` prices each
+    step by the seconds its own span overlaps the window, which prices a
+    schedule that starts or ends mid-step for exactly ``duration_s`` across the
+    steps it touches — never a whole step more at the front, and never twice
+    inside a fall-back hour.
     """
     if duration_s <= 0:
         return ()
     origin = _instant(start, zone)
-    first = _floor_step(origin)
-    finish = origin + timedelta(seconds=duration_s)
-    windows: list[tuple[datetime, datetime, float]] = []
-    step = first
-    while step < finish:
-        boundary = step + _STEP
-        overlap = (min(boundary, finish) - max(step, origin)).total_seconds()
-        windows.append((step, boundary, overlap))
-        step = boundary
-    return tuple(windows)
+    return ((origin, origin + timedelta(seconds=duration_s)),)
 
 
 def essential_profile(
@@ -387,37 +378,30 @@ def _carried_reads(keys: Sequence[int], curve: dict[int, float]) -> list[float]:
     """Read ``curve`` along the walked clock keys, carrying every gap forward.
 
     A key the curve did not answer takes the value of the last key it did answer,
-    and a run of unanswered keys in front of the first answer takes that answer:
-    a hole in the record says nobody read the step, not that the house drew
-    nothing. When the walk's own keys answer nothing, the carry is seeded from
-    the whole curve, read cyclically: the nearest answered key below the walk's
-    start, wrapping through the end of the curve when nothing was answered
-    earlier in the day. Only a curve that answers nothing anywhere has nothing
-    to carry, and inventing a load out of it would spend a battery on a night
-    nobody watched.
+    and a run of unanswered keys in front of the first answer takes the nearest
+    answered key *before* the walk's start, read cyclically back through the
+    curve's own day: a hole in the record says nobody read the step, not that
+    the house drew nothing. Seeding from a later answered key would price the
+    early steps at a rate the house only reaches hours afterwards. Only a curve
+    that answers nothing anywhere has nothing to carry, and inventing a load out
+    of it would spend a battery on a night nobody watched.
     """
-    head: float | None = None
+    if not keys or not curve:
+        return [0.0] * len(keys)
+    reads: list[float] = []
+    last: float | None = None
+    first = keys[0]
     for key in keys:
         value = curve.get(key)
         if value is not None:
-            head = value
-            break
-    if head is None:
-        if not keys or not curve:
-            return [0.0] * len(keys)
-        first = keys[0]
-        seed = min(curve, key=lambda key: (first - key) % (24 * 60))
-        head = curve[seed]
-
-    reads: list[float] = []
-    last = head
-    for key in keys:
-        value = curve.get(key)
-        if value is None:
-            reads.append(last)
-        else:
             last = value
-            reads.append(value)
+        elif last is None:
+            # Leading gap: the nearest answered key cyclically before the walk's
+            # start — not a later answered key, which would price the early
+            # steps at a rate the house only reaches hours afterwards.
+            seed = min(curve, key=lambda k: (first - k) % (24 * 60))
+            last = curve[seed]
+        reads.append(last)
     return reads
 
 
@@ -452,7 +436,7 @@ def simulate(
     now: datetime,
     end: datetime,
     zone: ZoneInfo,
-    scheduled_windows: tuple[tuple[datetime, datetime, float, float], ...] = (),
+    scheduled_windows: tuple[tuple[datetime, datetime, float], ...] = (),
 ) -> PlanResult:
     """Project the battery from ``now`` to ``end`` in step-sized pieces.
 
@@ -513,11 +497,14 @@ def simulate(
     reads = _carried_reads(keys, load_curve)
     added: list[float] = []
     for instant, _ in steps:
-        extra = 0.0
-        for window_start, window_end, watts, overlap_s in scheduled_windows:
-            if watts > 0 and window_start <= instant < window_end:
-                extra += watts * overlap_s / STEP_SECONDS
-        added.append(extra)
+        added_extra = 0.0
+        for window_start, window_end, watts in scheduled_windows:
+            overlap = (
+                min(instant + _STEP, window_end) - max(instant, window_start)
+            ).total_seconds()
+            if overlap > 0:
+                added_extra += watts * overlap / STEP_SECONDS
+        added.append(added_extra)
 
     soc = min(max(soc_now_pct, min_soc_pct), 100.0)
     trajectory: list[tuple[datetime, float]] = [(steps[0][0].astimezone(zone), soc)]
@@ -551,7 +538,7 @@ def simulate(
         if short and import_start is None:
             import_start = instant.astimezone(zone)
         if crossing is None and drawn > _EPS and soc <= min_soc_pct + _EPS:
-            crossing = boundary.astimezone(zone)
+            crossing = min(boundary, finish).astimezone(zone)
         trajectory.append((boundary.astimezone(zone), soc))
 
     return PlanResult(
@@ -764,8 +751,7 @@ def build_plan(
     if scheduled is not None:
         when, duration_s, watts = scheduled
         windows = tuple(
-            (window_start, window_end, watts, overlap_s)
-            for window_start, window_end, overlap_s in scheduled_windows(when, duration_s, zone)
+            (start, finish, watts) for start, finish in scheduled_windows(when, duration_s, zone)
         )
         caveat = (
             f"A scheduled load of {watts:.0f} W is added in full: without circuit history "
