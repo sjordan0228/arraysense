@@ -1075,18 +1075,22 @@ def overnight_plan(
     zone = _request_zone(store, tz)
     settings = SettingsStore(store)
     horizon: datetime | None = None
-    if end:
+    if end is not None and end.strip():
         try:
             horizon = datetime.fromisoformat(end)
         except ValueError:
             raise HTTPException(status_code=422, detail=f"unparsable end: {end!r}") from None
         if horizon.astimezone(UTC) > now + timedelta(days=7):
             raise HTTPException(status_code=422, detail="end more than 7 days ahead")
-    if sched_duration_s < 0 or sched_duration_s > 86400:
+    if sched_duration_s != sched_duration_s or sched_duration_s < 0 or sched_duration_s > 86400:
         raise HTTPException(status_code=422, detail="sched_duration_s must be 0-86400")
-    if sched_watts < 0 or sched_watts > 20000:
+    if sched_watts != sched_watts or sched_watts < 0 or sched_watts > 20000:
         raise HTTPException(status_code=422, detail="sched_watts must be 0-20000")
-    if essential_allowance_w < 0 or essential_allowance_w > 10000:
+    if (
+        essential_allowance_w != essential_allowance_w
+        or essential_allowance_w < 0
+        or essential_allowance_w > 10000
+    ):
         raise HTTPException(status_code=422, detail="essential_allowance_w must be 0-10000")
     if horizon is None or horizon.astimezone(UTC) <= now:
         # The configurable end hour from the registry, read at request time so
@@ -1122,10 +1126,11 @@ def overnight_plan(
     # the core's usable_ah spans only the window above the floor, and passing
     # the full capacity would let it drain the reserve.
     usable_ah = capacity_ah * (100.0 - min_soc) / 100.0 if capacity_ah is not None else None
-
-    if soc_now is None:
-        soc_now = min_soc  # the honest floor when nothing was ever recorded
-        stale = True
+    # A missing SoC is a refusal, not a projection from an invented floor:
+    # plan_status returns estimate_unavailable, and the guidance names it.
+    # The stale flag is set unconditionally so the page renders the warning.
+    # The floor value still reaches the response so the page can show where
+    # the reserve sits relative to the (unknown) current level.
 
     history_start = now - timedelta(days=_REPLAY_WINDOW_DAYS)
     rows = store.query(
@@ -1195,7 +1200,7 @@ def overnight_plan(
 
     efficiency = efficiency_pct / 100.0
     plan = overnight.build_plan(
-        soc_now,
+        soc_now if soc_now is not None else min_soc,
         usable_ah or 0.0,
         min_soc,
         efficiency,

@@ -236,7 +236,7 @@ def test_empty_store_refuses_and_names_the_gaps(tmp_path: Path) -> None:
         and len(data["scenarios"]["essential"]["trajectory"]) <= 2
     )
     assert data["replay"]["nights"] == []
-    assert data["inputs"]["soc_now_pct"] == 10.0
+    assert data["inputs"]["soc_now_pct"] is None
     assert data["inputs"]["usable_capacity_ah"] is None
     assert data["inputs"]["stale"] is True
     joined = " ".join(data["guidance"]).lower()
