@@ -38,7 +38,7 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
-from arraysense import __version__, drivers
+from arraysense import __version__, drivers, overnight
 from arraysense import mode as operating_mode
 from arraysense.alerts import NOT_A_CULPRIT, Contributor, counts_toward_total, high_usage
 from arraysense.auth import (
@@ -1027,6 +1027,268 @@ def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
     when = payload["last_full_charge"]
     payload["last_full_charge"] = when.isoformat() if when else None
     return payload
+
+
+# The replay seam needs the full seven-night history window before a night
+# becomes replayable, plus the replayed nights themselves: fourteen days is
+# the shortest window that can hold an eligible night at all. A shorter read
+# would always answer with an empty replay list.
+_REPLAY_WINDOW_DAYS = 14.0
+
+# A state-of-charge reading older than this says the collector has gone
+# quiet. The plan still projects from it, and the flag tells the page not to
+# treat the answer as fresh.
+_SOC_STALE_MINUTES = 15.0
+
+
+def _plan_float(value: object) -> float | None:
+    """Read one decoded store value as a float; silence stays None."""
+    return float(value) if isinstance(value, int | float) else None
+
+
+@router.get("/overnight")
+def overnight_plan(
+    request: Request,
+    store: _ReadStore,
+    end: str | None = None,
+    essential_allowance_w: float = 100.0,
+    sched_start: str | None = None,
+    sched_duration_s: int = 0,
+    sched_watts: float = 0.0,
+    tz: str | None = None,
+) -> dict[str, Any]:
+    """The overnight plan: three scenario projections and the replay's errors.
+
+    The endpoint reads, the estimation core computes. That split is the
+    slice-1 design kept: the functions in ``overnight.py`` stayed pure over
+    passed-in values so the replay harness could run without a database, and
+    pushing these store reads down into the core would have bought a shorter
+    call chain at the cost of that. The handler pays the assembly instead,
+    once here rather than in every surface that later shows a plan.
+
+    The reported plan is the grid-available one: at the reserve floor the
+    household starts importing. What an outage would mean instead -- supply
+    duration for backed-up loads only -- is stated in the assumptions; the
+    outage-mode simulation itself is a later slice, not this endpoint.
+    """
+    now = datetime.now(tz=UTC)
+    zone = _request_zone(store, tz)
+    horizon: datetime | None = None
+    if end:
+        try:
+            horizon = datetime.fromisoformat(end)
+        except ValueError:
+            horizon = None
+    if horizon is None or horizon.astimezone(UTC) <= now:
+        # Default horizon: the next local 07:00, the same morning edge the
+        # replay walks to. An unparsable or already-past end falls back to it
+        # too -- a refusal over a typo would say less than the honest plan.
+        local_now = now.astimezone(zone)
+        horizon = datetime(local_now.year, local_now.month, local_now.day, 7, 0, tzinfo=zone)
+        if horizon.astimezone(UTC) <= now:
+            horizon += timedelta(days=1)
+
+    settings = SettingsStore(store)
+    min_soc = _plan_float(settings.get("battery.min_soc_pct"))
+    efficiency_pct = _plan_float(settings.get("battery.round_trip_pct"))
+    max_charge_a = _plan_float(settings.get("battery.max_charge_a"))
+    min_soc = 10.0 if min_soc is None else min_soc
+    efficiency_pct = 91.4 if efficiency_pct is None else efficiency_pct
+    charge_limit_w = (0.0 if max_charge_a is None else max_charge_a) * overnight.NOMINAL_BUS_V
+
+    live = store.latest(["battery_soc_pct", "battery_power_w", "battery_full_capacity_ah"])
+    soc_now = _plan_float(live.get("battery_soc_pct")) if live else None
+    capacity_ah = _plan_float(live.get("battery_full_capacity_ah")) if live else None
+    stale = soc_now is None
+    if live is not None and not stale:
+        stamp = live.get("timestamp")
+        stale = not isinstance(stamp, datetime) or (now - stamp) > timedelta(
+            minutes=_SOC_STALE_MINUTES
+        )
+
+    history_start = now - timedelta(days=_REPLAY_WINDOW_DAYS)
+    rows = store.query(
+        ["load_power_w", "battery_soc_pct", "battery_power_w"],
+        history_start,
+        now,
+        tier="minute",
+    )
+    load_pairs: list[tuple[datetime, float | None]] = []
+    soc_pairs: list[tuple[datetime, float]] = []
+    discharges: list[float] = []
+    for row in rows:
+        stamp = row.get("timestamp")
+        if not isinstance(stamp, datetime):
+            continue
+        load_pairs.append((stamp, _plan_float(row.get("load_power_w"))))
+        soc = _plan_float(row.get("battery_soc_pct"))
+        if soc is not None:
+            soc_pairs.append((stamp, soc))
+        power = _plan_float(row.get("battery_power_w"))
+        if power is not None and power < 0.0:
+            discharges.append(-power)
+    # The discharge limit is observed, not assumed: the 95th percentile of
+    # the recorded discharge over the same nights the plan leans on, the way
+    # ``curtailment.window_max_limit`` reads a charge anchor. No discharge on
+    # record gives a limit of zero, which is silence, not a licence to drain.
+    discharge_limit_w = 0.0
+    if discharges:
+        ordered = sorted(discharges)
+        discharge_limit_w = ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]
+
+    # The drift question is answered by the same read /api/calibration gives
+    # the dashboard, called rather than copied: a ladder compared in two
+    # places is two ladders the day one rung moves.
+    calibration_state = calibration(request, store)
+    severity = calibration_state.get("severity")
+    drift_band = _plan_float(calibration_state.get("soc_spread_pct"))
+
+    curves = overnight.night_curves(load_pairs, zone)
+    essential_curve: dict[int, float] | None = None
+    if essential_allowance_w > 0:
+        circuit_watts = 0.0
+        if _emporia(request) is not None:
+            # The latest measured draw of the metered circuits stands in for
+            # per-circuit night curves for now: measured minutes carry their
+            # circuits' watts, unanswered minutes carry nobody's.
+            circuit_watts = sum(
+                circuit.watts
+                for circuit in CircuitRepository(store).latest()
+                if circuit.watts is not None and circuit.watts > 0
+            )
+        circuit_curves: list[dict[int, float]] | None = None
+        if circuit_watts > 0:
+            grid = range(0, 24 * 60, overnight.STEP_SECONDS // 60)
+            circuit_curves = [{minute: circuit_watts for minute in grid}]
+        essential_curve = overnight.essential_profile(circuit_curves, essential_allowance_w)
+
+    scheduled: tuple[datetime, int, float] | None = None
+    if sched_start and sched_duration_s > 0 and sched_watts > 0:
+        try:
+            schedule_start = datetime.fromisoformat(sched_start)
+        except ValueError:
+            schedule_start = None
+        if schedule_start is not None:
+            if schedule_start.tzinfo is None:
+                schedule_start = schedule_start.replace(tzinfo=zone)
+            scheduled = (schedule_start, sched_duration_s, sched_watts)
+
+    efficiency = efficiency_pct / 100.0
+    plan = overnight.build_plan(
+        0.0 if soc_now is None else soc_now,
+        capacity_ah,
+        min_soc,
+        efficiency,
+        charge_limit_w,
+        discharge_limit_w,
+        curves,
+        essential_curve,
+        scheduled,
+        None,
+        now,
+        horizon,
+        zone,
+        severity if isinstance(severity, str) else None,
+        drift_band,
+    )
+    replays = (
+        overnight.replay_nights(
+            load_pairs,
+            soc_pairs,
+            zone,
+            capacity_ah,
+            min_soc,
+            efficiency,
+            charge_limit_w,
+            discharge_limit_w,
+        )
+        if capacity_ah is not None and capacity_ah > 0
+        else []
+    )
+
+    guidance: list[str] = []
+    if severity == "elevated" or severity == "alert":
+        guidance.append(
+            f"Calibration reads {severity} drift between the packs: the state of charge "
+            "is not trustworthy enough to project a night on top of."
+        )
+    elif severity == "warning":
+        width = f" about {drift_band:.1f} points wide" if drift_band is not None else ""
+        guidance.append(f"Calibration reports a warning-level drift{width} between the packs.")
+    if capacity_ah is None or capacity_ah <= 0:
+        guidance.append(
+            "No usable battery capacity was reported: set the pack capacity and the "
+            "reserve floor, and the planner will have something to drain."
+        )
+    if len(curves) < overnight.MIN_USABLE_NIGHTS:
+        nights = f"{len(curves)} comparable night" + ("s" if len(curves) != 1 else "")
+        guidance.append(
+            f"Only {nights} of history answered, and a typical night needs at least "
+            f"{overnight.MIN_USABLE_NIGHTS}."
+        )
+
+    scenarios: dict[str, Any] = {}
+    for name in ("typical", "essential", "scheduled"):
+        result = plan.scenarios.get(name)
+        if name == "typical" and result is None:
+            result = plan.central
+        scenarios[name] = None if result is None else asdict(result)
+    if plan.status != "ok":
+        # A refusal surfaces at the summary level, and the default central
+        # result would otherwise reach the page as an "ok" curve with nothing
+        # in it -- the number that looks like an answer. The status and the
+        # reason travel outwards instead.
+        refused = asdict(plan.central)
+        refused["status"] = plan.status
+        refused["reason"] = plan.reason
+        scenarios["typical"] = refused
+
+    return {
+        "scenarios": scenarios,
+        "replay": {
+            "nights": [
+                {
+                    "night": replay.night.isoformat(),
+                    "projected_crossing": (
+                        None
+                        if replay.projected_crossing is None
+                        else replay.projected_crossing.isoformat()
+                    ),
+                    "actual_crossing": (
+                        None
+                        if replay.actual_crossing is None
+                        else replay.actual_crossing.isoformat()
+                    ),
+                    "wh_error": replay.wh_error,
+                }
+                for replay in replays
+            ],
+            "crossing_errors_minutes": [
+                error.total_seconds() / 60.0 for error in overnight.crossing_errors(replays)
+            ],
+            "wh_errors": overnight.wh_errors(replays),
+        },
+        "inputs": {
+            "soc_now_pct": soc_now,
+            "usable_capacity_ah": capacity_ah,
+            "min_soc_pct": min_soc,
+            "efficiency_pct": efficiency_pct,
+            "discharge_limit_w": discharge_limit_w,
+            "calibration_severity": severity,
+            "drift_band_pct": drift_band,
+            "stale": stale,
+            "emporia_enabled": _emporia(request) is not None,
+        },
+        "guidance": guidance,
+        "assumptions": [
+            *plan.assumptions,
+            "The grid is assumed available for this projection. If it were not, the "
+            "honest answer changes shape: the question becomes how long the "
+            "backed-up loads can be supplied from the battery alone, and that "
+            "outage mode is not simulated here -- only the grid-available result "
+            "is reported.",
+        ],
+    }
 
 
 @router.get("/settings")
