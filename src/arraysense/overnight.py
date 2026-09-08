@@ -21,7 +21,10 @@ of a gap in the record, and the projection then reports a battery that lasted
 longer than anything was measured to last. Carrying the last answered step
 forward is the conservative reading. It keeps a dishwasher's worth of draw alive
 across a hole in the record instead of switching the house off, and it costs a
-plan that is too short rather than a plan that is too long.
+plan that is too short rather than a plan that is too long. The carry starts
+from the whole curve, read cyclically: a projection whose window answers nothing
+still carries the nearest answered step of the day, and only a curve that
+answers nothing anywhere projects a flat line.
 
 Times are walked as real instants and looked up by local clock time, so the
 spring gap is walked over rather than through, and a fall-back hour is served
@@ -33,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from math import isfinite
 from statistics import median
 from zoneinfo import ZoneInfo
 
@@ -150,13 +154,14 @@ def night_curves(
     A night is cut on the installation's calendar and runs noon to noon, so the
     evening draw and the following morning's belong to the same night, and a
     25 hour fall-back night stays one night instead of splitting into two thin
-    halves. Rows are bucketed by the real instant they were taken at, so the two
-    passes through a fall-back clock minute are two answers of one night, and a
-    timestamp that arrived twice is one answer and not two.
+    halves. Rows are bucketed on the shared five-minute grid before any
+    counting, so the two passes through a fall-back clock minute are two
+    answers of one night, and a step read twice is one answer at its mean and
+    not two.
 
-    A night is usable when it answers at least half of its own steps, counted as
-    the clock minutes it writes to the curve. Below that the record is mostly
-    gaps, and a median taken over mostly gaps is a guess about a house nobody
+    A night is usable when it answers at least half of its own steps, counted
+    by the five-minute steps it answers. Below that the record is mostly gaps,
+    and a median taken over mostly gaps is a guess about a house nobody
     watched. Fewer than MIN_USABLE_NIGHTS usable nights is not a typical night
     yet, so nothing is returned rather than a profile built on a single night.
 
@@ -164,17 +169,24 @@ def night_curves(
     recent night that has any rows. It is a window of dates, not of usable
     nights: a silent night sits in the window and makes itself unusable rather
     than letting the plan reach back past it into older history, which is a
-    different season and not more evidence.
+    different season and not more evidence. A night whose rows all read
+    silence still holds its slot in the window: it is a real night that answers
+    nothing, not a night that never happened.
     """
-    nights: dict[date, dict[datetime, float]] = {}
+    # Each row's night is named before its values are filtered, so a recent
+    # night of pure silence still anchors the window instead of opening a gap
+    # to reach past. A bucket is one five-minute step: the step's floored
+    # instant is its identity, and everything read inside it is one answer.
+    nights: dict[date, dict[datetime, list[float]]] = {}
     for when, watts in sorted(rows, key=lambda row: _instant(row[0], zone)):
-        if watts is None:
-            continue
         instant = _instant(when, zone)
         clock = instant.astimezone(zone)
         day = clock.date()
         night = day if clock.hour < 12 else day + timedelta(days=1)
-        nights.setdefault(night, {}).setdefault(instant, float(watts))
+        slots = nights.setdefault(night, {})
+        if watts is None:
+            continue
+        slots.setdefault(_floor_step(instant), []).append(float(watts))
 
     if not nights:
         return []
@@ -190,8 +202,8 @@ def night_curves(
         if len(bucket) * 2 < _night_step_count(night, zone):
             continue
         passes: dict[int, list[float]] = {}
-        for instant in sorted(bucket):
-            passes.setdefault(_clock_key(instant, zone), []).append(bucket[instant])
+        for bucket_start in sorted(bucket):
+            passes.setdefault(_clock_key(bucket_start, zone), []).extend(bucket[bucket_start])
         # A repeated clock minute is averaged, not taken twice and not taken once.
         # The clock reading stands for both of the real passes it names, and their
         # mean is the value that spends the same energy across the two of them;
@@ -297,9 +309,9 @@ _SIMULATION_ASSUMPTIONS = (
     "A 48 V nominal bus is assumed: amp-hours are spent as watt-hours at 48 Wh "
     "per amp-hour, and the reserve floor is where the usable window ends.",
     "The discharge limit and the round-trip efficiency arrive from outside this "
-    "calculation: the limit is meant to be the busiest five minutes the last seven "
-    "nights recorded and the efficiency the registry's round-trip figure, so a "
-    "stale one is part of this answer.",
+    "calculation: the limit is meant to be the observed p95 of five-minute "
+    "battery_discharge_power_w over the last seven nights and the efficiency the "
+    "registry's round-trip figure, so a stale one is part of this answer.",
 )
 
 _RANGE_BASIS = (
@@ -317,7 +329,7 @@ _RANGE_BASIS_DRIFT = (
 
 def scheduled_windows(
     start: datetime, duration_s: int, zone: ZoneInfo
-) -> tuple[tuple[datetime, datetime], ...]:
+) -> tuple[tuple[datetime, datetime, float], ...]:
     """The real step-sized windows a schedule covers, oldest window first.
 
     The windows are instants, not clock readings, which is the whole point of
@@ -327,20 +339,24 @@ def scheduled_windows(
     exactly ``duration_s``. A spring-forward night is missing an hour of clock,
     and these windows step over it because they never name a clock time.
 
-    The first window starts at the step boundary below ``start``, and windows are
-    added until ``duration_s`` of real time is covered, so a schedule that starts
-    mid-step is charged for the whole step it starts in. ``simulate`` adds the
-    watts to a step whose own instant falls inside a window.
+    The first window starts at the step boundary below ``start``, and each
+    window carries the exact seconds the schedule runs inside it: a schedule
+    that starts mid-step covers only the part of that step it really runs
+    through, and the seconds add up to ``duration_s`` and not to a whole step
+    more at the front. ``simulate`` charges a step's watts by that fraction.
     """
     if duration_s <= 0:
         return ()
-    first = _floor_step(_instant(start, zone))
-    finish = _instant(start, zone) + timedelta(seconds=duration_s)
-    windows: list[tuple[datetime, datetime]] = []
+    origin = _instant(start, zone)
+    first = _floor_step(origin)
+    finish = origin + timedelta(seconds=duration_s)
+    windows: list[tuple[datetime, datetime, float]] = []
     step = first
     while step < finish:
-        windows.append((step, step + _STEP))
-        step += _STEP
+        boundary = step + _STEP
+        overlap = (min(boundary, finish) - max(step, origin)).total_seconds()
+        windows.append((step, boundary, overlap))
+        step = boundary
     return tuple(windows)
 
 
@@ -373,8 +389,12 @@ def _carried_reads(keys: Sequence[int], curve: dict[int, float]) -> list[float]:
     A key the curve did not answer takes the value of the last key it did answer,
     and a run of unanswered keys in front of the first answer takes that answer:
     a hole in the record says nobody read the step, not that the house drew
-    nothing. A curve that answers nothing anywhere has nothing to carry, and
-    inventing a load out of it would spend a battery on a night nobody watched.
+    nothing. When the walk's own keys answer nothing, the carry is seeded from
+    the whole curve, read cyclically: the nearest answered key below the walk's
+    start, wrapping through the end of the curve when nothing was answered
+    earlier in the day. Only a curve that answers nothing anywhere has nothing
+    to carry, and inventing a load out of it would spend a battery on a night
+    nobody watched.
     """
     head: float | None = None
     for key in keys:
@@ -383,7 +403,11 @@ def _carried_reads(keys: Sequence[int], curve: dict[int, float]) -> list[float]:
             head = value
             break
     if head is None:
-        return [0.0] * len(keys)
+        if not keys or not curve:
+            return [0.0] * len(keys)
+        first = keys[0]
+        seed = min(curve, key=lambda key: (first - key) % (24 * 60))
+        head = curve[seed]
 
     reads: list[float] = []
     last = head
@@ -400,10 +424,13 @@ def _carried_reads(keys: Sequence[int], curve: dict[int, float]) -> list[float]:
 def _percentile(times: list[datetime], fraction: float, zone: ZoneInfo) -> datetime:
     """Linear interpolation between sorted instants, the p25 and p75 of a spread.
 
-    Interpolating between the times rather than taking the earliest and the latest
-    keeps two odd nights out of the job of setting the width of every answer.
+    Interpolating between the times rather than taking the earliest and the
+    latest keeps two odd nights out of the job of setting the width of every
+    answer. Sorting and measuring happen in real instants: two clock readings
+    inside a fall-back hour share a clock hour and can sit two real hours
+    apart, and subtracting same-zone wall clock would call that gap negative.
     """
-    ordered = sorted(times)
+    ordered = sorted(when.astimezone(UTC) for when in times)
     position = fraction * (len(ordered) - 1)
     lower = int(position)
     if lower + 1 >= len(ordered):
@@ -425,7 +452,7 @@ def simulate(
     now: datetime,
     end: datetime,
     zone: ZoneInfo,
-    scheduled_windows: tuple[tuple[datetime, datetime, float], ...] = (),
+    scheduled_windows: tuple[tuple[datetime, datetime, float, float], ...] = (),
 ) -> PlanResult:
     """Project the battery from ``now`` to ``end`` in step-sized pieces.
 
@@ -436,10 +463,11 @@ def simulate(
     pass while the clock shows 01:xx twice.
 
     The walk starts on the grid. ``now`` is floored down to the step it sits in
-    and ``end`` is ceiled up to the step it sits in: the seconds between the
-    floored step and the real ``now`` are history, already spent, and are not
-    projected, while the step ``end`` falls inside is projected only for the
-    seconds left in it and costs that fraction of its energy.
+    and ``end`` is ceiled up to the step it sits in, and every step is charged
+    by its overlap with the real window: the seconds between the floored step
+    and the real ``now`` are history, already spent, and are not projected, the
+    step ``end`` falls inside is projected only for the seconds left in it, and
+    a scheduled window adds its watts only for the seconds it actually covers.
 
     Energy, not power, decides what the battery can do. A step asks the battery
     for what the loads want minus what solar already covers, the discharge limit
@@ -476,18 +504,19 @@ def simulate(
     steps: list[tuple[datetime, float]] = []
     step_start = _floor_step(start)
     while step_start < finish:
-        remaining = min(float(STEP_SECONDS), (finish - step_start).total_seconds())
-        steps.append((step_start, remaining / STEP_SECONDS))
-        step_start += _STEP
+        step_end = step_start + _STEP
+        covered = (min(step_end, finish) - max(step_start, start)).total_seconds()
+        steps.append((step_start, covered / STEP_SECONDS))
+        step_start = step_end
 
     keys = [_clock_key(instant, zone) for instant, _ in steps]
     reads = _carried_reads(keys, load_curve)
     added: list[float] = []
     for instant, _ in steps:
         extra = 0.0
-        for window_start, window_end, watts in scheduled_windows:
+        for window_start, window_end, watts, overlap_s in scheduled_windows:
             if watts > 0 and window_start <= instant < window_end:
-                extra += watts
+                extra += watts * overlap_s / STEP_SECONDS
         added.append(extra)
 
     soc = min(max(soc_now_pct, min_soc_pct), 100.0)
@@ -555,13 +584,20 @@ def _widened(
         if earlier is None:
             return None
         return (earlier.astimezone(zone), None)
-    low, high = window
+    # Compare as instants, converted out of the installation zone first:
+    # inside a fall-back hour two readings can share a clock hour, and only
+    # the instants order which one is really earlier.
+    low = window[0].astimezone(UTC)
+    high = None if window[1] is None else window[1].astimezone(UTC)
     if earlier is not None:
-        low = min(low, earlier)
+        low = min(low, earlier.astimezone(UTC))
     # A band that never reaches the floor leaves the upper edge open rather than
     # closed at the last crossing that did happen.
-    high = None if high is None or later is None else max(high, later)
-    return (low, high)
+    high = None if high is None or later is None else max(high, later.astimezone(UTC))
+    return (
+        low.astimezone(zone),
+        None if high is None else high.astimezone(zone),
+    )
 
 
 def build_plan(
@@ -662,14 +698,21 @@ def build_plan(
     basis = _RANGE_BASIS if window is not None else ""
 
     if calibration_severity == "warning":
-        if drift_band_pct is None:
+        # A drift band is a magnitude: a negative or non-finite width says
+        # nothing about how far apart the packs are, and goes the same path as
+        # no width at all. A finite non-negative width is used as given.
+        band = (
+            drift_band_pct
+            if drift_band_pct is not None and isfinite(drift_band_pct) and drift_band_pct >= 0.0
+            else None
+        )
+        if band is None:
             assumptions.append(
                 "Calibration reports a warning-level drift and no drift magnitude came "
                 "with it, so this range spans only the spread between nights and does not "
                 "include the disagreement between the packs."
             )
         else:
-            band = drift_band_pct
             source = (
                 f"This curve is reported as a band of plus or minus {band:.1f} points "
                 "of state of charge, which is the measured disagreement between the "
@@ -721,8 +764,8 @@ def build_plan(
     if scheduled is not None:
         when, duration_s, watts = scheduled
         windows = tuple(
-            (window_start, window_end, watts)
-            for window_start, window_end in scheduled_windows(when, duration_s, zone)
+            (window_start, window_end, watts, overlap_s)
+            for window_start, window_end, overlap_s in scheduled_windows(when, duration_s, zone)
         )
         caveat = (
             f"A scheduled load of {watts:.0f} W is added in full: without circuit history "

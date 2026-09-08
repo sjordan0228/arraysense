@@ -50,6 +50,10 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
 - `soc` clamps to [min_soc, 100]. **Grid-available assumption**: when `soc` reaches
   `min_soc`, the battery holds there and the model records `import_start` — the household
   begins importing; not an outage, because the grid serves the loads.
+- Steps are charged by real overlap: the walk starts on the grid at or before now, but the
+  first step is weighted by the seconds it has left after now, and the last by the seconds
+  left inside the end time. A plan that starts at 22:02 is charged for 22:02 onward, not
+  for the whole 22:00 step (which would overstate by up to a step).
 - **Grid-outage assumption**: loads beyond battery capability are dropped, and the model
   records `outage_duration` — how long the *backed-up* loads alone would have been served
   until `min_soc`.
@@ -68,9 +72,13 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
    288 normally, 300 across a fall-back, 276 across a spring-forward, walked from the
    dates rather than assumed from a flat day — and fewer than 3 usable nights means typical
    is unavailable and the page says what is missing. A step that did not answer is neither
-   filled with zeros nor read as no load: the last answered step carries forward across it.
-   Rows are bucketed by the real instant they were taken at, so a duplicated read is one
-   answer and the two passes through a fall-back clock minute average into one curve key.
+   filled with zeros nor read as no load: the last answered step carries forward across it,
+   seeded from the whole curve read cyclically (the nearest answered clock key below the
+   window's start, wrapping through the end of the curve), so a window with no answered key
+   still carries the day's last answer instead of a zero. Rows are bucketed on the shared
+   five-minute grid (counted once per bucket, duplicates averaged), and a night whose rows
+   all read silence still names the window's most recent night: it holds its slot in the
+   window, unusable but not gone.
 2. **Essential loads** - Emporia circuit selection when the module is enabled (measured
    histories for those circuits, unmonitored allowance added on top); without Emporia, a
    manual constant-watts entry. The label splits the two halves of the sum: a circuit curve
@@ -82,7 +90,11 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
    the schedule covers, and the simulation charges a step when that step's own instant falls
    inside one. A run whose clock hours sit inside a fall-back hour therefore pays for the
    seconds it actually runs and not for both passes through the repeated hour, and a run
-   over a spring-forward gap steps over the hour that never happened. **Double-count rule**:
+   over a spring-forward gap steps over the hour that never happened. Each window also
+   carries its exact overlap seconds (a run that starts mid-step covers only the part of
+   that step it really runs through), and a step is charged `watts * overlap_s / step_s`,
+   so a one-hour scheduled run costs exactly one hour of energy however the grid falls.
+   **Double-count rule**:
    when Emporia history shows that circuit already drawing during the scheduled window on
    the baseline nights, the baseline's overlapping contribution is stated in the result
    ("this window already carries ~X W of this circuit on a typical night"), and the delta
@@ -105,8 +117,10 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
   projection that refuses for one of those reasons is propagated: the summary carries that
   status and that reason, with no range and no scenarios derived from a curve that never ran.
 - **No point exhaustion times**: reserve crossing is reported as a **time range** whose
-  width is the p25 to the p75 of the per-night crossing times, interpolated linearly between
-  them, until slice 2's replay error distribution replaces it with something earned. Nights
+  width is the p25 to the p75 of the per-night crossing times, interpolated linearly
+  between them in real instants — crossings are converted to UTC before sorting and
+  interpolation, because two clock readings inside a fall-back hour are not one clock hour
+  apart — until slice 2's replay error distribution replaces it with something earned. Nights
   that never reach the floor inside the horizon are censored rather than dropped: with more
   than a quarter of them the range is reported open at the later end, and with all of them
   there is no range at all.

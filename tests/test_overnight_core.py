@@ -21,6 +21,8 @@ incidents:
 * The simulation walks real instants, starts on the five-minute grid, and looks
   up load by the local clock reading of each instant, so a spring-forward night
   is shorter than its clock times suggest and a repeated hour is served twice.
+  A step is charged only for the seconds of it that lie inside the window, and
+  a scheduled load is priced by the exact seconds its windows cover.
 
 The reference figures come from the design doc: a 100 Ah usable window on a
 48 V nominal bus is 4.8 kWh, which is what the drain tests below count against.
@@ -101,7 +103,7 @@ def sim(
     discharge_w: float = 5000.0,
     start: str = "2026-01-05T22:00",
     end: str = "2026-01-06T08:00",
-    windows: tuple[tuple[datetime, datetime, float], ...] = (),
+    windows: tuple[tuple[datetime, datetime, float, float], ...] = (),
 ) -> PlanResult:
     return simulate(
         soc,
@@ -181,6 +183,51 @@ def test_only_the_last_seven_nights_are_comparable() -> None:
     curves = night_curves(rows, NY)
     assert len(curves) == 7
     assert all(100.0 not in curve.values() and 101.0 not in curve.values() for curve in curves)
+
+
+def test_a_silent_night_still_holds_its_place_in_the_window() -> None:
+    # Three complete nights end at Jan 3, then a week of dates nobody recorded
+    # and a night whose every read came back silence. The silent night is a
+    # real night and the most recent one, so it anchors the seven-date window
+    # at its own date and only Jan 3's curve reaches the median. Filtering
+    # unanswered rows before naming their night would end the window at the
+    # older history instead and call a dead fortnight past.
+    old = (
+        sweep("2025-12-31T12:00", 250.0)
+        + sweep("2026-01-01T12:00", 250.0)
+        + sweep("2026-01-02T12:00", 250.0)
+    )
+    silent: list[tuple[datetime, float | None]] = [
+        (when, None) for when, _ in sweep("2026-01-08T12:00", 250.0)
+    ]
+    assert night_curves(old + silent, NY) == []
+    # The same three nights with nothing silent after them are three
+    # comparable nights, which pins the silent week as the reason.
+    assert len(night_curves(old, NY)) == 3
+
+
+def test_two_reads_in_one_step_are_one_answer_at_their_mean() -> None:
+    # Each pair of rows sits inside one five-minute step: 12:00 with 12:01,
+    # 12:05 with 12:06, and so on. Counted to the second these are 288
+    # answers of a 288-step night; counted by the step they are 144 -- still
+    # half, still usable -- and the curve carries their mean at each step
+    # rather than the two readings as two answers.
+    good = (
+        sweep("2026-01-03T12:00", 250.0)
+        + sweep("2026-01-04T12:00", 250.0)
+        + sweep("2026-01-05T12:00", 250.0)
+    )
+    pairs: list[tuple[datetime, float | None]] = []
+    first = at("2026-01-06T12:00").astimezone(UTC)
+    for step in range(144):
+        start = (first + timedelta(seconds=STEP_SECONDS * step)).astimezone(NY)
+        pairs.append((start, 100.0))
+        pairs.append(((start + timedelta(minutes=1)).astimezone(NY), 300.0))
+    curves = night_curves(good + pairs, NY)
+    assert len(curves) == 4
+    paired = curves[-1]
+    assert len(paired) == 144
+    assert all(value == pytest.approx(200.0) for value in paired.values())
 
 
 def test_recent_silence_is_not_backfilled_from_older_history() -> None:
@@ -328,6 +375,20 @@ def test_a_curve_that_never_answers_credits_no_load() -> None:
     assert sim({}, start="2026-01-06T00:00", end="2026-01-06T04:00").trajectory[-1][1] == 55.0
 
 
+def test_a_window_answered_elsewhere_carries_that_answer_into_the_window() -> None:
+    # The record answered 250 W at 20:00 and 100 W at 03:00 and nothing
+    # between. A projection of the 22:00 hour reads the 20:00 answer -- the
+    # last answered clock key before the walk starts, sought cyclically
+    # through the whole curve -- rather than inventing a silent house out of a
+    # two-hour hole in the record.
+    result = sim({1200: 250.0, 180: 100.0}, start="2026-01-05T22:00", end="2026-01-05T23:00")
+    assert spent_wh(result) == pytest.approx(250.0)
+    # A curve whose only answer is 23:30 is still an answer before a 22:00
+    # walk: read cyclically, it wrapped through midnight into the evening.
+    wrapped = sim({1410: 300.0}, start="2026-01-05T22:00", end="2026-01-05T23:00")
+    assert spent_wh(wrapped) == pytest.approx(300.0)
+
+
 def test_a_projection_starts_and_stops_on_the_step_grid() -> None:
     # A 22:02 start on a curve keyed 22:00, 22:05 and so on must still read the
     # 22:00 step, and a horizon that stops at 08:02 still owes 120 seconds of the
@@ -337,9 +398,19 @@ def test_a_projection_starts_and_stops_on_the_step_grid() -> None:
     assert len(result.trajectory) == 122
     assert result.trajectory[0][0] == at("2026-01-05T22:00")
     assert result.trajectory[-1][0] == at("2026-01-06T08:05")
-    # One hundred and twenty whole steps plus a fifth of one, at 10 Wh a step.
-    assert spent_wh(result) == pytest.approx(1204.0)
-    assert result.trajectory[-1][1] == pytest.approx(32.425)
+    # A fifth of a step at each end and one hundred and twenty whole steps
+    # between them: 120.0 step-equivalents at 10 Wh a step, not the 120.4 that
+    # charging the whole first step would cost.
+    assert spent_wh(result) == pytest.approx(1200.0)
+    assert result.trajectory[-1][1] == pytest.approx(32.5)
+
+
+def test_a_late_start_pays_only_for_the_time_the_plan_actually_runs() -> None:
+    # A constant 120 W from 22:02 to 23:02 is one hour of energy. Charging the
+    # whole 22:00 step for it overstates by up to a step, which is what a
+    # short projection was doing.
+    result = sim(flat(120.0), start="2026-01-05T22:02", end="2026-01-05T23:02")
+    assert spent_wh(result) == pytest.approx(120.0)
 
 
 def test_a_scheduled_load_is_priced_by_instant_and_not_by_clock_time() -> None:
@@ -347,14 +418,38 @@ def test_a_scheduled_load_is_priced_by_instant_and_not_by_clock_time() -> None:
     assert len(windows) == 13
     assert windows[0][0] == at("2026-01-05T21:35").astimezone(UTC)
     assert windows[-1][1] == at("2026-01-05T22:40").astimezone(UTC)
-    assert all((finish - start).total_seconds() == STEP_SECONDS for start, finish in windows)
+    assert all(
+        (finish - start).total_seconds() == STEP_SECONDS for start, finish, _seconds in windows
+    )
+    # The windows carry the exact seconds of schedule inside each step, and
+    # those add up to what the schedule actually runs for, not to a whole step
+    # more at the front.
+    assert sum(seconds for _start, _finish, seconds in windows) == 3600
+    assert windows[0][2] == 180.0
 
     # A run from 23:30 for an hour is twelve steps of real time that crosses
     # midnight as real time, not a lookup that has to remember the day changed.
     wrapped = scheduled_windows(at("2026-01-05T23:30"), 3600, NY)
-    keys = {step.astimezone(NY).hour * 60 + step.astimezone(NY).minute for step, _finish in wrapped}
+    keys = {
+        step.astimezone(NY).hour * 60 + step.astimezone(NY).minute
+        for step, _finish, _seconds in wrapped
+    }
     assert len(wrapped) == 12
     assert keys == set(range(1410, 1440, 5)) | set(range(0, 30, 5))
+
+
+def test_an_unaligned_schedule_costs_exactly_its_seconds() -> None:
+    # A one-hour run from 21:37 covers parts of thirteen steps: three and a
+    # half minutes in the first, whole minutes in the middle, two minutes in
+    # the last. Charging whole windows priced it at 65/60 of an hour of the
+    # load; carrying the exact seconds prices exactly one hour, however the
+    # grid falls.
+    windows = tuple(
+        (start, finish, 120.0, seconds)
+        for start, finish, seconds in scheduled_windows(at("2026-01-05T21:37"), 3600, NY)
+    )
+    result = sim({}, start="2026-01-05T21:30", end="2026-01-05T23:00", windows=windows)
+    assert spent_wh(result) == pytest.approx(120.0)
 
 
 def test_a_scheduled_window_is_not_charged_twice_across_the_repeated_hour() -> None:
@@ -369,8 +464,8 @@ def test_a_scheduled_window_is_not_charged_twice_across_the_repeated_hour() -> N
         ("2026-11-01T01:00", 7200),
     ):
         windows = tuple(
-            (window_start, window_end, 120.0)
-            for window_start, window_end in scheduled_windows(at(start), seconds, NY)
+            (window_start, window_end, 120.0, overlap_s)
+            for window_start, window_end, overlap_s in scheduled_windows(at(start), seconds, NY)
         )
         result = sim({}, start="2026-10-31T22:00", end="2026-11-01T07:00", windows=windows)
         assert spent_wh(result) == pytest.approx(120.0 * seconds / 3600.0, abs=1e-6)
@@ -378,7 +473,7 @@ def test_a_scheduled_window_is_not_charged_twice_across_the_repeated_hour() -> N
 
 def test_a_scheduled_window_skips_a_clock_hour_that_never_happened() -> None:
     windows = scheduled_windows(at("2026-03-08T01:50"), 3600, NY)
-    hours = {step.astimezone(NY).hour for step, _ in windows}
+    hours = {step.astimezone(NY).hour for step, _finish, _seconds in windows}
     assert len(windows) == 12
     assert 2 not in hours
 
@@ -560,6 +655,29 @@ def test_the_range_is_the_p25_to_p75_of_the_night_crossings() -> None:
     assert not any("25%" in text for text in summary.assumptions)
 
 
+def test_the_range_interpolates_between_real_instants_across_the_fold() -> None:
+    # Six nights cross the floor at 00:00, 01:30 (first pass), 01:20 (second
+    # pass), 02:00, 03:00 and 03:55. Sorted and interpolated on New York wall
+    # clock, the second-pass 01:20 sorts before the first-pass 01:30 and the
+    # repeated hour reads as a negative gap, so the interpolated start lands
+    # outside the two real crossings it is supposed to sit between. Sorted and
+    # interpolated as instants it sits between them, which is where a p25 of
+    # those crossings belongs.
+    summary = plan(
+        [flat(1200.0), flat(700.0), flat(560.0), flat(480.0), flat(400.0), flat(350.0)],
+        start="2026-10-31T22:00",
+        end="2026-11-01T07:00",
+    )
+    assert summary.status == "ok"
+    assert summary.reserve_window is not None
+    low, high = summary.reserve_window
+    # The four crossings inside the fold are two pairs of one clock hour two
+    # real hours wide: the window's ends interpolate through real time, not
+    # through a wall-clock reading that names two different instants.
+    assert low == at("2026-11-01T01:42:30")
+    assert high == at("2026-11-01T02:45")
+
+
 def test_nights_that_never_reach_the_floor_leave_the_range_open() -> None:
     # Two nights cross and two do not, which is half of the window, and a half is
     # more than a quarter. The later bound goes None rather than staying at the
@@ -615,6 +733,23 @@ def test_a_warning_widens_the_reserve_window_at_both_ends() -> None:
     assert "widened at both ends" in banded.range_basis
 
 
+def test_an_invalid_drift_magnitude_goes_the_none_path() -> None:
+    # A drift band is a magnitude: a negative or non-finite width says nothing
+    # about how far apart the packs are and takes the same path as no width --
+    # no band on the curve, no widening of the window, and an assumption
+    # naming the missing figure. A negative one in particular must not invert
+    # the reported band or the simulated runs.
+    for invalid in (-4.0, float("inf"), float("nan")):
+        refused = plan([flat(600.0)] * 3, severity="warning", band=invalid)
+        assert refused.status == "ok"
+        assert refused.central.trajectory_band == ()
+        assert any("no drift magnitude" in text for text in refused.assumptions)
+        assert not any("plus or minus" in text for text in refused.assumptions)
+    # And a finite non-negative width is used exactly as given.
+    used = plan([flat(600.0)] * 3, severity="warning", band=1.5)
+    assert used.central.trajectory_band != ()
+
+
 def test_a_warning_without_a_drift_magnitude_says_the_range_omits_it() -> None:
     warned = plan([flat(600.0)] * 3, severity="warning")
     assert warned.status == "ok"
@@ -649,7 +784,7 @@ def test_the_assumptions_say_what_the_model_assumed() -> None:
     assert "carries the last answered step forward" in joined
     assert "grid is assumed available" in joined
     assert any("48" in text for text in summary.assumptions)
-    assert any("busiest five minutes" in text for text in summary.assumptions)
+    assert any("p95" in text and "five-minute" in text for text in summary.assumptions)
     assert any("round-trip" in text for text in summary.assumptions)
     warned = plan([flat(500.0)] * 3, severity="warning")
     assert warned.status == "ok"
