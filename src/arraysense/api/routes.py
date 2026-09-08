@@ -1075,7 +1075,8 @@ def overnight_plan(
     zone = _request_zone(store, tz)
     settings = SettingsStore(store)
     horizon: datetime | None = None
-    if end is not None and end.strip():
+    if end is not None and not end.strip():
+        raise HTTPException(status_code=422, detail="end must be a non-empty string")
         try:
             horizon = datetime.fromisoformat(end)
         except ValueError:
@@ -1114,10 +1115,10 @@ def overnight_plan(
     # across both metrics returns the newest row carrying *any* of them, and a
     # newer power-only row would erase an older but still-valid SoC reading.
     # The capacity read is likewise independent, for the same reason.
-    soc_live = store.latest(["battery_soc_pct"])
+    soc_live = store.latest(["battery_soc_pct"], include_gaps=False)
     soc_now = _plan_float(soc_live.get("battery_soc_pct")) if soc_live else None
     soc_stamp = soc_live.get("timestamp") if soc_live else None
-    cap_live = store.latest(["battery_full_capacity_ah"])
+    cap_live = store.latest(["battery_full_capacity_ah"], include_gaps=False)
     capacity_ah = _plan_float(cap_live.get("battery_full_capacity_ah")) if cap_live else None
     stale = soc_now is None
     if not stale and isinstance(soc_stamp, datetime):
@@ -1192,7 +1193,9 @@ def overnight_plan(
         try:
             schedule_start = datetime.fromisoformat(sched_start)
         except ValueError:
-            schedule_start = None
+            raise HTTPException(
+                status_code=422, detail=f"unparsable sched_start: {sched_start!r}"
+            ) from None
         if schedule_start is not None:
             if schedule_start.tzinfo is None:
                 schedule_start = schedule_start.replace(tzinfo=zone)
@@ -1262,6 +1265,8 @@ def overnight_plan(
             f"The last state-of-charge reading is over {_SOC_STALE_MINUTES:.0f} "
             "minutes old: the collector may have gone quiet."
         )
+    # The two branches above are mutually exclusive: a missing SoC sets stale
+    # in the inputs block, but the guidance carries one message either way.
 
     scenarios: dict[str, Any] = {}
     for name in ("typical", "essential", "scheduled"):
@@ -1297,6 +1302,8 @@ def overnight_plan(
             f"The last state-of-charge reading is over {_SOC_STALE_MINUTES:.0f} "
             "minutes old: the collector may have gone quiet."
         )
+    # The two branches above are mutually exclusive: a missing SoC sets stale
+    # in the inputs block, but the guidance carries one message either way.
 
     return {
         "scenarios": scenarios,
