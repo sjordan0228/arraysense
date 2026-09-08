@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from math import isfinite
 from statistics import median
 from zoneinfo import ZoneInfo
@@ -786,3 +787,220 @@ def build_plan(
         scenarios=scenarios,
         assumptions=tuple(assumptions),
     )
+
+
+@dataclass(frozen=True)
+class NightReplay:
+    """What one replayed night says about its own projection.
+
+    A None crossing is not a crossing at midnight and a None energy error is
+    not a night that drew nothing: one means the reach of the floor could not
+    be confirmed, the other that the night had no SoC record to compare with.
+    """
+
+    night: date
+    projected_crossing: datetime | None
+    actual_crossing: datetime | None
+    wh_error: float | None
+
+
+def _night_of(instant: datetime, zone: ZoneInfo) -> date:
+    """The calendar night an instant belongs to, on the noon-to-noon cut."""
+    clock = instant.astimezone(zone)
+    day = clock.date()
+    return day if clock.hour < 12 else day + timedelta(days=1)
+
+
+def actual_crossing(
+    soc_rows: Sequence[tuple[datetime, float]], min_soc_pct: float, zone: ZoneInfo
+) -> datetime | None:
+    """The first instant the recorded SoC reaches min_soc, or None.
+
+    Inside the noon-to-noon night walk, that is: None when the record never
+    touches the floor, or when it is empty. Rows are taken in chronological
+    order, not arrival order: inside a fall-back hour two rows can carry one
+    clock reading, and the earlier instant is the answer. The walk compares
+    instants, converted out of the installation's zone first, for exactly
+    that reason.
+    """
+    for when, soc in sorted(soc_rows, key=lambda row: _instant(row[0], zone)):
+        if soc <= min_soc_pct + _EPS:
+            return _instant(when, zone).astimezone(zone)
+    return None
+
+
+def _replay_window(night: date, zone: ZoneInfo) -> tuple[datetime, datetime]:
+    """The replayed projection's horizon: the night's 22:00 to its 07:00.
+
+    Both ends are instants, not clock readings: the window over a fall-back
+    night is ten real hours and the window over a spring-forward night is
+    eight, because the walk runs on real time.
+    """
+    previous = night - timedelta(days=1)
+    start = datetime(previous.year, previous.month, previous.day, 22, 0, tzinfo=zone)
+    end = datetime(night.year, night.month, night.day, 7, 0, tzinfo=zone)
+    return _instant(start, zone), _instant(end, zone)
+
+
+def replay_nights(
+    rows: Sequence[tuple[datetime, float | None]],
+    soc_rows: Sequence[tuple[datetime, float]],
+    zone: ZoneInfo,
+    usable_ah: float,
+    min_soc_pct: float,
+    efficiency: float,
+    charge_limit_w: float,
+    discharge_limit_w: float,
+) -> list[NightReplay]:
+    """Replay every eligible night.
+
+    A night is eligible when it answers at least half of its own walked
+    steps, when it is past the first seven nights of the record, and when
+    its typical curve can be built from the seven nights before it. The
+    first seven nights are never replayed: the planner would not have had
+    its seven-night window yet, and a replay without that history grades
+    the planner on a curve it could not have drawn at the time. A night
+    whose SoC record is empty is not replayed either, because there is no
+    battery to project and nothing to compare the projection with.
+
+    The projection runs from the night's local 22:00 to its 07:00 the next
+    morning, on a median of the curves before it with the night's own load
+    held out. Solar enters as nothing, not as a stand-in forecast: this
+    call's seam carries load rows and state-of-charge rows only, archived
+    forecasts do not exist, and a replay handed a sun of any kind would be
+    graded against light the planner at 22:00 was never given.
+
+    Silence discipline on the SoC side: a hole in the record is silence,
+    never a slow night. A crossing is reported only when the walk step
+    before the reach answered and still sat above the floor, which is the
+    only way the record witnesses the floor being crossed; a reach that
+    opens straight out of a hole could have happened anywhere inside it,
+    so the night carries None. The energy side compares the readings that
+    exist, first against last, so a hole makes that comparison thinner but
+    never fills a gap with zeros.
+    """
+    if usable_ah <= 0 or efficiency <= 0 or min_soc_pct >= 100.0:
+        return []
+    per_point = usable_ah * NOMINAL_BUS_V / (100.0 - min_soc_pct)
+
+    # Every row names its night before its values are filtered, so a silent
+    # night still holds its place in the record. A night is counted once per
+    # five-minute step it answers, the same measure the curve window uses.
+    seen: set[date] = set()
+    answered: dict[date, set[datetime]] = {}
+    for when, value in rows:
+        instant = _instant(when, zone)
+        night = _night_of(instant, zone)
+        seen.add(night)
+        if value is not None:
+            answered.setdefault(night, set()).add(_floor_step(instant))
+
+    ordered = sorted(seen)
+    replays: list[NightReplay] = []
+    for index, night in enumerate(ordered):
+        if index < NIGHTS:
+            continue
+        if len(answered.get(night, ())) * 2 < _night_step_count(night, zone):
+            continue
+        previous = night - timedelta(days=1)
+        midnight_noon = datetime(previous.year, previous.month, previous.day, 12, 0, tzinfo=zone)
+        cut = _instant(midnight_noon, zone)
+        pre = [row for row in rows if _instant(row[0], zone) < cut]
+        curves = night_curves(pre, zone)
+        if not curves:
+            continue
+        start, end = _replay_window(night, zone)
+        # The battery state at the boundary must come from a reading at or
+        # before it: a later reading is information the 22:00 planner was
+        # never given, and starting from it would violate causality.
+        pre_boundary = sorted(
+            ((when, soc) for when, soc in soc_rows if _instant(when, zone) <= start),
+            key=lambda row: _instant(row[0], zone),
+        )
+        if not pre_boundary:
+            continue
+        starting_soc = pre_boundary[-1][1]
+        window = sorted(
+            ((when, soc) for when, soc in soc_rows if start <= _instant(when, zone) <= end),
+            key=lambda row: _instant(row[0], zone),
+        )
+        if not window:
+            continue
+        # The projection starts from the SoC the 22:00 planner was handed: the
+        # last reading at or before the boundary, not the first reading after
+        # it (which would borrow a future answer).
+        result = simulate(
+            starting_soc,
+            usable_ah,
+            min_soc_pct,
+            efficiency,
+            charge_limit_w,
+            discharge_limit_w,
+            median_curve(curves),
+            None,
+            start,
+            end,
+            zone,
+        )
+        reading: dict[datetime, float] = {}
+        for when, soc in window:
+            reading.setdefault(_instant(when, zone), soc)
+        crossing = actual_crossing(window, min_soc_pct, zone)
+        actual: datetime | None = None
+        if crossing is not None:
+            # A crossing at the window's own start is witnessed by the
+            # boundary reading itself: the recorded SoC at that instant IS
+            # the evidence. The witness-above-floor check only guards
+            # crossings that happen after the window opens, where a hole
+            # in the record could have hidden the real reach.
+            if crossing == start:
+                actual = crossing
+            else:
+                witness = reading.get(crossing.astimezone(UTC) - _STEP)
+                if witness is not None and witness > min_soc_pct + _EPS:
+                    actual = crossing
+        values = [point[1] for point in result.trajectory]
+        projected_draw = sum(max(0.0, a - b) for a, b in pairwise(values))
+        actual_draw = starting_soc - window[-1][1]
+        replays.append(
+            NightReplay(
+                night=night,
+                projected_crossing=result.reserve_crossing,
+                actual_crossing=actual,
+                wh_error=(projected_draw - actual_draw) * per_point,
+            )
+        )
+    return replays
+
+
+def crossing_errors(replays: Sequence[NightReplay]) -> list[timedelta]:
+    """Signed per-night crossing errors (projected minus actual).
+
+    Only the nights where both crossings exist are reported. The two sides
+    are subtracted as instants, converted out of the zone first: two clock
+    readings inside a fall-back hour are not one clock hour apart, and
+    same-zone clock would hide that. A night with only one side is censored
+    data, not a zero error: nights that never reach the floor inside the
+    horizon, and nights whose SoC record cannot confirm the reach,
+    contribute nothing.
+    """
+    errors: list[timedelta] = []
+    for night in replays:
+        if night.projected_crossing is not None and night.actual_crossing is not None:
+            projected = night.projected_crossing.astimezone(UTC)
+            actual = night.actual_crossing.astimezone(UTC)
+            errors.append(projected - actual)
+    return errors
+
+
+def wh_errors(replays: Sequence[NightReplay]) -> list[float]:
+    """Signed per-night energy errors for the nights where both sides exist.
+
+    A None is not a measured error of zero: it says the night had no actual
+    SoC to compare with, and it contributes nothing to the list.
+    """
+    errors: list[float] = []
+    for replay in replays:
+        if replay.wh_error is not None:
+            errors.append(replay.wh_error)
+    return errors
