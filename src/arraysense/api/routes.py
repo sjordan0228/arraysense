@@ -1251,6 +1251,17 @@ def overnight_plan(
             f"Only {nights} of history answered, and a typical night needs at least "
             f"{overnight.MIN_USABLE_NIGHTS}."
         )
+    if soc_now is None:
+        guidance.append(
+            "No battery state of charge has been recorded: check the collector "
+            "and the BMS connection, and the planner will have something to "
+            "project from."
+        )
+    elif stale:
+        guidance.append(
+            f"The last state-of-charge reading is over {_SOC_STALE_MINUTES:.0f} "
+            "minutes old: the collector may have gone quiet."
+        )
 
     scenarios: dict[str, Any] = {}
     for name in ("typical", "essential", "scheduled"):
