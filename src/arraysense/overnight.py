@@ -488,7 +488,6 @@ def simulate(
     # floor is 90 points of 53.33 Wh each. The floor is where usable capacity
     # ends, which is what the setting says it is.
     per_point = usable_ah * NOMINAL_BUS_V / (100.0 - min_soc_pct)
-    step_hours = STEP_SECONDS / 3600.0
 
     steps: list[tuple[datetime, float]] = []
     step_start = _floor_step(start)
@@ -507,17 +506,18 @@ def simulate(
     # battery is already at reserve as the plan begins, and the household needs
     # the grid from the first second of it. Only something has to need it.
     crossing: datetime | None = None
-    horizon_first = steps[0][0] if steps else start
+    horizon_first = start
     schedule_draws = any(
         min(finish.astimezone(UTC), window_end.astimezone(UTC))
         > max(horizon_first.astimezone(UTC), window_start.astimezone(UTC))
-        for window_start, window_end, _watts in scheduled_windows
+        for window_start, window_end, watts in scheduled_windows
+        if watts > 0
     )
     if soc <= min_soc_pct + _EPS and (any(value > _EPS for value in reads) or schedule_draws):
         crossing = start.astimezone(zone)
     import_start: datetime | None = None
 
-    for index, (instant, weight) in enumerate(steps):
+    for index, (instant, _weight) in enumerate(steps):
         # The step's projected span: the first step begins at the projection
         # start (which may sit mid-step), every span ends at the horizon at the
         # latest. Everything below - house rate, scheduled overlap, limits -
