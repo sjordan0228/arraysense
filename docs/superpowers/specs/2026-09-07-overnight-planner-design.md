@@ -90,10 +90,11 @@ soc_{t+dt}    = soc_t − (discharge_t − charge_t) × dt / (3600 × usable_cap
    the schedule covers, and the simulation charges a step when that step's own instant falls
    inside one. A run whose clock hours sit inside a fall-back hour therefore pays for the
    seconds it actually runs and not for both passes through the repeated hour, and a run
-   over a spring-forward gap steps over the hour that never happened. Each window also
-   carries its exact overlap seconds (a run that starts mid-step covers only the part of
-   that step it really runs through), and a step is charged `watts * overlap_s / step_s`,
-   so a one-hour scheduled run costs exactly one hour of energy however the grid falls.
+   over a spring-forward gap steps over the hour that never happened. `scheduled_windows`
+   returns the schedule's real instants as one window; the simulation prices each step by
+   the seconds its own projected span overlaps that window (`watts * overlap_s / 3600`,
+   summed as energy), so a one-hour scheduled run costs exactly one hour of energy however
+   the grid falls, and a schedule is never charged twice inside a fall-back hour.
    **Double-count rule**:
    when Emporia history shows that circuit already drawing during the scheduled window on
    the baseline nights, the baseline's overlapping contribution is stated in the result

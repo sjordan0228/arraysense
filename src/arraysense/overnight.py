@@ -203,7 +203,12 @@ def night_curves(
             continue
         passes: dict[int, list[float]] = {}
         for bucket_start in sorted(bucket):
-            passes.setdefault(_clock_key(bucket_start, zone), []).extend(bucket[bucket_start])
+            samples = bucket[bucket_start]
+            # The bucket's own mean first: a fall-back bucket holding many
+            # readings must not outweigh the other pass just by count.
+            passes.setdefault(_clock_key(bucket_start, zone), []).append(
+                sum(samples) / len(samples)
+            )
         # A repeated clock minute is averaged, not taken twice and not taken once.
         # The clock reading stands for both of the real passes it names, and their
         # mean is the value that spends the same energy across the two of them;
@@ -497,14 +502,17 @@ def simulate(
     reads = _carried_reads(keys, load_curve)
     added: list[float] = []
     for instant, _ in steps:
-        added_extra = 0.0
+        # The scheduled load is priced as energy: the seconds its window
+        # overlaps this step's *projected* span, times its watts. It is never
+        # re-weighted by the step's own projection fraction, which would
+        # discount a schedule twice when both it and the horizon clip the step.
+        projected_end = min(instant + _STEP, finish)
+        scheduled_wh = 0.0
         for window_start, window_end, watts in scheduled_windows:
-            overlap = (
-                min(instant + _STEP, window_end) - max(instant, window_start)
-            ).total_seconds()
+            overlap = (min(projected_end, window_end) - max(instant, window_start)).total_seconds()
             if overlap > 0:
-                added_extra += watts * overlap / STEP_SECONDS
-        added.append(added_extra)
+                scheduled_wh += watts * overlap / 3600.0
+        added.append(scheduled_wh)
 
     soc = min(max(soc_now_pct, min_soc_pct), 100.0)
     trajectory: list[tuple[datetime, float]] = [(steps[0][0].astimezone(zone), soc)]
@@ -518,27 +526,41 @@ def simulate(
     import_start: datetime | None = None
 
     for index, (instant, weight) in enumerate(steps):
-        load = reads[index] + added[index]
+        projected_h = step_hours * weight
+        load = reads[index]
         solar = 0.0 if solar_curve is None else solar_curve.get(keys[index], 0.0)
         needs = (load - solar) / efficiency
+        sched_wh = added[index]
         drawn = 0.0
         short = False
         if needs > _EPS:
-            wanted = min(needs, discharge_limit_w) * step_hours * weight
+            wanted = min(needs, discharge_limit_w) * projected_h + sched_wh
             available = (soc - min_soc_pct) * per_point
             if available > _EPS:
                 drawn = min(wanted, available)
-            short = needs - min(needs, discharge_limit_w) > _EPS or drawn + _EPS < wanted
+            short = wanted > drawn + _EPS or needs > discharge_limit_w + _EPS
             soc = max(min_soc_pct, soc - drawn / per_point)
         else:
-            surplus = min(-needs, charge_limit_w) * step_hours * weight
-            room = (100.0 - soc) * per_point
-            soc = min(100.0, soc + min(surplus, max(0.0, room)) / per_point)
-        boundary = instant + _STEP
+            surplus = min(-needs, charge_limit_w) * projected_h
+            deficit = sched_wh - surplus
+            if deficit > _EPS:
+                # A scheduled load bigger than the charging surplus drains the
+                # battery by the difference, and the shortfall beyond the
+                # reserve floor is what the grid covers.
+                available = (soc - min_soc_pct) * per_point
+                drawn = min(deficit, available) if available > _EPS else 0.0
+                soc = max(min_soc_pct, soc - drawn / per_point)
+                short = deficit > drawn + _EPS
+            else:
+                soc = min(
+                    100.0,
+                    soc + min(surplus - sched_wh, max(0.0, (100.0 - soc) * per_point)) / per_point,
+                )
+        boundary = min(instant + _STEP, finish)
         if short and import_start is None:
             import_start = instant.astimezone(zone)
         if crossing is None and drawn > _EPS and soc <= min_soc_pct + _EPS:
-            crossing = min(boundary, finish).astimezone(zone)
+            crossing = boundary.astimezone(zone)
         trajectory.append((boundary.astimezone(zone), soc))
 
     return PlanResult(

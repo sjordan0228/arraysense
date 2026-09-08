@@ -397,7 +397,11 @@ def test_a_projection_starts_and_stops_on_the_step_grid() -> None:
     result = sim(flat(120.0), start="2026-01-05T22:02", end="2026-01-06T08:02")
     assert len(result.trajectory) == 122
     assert result.trajectory[0][0] == at("2026-01-05T22:00")
-    assert result.trajectory[-1][0] == at("2026-01-06T08:05")
+    # The trajectory ends at the horizon, not at the step boundary after it:
+    # an owner asking about 08:02 gets a curve that stops at 08:02. The last
+    # step's energy is prorated by its covered seconds; its stamp is the
+    # horizon.
+    assert result.trajectory[-1][0] == at("2026-01-06T08:02")
     # A fifth of a step at each end and one hundred and twenty whole steps
     # between them: 120.0 step-equivalents at 10 Wh a step, not the 120.4 that
     # charging the whole first step would cost.
