@@ -63,17 +63,17 @@ def test_every_icon_reference_names_a_symbol_the_sprite_defines() -> None:
     )
 
 
-def test_the_nav_carries_seven_icons_and_inverter_is_the_one_text_only_entry() -> None:
-    # Seven of the eight entries name a symbol; Inverter deliberately does not,
+def test_the_nav_carries_eight_icons_and_inverter_is_the_one_text_only_entry() -> None:
+    # Eight of the nine entries name a symbol; Inverter deliberately does not,
     # because no glyph in the sprite names the box in the middle. That exclusion
     # is the design decision being pinned, not the count itself.
     common = (WEB / "common.js").read_text()
     nav = re.search(r"const NAV = \[(.*?)\];", common, re.S)
     assert nav is not None, "the NAV table is no longer one array"
     body = nav.group(1)
-    assert body.count("label:") == 8, "the nav should hold its eight entries"
+    assert body.count("label:") == 9, "the nav should hold its nine entries"
     iconed = re.findall(r"icon:\s*'(ph-[\w-]+)'", body)
-    assert len(iconed) == 7, f"expected seven iconed entries, got {iconed}"
+    assert len(iconed) == 8, f"expected eight iconed entries, got {iconed}"
     inverter = re.search(r"\{ key:\s*'inverter'[^}]*\}", body)
     assert inverter is not None, "the Inverter entry is missing"
     assert "icon:" not in inverter.group(0), "Inverter should stay text-only"

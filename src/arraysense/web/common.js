@@ -1130,6 +1130,7 @@ const NAV = [
   { key:'history', label:'History',     href:'/history',     icon:'ph-clock-counter-clockwise' },
   { key:'costs',   label:'Costs',       href:'/costs',       icon:'ph-currency-dollar' },
   { key:'efficiency', label:'Efficiency', href:'/efficiency', icon:'ph-gauge' },
+  { key:'overnight', label:'Overnight', href:'/overnight', icon:'ph-moon' },
   { key:'settings', label:'Settings',   href:'/settings',    icon:'ph-gear' },
 ];
 
