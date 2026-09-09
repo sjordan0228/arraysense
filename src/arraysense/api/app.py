@@ -47,6 +47,7 @@ PAGES = {
     # The charger gets a page rather than a card, because it is a thing an
     # owner acts on. Its nav entry appears only on an account that has one.
     "/charger": "charger.html",
+    "/overnight": "overnight.html",
 }
 
 # The code every page is built from — the palette, the formatters, the nav and
