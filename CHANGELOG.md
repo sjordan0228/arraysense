@@ -2,6 +2,47 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.3.0 — 7 September 2026
+
+The dashboard learns to ask whether the battery will last overnight, and the
+settings page carries the battery's own maintenance clock in its General tab.
+
+### Added
+
+- **An overnight battery planner.** The dashboard's new Overnight page projects
+  the battery from now to a chosen end time (default 07:00, configurable in
+  the registry as `overnight.end_hour`), under three scenarios the owner can
+  compare: typical overnight use (median of the last seven comparable nights),
+  essential loads (a manual watts allowance), and typical plus a scheduled
+  load (start, duration, watts). The projection walks real UTC instants in
+  five-minute steps, handles fall-back and spring-forward DST transitions,
+  and reports the reserve crossing as a p25–p75 range across the per-night
+  curves — censored nights open the window rather than fabricating precision.
+  A calibration drift gate refuses to project when the packs disagree too
+  much to trust (`elevated`/`alert`), and a `warning` widens the range by the
+  measured pack disagreement. The page renders the projections, the reserve
+  floor, the assumptions, and the guidance states.
+
+- **A replay validation harness.** For every eligible past night, the
+  projection is re-run using only prior-nights data and the night's own
+  recorded SoC, producing per-night crossing and energy errors. The harness
+  is the planner's own test: it measures the gap between what the planner
+  projected and what actually happened, using only information the planner
+  would have had at the time.
+
+- **A maintenance-timing log.** The rollup and retention passes each log one
+  INFO line naming every stage's duration and what it cost, so the next time
+  the event loop stalls the log names the suspect instead of the suspects
+  list.
+
+### Fixed
+
+- **The advisory strip fills its panel.** The "State of charge maybe
+  drifting" banner packed its text and Dismiss button at the strip's left
+  and stranded the panel's right half as dead space.
+- **A settings-page explainer that said what the masked inputs already say
+  by being masked was removed** — the About tab keeps the facts.
+
 ## 1.2.1 — 30 August 2026
 
 The battery library moves from this project's fork to upstream, which now

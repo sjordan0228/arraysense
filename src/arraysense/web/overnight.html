@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Overnight · Solar ArraySense</title>
+<!-- uPlot draws the projection against a time axis, so its script travels
+     with its stylesheet: a canvas drawn without the layout rules keeps its
+     raw device-pixel size and paints itself across the page behind
+     everything else, which is how the Efficiency chart once shipped. The
+     shared front end loads after both so the page's own rules come second
+     in the cascade. -->
+<link rel="stylesheet" href="/vendor/uPlot.min.css">
+<script src="/vendor/uPlot.iife.min.js"></script>
+<script src="/common.js"></script>
+<style>
+  .plan{display:flex;flex-direction:column;gap:14px;margin-bottom:12px}
+  .plan h2{margin:2px 0 0;font-size:18px;font-weight:300;letter-spacing:-.02em}
+  /* The three lines compared in one picture is the whole reason this is a
+     chart: the question is which night ends how far down, and the answer is
+     a comparison. Legend and axes come from uPlot's own labels. */
+  #planChartWrap{height:260px}
+  .chartlegend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--ink3);margin-top:6px}
+  .chartlegend i{display:inline-block;width:18px;height:2px;margin-right:5px;vertical-align:middle}
+  .scen td:first-child{font-weight:600;color:var(--ink2)}
+  .scen td{font-variant-numeric:tabular-nums}
+  .scen .why{color:var(--ink3);font-size:11px}
+  .badge{display:inline-block;font-size:10px;padding:2px 8px;border-radius:4px;
+    background:var(--tint);color:var(--ink3);margin-right:8px}
+  .badge.stale{background:var(--warn);color:var(--panel)}
+  .guidance{margin:8px 0;padding:8px 12px;border-left:3px solid var(--warn);
+    font-size:12px;color:var(--ink2)}
+  .guidance li{margin:3px 0}
+  .assumptions{font-size:11px;color:var(--ink3);line-height:1.7}
+  .assumptions li{margin:2px 0}
+</style>
+<link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
+<script>applyStoredAppearance();</script>
+</head>
+<body>
+<div class="sunglow"></div>
+<main>
+  <header>
+    <h1>Solar ArraySense</h1>
+    <div class="hright">
+      <div class="conn" id="conn"><span class="dot" style="background:var(--ink3)"></span>connecting…</div>
+      <button id="settingsBtn" class="iconbtn" title="Settings" aria-label="Settings"><svg class="ic" aria-hidden="true"><use href="#ph-gear"></use></svg></button>
+    </div>
+  </header>
+  <nav class="nav" id="nav" aria-label="Views"></nav>
+
+  <section class="p plan" id="planSec">
+    <h2>Overnight plan</h2>
+    <p id="planNote">Loading…</p>
+    <div class="guidance"><ul id="guidanceBox"></ul></div>
+    <div class="chart" id="planChartWrap" role="img"
+      aria-label="Projected battery state of charge through the night"></div>
+    <div class="chartlegend">
+      <span><i style="background:var(--amber)"></i>typical night</span>
+      <span><i style="background:var(--green)"></i>essential loads</span>
+      <span><i style="background:var(--red)"></i>with a scheduled load</span>
+      <span><i style="background:var(--ink3)"></i>reserve floor</span>
+    </div>
+    <table class="scen">
+      <thead><tr><td>Scenario</td><td>Ends at</td><td>Below reserve</td><td>Import from</td></tr></thead>
+      <tbody id="scenRows"></tbody>
+    </table>
+    <ul class="assumptions" id="assumptionsBox"></ul>
+  </section>
+</main>
+<script>
+drawNav('overnight');
+
+// >>> overnight-page
+// The page draws ranges and states, not points. The inputs support a window
+// (a spread across comparable nights, a drift band on the state of charge),
+// and a single timestamp printed over them would be the fabricated-precision
+// bug the issue names: the page shows both edges when there is a spread, and
+// says so when there is nothing to project on. The three scenario names are
+// the API's own keys so legend, rows and response read alike.
+
+// One row per scenario the response answered. An unanswered scenario is a
+// null and gets no row: a line and a number for a night nobody projected is
+// the same lie as a drawn zero for an unmeasured reading. The end SoC is the
+// curve's last point; when there is no curve the row carries its reason
+// rather than a number, because a missing reading is a dash, never a zero.
+function scenarioRows(data) {
+  const clock = (iso) => (typeof iso === 'string' ? iso.slice(11, 16) : '');
+  const scens = data.scenarios || {};
+  const out = [];
+  for (const name of ['typical', 'essential', 'scheduled']) {
+    const s = scens[name];
+    if (!s) continue;
+    const curve = s.trajectory || [];
+    const last = curve.length ? curve[curve.length - 1][1] : null;
+    const ends = last === null || !isFinite(last)
+      ? '<span class="why">' + esc(s.reason || 'no curve') + '</span>'
+      : last.toFixed(1) + '%';
+    const crossed = s.reserve_window && s.range_basis
+      ? clock(s.reserve_window[0]) + ' to ' + clock(s.reserve_window[1])
+      : clock(s.reserve_crossing);
+    out.push('<tr><td>' + esc(name) + '</td><td>' + ends + '</td><td>'
+      + esc(crossed) + '</td><td>' + esc(clock(s.import_start)) + '</td></tr>');
+  }
+  return out.join('');
+}
+
+// Guidance arrives as plain sentences and leaves as list items. Interpolated
+// raw, a sentence containing a tag would be markup the page never approved;
+// esc is why it can stay data.
+function guidanceList(data) {
+  return (data.guidance || []).map((g) => '<li>' + esc(g) + '</li>').join('');
+}
+
+// The chart is one picture of the night, not three. uPlot's time scale
+// counts seconds; every scenario keeps its own timestamps and a shared axis
+// fills from them, a null where a curve has none. The reserve line is the
+// floor itself, held at the response's min_soc_pct rather than an assumed
+// height, so the page and the planner can never disagree about where the
+// night ends.
+function drawPlan(data) {
+  const inputs = data.inputs || {};
+  const stale = inputs.stale === true;
+  const socNow = typeof inputs.soc_now_pct === 'number'
+    ? inputs.soc_now_pct.toFixed(1) + '% state of charge'
+    : 'no state of charge on record';
+  const note = document.getElementById('planNote');
+  note.innerHTML = (stale
+    ? '<span class="badge stale">SoC reading is stale</span>'
+    : '') + esc(socNow) + ', projected from the last readings';
+
+  const scens = data.scenarios || {};
+  const lines = ['typical', 'essential', 'scheduled'].filter((n) => scens[n]);
+  const stamps = new Set();
+  lines.forEach((n) => (scens[n].trajectory || [])
+    .forEach((p) => stamps.add(Date.parse(p[0]) / 1000)));
+  const xs = Array.from(stamps).sort((a, b) => a - b);
+  const valuesOf = (n) => {
+    const byStamp = new Map((scens[n].trajectory || [])
+      .map((p) => [Date.parse(p[0]) / 1000, p[1]]));
+    return xs.map((t) => (byStamp.has(t) ? byStamp.get(t) : null));
+  };
+  const reserve = typeof inputs.min_soc_pct === 'number'
+    ? inputs.min_soc_pct : null;
+
+  const series = [{label: 'x'}];
+  const columns = [xs];
+  // Each series carries its own column as data as well as riding in the
+  // chart-wide array, because it is the handle that lets a reader (here and
+  // in the seam test) see what height was actually drawn, series by series.
+  lines.forEach((n) => {
+    const column = valuesOf(n);
+    series.push({label: n, stroke: 'var(--ink2)', data: column});
+    columns.push(column);
+  });
+  if (reserve !== null) {
+    const floor = xs.map(() => reserve);
+    series.push({label: 'reserve', show: true, stroke: 'var(--ink3)',
+      width: 1, dash: () => true, points: {show: false}, data: floor});
+    columns.push(floor);
+  }
+
+  const wrap = document.getElementById('planChartWrap');
+  if (wrap && typeof uPlot !== 'undefined' && xs.length > 1) {
+    const plot = new uPlot({
+      width: wrap.clientWidth || 600,
+      height: 260,
+      scales: {x: {time: true}, y: {min: 0, max: 100}},
+      series: series,
+      data: columns,
+      axes: [
+        {values: (u, splits) => splits.map((t) =>
+          new Date(t * 1000).toLocaleTimeString(undefined,
+            {hour: '2-digit', minute: '2-digit'}))},
+        {size: 34, values: (u, splits) => splits.map((v) => v.toFixed(0) + '%')},
+      ],
+    }, wrap);
+    void plot;
+  }
+
+  document.getElementById('guidanceBox').innerHTML = guidanceList(data);
+  document.getElementById('assumptionsBox').innerHTML = (data.assumptions || [])
+    .map((a) => '<li>' + esc(a) + '</li>').join('');
+  document.getElementById('scenRows').innerHTML = scenarioRows(data);
+}
+// <<< overnight-page
+
+(async () => {
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const r = await fetch('/api/overnight?tz=' + encodeURIComponent(zone));
+    drawPlan(await r.json());
+  } catch (err) {
+    document.getElementById('planNote').innerHTML =
+      'The plan endpoint did not answer: ' + esc(String(err));
+  }
+})();
+</script>
+</body>
+</html>

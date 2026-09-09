@@ -318,10 +318,25 @@ def test_each_per_browser_choice_has_exactly_one_writer() -> None:
     # of truth, and the failure is the quiet kind: two controls showing
     # different answers for one browser, each of them certain.
     common = _web("common.js")
-    for key in ("THEME_KEY", "APPEARANCE_KEY"):
-        writes = common.count(f"localStorage.setItem({key}")
-        assert writes == 1, f"{key} is written from {writes} places in common.js, not one"
-    # And not from a page at all, under the constant's name or its own.
+    writes = common.count("localStorage.setItem(THEME_KEY")
+    assert writes == 1, f"THEME_KEY is written from {writes} places in common.js, not one"
+    # The look moved to a cookie and the rule holds one level lower: exactly
+    # one site writes document.cookie — the writeCookie helper — so the
+    # control's choice and the migration's copy can never be written in
+    # different shapes. Two calls go through that one writer, the Settings
+    # control and the migration, and a third would be a third source again.
+    # The read is deliberately not counted: parsing the pairs is one reader
+    # whoever calls it, and it is the writing that forks into disagreement.
+    builds = common.count("document.cookie =")
+    assert builds == 1, f"the cookie string is written at {builds} sites in common.js, not one"
+    callers = common.count("writeCookie(APPEARANCE_KEY")
+    assert callers == 2, (
+        f"writeCookie(APPEARANCE_KEY is called {callers} times: the control's "
+        "write and the migration are the two, and a missing one is a choice "
+        "that stops being persisted"
+    )
+    # And not from a page at all, under the constant's name, the cookie's own
+    # name, or the raw API either of them is written through.
     from arraysense.api.app import PAGES
 
     for name in PAGES.values():
@@ -329,6 +344,7 @@ def test_each_per_browser_choice_has_exactly_one_writer() -> None:
         for spelling in (
             "localStorage.setItem(THEME_KEY",
             "localStorage.setItem(APPEARANCE_KEY",
+            "document.cookie",
             "arraysense-theme",
             "arraysense-appearance",
         ):
@@ -363,6 +379,27 @@ def test_every_look_and_theme_a_control_can_offer_has_a_word_for_it() -> None:
     assert set(re.findall(r"'([a-z]+)'", order.group(1))) == set(
         _js_map_keys(common, "THEME_NAMES")
     )
+
+
+def test_the_server_look_table_and_the_browser_look_table_agree() -> None:
+    # The page route drops a page's link line on membership in the Python
+    # table, and the browser settles its look on membership in the JavaScript
+    # one of the same name. A look named in only half of them is answered the
+    # wrong way on every navigation — a browser kept on a sheet it asked to
+    # drop, or served no sheet when it asked for one — so the two tables are
+    # held to the same looks and to the same sheet per look.
+    from arraysense.api.app import APPEARANCE_SHEET
+
+    common = _web("common.js")
+    start = common.index("const APPEARANCE_SHEET = {")
+    body = common[start : common.index("};", start)]
+    browser = dict(re.findall(r"[{,]\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*('[^']*'|null)", body))
+    assert set(browser) == set(APPEARANCE_SHEET), (
+        "the page route and the browser disagree about which looks exist"
+    )
+    for look, sheet in APPEARANCE_SHEET.items():
+        want = "null" if sheet is None else f"'/{sheet}'"
+        assert browser[look] == want, f"{look} names {browser[look]} in common.js, not {want}"
 
 
 def test_the_theme_area_is_outside_the_form_that_is_redrawn() -> None:
