@@ -14,6 +14,7 @@ import itertools
 import re
 import sqlite3
 import threading
+import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1217,6 +1218,50 @@ def test_a_classic_cookie_removes_the_link_line_and_nothing_else(client: Any) ->
     )
 
 
+FAVICON_LINK = '<link rel="icon" type="image/svg+xml" href="/favicon.svg">'
+
+
+@pytest.mark.parametrize("filename", sorted(PAGES.values()))
+def test_every_page_declares_the_favicon_link(filename: str) -> None:
+    # Declaring an icon is what stops the browser asking for /favicon.ico on
+    # its own and logging a 404 on every page load. The app serves the file
+    # itself, so the fault this catches is a page that forgets to declare it,
+    # and a second icon line would undo the one-source rule the declaration
+    # exists to keep.
+    web = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web"
+    head = (web / filename).read_text().split("</head>", 1)[0]
+    assert FAVICON_LINK in head, f"{filename} carries no favicon link"
+    assert head.count('<link rel="icon"') == 1
+
+
+def test_the_favicon_is_served_as_an_svg(client: Any) -> None:
+    # The icon has to arrive as an SVG document under its own media type.
+    # Served as anything else the browser ignores the declaration and falls
+    # back to asking for /favicon.ico, which is the 404 the declaration exists
+    # to prevent. The parse is what says these bytes are a document rather than
+    # something that happens to start with the right four characters.
+    r = client.get("/favicon.svg")
+    assert r.status_code == 200
+    assert r.headers["content-type"].split(";")[0] == "image/svg+xml"
+    assert "no-cache" in r.headers.get("cache-control", "")
+    assert ET.fromstring(r.content).tag.endswith("svg")
+
+
+@pytest.mark.parametrize("route", sorted(PAGES))
+@pytest.mark.parametrize("cookie", [None, "classic"])
+def test_the_favicon_link_survives_the_appearance_transform(
+    client: Any, route: str, cookie: str | None
+) -> None:
+    # The transform drops the appearance-sheet line when the cookie names a
+    # look with no sheet. The icon is page markup rather than part of that
+    # transform, so every page carries it exactly once whichever cookie asked
+    # for the page - including the Classic one the transform acts on.
+    cookies = {} if cookie is None else {"arraysense-appearance": cookie}
+    r = client.get(route, cookies=cookies)
+    assert r.status_code == 200
+    assert r.text.count(FAVICON_LINK) == 1
+
+
 def test_page_responses_vary_on_the_cookie_and_assets_do_not_need_to(client: Any) -> None:
     # The handler answers differently for different cookies, and Vary writes
     # that promise down for any cache that ever sits in front of the service.
@@ -1224,7 +1269,12 @@ def test_page_responses_vary_on_the_cookie_and_assets_do_not_need_to(client: Any
     # so they carry no such promise and no reason to key on a cookie.
     for route in sorted(PAGES):
         assert client.get(route).headers["vary"] == "Cookie", route
-    for asset in (f"/{SHARED_SCRIPT}", *(f"/{sheet}" for sheet in THEME_SHEETS), "/uPlot.LICENSE"):
+    for asset in (
+        f"/{SHARED_SCRIPT}",
+        "/favicon.svg",
+        *(f"/{sheet}" for sheet in THEME_SHEETS),
+        "/uPlot.LICENSE",
+    ):
         assert "vary" not in client.get(asset).headers, asset
 
 

@@ -54,6 +54,11 @@ PAGES = {
 # the chart factory. Served once so the pages cannot drift apart.
 SHARED_SCRIPT = "common.js"
 
+# The tab icon, named like the shared script so the page markup and the route
+# cannot drift apart. Declaring it is what stops the browser asking for
+# /favicon.ico on its own and logging a 404 on every page load.
+FAVICON = "favicon.svg"
+
 # The appearance sheets, one file per look, layered over the base styling common.js
 # injects. Classic is the absence of any of them, so this set holds only the
 # alternatives. Adding one needs no new routing code — a filename here is enough
@@ -179,9 +184,9 @@ def _file_route(path: Path, media_type: str) -> Callable[[], Awaitable[FileRespo
     has written yet, or one left out of a deployment, is a missing page and not
     a broken server.
 
-    The shared script and each theme sheet served here, and the pages served
-    by ``_page_route``, all go out ``no-cache``, which asks the browser to
-    check with the service on every load rather than forbidding it to store
+    The shared script, the icon and each theme sheet served here, and the pages
+    served by ``_page_route``, all go out ``no-cache``, which asks the browser
+    to check with the service on every load rather than forbidding it to store
     anything. Nothing here answers that check cheaply:
     Starlette's ``FileResponse`` sends an etag and a last-modified but reads
     neither ``If-None-Match`` nor ``If-Modified-Since``, so the reply is always
@@ -320,7 +325,7 @@ def install_text_guard(app: FastAPI) -> None:
 
 
 def mount_pages(app: FastAPI) -> None:
-    """Attach the pages, shared script, theme sheets and vendored files to an app.
+    """Attach the pages, shared script, icon, theme sheets and vendored files to an app.
 
     Split from create_app so first-run setup mode serves the same pages by
     the same routes and the same renderers: a second page-mounting loop would
@@ -334,6 +339,10 @@ def mount_pages(app: FastAPI) -> None:
 
     app.get(f"/{SHARED_SCRIPT}", include_in_schema=False, name=SHARED_SCRIPT)(
         _file_route(web / SHARED_SCRIPT, "text/javascript")
+    )
+
+    app.get(f"/{FAVICON}", include_in_schema=False, name=FAVICON)(
+        _file_route(web / FAVICON, "image/svg+xml")
     )
 
     for sheet in THEME_SHEETS:
