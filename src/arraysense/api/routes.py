@@ -928,6 +928,48 @@ async def capabilities(request: Request) -> dict[str, Any]:
     return {"devices": devices}
 
 
+@router.get("/charge")
+async def charge(request: Request) -> dict[str, Any]:
+    """The inverter's AC-charge configuration, read from the device.
+
+    Read-only. An installation whose driver does not report charge
+    configuration answers 404 with that reason: an empty shape would read
+    as "nothing is configured", which is a different claim.
+    """
+    reader = getattr(request.app.state.service.source, "read_charge_config", None)
+    if reader is None:
+        raise HTTPException(
+            status_code=404,
+            detail="this installation's driver does not report charge configuration",
+        )
+    config = await reader()
+    return {
+        "ac_charge_enabled": config.ac_charge_enabled,
+        "power_w": config.power_w,
+        "stop_soc_pct": config.stop_soc_pct,
+        "windows": [
+            {
+                "start_hour": window.start_hour,
+                "start_minute": window.start_minute,
+                "end_hour": window.end_hour,
+                "end_minute": window.end_minute,
+                "is_set": window.is_set,
+            }
+            for window in config.windows
+        ],
+        "schedule_type": config.schedule_type,
+        "start_soc_pct": config.start_soc_pct,
+        "window_end_soc_pct": config.window_end_soc_pct,
+        "start_voltage_v": config.start_voltage_v,
+        "stop_voltage_v": config.stop_voltage_v,
+        "quick_charge_remaining_s": config.quick_charge_remaining_s,
+        # String keys, because a JSON object has no integer ones and the
+        # confirmation step needs the raw registers to arrive whole.
+        "registers": {str(address): value for address, value in config.registers.items()},
+        "read_at": config.read_at.isoformat(),
+    }
+
+
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:
     """Read every module's state of charge across one absorb window and its margins.
 

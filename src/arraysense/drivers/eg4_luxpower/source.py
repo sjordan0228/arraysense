@@ -59,6 +59,15 @@ from pylxpweb.transports.exceptions import TransportError, TransportResponseMism
 from pylxpweb.transports.factory import create_dongle_transport, create_serial_transport
 from pylxpweb.transports.modbus_serial import ModbusSerialTransport
 
+from arraysense.charge import (
+    AC_CHARGE_ENABLE_REGISTER,
+    AC_CHARGE_POWER_REGISTER,
+    AC_CHARGE_START_VOLTAGE_REGISTER,
+    AC_CHARGE_TYPE_REGISTER,
+    AC_CHARGE_WINDOW_START_REGISTER,
+    ChargeConfig,
+    decode_charge_config,
+)
 from arraysense.config import Config
 from arraysense.drivers.base import (
     Capabilities,
@@ -1338,6 +1347,24 @@ class _RegisterReader(Protocol):
         ...
 
 
+class _ChargeConfigReader(Protocol):
+    """The transport slice ``read_charge_config`` uses.
+
+    Kept off ``_Transport`` for the reason ``_RegisterReader`` gives: a
+    method on the shared protocol is demanded of every stand-in transport,
+    and the quick-charge countdown is a question a transport need not be
+    able to answer. Only the charge read casts down to this.
+    """
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        """Read a block of holding registers, keyed by register number."""
+        ...
+
+    async def read_quick_charge_remaining_seconds(self) -> int | None:
+        """Read the quick-charge countdown, or None when no quick charge runs."""
+        ...
+
+
 class Eg4LuxPowerSource:
     """An InverterSource backed by one of pylxpweb's local transports.
 
@@ -1815,6 +1842,40 @@ class Eg4LuxPowerSource:
                 readings={k: v for k, v in sample.readings.items() if k not in self._unreadable},
             )
         return sample
+
+    async def read_charge_config(self) -> ChargeConfig:
+        """Read the inverter's AC-charge configuration.
+
+        Reads only: this method exists so the dashboard can show what the
+        inverter holds, and so the register map can be checked against the
+        device's own display before any packet that writes is trusted.
+        """
+        reader = cast(_ChargeConfigReader, self._transport)
+        registers: dict[int, int] = {}
+        # Five blocks covering registers 21, 66-67, 68-73, 120 and 158-161.
+        # A block the device will not answer simply contributes fewer
+        # registers, and the decode turns an absent one into None rather
+        # than a claim that the setting is off.
+        for start, count in (
+            (AC_CHARGE_ENABLE_REGISTER, 1),
+            (AC_CHARGE_POWER_REGISTER, 2),
+            (AC_CHARGE_WINDOW_START_REGISTER, 6),
+            (AC_CHARGE_TYPE_REGISTER, 1),
+            (AC_CHARGE_START_VOLTAGE_REGISTER, 4),
+        ):
+            registers.update(await reader.read_parameters(start, count))
+        try:
+            remaining = await reader.read_quick_charge_remaining_seconds()
+        except (TransportError, TransportResponseMismatchError, AttributeError):
+            # A transport that cannot answer this one question — no method,
+            # or a read that failed — must not fail the whole configuration
+            # read with it. The answer joins the None-equals-unread family.
+            remaining = None
+        return decode_charge_config(
+            registers,
+            quick_charge_remaining_s=remaining,
+            read_at=datetime.now(tz=UTC),
+        )
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.

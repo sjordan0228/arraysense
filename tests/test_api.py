@@ -2745,6 +2745,15 @@ def test_capabilities_reports_the_detected_model_beside_the_configured_one(
     }
 
 
+def test_an_installation_without_charge_control_answers_404(client: Any) -> None:
+    # FakeSource carries no read_charge_config. The 404 names that reason:
+    # an empty charge shape would read as "nothing is configured", which is
+    # a different claim than "this installation's driver cannot tell you".
+    response = client.get("/api/charge")
+    assert response.status_code == 404
+    assert "does not report charge configuration" in response.json()["detail"]
+
+
 # --- which tariff band a moment fell in (#46) -----------------------------------
 #
 # The Power flow chart shades its background by band so grid import can be read

@@ -1,0 +1,208 @@
+"""test_charge.py — reading the inverter's AC-charge configuration.
+
+No hardware and no serial port: the decode is driven with literal register
+maps, and the driver method with an injected fake transport. That is the
+point of the last two tests — a read path that also wrote registers would
+undo every rule about confirming the register map against this installation's
+own inverter before anything ships that changes it.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+
+import pytest
+
+from arraysense.charge import (
+    ChargeConfig,
+    ChargeWindow,
+    decode_charge_config,
+    unpack_time,
+)
+from arraysense.config import Config
+from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource
+
+READ_AT = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+
+def _packed(hour: int, minute: int) -> int:
+    """One window register: hour in the low byte, minute in the high one."""
+    return (hour & 0xFF) | ((minute & 0xFF) << 8)
+
+
+def _decode(registers: dict[int, int], quick: int | None = None) -> ChargeConfig:
+    return decode_charge_config(registers, quick_charge_remaining_s=quick, read_at=READ_AT)
+
+
+# A fully configured unit: every register the read asks for, answered.
+_FULL: dict[int, int] = {
+    21: 0x0080,  # bit 7: AC charge enabled
+    66: 12,  # 12 x 100 W
+    67: 95,  # stop charging at 95 %
+    68: _packed(2, 30),
+    69: _packed(4, 0),
+    70: 0,
+    71: 0,
+    72: _packed(13, 15),
+    73: _packed(14, 45),
+    120: 4,  # Time + SOC/Volt
+    158: 460,  # 46.0 V
+    159: 520,  # 52.0 V
+    160: 20,
+    161: 90,
+}
+
+
+def test_a_configured_ac_charge_decodes_from_its_registers() -> None:
+    config = _decode(_FULL, quick=600)
+    assert config.ac_charge_enabled is True
+    assert config.power_w == 1200
+    assert config.stop_soc_pct == 95
+    assert config.windows == (
+        ChargeWindow(2, 30, 4, 0),
+        ChargeWindow(0, 0, 0, 0),
+        ChargeWindow(13, 15, 14, 45),
+    )
+    assert config.windows[1].is_set is False
+    assert config.schedule_type == "time_and_soc_voltage"
+    assert config.start_voltage_v == pytest.approx(46.0)
+    assert config.stop_voltage_v == pytest.approx(52.0)
+    assert config.start_soc_pct == 20
+    assert config.window_end_soc_pct == 90
+    assert config.quick_charge_remaining_s == 600
+    # The raw answer comes back with the decode, so the confirmation step can
+    # compare what the device said against its own display.
+    assert config.registers == _FULL
+
+
+def test_the_power_command_is_in_hundred_watt_units() -> None:
+    assert _decode({66: 1}).power_w == 100
+    assert _decode({66: 150}).power_w == 15000
+
+
+def test_a_stop_soc_of_101_is_kept_rather_than_translated() -> None:
+    # 101 is the device's own "never stop" command, not a 101 percent
+    # target. Whether to label it "never" is the caller's decision.
+    assert _decode({67: 101}).stop_soc_pct == 101
+
+
+def test_a_window_decodes_hour_and_minute_from_the_packed_pair() -> None:
+    assert unpack_time(0x0A08) == (8, 10)
+
+
+def test_an_all_zero_window_reads_as_not_set() -> None:
+    assert ChargeWindow(0, 0, 0, 0).is_set is False
+    assert ChargeWindow(8, 10, 9, 30).is_set is True
+
+
+def test_an_unnamed_schedule_type_decodes_as_unknown() -> None:
+    # 7 in the field is a mode the register map does not name; the docs say
+    # the firmware may support modes the EG4 web UI never exposes.
+    assert _decode({120: 0x0E}).schedule_type == "unknown"
+    assert _decode({}).schedule_type == "unknown"
+
+
+def test_a_register_that_was_not_read_decodes_as_unknown_not_as_off() -> None:
+    # A missing register must not claim the feature is off or unconfigured;
+    # only a read that answered says anything about what the device holds.
+    config = _decode({})
+    assert config == ChargeConfig(
+        ac_charge_enabled=None,
+        power_w=None,
+        stop_soc_pct=None,
+        windows=(),
+        schedule_type="unknown",
+        start_soc_pct=None,
+        window_end_soc_pct=None,
+        start_voltage_v=None,
+        stop_voltage_v=None,
+        quick_charge_remaining_s=None,
+        registers={},
+        read_at=READ_AT,
+    )
+    assert config.ac_charge_enabled is None
+    assert config.registers == {}
+    assert config.windows == ()
+
+
+def test_a_half_read_schedule_does_not_decode_as_a_schedule() -> None:
+    # Registers 68-72 arrived and 73 did not. Three pairs are one schedule;
+    # a partial one would read as a schedule with a hole in it.
+    config = _decode(
+        {
+            68: _packed(2, 30),
+            69: _packed(4, 0),
+            70: 0,
+            71: 0,
+            72: _packed(13, 15),
+        }
+    )
+    assert config.windows == ()
+
+
+class _ChargeTransport:
+    """A stand-in transport that records register reads and refuses writes.
+
+    write_parameters raises rather than quietly succeeding, and records
+    anyway: this packet's guarantee is that nothing writes, and a silent
+    write mid-read is exactly what that guarantee forbids. It answers only
+    registers it was given, so a range the driver did not ask about stays
+    empty. It carries no read_quick_charge_remaining_seconds, which is the
+    shape of a transport that cannot answer that question.
+    """
+
+    def __init__(self, registers: dict[int, int]) -> None:
+        self.registers = registers
+        self.reads: list[tuple[int, int]] = []
+        self.writes: list[dict[int, int]] = []
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        self.reads.append((start_address, count))
+        return {
+            addr: self.registers[addr]
+            for addr in range(start_address, start_address + count)
+            if addr in self.registers
+        }
+
+    async def write_parameters(self, parameters: dict[int, int]) -> bool:
+        self.writes.append(parameters)
+        raise AssertionError("charge configuration is read here, never written")
+
+
+def _driver(transport: object) -> Eg4LuxPowerSource:
+    # The same injected-transport seam tests/test_eg4_luxpower_source.py
+    # uses: a driver with no hardware behind it.
+    return Eg4LuxPowerSource(
+        Config(
+            dongle_host="127.0.0.1",
+            dongle_serial="BA12345678",
+            inverter_serial="CE12345678",
+            database_path=":memory:",
+            poll_interval=11.0,
+        ),
+        transport=transport,  # type: ignore[arg-type]
+    )
+
+
+async def test_the_driver_reads_only_the_registers_it_needs() -> None:
+    transport = _ChargeTransport(_FULL)
+    config = await _driver(transport).read_charge_config()
+    # The exact question asked, not just an answer received: five blocks
+    # that together cover registers 21, 66-67, 68-73, 120 and 158-161.
+    assert transport.reads == [(21, 1), (66, 2), (68, 6), (120, 1), (158, 4)]
+    assert transport.writes == []
+    assert config.ac_charge_enabled is True
+    assert config.quick_charge_remaining_s is None
+
+
+async def test_a_transport_that_cannot_report_quick_charge_still_answers() -> None:
+    # The fake has no read_quick_charge_remaining_seconds at all. A
+    # transport that cannot answer one question must not fail the whole
+    # read over it.
+    transport = _ChargeTransport(_FULL)
+    config = await _driver(transport).read_charge_config()
+    assert config.quick_charge_remaining_s is None
+    assert config.ac_charge_enabled is True
+    assert config.power_w == 1200
+    assert len(config.windows) == 3
+    assert config.schedule_type == "time_and_soc_voltage"
