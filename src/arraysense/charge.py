@@ -1,18 +1,20 @@
-"""charge.py — decoding the inverter's AC-charge configuration.
+"""charge.py — the inverter's AC-charge configuration: how it reads, what a charge may cost.
 
 Pure: no transport, no I/O, no clock. The register map is transcribed from
 ``pylxpweb/constants/registers.py``, which is documented against an 18kPV
 and must be confirmed against this installation's own unit before anything
-writes. This module describes what the device answered and nothing else: a
-register nobody read decodes to None, never to a value that claims the
-setting is off.
+writes. In the decode half, this module says what the device answered and
+nothing else: a register nobody read decodes to None, never to a value that
+claims the setting is off. The planning half added below is the same kind of
+file — arithmetic over numbers a caller supplies, deciding how hard a charge
+may run and which periods it occupies. It asks the device nothing.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 AC_CHARGE_ENABLE_REGISTER = 21
 AC_CHARGE_ENABLE_BIT = 7
@@ -129,4 +131,155 @@ def decode_charge_config(
         # compare what the device said against its own display.
         registers=dict(registers),
         read_at=read_at,
+    )
+
+
+# The planning numbers. Defaults, not facts about the device: the site limit
+# and the house's draw arrive as arguments, and each of these can be replaced
+# by a caller that has read something better than a default.
+GRID_CHARGE_DEFAULT_W = 3000  # the shipped request, ~8 kW of a 12 kW site with a 5 kW house
+GRID_CHARGE_MIN_W = 1000  # below this a charge is not worth starting
+GRID_CHARGE_MAX_W = 12000  # the hard ceiling a request can never raise
+GRID_CHARGE_MARGIN_W = 1000  # headroom kept for the house to breathe
+GRID_CHARGE_TARGET_SOC_PCT = 100  # what a charge-to-full charges to
+
+
+@dataclass(frozen=True)
+class ChargeLimits:
+    """What the installation allows, and what the house is doing right now.
+
+    ``house_load_w`` is None when the load could not be read, which is not the
+    same fact as a quiet house. Read as a zero it would hand a charge the
+    whole of the site's remaining capacity on top of whatever the house was
+    already drawing, so an unread load is treated as a load nobody may ignore.
+    """
+
+    site_limit_w: int
+    house_load_w: int | None
+    max_power_w: int = GRID_CHARGE_MAX_W
+    min_power_w: int = GRID_CHARGE_MIN_W
+    margin_w: int = GRID_CHARGE_MARGIN_W
+
+
+@dataclass(frozen=True)
+class ChargeDecision:
+    """The charge power a request may have, and the words for why that number.
+
+    ``power_w`` None means do not start a charge, which is a different command
+    from a small one and needs to be told apart from it.
+
+    ``refused`` is not an error. It carries the difference between what was
+    asked and what the installation allows, so an audit line can say "asked
+    10000 W, allowed 6000 W" instead of recording a number nobody requested
+    with no hint of where it came from.
+    """
+
+    power_w: int | None
+    reason: str
+    refused: str | None = None
+
+
+def decide_charge_power(requested_w: int, limits: ChargeLimits) -> ChargeDecision:
+    """The charge power this installation may actually draw.
+
+    The site limit beats any configured ceiling, and what the house is drawing
+    right now plus a margin comes off it before a charge is considered. This
+    installation stores a 10 kW AC-charge command against a 12 kW site limit,
+    and its house routinely draws 5 kW, so a window opened on the stored value
+    would have pulled about 15 kW: the clamp is what makes that impossible
+    rather than merely unlikely.
+
+    The floor is compared against the already-clamped power and never used to
+    raise it. With a 1000 W floor and 500 W of headroom, lifting the charge to
+    the floor would command twice what the site had left. Two settings that can
+    be typed in either order will eventually disagree, and when they do the
+    lower bound wins, because exceeding a limit is the failure with a breaker
+    on the other end of it.
+    """
+    # A ceiling is something an owner or a future packet typed. The site limit
+    # is what the installation was built to carry, so it wins.
+    cap = min(limits.max_power_w, limits.site_limit_w)
+
+    if requested_w <= 0:
+        return ChargeDecision(None, f"asked {requested_w} W, which is not a charge to start")
+
+    house = limits.house_load_w
+    # An unread load is not a zero load. The decision still needs a number to
+    # run on, so it runs on the ceiling and says so: the owner is entitled to
+    # see which of the two the plan used.
+    headroom = cap if house is None else limits.site_limit_w - house - limits.margin_w
+
+    if headroom <= 0:
+        if house is None:
+            return ChargeDecision(None, f"the {cap} W ceiling leaves no headroom for a charge")
+        return ChargeDecision(
+            None,
+            f"the house is already drawing {house} W of the {limits.site_limit_w} W site limit",
+        )
+
+    power = min(requested_w, cap, headroom)
+    if power < limits.min_power_w:
+        return ChargeDecision(
+            None,
+            f"a charge under the {limits.min_power_w} W floor is not worth starting",
+            f"asked {requested_w} W against {headroom} W of headroom, under the "
+            f"{limits.min_power_w} W floor",
+        )
+
+    if power < requested_w:
+        # Whichever bound cut the request is named by its own number, so the
+        # reason reads as arithmetic rather than as a verdict.
+        basis = f"{power} W the site had left" if headroom < cap else f"{cap} W ceiling"
+        reason = f"asked {requested_w} W, held at the {basis}"
+        refused = f"asked {requested_w} W, allowed {power} W"
+    else:
+        reason = f"charging at the requested {requested_w} W"
+        refused = None
+        if house is None:
+            reason = f"{reason} under the {cap} W ceiling"
+    if house is None:
+        reason = f"house load was not available: {reason}"
+    return ChargeDecision(power, reason, refused)
+
+
+def pack_time(hour: int, minute: int) -> int:
+    """One packed window register: hour low byte, minute high byte.
+
+    The exact inverse of ``unpack_time``, so a window this module builds and a
+    window it decodes are the same two numbers read in opposite directions.
+    """
+    return (hour & 0xFF) | ((minute & 0xFF) << 8)
+
+
+def windows_for(start: datetime, end: datetime) -> tuple[ChargeWindow, ...]:
+    """The one or two periods that cover [start, end) in the inverter's single-day schedule.
+
+    The device holds one day's schedule with no date in it, so a run that
+    crosses midnight is written as two periods — 22:00 to 23:59, then 00:00 to
+    its end — instead of one period that only works if the register pair is
+    read as a range running backwards through midnight. Nobody has confirmed
+    that wrap-around on this hardware, and a charge that silently never opens
+    is worse than one written twice.
+
+    A span longer than a day raises rather than being truncated: the schedule
+    cannot express it, and a shortened window would under-deliver a charge the
+    owner asked for while looking like it was delivered.
+    """
+    # Daylight-saving offsets are the reason this asks for the offset and not
+    # just a tzinfo: a bare name says nothing about which day the two instants
+    # fall on, and the choice between one period and two is made on the day.
+    if any(instant.tzinfo is None or instant.utcoffset() is None for instant in (start, end)):
+        raise ValueError("a charge window needs timezone-aware instants")
+    if end <= start:
+        raise ValueError(f"a charge window must end after it starts, not at {end}")
+    if end - start > timedelta(days=1):
+        raise ValueError("the schedule holds one day, and this window is longer than that")
+    if start.date() == end.date():
+        return (ChargeWindow(start.hour, start.minute, end.hour, end.minute),)
+    return (
+        # 23:59 is the latest end the encoding carries. The minute it leaves
+        # out is the price of not relying on a midnight wrap nobody has tested;
+        # it is one minute, and it is on the side of charging less.
+        ChargeWindow(start.hour, start.minute, 23, 59),
+        ChargeWindow(0, 0, end.hour, end.minute),
     )
