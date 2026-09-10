@@ -1,23 +1,31 @@
-"""test_charge.py — reading the inverter's AC-charge configuration.
+"""test_charge.py — the inverter's AC-charge configuration and the charge plan.
 
 No hardware and no serial port: the decode is driven with literal register
 maps, and the driver method with an injected fake transport. That is the
-point of the last two tests — a read path that also wrote registers would
+point of the driver tests — a read path that also wrote registers would
 undo every rule about confirming the register map against this installation's
-own inverter before anything ships that changes it.
+own inverter before anything ships that changes it. The planning tests at the
+end are the same kind of thing: arithmetic over literal numbers, with no clock
+and no device, because the number they produce is the one a later packet
+writes into the inverter.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from arraysense.charge import (
+    GRID_CHARGE_DEFAULT_W,
     ChargeConfig,
+    ChargeLimits,
     ChargeWindow,
+    decide_charge_power,
     decode_charge_config,
+    pack_time,
     unpack_time,
+    windows_for,
 )
 from arraysense.config import Config
 from arraysense.drivers.eg4_luxpower.source import Eg4LuxPowerSource
@@ -206,3 +214,135 @@ async def test_a_transport_that_cannot_report_quick_charge_still_answers() -> No
     assert config.power_w == 1200
     assert len(config.windows) == 3
     assert config.schedule_type == "time_and_soc_voltage"
+
+
+# The planning half: how hard a charge may run and when its window opens. The
+# numbers are literals a caller would hand over, and none of them come from a
+# device. A stored 10 kW command beside a 5 kW house on a 12 kW site is what
+# these rules exist to make impossible.
+
+
+def test_pack_time_is_the_inverse_of_unpack_time() -> None:
+    for hour, minute in ((0, 0), (2, 30), (8, 10), (13, 15), (23, 59)):
+        assert unpack_time(pack_time(hour, minute)) == (hour, minute)
+    # Midnight is the all-zero register an unset window holds, and 0x0A08 is
+    # the 8:10 the decode above reads back.
+    assert pack_time(0, 0) == 0
+    assert pack_time(8, 10) == 0x0A08
+
+
+def test_a_window_inside_one_day_is_one_period() -> None:
+    start = datetime(2026, 8, 6, 2, 30, tzinfo=UTC)
+    end = datetime(2026, 8, 6, 4, 0, tzinfo=UTC)
+    assert windows_for(start, end) == (ChargeWindow(2, 30, 4, 0),)
+
+
+def test_a_window_crossing_midnight_is_two_periods() -> None:
+    start = datetime(2026, 8, 6, 22, 0, tzinfo=UTC)
+    end = datetime(2026, 8, 7, 6, 0, tzinfo=UTC)
+    # The schedule holds one day with no date in it, so a run over midnight is
+    # written as two periods instead of relying on a wrap-around that nobody
+    # has confirmed on this hardware.
+    assert windows_for(start, end) == (
+        ChargeWindow(22, 0, 23, 59),
+        ChargeWindow(0, 0, 6, 0),
+    )
+
+
+def test_a_window_longer_than_a_day_is_refused() -> None:
+    start = datetime(2026, 8, 6, 22, 0, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        windows_for(start, start + timedelta(hours=32))
+
+
+def test_a_reversed_or_empty_window_is_refused() -> None:
+    late = datetime(2026, 8, 6, 6, 0, tzinfo=UTC)
+    early = datetime(2026, 8, 6, 4, 0, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        windows_for(late, early)
+    with pytest.raises(ValueError):
+        windows_for(late, late)
+
+
+def test_a_window_is_refused_without_timezones() -> None:
+    # A naive instant has no day of its own to compare, which is how
+    # windows_for chooses between one period and two, so it raises rather than
+    # guessing a UTC day and silently picking the wrong half of it. The second
+    # call is the mixed pair: comparing the two would be a TypeError, and the
+    # missing timezone is the fact worth reporting.
+    naive_start = datetime(2026, 8, 6, 2, 30)
+    with pytest.raises(ValueError):
+        windows_for(naive_start, datetime(2026, 8, 6, 4, 0))
+    with pytest.raises(ValueError):
+        windows_for(naive_start, datetime(2026, 8, 6, 4, 0, tzinfo=UTC))
+
+
+def test_the_default_request_is_three_kilowatts() -> None:
+    assert GRID_CHARGE_DEFAULT_W == 3000
+    decision = decide_charge_power(GRID_CHARGE_DEFAULT_W, ChargeLimits(12000, 0))
+    assert decision.power_w == 3000
+    assert decision.refused is None
+
+
+def test_the_site_limit_caps_the_configured_ceiling() -> None:
+    # A 12000 W ceiling typed over an 8000 W site limit is an 8000 W ceiling:
+    # the site limit is the number with a breaker on the other end of it.
+    limits = ChargeLimits(site_limit_w=8000, house_load_w=0, margin_w=0)
+    decision = decide_charge_power(12000, limits)
+    assert decision.power_w == 8000
+    assert "12000" in decision.reason
+    assert "8000" in decision.reason
+    # With the 1000 W margin back the same quiet house leaves 7000 W. The
+    # margin comes off the site limit, never off the request.
+    assert decide_charge_power(12000, ChargeLimits(8000, 0)).power_w == 7000
+
+
+def test_the_house_load_and_the_margin_are_subtracted() -> None:
+    limits = ChargeLimits(site_limit_w=12000, house_load_w=5000, margin_w=1000)
+    decision = decide_charge_power(10000, limits)
+    # 12000 - 5000 - 1000 leaves 6000 W of headroom, and 10000 W was asked.
+    assert decision.power_w == 6000
+    assert "10000" in decision.reason
+    assert "6000" in decision.reason
+
+
+def test_a_house_already_at_the_limit_refuses_rather_than_trickling() -> None:
+    limits = ChargeLimits(site_limit_w=12000, house_load_w=11500, margin_w=1000)
+    decision = decide_charge_power(10000, limits)
+    assert decision.power_w is None
+    assert "11500" in decision.reason
+    assert "12000" in decision.reason
+
+
+def test_headroom_below_the_floor_refuses() -> None:
+    # 500 W of headroom is above zero and under the 1000 W floor. The floor
+    # refuses the charge; it never lifts it until it looks worthwhile, which
+    # would command more than the site had left.
+    limits = ChargeLimits(site_limit_w=12000, house_load_w=10500, margin_w=1000)
+    decision = decide_charge_power(10000, limits)
+    assert decision.power_w is None
+    assert decision.refused is not None
+    assert "500" in decision.refused
+    assert "1000" in decision.refused
+    assert "1000" in decision.reason
+
+
+def test_an_unreadable_house_load_falls_back_to_the_ceiling_and_says_so() -> None:
+    # An unread load is not a zero load: the decision runs on the ceiling and
+    # names it, so the owner can tell which number produced this charge.
+    unread = decide_charge_power(10000, ChargeLimits(site_limit_w=12000, house_load_w=None))
+    assert unread.power_w == 10000
+    assert "not available" in unread.reason
+    # The ceiling is still a ceiling. Over an 8000 W site the same request is
+    # held at 8000, not lifted to make the charge worth starting.
+    tight_limits = ChargeLimits(site_limit_w=8000, house_load_w=None)
+    tight = decide_charge_power(10000, tight_limits)
+    assert tight.power_w == 8000
+    assert tight.power_w is None or tight.power_w <= tight_limits.site_limit_w
+    assert "not available" in tight.reason
+
+
+def test_nothing_is_asked_for_nothing_is_refused_rather_than_started() -> None:
+    limits = ChargeLimits(site_limit_w=12000, house_load_w=0)
+    assert decide_charge_power(0, limits).power_w is None
+    assert decide_charge_power(-500, limits).power_w is None
