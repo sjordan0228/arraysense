@@ -2,6 +2,34 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.3.2 — 10 September 2026
+
+Nothing on screen changes. This release carries the first packet of the System
+Health work to production: the finding lifecycle model the later packets are
+built on. It has no caller yet, so no page, endpoint or collection behaves
+differently — the release exists so the published version matches the merged
+tree.
+
+### Added
+
+- **`arraysense.health`, the finding lifecycle model.** A finding is one record
+  per condition — a pack drifting, a string group underperforming, telemetry
+  gone quiet — that survives recurrence: a condition seen again updates the
+  record's counters instead of appending an event, and an event is written only
+  when the state actually changes. Three states exist: active, recovered, and
+  unassessable, where the readings needed to judge were missing. A missing
+  measurement never reads as a recovery. A finding's identity includes the
+  rule's version, so a rule whose meaning changes starts a new record rather
+  than redefining an old one, and an observation is refused rather than merged
+  into a record with a different identity, so one condition can never rewrite
+  another's history.
+
+  The module is pure: it is given the previous record, one observation and
+  their timestamps, and it answers what the record becomes. No store, no clock,
+  no inverter. Persistence, the rule families, a bounded background evaluator
+  and the System Health page follow in later releases before anything appears
+  on screen.
+
 ## 1.3.1 — 10 September 2026
 
 Every page declares its icon, so the browser stops asking for one of its own.
