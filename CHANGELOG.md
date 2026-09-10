@@ -2,6 +2,24 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.3.1 — 10 September 2026
+
+Every page declares its icon, so the browser stops asking for one of its own.
+The console loses its only error.
+
+### Fixed
+
+- **The `GET /favicon.ico` 404 on every page load.** No page declared an icon,
+  so the browser requested `/favicon.ico` by itself and the service answered
+  404 — one console error on every navigation of every page. All nine pages now
+  carry an identical
+  `<link rel="icon" type="image/svg+xml" href="/favicon.svg">` line, and a
+  project-drawn `favicon.svg` is served from its own route under the same
+  no-cache rule as the shared script, so the fallback request never fires. The
+  icon is drawn in the palette's accent, so the tab matches the dashboard rather
+  than the browser's default. Verified in a browser on the dev rig: `/overnight`
+  and `/` load with a clean console and issue no `/favicon.ico` request at all.
+
 ## 1.3.0 — 7 September 2026
 
 The dashboard learns to ask whether the battery will last overnight, and the
