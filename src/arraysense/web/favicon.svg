@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">
+<!-- Project artwork drawn for this app. Not a vendored upstream file, so it
+     carries no third-party licence notice. -->
+<rect x="1.75" y="3.75" width="12.5" height="8.5" rx="1.25" fill="none"
+      stroke="#cf7b26" stroke-width="1.5"/>
+<path d="M8 3.75v8.5M1.75 8h12.5" stroke="#cf7b26" stroke-width="1.5"/>
+</svg>
