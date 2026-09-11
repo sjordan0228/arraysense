@@ -57,6 +57,21 @@ from arraysense.calibration import (
     charge_completed_at,
     full_charge_windows,
 )
+from arraysense.charge import (
+    GRID_CHARGE_DEFAULT_W,
+    GRID_CHARGE_MAX_W,
+    ChargeConfig,
+    ChargeLimits,
+    ChargeWriteRefusedError,
+    decide_charge_power,
+)
+from arraysense.charge_override import (
+    ChargeOverride,
+    clear_override,
+    load_override,
+    override_is_active,
+    save_override,
+)
 from arraysense.config import Config, effective
 from arraysense.costs import (
     band_intervals,
@@ -110,11 +125,13 @@ from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
     CHARGE_CEILING_KEY,
     CHARGE_FLOOR_KEY,
+    CHARGE_OVERRIDE_KEY,
     CHARGE_OVERRIDE_MINUTES_KEY,
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
     HIGH_USAGE_WATTS_KEY,
+    INVERTER_LIMIT_KEY,
     PANELS_STRINGS_KEY,
     SETTING_LATITUDE,
     SETTING_LONGITUDE,
@@ -928,21 +945,8 @@ async def capabilities(request: Request) -> dict[str, Any]:
     return {"devices": devices}
 
 
-@router.get("/charge")
-async def charge(request: Request) -> dict[str, Any]:
-    """The inverter's AC-charge configuration, read from the device.
-
-    Read-only. An installation whose driver does not report charge
-    configuration answers 404 with that reason: an empty shape would read
-    as "nothing is configured", which is a different claim.
-    """
-    reader = getattr(request.app.state.service.source, "read_charge_config", None)
-    if reader is None:
-        raise HTTPException(
-            status_code=404,
-            detail="this installation's driver does not report charge configuration",
-        )
-    config = await reader()
+def _charge_config_json(config: ChargeConfig) -> dict[str, Any]:
+    """One charge configuration as the API reports it."""
     return {
         "ac_charge_enabled": config.ac_charge_enabled,
         "power_w": config.power_w,
@@ -968,6 +972,223 @@ async def charge(request: Request) -> dict[str, Any]:
         "registers": {str(address): value for address, value in config.registers.items()},
         "read_at": config.read_at.isoformat(),
     }
+
+
+def _charge_override_json(request: Request) -> dict[str, Any]:
+    """The stored charge record as the read endpoint reports it.
+
+    An unreadable record is reported with readable false rather than turning
+    the page into a 500 or drawn as no charge at all: a page has to be able
+    to say a charge may be running, and the damaged record is the only
+    description of how to undo it. Decoding is what raises; reading whether
+    one is stored is not.
+    """
+    settings = SettingsStore(request.app.state.store)
+    raw = settings.get(CHARGE_OVERRIDE_KEY)
+    recorded = isinstance(raw, str) and bool(raw.strip())
+    override: ChargeOverride | None = None
+    if recorded:
+        try:
+            override = load_override(settings)
+        except ValueError:
+            override = None
+    return {
+        "recorded": recorded,
+        "readable": override is not None,
+        "active": override_is_active(override, datetime.now(tz=UTC)),
+        "until": None if override is None else override.until.isoformat(),
+        "requested_w": None if override is None else override.requested_w,
+    }
+
+
+@router.get("/charge")
+async def charge(request: Request) -> dict[str, Any]:
+    """The inverter's AC-charge configuration, read from the device.
+
+    Read-only. An installation whose driver does not report charge
+    configuration answers 404 with that reason: an empty shape would read
+    as "nothing is configured", which is a different claim. The override
+    block says whether a charge this service started is running and when
+    its window closes, and it answers even when the stored record cannot
+    be decoded.
+    """
+    reader = getattr(request.app.state.service.source, "read_charge_config", None)
+    if reader is None:
+        raise HTTPException(
+            status_code=404,
+            detail="this installation's driver does not report charge configuration",
+        )
+    config = await reader()
+    body = _charge_config_json(config)
+    body["override"] = _charge_override_json(request)
+    return body
+
+
+class ChargeStartRequest(BaseModel):
+    """How hard to charge, and for how long."""
+
+    power_w: int = Field(default=GRID_CHARGE_DEFAULT_W, gt=0, le=GRID_CHARGE_MAX_W)
+    duration_min: int = Field(default=600, gt=0, le=1440)
+
+
+@router.post("/charge/start", dependencies=[Depends(_require_write)])
+async def charge_start(request: Request, body: ChargeStartRequest) -> dict[str, Any]:
+    """Start a bounded grid charge, keeping the record that makes it undoable.
+
+    The bound comes from the site limit and the house's current draw, not
+    from the request: what was asked for is held to what the installation
+    has left. The configuration the inverter held is recorded before the
+    write and the device is read back after it, because a charge whose undo
+    was never kept is a charge that cannot be stopped cleanly.
+    """
+    from pylxpweb.transports.exceptions import TransportError
+
+    source = request.app.state.service.source
+    reader = getattr(source, "read_charge_config", None)
+    starter = getattr(source, "start_grid_charge", None)
+    if reader is None or starter is None:
+        raise HTTPException(
+            status_code=404, detail="this installation's driver cannot start a grid charge"
+        )
+    settings = SettingsStore(request.app.state.store)
+    raw_limit = settings.get(INVERTER_LIMIT_KEY)
+    limit = raw_limit if isinstance(raw_limit, int) else 0
+    if limit <= 0:
+        # No site limit means no bound, and an unbounded charge is not a
+        # thing this endpoint starts on a guess: the limit is the only
+        # number that says what the installation was built to carry, and
+        # this installation has already outrun an unbounded charge once.
+        # The key is named in the detail because the fix is to set it.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "no site limit is configured, so a charge cannot be bounded; "
+                f"set {INVERTER_LIMIT_KEY} first"
+            ),
+        )
+    row = request.app.state.store.latest(["load_power_w"])
+    raw_load = row.get("load_power_w") if row is not None else None
+    # An unread load passes through as None rather than as an invented zero:
+    # the planning layer keeps a rule for the unknown precisely because a
+    # quiet-house guess hands a charge the whole site on top of whatever
+    # the house was already drawing.
+    load = int(raw_load) if isinstance(raw_load, (int, float)) else None
+    decision = decide_charge_power(
+        body.power_w, ChargeLimits(site_limit_w=limit, house_load_w=load)
+    )
+    if decision.power_w is None:
+        # The reason already carries the numbers, so it is passed through
+        # rather than rewritten here; the endpoint only says no.
+        raise HTTPException(status_code=409, detail=decision.reason)
+    try:
+        existing = load_override(settings)
+    except ValueError as exc:
+        # An unreadable record is refused rather than read as absence: it
+        # may be the only description of a charge that is running, and a
+        # second charge would overwrite the one thing that could undo the
+        # first. This is the reason load_override raises.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if existing is not None:
+        if override_is_active(existing, datetime.now(tz=UTC)):
+            raise HTTPException(
+                status_code=409, detail="a grid charge is already running; stop it first"
+            )
+        # The window has closed but the record stands: it is still the only
+        # way back from whatever the charge changed, so starting over it
+        # stays refused until a stop has written those registers back.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "the recorded charge's window has closed; stop it first, its record "
+                "is the only way to put the inverter back"
+            ),
+        )
+    try:
+        before = await reader()
+    except (TransportError, OSError) as exc:
+        # Without what the inverter held there is nothing to record and
+        # nothing to restore, so the charge stops here rather than writing
+        # registers with no undo. No record is written on this path.
+        raise HTTPException(
+            status_code=502,
+            detail=f"the charge configuration could not be read: {exc}",
+        ) from exc
+    now = datetime.now(tz=UTC)
+    until = now + timedelta(minutes=body.duration_min)
+    # The record is written before the inverter is touched. A write can
+    # fail half-done with some registers already changed, and this record —
+    # the configuration read above — is how a stop puts them back; a
+    # failure that cleared it instead would strand the change.
+    save_override(settings, ChargeOverride(saved=before, until=until, requested_w=body.power_w))
+    try:
+        change = await starter(power_w=decision.power_w, duration_min=body.duration_min, now=now)
+    except (ChargeWriteRefusedError, TransportError, OSError) as exc:
+        # The record is kept, not cleared and not replaced: the fault only
+        # says the transport did not take the write, and the driver's own
+        # contract is that some registers may already be changed, so the
+        # record is the description of how to undo what may have happened.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"the charge write failed: {exc}; the recorded configuration is kept, "
+                "so a stop can restore the inverter"
+            ),
+        ) from exc
+    # The driver read the registers back after the write, so its copy of
+    # what the inverter held is the authoritative undo; the record is
+    # rewritten from it, and it may differ from the pre-write read.
+    record = ChargeOverride(saved=change.saved, until=change.until, requested_w=body.power_w)
+    save_override(settings, record)
+    logger.info("grid charge started at %d W for %d min", decision.power_w, body.duration_min)
+    return {
+        "applied": _charge_config_json(change.applied),
+        "saved": _charge_config_json(change.saved),
+        "until": change.until.isoformat(),
+        "power_w": decision.power_w,
+        "requested_w": body.power_w,
+        "reason": decision.reason,
+    }
+
+
+@router.post("/charge/stop", dependencies=[Depends(_require_write)])
+async def charge_stop(request: Request) -> dict[str, Any]:
+    """Write the recorded configuration back, and forget it only once that worked.
+
+    The record is the answer to what the inverter held before the charge.
+    A restore that failed is exactly the moment it is still needed, so
+    failure keeps it and only a completed restore clears it.
+    """
+    from pylxpweb.transports.exceptions import TransportError
+
+    restorer = getattr(request.app.state.service.source, "restore_grid_charge", None)
+    if restorer is None:
+        raise HTTPException(
+            status_code=404, detail="this installation's driver cannot restore a grid charge"
+        )
+    settings = SettingsStore(request.app.state.store)
+    try:
+        override = load_override(settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if override is None:
+        raise HTTPException(status_code=409, detail="no grid charge is recorded")
+    try:
+        restored = await restorer(override.saved)
+    except (ChargeWriteRefusedError, TransportError, OSError) as exc:
+        # The record is kept. The fault only says the transport did not
+        # take the restore; a cleared record would leave whatever the
+        # inverter now holds with nothing left to write back, and another
+        # attempt would be impossible.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"the restore failed: {exc}; the recorded configuration is kept, "
+                "so the stop can be attempted again"
+            ),
+        ) from exc
+    clear_override(settings)
+    logger.info("grid charge stopped, the recorded configuration was restored")
+    return {"applied": _charge_config_json(restored), "restored": True}
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:

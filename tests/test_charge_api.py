@@ -1,0 +1,360 @@
+"""test_charge_api.py — the charge endpoints over a register map that can start.
+
+No hardware: the app stands on a temporary store and a fake source holding a
+register map, so every read-back is what the "device" reports after the write
+rather than what the API assumed going in. The fake carries the failure modes
+the endpoints have to survive — a refused write, a refused restore — because
+the refusal paths are the safety story here, not an afterthought.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from fastapi.testclient import TestClient
+
+from arraysense.api.app import create_app
+from arraysense.charge import (
+    ChargeConfig,
+    ChargeWriteRefusedError,
+    GridChargeChange,
+    decode_charge_config,
+    pack_time,
+)
+from arraysense.charge_override import load_override
+from arraysense.collector.service import CollectorService
+from arraysense.config import Config
+from arraysense.models import Sample
+from arraysense.settings import CHARGE_OVERRIDE_KEY, INVERTER_LIMIT_KEY, SettingsStore
+from arraysense.store.sqlite_store import SqliteStore
+from conftest import TEST_DEVICE
+
+T0 = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+
+# What the "inverter" holds before any charge: the enable bit of register 21
+# is clear, power sits at 1 kW, and one window is set. All nine write
+# addresses are present so a start reaches the wire instead of being refused
+# for want of an undo.
+ORIGINAL_REGISTERS = {
+    21: 0x00,
+    66: 10,
+    67: 0,
+    68: pack_time(4, 0),
+    69: pack_time(6, 0),
+    70: 0,
+    71: 0,
+    72: 0,
+    73: 0,
+    120: 0x02,
+    158: 460,
+    159: 540,
+    160: 0,
+    161: 100,
+}
+
+
+class ChargeSource:
+    """A register map that starts and restores a charge the way the driver does.
+
+    It records every start's arguments so a test can check the power that
+    reached it, and it takes the two faults the endpoints must survive. The
+    probe runs at the top of a start, while the caller can still be checked:
+    that is how a test sees what was already stored before the inverter was
+    touched.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_start: Exception | None = None,
+        fail_restore: Exception | None = None,
+        probe: Callable[[], None] | None = None,
+    ) -> None:
+        self.registers = dict(ORIGINAL_REGISTERS)
+        self.start_calls: list[dict[str, Any]] = []
+        self.restore_calls: list[ChargeConfig] = []
+        self.fail_start = fail_start
+        self.fail_restore = fail_restore
+        self.probe = probe
+
+    async def read_charge_config(self) -> ChargeConfig:
+        return decode_charge_config(
+            self.registers,
+            quick_charge_remaining_s=None,
+            read_at=datetime.now(tz=UTC),
+        )
+
+    async def start_grid_charge(
+        self,
+        *,
+        power_w: int,
+        duration_min: int,
+        target_soc_pct: int = 100,
+        now: datetime | None = None,
+    ) -> GridChargeChange:
+        if self.probe is not None:
+            self.probe()
+        self.start_calls.append({"power_w": power_w, "duration_min": duration_min})
+        saved = await self.read_charge_config()
+        start = now if now is not None else datetime.now(tz=UTC)
+        until = start + timedelta(minutes=duration_min)
+        if self.fail_start is not None:
+            # A refused write is not a clean one: some registers may already
+            # be changed by the time the transport answers, which is why the
+            # record has to exist before the write rather than after it.
+            self.registers[21] |= 1 << 7
+            self.registers[66] = power_w // 100
+            raise self.fail_start
+        self.registers[21] |= 1 << 7
+        self.registers[66] = power_w // 100
+        self.registers[67] = target_soc_pct
+        self.registers[68] = pack_time(start.hour, start.minute)
+        self.registers[69] = pack_time(until.hour, until.minute)
+        applied = await self.read_charge_config()
+        return GridChargeChange(saved=saved, applied=applied, until=until)
+
+    async def restore_grid_charge(self, saved: ChargeConfig) -> ChargeConfig:
+        self.restore_calls.append(saved)
+        if self.fail_restore is not None:
+            raise self.fail_restore
+        self.registers = dict(saved.registers)
+        return await self.read_charge_config()
+
+
+class PlainSource:
+    """An installation whose driver has none of the charge methods."""
+
+
+@contextmanager
+def _rig(
+    tmp_path: Path,
+    source: Any,
+    *,
+    load_w: float | None = 5000.0,
+    limit: int | None = 12000,
+) -> Iterator[Any]:
+    """The whole app over a temporary store, one seeded load row and a limit.
+
+    The seeded house draws 5000 W against a 12000 W site limit, the shape the
+    planning layer was written against. Tests that need a different house or
+    no limit at all say so here rather than editing the store afterwards.
+    """
+    store = SqliteStore(str(tmp_path / "charge.db"), device=TEST_DEVICE)
+    if load_w is not None:
+        store.append(Sample(timestamp=T0, readings={"load_power_w": load_w}))
+    config = Config(
+        dongle_host="h",
+        dongle_serial="s",
+        inverter_serial="i",
+        database_path=str(tmp_path / "charge.db"),
+        poll_interval=10.0,
+    )
+    service = CollectorService(source=source, store=store, interval=3600)
+    app = create_app(store=store, service=service, config=config)
+    settings = SettingsStore(store)
+    if limit is not None:
+        settings.set(INVERTER_LIMIT_KEY, limit)
+    try:
+        with TestClient(app) as client:
+            yield client, source, store, settings
+    finally:
+        store.close()
+
+
+# --- refusals before anything reaches the inverter -------------------------------
+
+
+def test_start_refuses_when_the_driver_cannot_charge(tmp_path: Path) -> None:
+    with _rig(tmp_path, PlainSource()) as (client, _src, _store, settings):
+        start = client.post("/api/charge/start", json={})
+        assert start.status_code == 404
+        assert "cannot start a grid charge" in start.json()["detail"]
+        stop = client.post("/api/charge/stop")
+        assert stop.status_code == 404
+        assert "cannot restore a grid charge" in stop.json()["detail"]
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+
+
+def test_start_refuses_when_no_site_limit_is_configured(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source, limit=None) as (client, _src, _store, settings):
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 409
+        assert "emporia.inverter_limit_w" in response.json()["detail"]
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+        assert source.start_calls == []
+
+
+def test_start_refuses_when_the_house_leaves_no_headroom(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source, load_w=11500.0) as (client, _src, _store, _settings):
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "11500" in detail
+        assert "12000" in detail
+        assert source.start_calls == []
+
+
+def test_start_bounds_the_power_to_what_the_site_has_left(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        response = client.post("/api/charge/start", json={"power_w": 10000})
+        assert response.status_code == 200
+        assert src.start_calls == [{"power_w": 6000, "duration_min": 600}]
+        body = response.json()
+        assert body["power_w"] == 6000
+        assert body["requested_w"] == 10000
+
+
+# --- the record around the write --------------------------------------------------
+
+
+def test_the_record_is_written_before_the_inverter_is_touched(tmp_path: Path) -> None:
+    seen: list[Any] = []
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, store, _settings):
+        src.probe = lambda: seen.append(load_override(SettingsStore(store)))
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 200
+        assert len(seen) == 1
+        assert seen[0] is not None
+        assert seen[0].requested_w == 3000
+        assert seen[0].saved.registers == dict(ORIGINAL_REGISTERS)
+
+
+def test_a_refused_write_leaves_a_record_a_stop_can_use(tmp_path: Path) -> None:
+    source = ChargeSource(
+        fail_start=ChargeWriteRefusedError("the inverter did not acknowledge the charge write")
+    )
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        start = client.post("/api/charge/start", json={})
+        assert start.status_code == 502
+        assert "kept" in start.json()["detail"]
+        assert settings.get(CHARGE_OVERRIDE_KEY) != ""
+        assert src.registers[21] & (1 << 7)
+        stop = client.post("/api/charge/stop")
+        assert stop.status_code == 200
+        assert src.registers == dict(ORIGINAL_REGISTERS)
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+
+
+def test_a_second_start_is_refused_and_the_first_record_survives(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        first = client.post("/api/charge/start", json={"power_w": 3000})
+        assert first.status_code == 200
+        record = load_override(settings)
+        assert record is not None
+        second = client.post("/api/charge/start", json={"power_w": 10000})
+        assert second.status_code == 409
+        assert "already running" in second.json()["detail"]
+        kept = load_override(settings)
+        assert kept is not None
+        assert kept.requested_w == 3000
+        assert kept.saved.registers == dict(ORIGINAL_REGISTERS)
+        assert len(src.start_calls) == 1
+
+
+# --- stop -------------------------------------------------------------------------
+
+
+def test_stop_restores_what_the_inverter_held_before_the_charge(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        started = client.post("/api/charge/start", json={})
+        assert started.status_code == 200
+        assert src.registers != dict(ORIGINAL_REGISTERS)
+        stop = client.post("/api/charge/stop")
+        assert stop.status_code == 200
+        assert stop.json()["restored"] is True
+        assert src.registers == dict(ORIGINAL_REGISTERS)
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+        assert len(src.restore_calls) == 1
+        assert src.restore_calls[0].registers == dict(ORIGINAL_REGISTERS)
+
+
+def test_stop_without_a_record_is_refused(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        stop = client.post("/api/charge/stop")
+        assert stop.status_code == 409
+        assert "no grid charge is recorded" in stop.json()["detail"]
+        assert src.restore_calls == []
+
+
+def test_a_failed_restore_keeps_the_record_for_another_attempt(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        assert client.post("/api/charge/start", json={}).status_code == 200
+        src.fail_restore = ChargeWriteRefusedError(
+            "the inverter did not acknowledge the charge restore"
+        )
+        first = client.post("/api/charge/stop")
+        assert first.status_code == 502
+        assert settings.get(CHARGE_OVERRIDE_KEY) != ""
+        src.fail_restore = None
+        second = client.post("/api/charge/stop")
+        assert second.status_code == 200
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+
+
+def test_an_unreadable_record_is_reported_rather_than_treated_as_no_charge(
+    tmp_path: Path,
+) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        settings.set(CHARGE_OVERRIDE_KEY, "{")
+        stop = client.post("/api/charge/stop")
+        assert stop.status_code == 409
+        assert "not valid JSON" in stop.json()["detail"]
+        assert src.restore_calls == []
+        assert settings.get(CHARGE_OVERRIDE_KEY) == "{"
+
+
+# --- the read endpoint ------------------------------------------------------------
+
+
+def test_the_read_endpoint_reports_the_override_state(tmp_path: Path) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, _src, _store, _settings):
+        before = client.get("/api/charge").json()["override"]
+        assert before["recorded"] is False
+        assert before["readable"] is False
+        assert before["active"] is False
+        assert before["until"] is None
+        assert before["requested_w"] is None
+        assert client.post("/api/charge/start", json={}).status_code == 200
+        during = client.get("/api/charge").json()["override"]
+        assert during["recorded"] is True
+        assert during["readable"] is True
+        assert during["active"] is True
+        datetime.fromisoformat(during["until"])
+        assert during["requested_w"] == 3000
+        assert client.post("/api/charge/stop").status_code == 200
+        after = client.get("/api/charge").json()["override"]
+        assert after["recorded"] is False
+        assert after["active"] is False
+
+
+def test_the_start_response_carries_the_configuration_the_device_reports(
+    tmp_path: Path,
+) -> None:
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, _src, _store, _settings):
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 200
+        body = response.json()
+        applied = body["applied"]
+        saved = body["saved"]
+        assert all(isinstance(key, str) for key in applied["registers"])
+        assert saved["registers"]["21"] == 0x00
+        assert applied["registers"]["21"] == 128
+        assert saved["registers"]["66"] == 10
+        assert applied["registers"]["66"] == 30
+        assert datetime.fromisoformat(body["until"])
+        assert "reason" in body
