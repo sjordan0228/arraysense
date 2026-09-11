@@ -380,7 +380,11 @@ const TABS = [
   {
     id: 'battery',
     title: 'Battery',
-    prefixes: ['battery'],
+    // 'charge' holds the AC-charge override record the service writes while
+    // a grid charge runs. It lands beside the bank that charge refills;
+    // naming the prefix here keeps every registry prefix claimed by exactly
+    // one tab, which the settings-tab guard test checks under node.
+    prefixes: ['battery', 'charge'],
   },
   {
     id: 'collection',

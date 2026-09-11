@@ -2,6 +2,48 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.0 — 11 September 2026
+
+The dashboard can charge the battery from the grid, because the warning that
+stopped the Overnight page had no answer inside the tool: the way out of "the
+state of charge is not trustworthy enough to project a night on" is a full
+charge, and getting one meant leaving for the inverter's own app.
+
+### Added
+
+- **Charge to full from grid, from the Overnight page.** The control sits under
+  the plan note, reports what the inverter holds and whether a charge this
+  service started is running, and offers one button that says what it will do.
+  The charge runs at a chosen power (2, 3 or 5 kW, 3 kW by default), stops at
+  100%, and is bounded by a window written into the inverter itself — so a
+  service that dies mid-charge cannot leave the grid charging for ever.
+
+  What bounds it is the site's own limit (`emporia.inverter_limit_w`), less what
+  the house is drawing and a 1 kW margin, floored at 1 kW. A request that cannot
+  be started without crossing that limit is refused with the numbers, rather
+  than started at whatever fitted. On the reference installation the inverter
+  held a 10 kW AC-charge command against a 12 kW site limit with the house
+  drawing 5 kW, so what the button writes is 3 kW: the stored command is read,
+  kept and put back, never used.
+
+  Stopping writes back the configuration the inverter held before the charge,
+  exactly as it was read. The record that makes that possible lives in the
+  database, so the undo survives a restart, and it is written before the
+  inverter is touched rather than after — a write that fails half-done still
+  leaves a way back.
+
+- **`GET /api/charge`, `POST /api/charge/start`, `POST /api/charge/stop`.** The
+  read is open like the dashboard's other reads; the two writes take the same
+  authentication as every other write, which today is none while no dashboard
+  password is set. An installation whose driver cannot report or write charge
+  configuration answers 404 rather than an empty shape, and the page renders no
+  control at all there.
+
+- **The `charge.override` setting**, holding what the inverter held before a
+  charge this service started. Written by the service rather than chosen, like
+  the Emporia override's own lapse time, and the page reports it as
+  unreadable rather than as no charge if its value is ever damaged.
+
 ## 1.3.2 — 10 September 2026
 
 Nothing on screen changes. This release carries the first packet of the System
