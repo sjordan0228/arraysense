@@ -2,6 +2,21 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.2 — 11 September 2026
+
+One line on the Overnight page, fixed the moment the release above was deployed
+and the live page was read.
+
+### Fixed
+
+- **An enabled charge bit was reported as a running charge.** The status line
+  called an active record a charge whenever the device reported AC charging on,
+  but a charge needs two things on the device: the enable bit and a window to
+  charge in. This installation's resting state has the bit set — the owner's own
+  setting from before this feature existed — with its window empty, so the page
+  announced a 10 kW charge that was not happening while offering a stop for it.
+  The line now says the inverter holds no charge window.
+
 ## 1.4.1 — 11 September 2026
 
 The charge button's first live press failed on the inverter with nothing on the
