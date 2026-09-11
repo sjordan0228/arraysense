@@ -204,7 +204,7 @@ def test_there_is_no_panel_when_the_driver_cannot_report_charge() -> None:
     line, no buttons and no configuration line."""
     assert _call("chargePanelVisible", None) is False
     assert _call("chargeStatusLine", None, NOW_MS) == ""
-    assert _call("chargeStartVisible", None) is False
+    assert _call("chargeGoAction", None) is None
     assert _call("chargeStopVisible", None) is False
     assert _call("chargeConfigLine", None) == ""
     # The control that makes the five answers above mean something. A page that
@@ -231,16 +231,18 @@ def test_the_panel_appears_with_a_configuration_and_no_record() -> None:
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
-def test_a_start_button_is_offered_only_when_nothing_is_recorded() -> None:
+def test_a_start_is_offered_only_when_nothing_is_recorded() -> None:
     """A second start is refused while a record stands, in either window state.
     A control that can only be refused is not shown: it invites the press and
-    then explains."""
-    assert _call("chargeStartVisible", _charge()) is True
+    then explains. What the button does while a record stands — change the power
+    of the charge that is running, or nothing at all — is chargeGoAction's own
+    answer, tested beside the labels it chooses between."""
+    assert _call("chargeGoAction", _charge()) == "start"
     running = _charge(override=_override(True, True, True, UNTIL, 3000))
-    assert _call("chargeStartVisible", running) is False
+    assert _call("chargeGoAction", running) != "start"
     closed = _charge(override=_override(True, True, False, UNTIL, 3000))
-    assert _call("chargeStartVisible", closed) is False
-    assert _call("chargeStartVisible", None) is False
+    assert _call("chargeGoAction", closed) != "start"
+    assert _call("chargeGoAction", None) is None
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -262,7 +264,7 @@ def test_no_buttons_are_offered_when_the_record_cannot_be_read() -> None:
     configuration to write back, and a button that promises the impossible is
     worse than none. The status line carries the warning in their place."""
     cfg = _charge(override=_override(True, False, False))
-    assert _call("chargeStartVisible", cfg) is False
+    assert _call("chargeGoAction", cfg) is None
     assert _call("chargeStopVisible", cfg) is False
     line = _call("chargeStatusLine", cfg, NOW_MS)
     assert "cannot be read" in line
@@ -328,7 +330,7 @@ def test_a_closed_window_says_so_and_still_offers_the_stop() -> None:
     assert "closed" in line
     assert "back the way it was" in line
     assert _call("chargeStopVisible", cfg) is True
-    assert _call("chargeStartVisible", cfg) is False
+    assert _call("chargeGoAction", cfg) != "start"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

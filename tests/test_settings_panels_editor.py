@@ -16,13 +16,20 @@ from arraysense.panels import parse_strings
 
 NODE = shutil.which("node")
 PAGE = Path(__file__).resolve().parent.parent / "src" / "arraysense" / "web" / "settings.html"
-SLICE_FROM = "const PANELS_KEY"
-SLICE_TO = "function panelsEditorEnd("
+# The marked slice, the way the page's other node-tested regions are cut. The end
+# used to be an empty function kept alive only to be searched for, which every
+# reader — and an audit of the pages — took for dead code; these tests were the
+# only thing that noticed when it was deleted, so the boundary is explicit now.
+SLICE_FROM = "// >>> panels-editor"
+SLICE_TO = "// <<< panels-editor"
 
 
 def _slice() -> str:
     text = PAGE.read_text()
-    return text[text.index(SLICE_FROM) : text.index(SLICE_TO)]
+    start = text.index(SLICE_FROM)
+    end = text.index(SLICE_TO, start)
+    assert start < end, f"panels-editor markers out of order in {PAGE.name}"
+    return text[start:end]
 
 
 def _run(body: str) -> str:
