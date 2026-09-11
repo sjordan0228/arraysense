@@ -10,6 +10,7 @@ the refusal paths are the safety story here, not an afterthought.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -17,10 +18,13 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
+from arraysense.api import app as app_module
 from arraysense.api.app import create_app
+from arraysense.api.routes import expire_recorded_charge
 from arraysense.charge import (
     ChargeConfig,
     ChargeWriteRefusedError,
@@ -28,7 +32,7 @@ from arraysense.charge import (
     decode_charge_config,
     pack_time,
 )
-from arraysense.charge_override import load_override
+from arraysense.charge_override import ChargeOverride, load_override, save_override
 from arraysense.collector.service import CollectorService
 from arraysense.config import Config
 from arraysense.models import Sample
@@ -184,7 +188,11 @@ def _assembled(
     """
     store = SqliteStore(str(tmp_path / "charge.db"), device=TEST_DEVICE)
     if load_w is not None:
-        store.append(Sample(timestamp=T0, readings={"load_power_w": load_w}))
+        # Stamped now, not at T0: a charge is sized against what the house is
+        # drawing at the moment of the press, and the endpoint refuses a reading
+        # old enough that nobody is watching the house. A fixed timestamp would
+        # make every charge test a test of that refusal instead.
+        store.append(Sample(timestamp=datetime.now(tz=UTC), readings={"load_power_w": load_w}))
     config = Config(
         dongle_host="h",
         dongle_serial="s",
@@ -319,6 +327,44 @@ async def test_a_restore_the_inverter_did_not_take_keeps_the_record(tmp_path: Pa
         assert settings.get(CHARGE_OVERRIDE_KEY) != ""
 
 
+def test_start_refuses_when_the_house_load_is_not_being_measured(tmp_path: Path) -> None:
+    """The site limit caps the charge, not the charge plus the house, so a
+    charge sized with no idea what the house is drawing can put more on the site
+    than the site was limited to. No reading at all is refused rather than
+    guessed at, and the reason says which reading is missing."""
+    source = ChargeSource()
+    with _rig(tmp_path, source, load_w=None) as (client, src, _store, settings):
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 409
+        assert "not being measured" in response.json()["detail"]
+        assert "missing" in response.json()["detail"]
+        assert src.start_calls == []
+        assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+
+
+def test_start_refuses_a_load_reading_old_enough_that_nobody_is_watching(
+    tmp_path: Path,
+) -> None:
+    """Recency is not health either way round: a reading from half an hour ago
+    describes a house at that moment, and the collector polls every few seconds,
+    so a number this old means the collector is not running."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source, load_w=None)
+    store.append(
+        Sample(
+            timestamp=datetime.now(tz=UTC) - timedelta(minutes=30),
+            readings={"load_power_w": 5000.0},
+        )
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/charge/start", json={})
+    assert response.status_code == 409
+    assert "not being measured" in response.json()["detail"]
+    assert source.start_calls == []
+    assert settings.get(CHARGE_OVERRIDE_KEY) == ""
+    store.close()
+
+
 # --- the record around the write --------------------------------------------------
 
 
@@ -366,6 +412,110 @@ def test_a_second_start_is_refused_and_the_first_record_survives(tmp_path: Path)
         assert kept.requested_w == 3000
         assert kept.saved.registers == dict(ORIGINAL_REGISTERS)
         assert len(src.start_calls) == 1
+
+
+async def test_a_charge_whose_window_has_closed_is_put_back_without_a_press(
+    tmp_path: Path,
+) -> None:
+    """A device schedule has no date in it, so the window written for this
+    charge opens again the next night at the same hour. The record is what knows
+    the charge is over, and the expiry is the stop the owner would otherwise
+    have to press — taken at the window's edge, and doing nothing at all while
+    the window is still open."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post("/api/charge/start", json={})).status_code == 200
+    record = load_override(settings)
+    assert record is not None
+    lock = app.state.charge_lock
+    # Inside the window: nothing is written, nothing is cleared. The window
+    # closes *at* its end, which is the rule the record itself reports on.
+    assert (
+        await expire_recorded_charge(store, source, lock, now=record.until - timedelta(seconds=1))
+        is False
+    )
+    assert source.restore_calls == []
+    assert load_override(settings) is not None
+    # Past the window: the record's own saved configuration goes back, and the
+    # record is cleared only because the restore worked.
+    assert (
+        await expire_recorded_charge(store, source, lock, now=record.until + timedelta(minutes=1))
+        is True
+    )
+    assert source.restore_calls == [record.saved]
+    assert source.registers == dict(ORIGINAL_REGISTERS)
+    assert load_override(settings) is None
+    store.close()
+
+
+async def test_the_expiry_keeps_the_record_when_the_inverter_cannot_be_put_back(
+    tmp_path: Path,
+) -> None:
+    """The record is cleared only by a restore that landed. An expiry that
+    cleared it on a failed write would leave a charge running with nothing left
+    that describes how to end it, and no button that could try again."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post("/api/charge/start", json={})).status_code == 200
+    record = load_override(settings)
+    assert record is not None
+    source.fail_restore = ChargeWriteRefusedError(
+        "the inverter read back a different restore than it was written"
+    )
+    expired = await expire_recorded_charge(
+        store, source, app.state.charge_lock, now=record.until + timedelta(minutes=1)
+    )
+    assert expired is False
+    assert load_override(settings) is not None
+    store.close()
+
+
+def test_the_running_service_ends_a_charge_whose_window_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wiring, not the rule: the expiry has to run inside the app the
+    service actually serves, on its own timer, with no request asking for it. A
+    rule nothing calls would pass every other test in this file."""
+    source = ChargeSource()
+    monkeypatch.setattr(app_module, "CHARGE_EXPIRY_INTERVAL", 0.05)
+    app, store, settings = _assembled(tmp_path, source)
+    with TestClient(app) as client:
+        assert client.post("/api/charge/start", json={}).status_code == 200
+        record = load_override(settings)
+        assert record is not None
+        # The window is over: the device's own schedule would open again at the
+        # same hour tomorrow night, which is the charge nobody asked for.
+        save_override(
+            settings,
+            ChargeOverride(
+                saved=record.saved,
+                until=datetime.now(tz=UTC) - timedelta(minutes=1),
+                requested_w=record.requested_w,
+            ),
+        )
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and load_override(settings) is not None:
+            time.sleep(0.05)
+    assert load_override(settings) is None
+    assert source.registers == dict(ORIGINAL_REGISTERS)
+    store.close()
+
+
+async def test_the_expiry_leaves_an_unreadable_record_alone(tmp_path: Path) -> None:
+    """A record nobody can read is not a record that is absent: something may be
+    charging on it, and the damaged text is the only description of how to stop
+    that. The expiry reports it and writes nothing."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    settings.set(CHARGE_OVERRIDE_KEY, "{")
+    assert await expire_recorded_charge(store, source, app.state.charge_lock) is False
+    assert source.restore_calls == []
+    assert settings.get(CHARGE_OVERRIDE_KEY) == "{"
+    store.close()
 
 
 # --- stop -------------------------------------------------------------------------

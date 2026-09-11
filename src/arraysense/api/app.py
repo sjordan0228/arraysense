@@ -9,15 +9,17 @@ or a real config file.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
 from arraysense import __version__
-from arraysense.api.routes import router
+from arraysense.api.routes import expire_recorded_charge, router
 from arraysense.auth import LoginThrottle, Sessions
 from arraysense.collector.service import CollectorService
 from arraysense.config import Config
@@ -257,6 +259,47 @@ def _page_route(path: Path) -> Callable[[Request], Response]:
     return serve
 
 
+# How often the recorded charge's window is checked. The window is written into
+# the inverter as clock times and the device repeats that schedule every day, so
+# a charge left standing after its window closes would charge the battery again
+# the following night without anybody pressing anything. A minute is far more
+# often than the window edge needs, and costs one settings read.
+CHARGE_EXPIRY_INTERVAL = 60.0
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Run the record's own expiry alongside the requests.
+
+    The collector already has a loop, but the expiry has to hold the same lock
+    the charge routes hold, and that lock belongs to the app. A task here also
+    means the expiry behaves the same whether or not the collector is running: a
+    service that is up and serving is exactly when a stale record needs ending.
+    """
+    task = asyncio.create_task(_expire_recorded_charges(app))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _expire_recorded_charges(app: FastAPI) -> None:
+    """Check the record's window on a timer until the app shuts down."""
+    while True:
+        await asyncio.sleep(CHARGE_EXPIRY_INTERVAL)
+        try:
+            await expire_recorded_charge(
+                app.state.store, app.state.service.source, app.state.charge_lock
+            )
+        except Exception:
+            # A sweep that died would take the undo with it and leave a record
+            # nobody ends, so the failure is logged and the loop continues.
+            # Nothing here is on a request path: the log is the only symptom.
+            logger.exception("the recorded charge's expiry check failed")
+
+
 def create_app(
     store: SqliteStore,
     service: CollectorService,
@@ -273,6 +316,7 @@ def create_app(
         title="Solar ArraySense",
         version=__version__,
         description="Local solar and battery monitoring for EG4 and LuxPower inverters.",
+        lifespan=_lifespan,
     )
     app.state.store = store
     app.state.service = service

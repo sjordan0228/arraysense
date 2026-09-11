@@ -158,6 +158,13 @@ GRID_CHARGE_MIN_W = 1000  # below this a charge is not worth starting
 GRID_CHARGE_MAX_W = 12000  # the hard ceiling a request can never raise
 GRID_CHARGE_MARGIN_W = 1000  # headroom kept for the house to breathe
 GRID_CHARGE_TARGET_SOC_PCT = 100  # what a charge-to-full charges to
+# How old the house's own load reading may be before a charge is refused rather
+# than sized against it. The collector polls every few seconds, so this is
+# roughly "the collector is running"; an older number describes a house nobody
+# is watching, and the site limit caps the charge rather than the charge plus
+# the house, so sizing against a reading that old can put more on the site than
+# the site was limited to.
+CHARGE_LOAD_FRESHNESS = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)

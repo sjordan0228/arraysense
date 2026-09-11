@@ -58,6 +58,7 @@ from arraysense.calibration import (
     full_charge_windows,
 )
 from arraysense.charge import (
+    CHARGE_LOAD_FRESHNESS,
     GRID_CHARGE_DEFAULT_W,
     GRID_CHARGE_MAX_W,
     ChargeConfig,
@@ -1080,13 +1081,28 @@ async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict
                 f"set {INVERTER_LIMIT_KEY} first"
             ),
         )
-    row = request.app.state.store.latest(["load_power_w"])
+    # The house's draw has to be measured *now*, not merely known. The site
+    # limit caps the charge, not the charge plus the house, so a charge sized
+    # against a stale or absent reading can put more on the site than the site
+    # was limited to. Gaps are walked past: a row with no load in it is not a
+    # reading of the load, however recent it is.
+    row = request.app.state.store.latest(["load_power_w"], include_gaps=False)
+    stamp = row.get("timestamp") if row is not None else None
     raw_load = row.get("load_power_w") if row is not None else None
-    # An unread load passes through as None rather than as an invented zero:
-    # the planning layer keeps a rule for the unknown precisely because a
-    # quiet-house guess hands a charge the whole site on top of whatever
-    # the house was already drawing.
-    load = int(raw_load) if isinstance(raw_load, (int, float)) else None
+    if (
+        not isinstance(stamp, datetime)
+        or datetime.now(tz=UTC) - stamp > CHARGE_LOAD_FRESHNESS
+        or not isinstance(raw_load, (int, float))
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "the house's load is not being measured right now, so a charge cannot be "
+                "sized against it; the newest reading is "
+                + (stamp.isoformat() if isinstance(stamp, datetime) else "missing")
+            ),
+        )
+    load = int(raw_load)
     decision = decide_charge_power(
         body.power_w, ChargeLimits(site_limit_w=limit, house_load_w=load)
     )
@@ -1221,6 +1237,64 @@ async def _stop_grid_charge(request: Request) -> dict[str, Any]:
     clear_override(settings)
     logger.info("grid charge stopped, the recorded configuration was restored")
     return {"applied": _charge_config_json(restored), "restored": True}
+
+
+async def expire_recorded_charge(
+    store: SqliteStore,
+    source: object,
+    lock: asyncio.Lock,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Put the inverter back when a recorded charge's window has closed.
+
+    The window is written into the inverter as clock times, and a device
+    schedule has no date in it: the same window opens again the next day at the
+    same hour. A record left standing after its window closes would therefore
+    charge the battery again the following night without anybody pressing
+    anything — which is not what a button that starts one charge promises.
+
+    So this is the stop the owner would otherwise have to press, taken at the
+    moment the record itself says the charge is over. It is not a second writer
+    with an opinion: it does nothing unless this service has a record, does
+    nothing while that record's window is still open, and keeps the record when
+    the inverter cannot be put back so the next attempt and the stop button both
+    still have it. It holds the same lock the start and the stop hold, so it
+    cannot interleave with a press.
+
+    Returns whether the inverter was put back.
+    """
+    from pylxpweb.transports.exceptions import TransportError
+
+    restorer = getattr(source, "restore_grid_charge", None)
+    if restorer is None:
+        return False
+    settings = SettingsStore(store)
+    async with lock:
+        try:
+            override = load_override(settings)
+        except ValueError as exc:
+            # An unreadable record is not an absent one: something may be
+            # charging on it, and the damaged record is the only description of
+            # how to stop that. It is reported and left alone.
+            logger.warning("the recorded charge cannot be read back: %s", exc)
+            return False
+        if override is None:
+            return False
+        if override_is_active(override, now if now is not None else datetime.now(tz=UTC)):
+            return False
+        try:
+            await restorer(override.saved)
+        except (ChargeWriteRefusedError, TransportError, OSError) as exc:
+            logger.warning(
+                "the recorded charge's window has closed but the inverter could not be "
+                "put back: %s; the record is kept",
+                exc,
+            )
+            return False
+        clear_override(settings)
+    logger.info("the recorded charge's window closed; the inverter was put back")
+    return True
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:
