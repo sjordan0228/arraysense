@@ -105,7 +105,7 @@ const element = (id) => (boxes[id] ??= {
   innerHTML: '',
   hidden: false,
   disabled: false,
-  value: id === 'chargePower' ? '3000' : '',
+  value: id === 'chargePower' ? '3' : '',
   listeners: {},
   addEventListener(type, fn) { this.listeners[type] = fn; },
 });
@@ -128,6 +128,10 @@ globalThis.fetch = async (url, options) => {
       button: element('chargeGo').textContent,
       status: element('chargeStatus').textContent,
     });
+  } else if (target.startsWith('/api/charge/plan')) {
+    // The slider's preview. Queued last-in-first-out would hide a repeat, so
+    // every answer is handed out in order and the last one stands.
+    answer = queued.plan.length > 1 ? queued.plan.shift() : queued.plan[0];
   } else if (target === '/api/charge') {
     answer = queued.charge.shift();
   }
@@ -381,6 +385,12 @@ def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
             # because the inverter may have taken part of the write.
             {"status": 200, "body": _charge(override=_override(True, True, True, UNTIL, 3000))},
         ],
+        "plan": [
+            {
+                "status": 200,
+                "body": _plan(effective_w=3000, requested_w=3000),
+            }
+        ],
         "start": [{"status": 409, "body": {"detail": "the inverter did not answer the write"}}],
     }
     driver = """
@@ -390,6 +400,11 @@ def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
     calls: calls.slice(),
     startHidden: element('chargeGo').hidden,
     stopHidden: element('chargeStop').hidden,
+    label: element('chargeGo').textContent,
+    note: element('chargePowerNote').textContent,
+    noteHidden: element('chargePowerNote').hidden,
+    sliderMax: element('chargePower').max,
+    readout: element('chargePowerOut').textContent,
   };
   await startCharge();
   await settle();
@@ -429,6 +444,17 @@ def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
     # The panel starts on the healthy shape: a start to offer, no stop.
     assert out["before"]["startHidden"] is False
     assert out["before"]["stopHidden"] is True
+    # The handle, the number beside it, the button and the preview all come from
+    # one request, carrying the slider's watts — and the handle's own ends come
+    # from the server's bounds rather than from a copy of them in the markup.
+    assert [c for c in out["before"]["calls"] if c.startswith("GET /api/charge/plan")] == [
+        "GET /api/charge/plan?power_w=3000"
+    ]
+    assert out["before"]["label"] == "Charge to full from grid at 3 kW"
+    assert out["before"]["readout"] == "3 kW"
+    assert out["before"]["noteHidden"] is False
+    assert "Runs at 3 kW" in out["before"]["note"]
+    assert out["before"]["sliderMax"] == "12"
 
     # The press announces itself on the way out, and it is taken out of the
     # owner's hands while it is out.
@@ -450,6 +476,151 @@ def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
     # standing over an inverter that reports it is not charging, rather than the
     # "Charging from the grid" the page used to print for any active record.
     assert "reports AC charging off" in out["after"]["status"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_power_the_site_cannot_give_disables_the_press_and_says_why() -> None:
+    """The handle reaches the inverter's own maximum and the site does not always
+    have that much left: with the house already at the limit, the preview answers
+    with nothing to charge and the reason. The page must not offer a press the
+    server would refuse — the disabled button and the sentence beside it are the
+    whole point of asking before the press."""
+    assert NODE is not None
+    responses = {
+        "charge": [{"status": 200, "body": _charge()}],
+        "plan": [
+            {
+                "status": 200,
+                "body": _plan(
+                    effective_w=None,
+                    requested_w=12000,
+                    house_load_w=11500,
+                    reason="the house is already drawing 11500 W of the 12000 W site limit",
+                ),
+            }
+        ],
+        "start": [],
+    }
+    driver = """
+(async () => {
+  element('chargePower').value = '12';
+  await refreshChargePlan();
+  console.log(JSON.stringify({
+    calls,
+    disabled: element('chargeGo').disabled,
+    label: element('chargeGo').textContent,
+    readout: element('chargePowerOut').textContent,
+    note: element('chargePowerNote').textContent,
+    noteHidden: element('chargePowerNote').hidden,
+  }));
+})();
+"""
+    script = (
+        "const RESPONSES = "
+        + json.dumps(responses)
+        + ";\n"
+        + _HARNESS
+        + "\n"
+        + _slice()
+        + "\n"
+        + _wiring()
+        + "\n"
+        + driver
+    )
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    out = json.loads(result.stdout.strip())
+
+    assert "GET /api/charge/plan?power_w=12000" in out["calls"]
+    assert out["disabled"] is True
+    assert out["label"] == "Charge to full from grid at 12 kW"
+    assert out["readout"] == "12 kW"
+    assert out["noteHidden"] is False
+    assert "cannot start now" in out["note"]
+    assert "11500" in out["note"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_slider_holds_kilowatts_and_the_api_takes_watts() -> None:
+    """The handle runs from the driver's floor to the inverter's own AC charge
+    maximum, and it holds kilowatts while the API takes watts. The conversion is
+    the device's own hundred-watt unit, so what leaves the page is a power the
+    inverter can be written with rather than a rounding of one."""
+    assert _call("chargeSliderWatts", "1") == 1000
+    assert _call("chargeSliderWatts", 3) == 3000
+    assert _call("chargeSliderWatts", "7.5") == 7500
+    assert _call("chargeSliderWatts", "12") == 12000
+    # A value between the device's units rounds to the nearest one rather than
+    # sending a fractional watt.
+    assert _call("chargeSliderWatts", "2.04") == 2000
+    assert _call("chargeSliderWatts", "2.06") == 2100
+    # Nothing usable in, nothing sent: the server refuses a zero, and the page
+    # must not ask it to.
+    assert _call("chargeSliderWatts", "") == 0
+    assert _call("chargeSliderWatts", "0") == 0
+
+
+def _plan(
+    effective_w: int | None = 6000,
+    requested_w: int = 12000,
+    site_limit_w: int | None = 12000,
+    house_load_w: int | None = 5000,
+    margin_w: int = 1000,
+    reason: str = "asked 12000 W against 6000 W of headroom",
+) -> dict[str, Any]:
+    """One /api/charge/plan body, in the shape the endpoint answers with."""
+    return {
+        "requested_w": requested_w,
+        "effective_w": effective_w,
+        "reason": reason,
+        "site_limit_w": site_limit_w,
+        "house_load_w": house_load_w,
+        "load_read_at": "2026-09-11T11:00:00+00:00",
+        "margin_w": margin_w,
+        "min_w": 1000,
+        "max_w": 12000,
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_chosen_power_and_the_power_it_will_run_at_are_both_said() -> None:
+    """A charge power is a request, not a setting: the site limit, the house's
+    draw and the reserve come off it. A page that printed only what was asked
+    for would report the charge it promised rather than the charge it started,
+    which this page has already done once."""
+    line = _call("chargePlanLine", _plan())
+    assert "12 kW selected" in line
+    assert "will run at 6 kW" in line
+    assert "site limit 12 kW" in line
+    assert "house 5 kW" in line
+    assert "1 kW held back" in line
+    # A chosen power that fits needs no second number, and the numbers behind it
+    # are still worth printing.
+    fits = _call("chargePlanLine", _plan(effective_w=3000, requested_w=3000))
+    assert "Runs at 3 kW" in fits
+    assert "selected" not in fits
+    assert "site limit 12 kW" in fits
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_power_that_cannot_start_says_so_before_the_press() -> None:
+    """The handle reaches the inverter's maximum and the site does not always
+    have that much left, so the refusal belongs beside the handle rather than
+    after the press — and it is the server's own reason, because the page does
+    not decide how much a site can carry."""
+    empty = _call(
+        "chargePlanLine",
+        _plan(
+            effective_w=None,
+            reason="the house is already drawing 11500 W of the 12000 W site limit",
+        ),
+    )
+    assert "cannot start now" in empty
+    assert "11500" in empty
+    # A body that carried no reason still says something rather than nothing.
+    silent = _call("chargePlanLine", _plan(effective_w=None, reason=""))
+    assert "cannot start now" in silent
+    assert "not reported" in silent
+    assert _call("chargePlanLine", None) == ""
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
