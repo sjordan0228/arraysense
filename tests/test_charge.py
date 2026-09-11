@@ -15,12 +15,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pylxpweb.transports.exceptions import TransportError
 
 from arraysense.charge import (
     GRID_CHARGE_DEFAULT_W,
     ChargeConfig,
     ChargeLimits,
     ChargeWindow,
+    ChargeWriteRefusedError,
     decide_charge_power,
     decode_charge_config,
     pack_time,
@@ -346,3 +348,189 @@ def test_nothing_is_asked_for_nothing_is_refused_rather_than_started() -> None:
     limits = ChargeLimits(site_limit_w=12000, house_load_w=0)
     assert decide_charge_power(0, limits).power_w is None
     assert decide_charge_power(-500, limits).power_w is None
+
+
+# The write path. These tests drive the two write methods through a fake that
+# applies what it is given, so the read-back the driver performs sees the
+# device's new state. The read-only fake above stays as it was: a start or a
+# restore that skipped its read, or wrote a register it could not put back, is
+# the exact failure the two methods exist to prevent.
+
+
+_SEED: dict[int, int] = {
+    21: 0x0002,  # bit 7 clear: AC charge disabled, one other bit set
+    66: 12,  # 12 x 100 W
+    67: 95,
+    68: _packed(2, 30),
+    69: _packed(4, 0),
+    70: 0,
+    71: 0,
+    72: _packed(13, 15),
+    73: _packed(14, 45),
+}
+
+_NOON = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
+
+
+class _WriteTransport:
+    """A transport that applies a write to its own register map.
+
+    read_parameters answers from the map; write_parameters commits the given
+    values into it and reports whether it took them. That is the seam the write
+    path needs: the driver reads back after it writes, and only a map that
+    changes under a write can be read back. It carries no
+    read_quick_charge_remaining_seconds, the shape of a transport that cannot
+    answer that question.
+    """
+
+    def __init__(self, registers: dict[int, int]) -> None:
+        self.registers = dict(registers)
+        self.reads: list[tuple[int, int]] = []
+        self.writes: list[dict[int, int]] = []
+        self.accepts_writes = True
+        self.read_error: Exception | None = None
+
+    async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
+        self.reads.append((start_address, count))
+        if self.read_error is not None:
+            raise self.read_error
+        return {
+            addr: self.registers[addr]
+            for addr in range(start_address, start_address + count)
+            if addr in self.registers
+        }
+
+    async def write_parameters(self, parameters: dict[int, int]) -> bool:
+        self.writes.append(dict(parameters))
+        if not self.accepts_writes:
+            return False
+        self.registers.update(parameters)
+        return True
+
+
+def _write_setup(
+    registers: dict[int, int] | None = None,
+) -> tuple[Eg4LuxPowerSource, _WriteTransport]:
+    transport = _WriteTransport(_SEED if registers is None else registers)
+    return _driver(transport), transport
+
+
+async def test_a_start_saves_what_the_inverter_held_before_it_wrote() -> None:
+    driver, _ = _write_setup()
+    change = await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
+    # saved is the state read before anything was written: the original twelve
+    # units of power and the schedule the device held, untouched.
+    assert change.saved.registers == _SEED
+    assert change.saved.power_w == 1200
+    # applied is the read-back after the write, so it carries the new thirty-
+    # unit command the write applied, not the 3050 W that was asked for.
+    assert change.applied.registers[66] == 30
+    assert change.applied.power_w == 3000
+    assert change.until == _NOON + timedelta(minutes=90)
+
+
+async def test_a_start_writes_the_power_the_target_and_the_whole_window_family_in_one_call() -> (
+    None
+):
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
+    assert len(transport.writes) == 1
+    assert set(transport.writes[0]) == {21, 66, 67, 68, 69, 70, 71, 72, 73}
+
+
+async def test_the_enable_bit_is_added_without_disturbing_the_other_bits() -> None:
+    seed = {**_SEED, 21: 0x0055}  # bit 7 clear, five other bits set
+    driver, transport = _write_setup(seed)
+    await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    written = transport.writes[0][21]
+    assert written == 0x0055 | 0x0080
+    assert written & 0x007F == 0x0055  # bit 7 is the only one that changed
+
+
+async def test_an_inverter_already_enabled_keeps_its_enable_register_verbatim() -> None:
+    seed = {**_SEED, 21: 0x67D5}  # this installation's real register 21
+    driver, transport = _write_setup(seed)
+    await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    assert transport.writes[0][21] == 0x67D5
+
+
+async def test_a_window_crossing_midnight_uses_two_periods_and_clears_the_third() -> None:
+    driver, transport = _write_setup()
+    start = datetime(2026, 8, 6, 22, 0, tzinfo=UTC)
+    await driver.start_grid_charge(power_w=3000, duration_min=480, now=start)
+    write = transport.writes[0]
+    # 22:00 to 23:59, then 00:00 to the end; the unused third pair is cleared.
+    assert write[68] == _packed(22, 0)
+    assert write[69] == _packed(23, 59)
+    assert write[70] == _packed(0, 0)
+    assert write[71] == _packed(6, 0)
+    assert write[72] == 0
+    assert write[73] == 0
+
+
+async def test_the_power_rounds_down_to_the_hundred_watt_unit() -> None:
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    assert transport.writes[0][66] == 30  # not 31: never stronger than decided
+
+
+async def test_a_power_that_cannot_be_expressed_is_refused() -> None:
+    for watts in (50, 20000):
+        driver, transport = _write_setup()
+        with pytest.raises(ValueError):
+            await driver.start_grid_charge(power_w=watts, duration_min=60, now=_NOON)
+        assert transport.writes == []
+
+
+async def test_a_start_that_cannot_read_the_configuration_writes_nothing() -> None:
+    transport = _WriteTransport(_SEED)
+    transport.read_error = TransportError("link down")
+    driver = _driver(transport)
+    with pytest.raises(TransportError):
+        await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    assert transport.writes == []
+
+
+async def test_a_start_refuses_when_the_configuration_it_must_restore_was_not_fully_read() -> None:
+    seed = {k: v for k, v in _SEED.items() if k != 66}  # register 66 not read
+    driver, transport = _write_setup(seed)
+    with pytest.raises(ValueError):
+        await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    assert transport.writes == []
+
+
+async def test_a_restore_puts_the_saved_registers_back_verbatim() -> None:
+    driver, transport = _write_setup()
+    original = dict(transport.registers)
+    change = await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    assert transport.registers != original  # the charge changed the map
+    await driver.restore_grid_charge(change.saved)
+    assert transport.registers == original
+
+
+async def test_a_restore_without_the_registers_it_needs_is_refused() -> None:
+    seed = {k: v for k, v in _SEED.items() if k != 72}
+    saved = _decode(seed)
+    driver, transport = _write_setup(seed)
+    with pytest.raises(ValueError):
+        await driver.restore_grid_charge(saved)
+    assert transport.writes == []
+
+
+async def test_the_applied_configuration_is_what_the_device_says_not_what_was_asked() -> None:
+    driver, _ = _write_setup()
+    change = await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    # The read-back reflects the map the fake applied the write to: charge
+    # enabled, the new thirty-unit power, and the written window in place.
+    assert change.applied.ac_charge_enabled is True
+    assert change.applied.power_w == 3000
+    assert change.applied.registers[66] == 30
+    assert len(change.applied.windows) == 3
+    assert change.applied.windows[0] == ChargeWindow(12, 0, 13, 0)
+
+
+async def test_a_write_the_device_refuses_is_reported() -> None:
+    driver, transport = _write_setup()
+    transport.accepts_writes = False
+    with pytest.raises(ChargeWriteRefusedError):
+        await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)

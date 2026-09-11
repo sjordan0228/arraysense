@@ -60,13 +60,23 @@ from pylxpweb.transports.factory import create_dongle_transport, create_serial_t
 from pylxpweb.transports.modbus_serial import ModbusSerialTransport
 
 from arraysense.charge import (
+    AC_CHARGE_ENABLE_BIT,
     AC_CHARGE_ENABLE_REGISTER,
     AC_CHARGE_POWER_REGISTER,
     AC_CHARGE_START_VOLTAGE_REGISTER,
+    AC_CHARGE_STOP_SOC_REGISTER,
     AC_CHARGE_TYPE_REGISTER,
+    AC_CHARGE_WINDOW_PERIODS,
     AC_CHARGE_WINDOW_START_REGISTER,
+    GRID_CHARGE_TARGET_SOC_PCT,
+    POWER_COMMAND_WATTS,
     ChargeConfig,
+    ChargeWindow,
+    ChargeWriteRefusedError,
+    GridChargeChange,
     decode_charge_config,
+    pack_time,
+    windows_for,
 )
 from arraysense.config import Config
 from arraysense.drivers.base import (
@@ -1365,6 +1375,34 @@ class _ChargeConfigReader(Protocol):
         ...
 
 
+class _ChargeWriter(Protocol):
+    """The transport slice the charge writes use.
+
+    Kept off ``_Transport`` for the reason ``_RegisterReader`` gives: a method
+    on the shared protocol is demanded of every stand-in transport, and a
+    read-only test double need not be able to write. Only the charge writes
+    cast down to this.
+    """
+
+    async def write_parameters(self, parameters: dict[int, int]) -> bool:
+        """Write holding registers, answering whether the device took them."""
+        ...
+
+
+# The nine registers a charge write overwrites: the enable bit, the two charge
+# settings, and the three-period window schedule. An address is written only
+# when the read captured it, so this is also what a restore must put back.
+_CHARGE_WRITE_ADDRESSES: tuple[int, ...] = (
+    AC_CHARGE_ENABLE_REGISTER,
+    AC_CHARGE_POWER_REGISTER,
+    AC_CHARGE_STOP_SOC_REGISTER,
+    *range(
+        AC_CHARGE_WINDOW_START_REGISTER,
+        AC_CHARGE_WINDOW_START_REGISTER + 2 * AC_CHARGE_WINDOW_PERIODS,
+    ),
+)
+
+
 class Eg4LuxPowerSource:
     """An InverterSource backed by one of pylxpweb's local transports.
 
@@ -1876,6 +1914,104 @@ class Eg4LuxPowerSource:
             quick_charge_remaining_s=remaining,
             read_at=datetime.now(tz=UTC),
         )
+
+    async def start_grid_charge(
+        self,
+        *,
+        power_w: int,
+        duration_min: int,
+        target_soc_pct: int = GRID_CHARGE_TARGET_SOC_PCT,
+        now: datetime | None = None,
+    ) -> GridChargeChange:
+        """Start a grid charge and report what the inverter held and now holds.
+
+        The read comes before the write, and the enable bit is read again
+        immediately before it is written: a charge that cannot be put back is
+        refused, and an undo needs what was there first.
+
+        A refused write does not mean nothing happened. The answer only says the
+        transport did not take it; some registers may already be changed, so a
+        caller that sees ChargeWriteRefusedError must read the device and restore
+        rather than assume the write left the inverter untouched.
+        """
+        if now is None:
+            now = datetime.now(tz=UTC)
+        # Read first. Without what the inverter held there is nothing to restore
+        # to, so a failed read stops the method before any write is considered.
+        saved = await self.read_charge_config()
+        # Refuse what cannot be put back: a write over a register the read did
+        # not capture is a change with no undo, so all nine addresses must be
+        # present before any of them is touched.
+        missing = [addr for addr in _CHARGE_WRITE_ADDRESSES if addr not in saved.registers]
+        if missing:
+            raise ValueError(f"cannot undo a write over registers it did not read: {missing}")
+        if not isinstance(duration_min, int) or duration_min <= 0:
+            raise ValueError(f"a charge needs a positive number of minutes, not {duration_min}")
+        end = now + timedelta(minutes=duration_min)
+        # windows_for raises for a naive instant or a span longer than the
+        # one-day schedule; both are refused here, unchanged.
+        periods = windows_for(now, end)
+        # Pad to three pairs so a short charge still writes the whole family and
+        # leaves no half-set window: an unused period is the all-zero pair.
+        padded = periods + tuple(
+            ChargeWindow(0, 0, 0, 0) for _ in range(AC_CHARGE_WINDOW_PERIODS - len(periods))
+        )
+        command = power_w // POWER_COMMAND_WATTS
+        # Rounded down, never up: a charge must not run stronger than the number
+        # that was decided. Under one unit or over the register's range, the
+        # request is refused rather than clamped to a power nobody chose.
+        if command < 1 or command > 150:
+            raise ValueError(
+                f"{power_w} W is not a whole hundred-watt command between 100 W and 15000 W"
+            )
+        reader = cast(_ChargeConfigReader, self._transport)
+        # The other bits in register 21 belong to functions this code knows
+        # nothing about, so the enable bit is added to the value read now rather
+        # than to one assumed. If that read came back empty, the value the
+        # configuration read held stands in, so no bit is silently dropped.
+        enable_read = await reader.read_parameters(AC_CHARGE_ENABLE_REGISTER, 1)
+        enable_source = enable_read.get(AC_CHARGE_ENABLE_REGISTER)
+        if enable_source is None:
+            enable_source = saved.registers.get(AC_CHARGE_ENABLE_REGISTER, 0)
+        parameters: dict[int, int] = {
+            AC_CHARGE_ENABLE_REGISTER: enable_source | (1 << AC_CHARGE_ENABLE_BIT),
+            AC_CHARGE_POWER_REGISTER: command,
+            AC_CHARGE_STOP_SOC_REGISTER: target_soc_pct,
+        }
+        # The window registers are one family: a single-register write on a
+        # packed-time pair does not round-trip, so all six travel in the same
+        # write as the enable and power registers.
+        for index, window in enumerate(padded):
+            start = AC_CHARGE_WINDOW_START_REGISTER + 2 * index
+            parameters[start] = pack_time(window.start_hour, window.start_minute)
+            parameters[start + 1] = pack_time(window.end_hour, window.end_minute)
+        writer = cast(_ChargeWriter, self._transport)
+        if not await writer.write_parameters(parameters):
+            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge write")
+        applied = await self.read_charge_config()
+        return GridChargeChange(saved=saved, applied=applied, until=end)
+
+    async def restore_grid_charge(self, saved: ChargeConfig) -> ChargeConfig:
+        """Write a saved configuration back and report what the device holds.
+
+        The nine charge registers go back exactly as they were read, with no
+        recomputation: the point is to undo, not to re-decide. A refused write
+        does not mean the device is unchanged, so the read-back reports what it
+        actually holds rather than what it was handed.
+        """
+        # Restore only a configuration read whole; a partial one has no verbatim
+        # values to put back.
+        missing = [addr for addr in _CHARGE_WRITE_ADDRESSES if addr not in saved.registers]
+        if missing:
+            raise ValueError(f"cannot restore a charge over registers it did not read: {missing}")
+        # Write back the nine read verbatim, and only those. The registers read
+        # alongside them (120 and 158-161) were never changed, and rewriting an
+        # unchanged register is a risk with no purpose.
+        parameters = {addr: saved.registers[addr] for addr in _CHARGE_WRITE_ADDRESSES}
+        writer = cast(_ChargeWriter, self._transport)
+        if not await writer.write_parameters(parameters):
+            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge restore")
+        return await self.read_charge_config()
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.

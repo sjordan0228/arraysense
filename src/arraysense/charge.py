@@ -283,3 +283,16 @@ def windows_for(start: datetime, end: datetime) -> tuple[ChargeWindow, ...]:
         ChargeWindow(start.hour, start.minute, 23, 59),
         ChargeWindow(0, 0, end.hour, end.minute),
     )
+
+
+class ChargeWriteRefusedError(Exception):
+    """The transport answered that it did not take a charge write."""
+
+
+@dataclass(frozen=True)
+class GridChargeChange:
+    """What a charge write found, what it applied, and when it closes."""
+
+    saved: ChargeConfig
+    applied: ChargeConfig
+    until: datetime
