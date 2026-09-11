@@ -111,12 +111,16 @@ const element = (id) => (boxes[id] ??= {
 });
 const document = { getElementById: element };
 const calls = [];
+const bodies = [];
 const during = [];
 const queued = JSON.parse(JSON.stringify(RESPONSES));
 globalThis.fetch = async (url, options) => {
   const target = String(url);
   const method = (options && options.method) || 'GET';
   calls.push(method + ' ' + target);
+  // What the page sent, so a test can check the power that travelled rather
+  // than only that something was posted.
+  if (options && options.body) bodies.push(method + ' ' + target + ' ' + options.body);
   let answer = { status: 200, body: {} };
   if (target === '/api/charge/start') {
     answer = queued.start.shift();
@@ -132,6 +136,8 @@ globalThis.fetch = async (url, options) => {
     // The slider's preview. Queued last-in-first-out would hide a repeat, so
     // every answer is handed out in order and the last one stands.
     answer = queued.plan.length > 1 ? queued.plan.shift() : queued.plan[0];
+  } else if (target === '/api/charge/power') {
+    answer = queued.power.shift();
   } else if (target === '/api/charge') {
     answer = queued.charge.shift();
   }
@@ -621,6 +627,157 @@ def test_a_power_that_cannot_start_says_so_before_the_press() -> None:
     assert "cannot start now" in silent
     assert "not reported" in silent
     assert _call("chargePlanLine", None) == ""
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_the_button_changes_a_charge_only_when_one_is_running() -> None:
+    """The primary button either starts a charge or changes the power of one that
+    is running, and a record standing is not a charge running: the record is
+    written before the inverter is touched and kept when a write fails, and this
+    installation's resting state is its own charge bit set with the window empty.
+    Changing the power of a charge that is not charging is a write nobody asked
+    for, so that state offers the stop and nothing else."""
+    recorded = _override(True, True, True, UNTIL, 3000)
+    assert _call("chargeGoAction", _charge()) == "start"
+    # A charge that is really running: enabled, with a window to run in.
+    running = _charge(ac_charge_enabled=True, windows=2, override=recorded)
+    assert _call("chargeGoAction", running) == "power"
+    # The same record over a device that is not charging, in the two ways that
+    # happens: the bit is off, or the bit is set with no window configured.
+    assert _call("chargeGoAction", _charge(ac_charge_enabled=False, override=recorded)) is None
+    no_window = _charge(ac_charge_enabled=True, windows=0, override=recorded)
+    assert _call("chargeGoAction", no_window) is None
+    # An unreadable record has no button at all: nothing to write back, and no
+    # way to know what the device is doing.
+    assert _call("chargeGoAction", _charge(override=_override(True, False, False))) is None
+    assert _call("chargeGoAction", None) is None
+    # The label promises the change and nothing else: no window moves, no undo is
+    # rewritten.
+    assert _call("chargeChangeLabel", 7500) == "Change the charge to 7.5 kW"
+    assert _call("chargeChangeLabel", None) == "Change the charge to the chosen power"
+    assert _call("chargeBusyLine", "power") == "Changing the charge…"
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_site_with_no_room_leaves_a_running_charge_alone() -> None:
+    """A refusal while a charge is running is not a stopped charge: the power
+    stays where it was, and the sentence says so rather than reading like a
+    start that failed."""
+    line = _call(
+        "chargePlanLine",
+        _plan(effective_w=None, reason="the house is already drawing 12000 W of the 12000 W limit"),
+        "power",
+    )
+    assert "keeps running as it is" in line
+    assert "12000" in line
+    assert "cannot start" not in line
+    # The same body without a charge running is a start that cannot happen.
+    assert "cannot start now" in _call("chargePlanLine", _plan(effective_w=None), "start")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_running_charge_can_have_its_power_changed_from_the_slider() -> None:
+    """The slider is not only a before-you-press choice. While a charge this
+    service started is running, the same button changes its power — register 66
+    and nothing else — so the answer to an oven coming on is a number rather than
+    a stop: the press sends only the power, and the panel is re-read after it."""
+    assert NODE is not None
+    running = _charge(
+        ac_charge_enabled=True, windows=2, override=_override(True, True, True, UNTIL, 3000)
+    )
+    responses = {
+        "charge": [
+            {"status": 200, "body": running},
+            {
+                "status": 200,
+                "body": _charge(
+                    ac_charge_enabled=True,
+                    windows=2,
+                    power_w=7500,
+                    override=_override(True, True, True, UNTIL, 7500),
+                ),
+            },
+        ],
+        "plan": [{"status": 200, "body": _plan(effective_w=7500, requested_w=7500)}],
+        "start": [],
+        "power": [{"status": 200, "body": {"power_w": 7500, "requested_w": 7500}}],
+    }
+    driver = """
+(async () => {
+  await settle();
+  const openedAt = {
+    label: element('chargeGo').textContent,
+    disabled: element('chargeGo').disabled,
+    sliderHidden: element('chargeCtl').hidden,
+    stopHidden: element('chargeStop').hidden,
+  };
+  // The handle is left where the charge is already running, which is a press
+  // that would write the number the device already holds.
+  const asked = [];
+  asked.push(element('chargeGo').disabled);
+  element('chargePower').value = '7.5';
+  await refreshChargePlan();
+  const moved = {
+    label: element('chargeGo').textContent,
+    disabled: element('chargeGo').disabled,
+    readout: element('chargePowerOut').textContent,
+    note: element('chargePowerNote').textContent,
+  };
+  await chargeGoPressed();
+  await settle();
+  console.log(JSON.stringify({
+    openedAt,
+    asked,
+    moved,
+    calls,
+    bodies,
+    status: element('chargeStatus').textContent,
+    label: element('chargeGo').textContent,
+    already: [element('chargeGo').disabled],
+    noteAfter: element('chargePowerNote').textContent,
+  }));
+})();
+"""
+    script = (
+        "const RESPONSES = "
+        + json.dumps(responses)
+        + ";\n"
+        + _HARNESS
+        + "\n"
+        + _slice()
+        + "\n"
+        + _wiring()
+        + "\n"
+        + driver
+    )
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    out = json.loads(result.stdout.strip())
+
+    # The slider is still there while the charge runs, and the button promises
+    # the change rather than a second start.
+    assert out["openedAt"]["sliderHidden"] is False
+    assert out["openedAt"]["stopHidden"] is False
+    assert out["openedAt"]["label"] == "Change the charge to 3 kW"
+    # Asking for the power the device already holds is not a press: nothing would
+    # change. The charge's own device power is 3000 W.
+    assert out["asked"] == [True]
+    assert out["moved"]["disabled"] is False
+    assert out["moved"]["label"] == "Change the charge to 7.5 kW"
+    assert out["moved"]["readout"] == "7.5 kW"
+    assert "Will run at 7.5 kW" in out["moved"]["note"]
+    # The press sends the power alone, and re-reads the panel afterwards.
+    assert "POST /api/charge/power" in out["calls"]
+    assert [b for b in out["bodies"] if b.startswith("POST /api/charge/power")] == [
+        'POST /api/charge/power {"power_w":7500}'
+    ]
+    assert out["calls"].count("GET /api/charge") == 2
+    # The panel is re-read after the change, and the handle stays where the owner
+    # put it: the number the label promises is now the number the device holds, so
+    # the press is disabled and the note says the charge is already there.
+    assert out["label"] == "Change the charge to 7.5 kW"
+    assert out["status"].startswith("Charging from the grid at 7.5 kW")
+    assert out["already"] == [True]
+    assert "already running at 7.5 kW" in out["noteAfter"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

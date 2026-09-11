@@ -369,12 +369,43 @@ function chargeConfigLine(charge) {
   return [ac, power, stop, windowText].join(' · ');
 }
 
+// What the primary button would do, in one place: it either starts a charge or
+// changes the power of the one that is running, and a page that offered the same
+// button for both without saying which would be promising two different things
+// in one sentence. An unreadable record has no button at all: there is no
+// configuration to write back and no way to know what the device is running.
+function chargeGoAction(charge) {
+  if (!chargePanelVisible(charge)) return null;
+  const o = charge.override || {};
+  if (o.recorded !== true) return 'start';
+  if (o.readable !== true) return null;
+  // A record standing is not a charge running: the record is written before the
+  // inverter is touched and kept when a write fails. Changing the power of a
+  // charge needs the two things a charge needs — the enable bit and a window to
+  // charge in — so a record over a device that reports anything else is a record
+  // to stop rather than one to tune. This installation's resting state is
+  // exactly that: its own charge bit set with the window empty.
+  if (charge.ac_charge_enabled !== true) return null;
+  const windows = Array.isArray(charge.windows)
+    ? charge.windows.filter((w) => w && w.is_set === true).length : null;
+  return windows === 0 ? null : 'power';
+}
+
 // The label is a promise about the press, never a report of the device. A
 // button labelled with the current state is a coin toss every time; one
 // labelled with the action can be checked against what actually happened.
 function chargeActionLabel(powerW) {
   const at = chargeKw(powerW);
   return 'Charge to full from grid' + (at ? ' at ' + at : '');
+}
+
+// The same promise for the other thing the button does. Changing the power of a
+// running charge moves register 66 and nothing else — not the window the charge
+// is running inside, not the recorded undo — so the sentence promises only the
+// power.
+function chargeChangeLabel(powerW) {
+  const at = chargeKw(powerW);
+  return 'Change the charge to' + (at ? ' ' + at : ' the chosen power');
 }
 
 // The slider works in kilowatts and the API takes watts. One conversion, in one
@@ -392,12 +423,19 @@ const chargeSliderWatts = (value) => {
 // asked for while the house draws 5 kW runs at 6 kW. The page has already once
 // reported the charge it promised rather than the charge it started, so the
 // numbers behind the decision are printed here, before the press.
-function chargePlanLine(plan) {
+function chargePlanLine(plan, action, runningW) {
   if (!chargePanelVisible(plan)) return '';
+  // Which verb the sentence takes depends on what the press would do: a site
+  // with no room left cannot start a charge, and it cannot raise the one that is
+  // running either — but the second is a different sentence, because the charge
+  // carries on at the power it already has.
+  const running = action === 'power';
   if (plan.effective_w === null || plan.effective_w === undefined) {
     const reason = typeof plan.reason === 'string' && plan.reason !== ''
       ? plan.reason : 'the reason was not reported.';
-    return 'A charge cannot start now: ' + reason;
+    return running
+      ? 'The charge keeps running as it is: ' + reason
+      : 'A charge cannot start now: ' + reason;
   }
   const at = chargeKw(plan.effective_w);
   const asked = chargeKw(plan.requested_w);
@@ -410,10 +448,16 @@ function chargePlanLine(plan) {
   if (margin) parts.push(margin + ' held back');
   const why = parts.length ? ' (' + parts.join(', ') + ')' : '';
   if (!at) return 'The charge power was not reported.';
+  // Asking for the power the device already holds is not a change, and the
+  // button is disabled for it: the sentence says why rather than promising a
+  // press that would write the number that is already there.
+  if (running && typeof runningW === 'number' && runningW === plan.effective_w) {
+    return 'The charge is already running at ' + at + why + '.';
+  }
   if (asked && plan.effective_w !== plan.requested_w) {
     return asked + ' selected; the charge will run at ' + at + why + '.';
   }
-  return 'Runs at ' + at + why + '.';
+  return (running ? 'Will run at ' : 'Runs at ') + at + why + '.';
 }
 
 // What the panel says while a press is in flight, in the status line and on the
@@ -422,7 +466,9 @@ function chargePlanLine(plan) {
 // went out, the inverter did not answer it, and nothing on screen had said the
 // press had been taken at all.
 function chargeBusyLine(action) {
-  return action === 'stop' ? 'Stopping the charge…' : 'Starting the charge…';
+  if (action === 'stop') return 'Stopping the charge…';
+  if (action === 'power') return 'Changing the charge…';
+  return 'Starting the charge…';
 }
 
 // The refusal paragraph is the only thing telling the owner that nothing
@@ -440,6 +486,10 @@ function chargeRefusalText(payload) {
 // nothing by itself: no timer and no page load starts a charge, because those
 // are the two ways a service comes to be charging a battery unasked.
 
+// The panel's last read, kept so the preview knows what the button it is
+// labelling would do and what the charge is running at.
+let currentCharge = null;
+
 async function loadCharge() {
   let charge = null;
   try {
@@ -453,21 +503,25 @@ async function loadCharge() {
     charge = null;
   }
   const panel = document.getElementById('chargePanel');
-  if (!chargePanelVisible(charge)) { panel.hidden = true; return; }
+  if (!chargePanelVisible(charge)) { panel.hidden = true; currentCharge = null; return; }
   const pick = document.getElementById('chargeCtl');
   const go = document.getElementById('chargeGo');
   const stop = document.getElementById('chargeStop');
   panel.hidden = false;
+  // Kept for the preview below: whether the button it labels starts a charge or
+  // changes the power of the one that is running, and what that charge runs at.
+  currentCharge = charge;
   document.getElementById('chargeStatus').textContent = chargeStatusLine(charge, Date.now());
   document.getElementById('chargeConfig').textContent = chargeConfigLine(charge);
-  // A control the API would only refuse is not rendered. A second start is
-  // refused while a record stands, and a stop has nothing to restore without
-  // a readable one, so both come from the record rather than from a default.
-  const goOn = chargeStartVisible(charge);
+  // A control the API would only refuse is not rendered. A start with a record
+  // standing is refused and a power change with nothing recorded has no charge
+  // to change, so both come from the record rather than from a default — and an
+  // unreadable record gets neither, because there is nothing it can promise.
+  const action = chargeGoAction(charge);
+  const goOn = action !== null;
   go.hidden = !goOn;
-  // The power picker only exists with a button to spend it on. Under a record
-  // there is no start to choose a power for, and a handle above no action is a
-  // knob that does nothing, so the row leaves with the button.
+  // The power row belongs to the primary button in either state: choosing how
+  // hard a charge runs is the same question before the press and during it.
   pick.hidden = !goOn;
   stop.hidden = !chargeStopVisible(charge);
   // The chosen power, its label and what it will actually run at all come from
@@ -487,8 +541,16 @@ async function refreshChargePlan() {
   const slider = document.getElementById('chargePower');
   const watts = chargeSliderWatts(slider.value);
   const note = document.getElementById('chargePowerNote');
+  const go = document.getElementById('chargeGo');
+  const action = chargeGoAction(currentCharge);
+  // What the device is charging at right now, if a charge of ours is running.
+  // The note needs it to tell "this is what it will run at" from "this is what
+  // it is already running at", which is the difference between a press that does
+  // something and a press that would write the number already there.
+  const running = currentCharge && typeof currentCharge.power_w === 'number'
+    ? currentCharge.power_w : null;
   document.getElementById('chargePowerOut').textContent = chargeKw(watts) || '—';
-  document.getElementById('chargeGo').textContent = chargeActionLabel(watts);
+  go.textContent = action === 'power' ? chargeChangeLabel(watts) : chargeActionLabel(watts);
   let plan = null;
   try {
     const r = await fetch('/api/charge/plan?power_w=' + encodeURIComponent(watts));
@@ -496,7 +558,7 @@ async function refreshChargePlan() {
   } catch (err) {
     plan = null;
   }
-  note.textContent = chargePlanLine(plan);
+  note.textContent = chargePlanLine(plan, action, running);
   note.hidden = note.textContent === '';
   // The handle's ends come from the API's own bounds, so the range on screen is
   // the range the server enforces — the inverter's AC charge maximum at the top
@@ -507,11 +569,63 @@ async function refreshChargePlan() {
   if (plan && typeof plan.min_w === 'number' && plan.min_w > 0) {
     slider.min = String(plan.min_w / 1000);
   }
-  // A power that cannot start is not a button to press. The range runs to the
+  // A power that cannot run is not a button to press. The range reaches the
   // inverter's maximum and the site does not always have that much left, so the
   // refusal is shown here instead of being discovered after the press.
-  document.getElementById('chargeGo').disabled = !(plan && plan.effective_w !== null
-    && plan.effective_w !== undefined);
+  const allowed = !!(plan && plan.effective_w !== null && plan.effective_w !== undefined);
+  // Nor is a press that would write the number the device already holds: a
+  // charge running at 5 kW is not changed by asking for 5 kW.
+  const already = action === 'power' && running !== null && running === watts;
+  go.disabled = !allowed || already;
+}
+
+// The primary button does one of two things, and which one is decided by the
+// record rather than by the button: with nothing recorded it starts a charge,
+// and with one standing it changes the power of the charge that is running.
+// Both are announced the same way, and neither is offered when the API would
+// only refuse it.
+async function chargeGoPressed() {
+  if (chargeGoAction(currentCharge) === 'power') {
+    await setChargePower();
+    return;
+  }
+  await startCharge();
+}
+
+async function setChargePower() {
+  const why = document.getElementById('chargeWhy');
+  const go = document.getElementById('chargeGo');
+  const status = document.getElementById('chargeStatus');
+  why.textContent = '';
+  why.hidden = true;
+  go.disabled = true;
+  go.textContent = chargeBusyLine('power');
+  status.textContent = chargeBusyLine('power');
+  try {
+    // Only the power travels. The window the charge is running inside and the
+    // configuration to put back are the server's, and a page that sent either
+    // one would be guessing at what the inverter holds.
+    const r = await fetch('/api/charge/power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        power_w: chargeSliderWatts(document.getElementById('chargePower').value),
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // A refused change leaves the charge running at the power it had, so the
+      // sentence says that rather than reading as a stopped charge.
+      why.textContent = chargeRefusalText(body);
+      why.hidden = false;
+    }
+  } catch (err) {
+    why.textContent = 'This service did not answer.';
+    why.hidden = false;
+  } finally {
+    go.disabled = false;
+    await refreshCharge();
+  }
 }
 
 async function startCharge() {
@@ -589,7 +703,7 @@ async function stopCharge() {
   }
 }
 
-document.getElementById('chargeGo').addEventListener('click', startCharge);
+document.getElementById('chargeGo').addEventListener('click', chargeGoPressed);
 document.getElementById('chargeStop').addEventListener('click', stopCharge);
 // The label, the number beside the handle and the power the charge would run at
 // all follow the handle. It is answered on `input` so the numbers move with the

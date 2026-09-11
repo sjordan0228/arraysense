@@ -90,6 +90,8 @@ class ChargeSource:
         self.registers = dict(ORIGINAL_REGISTERS)
         self.start_calls: list[dict[str, Any]] = []
         self.restore_calls: list[ChargeConfig] = []
+        self.power_calls: list[int] = []
+        self.fail_power: Exception | None = None
         self.fail_start = fail_start
         self.fail_restore = fail_restore
         self.probe = probe
@@ -138,6 +140,13 @@ class ChargeSource:
         self.registers[69] = pack_time(until.hour, until.minute)
         applied = await self.read_charge_config()
         return GridChargeChange(saved=saved, applied=applied, until=until)
+
+    async def set_grid_charge_power(self, *, power_w: int) -> ChargeConfig:
+        self.power_calls.append(power_w)
+        if self.fail_power is not None:
+            raise self.fail_power
+        self.registers[66] = power_w // 100
+        return await self.read_charge_config()
 
     async def restore_grid_charge(self, saved: ChargeConfig) -> ChargeConfig:
         self.restore_calls.append(saved)
@@ -580,6 +589,105 @@ async def test_the_expiry_leaves_an_unreadable_record_alone(tmp_path: Path) -> N
     assert source.restore_calls == []
     assert settings.get(CHARGE_OVERRIDE_KEY) == "{"
     store.close()
+
+
+# --- changing the power of a charge that is running ---------------------------------
+
+
+def test_a_running_charge_can_have_its_power_changed(tmp_path: Path) -> None:
+    """The house changes under a charge — an oven, a car — and the power the site
+    could spare when it began is not the power it can spare now. The change
+    re-decides against the site as it is now, and it leaves the record's window
+    and saved configuration exactly where they were, because the charge still has
+    to end where the window said it would."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        assert client.post("/api/charge/start", json={"power_w": 3000}).status_code == 200
+        before = load_override(settings)
+        assert before is not None
+        # 5000 W fits the headroom (12000 - 5000 of house - 1000 held back), so
+        # what is written is what was asked for; the clamping case is its own
+        # test below.
+        changed = client.post("/api/charge/power", json={"power_w": 5000})
+        assert changed.status_code == 200
+        assert src.power_calls == [5000]
+        assert changed.json()["power_w"] == 5000
+        assert changed.json()["requested_w"] == 5000
+        assert changed.json()["until"] == before.until.isoformat()
+        # The record's request moved; its window and its saved configuration did
+        # not, so the undo is the configuration the inverter held before the
+        # charge rather than anything the change touched.
+        after = load_override(settings)
+        assert after is not None
+        assert (after.requested_w, after.until, after.saved.registers) == (
+            5000,
+            before.until,
+            before.saved.registers,
+        )
+
+
+def test_a_power_change_is_held_to_what_the_site_has_left_now(tmp_path: Path) -> None:
+    """Raising a charge mid-flight crosses the same limit a start would: the
+    request is clamped to the headroom of the moment, and the answer carries the
+    number that was actually written."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        assert client.post("/api/charge/start", json={"power_w": 3000}).status_code == 200
+        changed = client.post("/api/charge/power", json={"power_w": 12000})
+        assert changed.status_code == 200
+        # 12000 W site limit, 5000 W of house, 1000 W held back.
+        assert changed.json()["power_w"] == 6000
+        assert src.power_calls == [6000]
+
+
+def test_a_power_change_without_a_record_is_refused(tmp_path: Path) -> None:
+    """With no charge of ours running, register 66 is the owner's own setting and
+    not ours to change. The refusal says which of the two the page is looking at."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        refused = client.post("/api/charge/power", json={"power_w": 5000})
+        assert refused.status_code == 409
+        assert "no grid charge is recorded" in refused.json()["detail"]
+        assert src.power_calls == []
+
+
+def test_a_power_change_with_no_room_leaves_the_charge_running(tmp_path: Path) -> None:
+    """A refusal here is not a stopped charge. The power stays where it is, the
+    record stays, and the reason carries the numbers."""
+    source = ChargeSource()
+    with _rig(tmp_path, source, load_w=11500.0) as (client, src, _store, settings):
+        assert client.post("/api/charge/start", json={"power_w": 1000}).status_code == 409
+        # No room to start either, so a record is made by hand: what is being
+        # tested is the change, not the start.
+        saved = decode_charge_config(src.registers, quick_charge_remaining_s=None, read_at=T0)
+        save_override(
+            settings,
+            ChargeOverride(saved=saved, until=T0 + timedelta(minutes=600), requested_w=1000),
+        )
+        refused = client.post("/api/charge/power", json={"power_w": 5000})
+        assert refused.status_code == 409
+        assert "11500" in refused.json()["detail"]
+        assert src.power_calls == []
+        assert load_override(settings) is not None
+
+
+def test_a_refused_power_write_keeps_the_record_and_the_charge(tmp_path: Path) -> None:
+    """The charge is still running and still needs its undo, so a write that did
+    not land keeps the record: the failure only says the new number did not
+    arrive."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        assert client.post("/api/charge/start", json={"power_w": 3000}).status_code == 200
+        src.fail_power = ChargeWriteRefusedError(
+            "the inverter did not acknowledge the charge write to register 66"
+        )
+        failed = client.post("/api/charge/power", json={"power_w": 7500})
+        assert failed.status_code == 502
+        assert "still running at the power it had" in failed.json()["detail"]
+        record = load_override(settings)
+        assert record is not None
+        assert record.requested_w == 3000  # the change did not happen
+        assert src.registers[66] == 30  # the charge is still at 3 kW
 
 
 # --- stop -------------------------------------------------------------------------
