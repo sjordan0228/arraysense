@@ -2,6 +2,35 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.4 — 11 September 2026
+
+The power of a charge can be changed while it runs, which is the answer the
+button did not have for an oven coming on halfway through a charge.
+
+### Added
+
+- **`POST /api/charge/power` — change the power of a charge that is running.**
+  A charge is not one decision made at the start: the house changes under it, and
+  the power the site could spare when the charge began is not the power it can
+  spare now. The endpoint writes register 66 and nothing else — not the window
+  the charge is running inside, not the enable bit, not the recorded undo — and
+  re-decides the power against the site as it is *now* through the same
+  `decide_charge_power` a start uses, so raising a charge cannot cross a limit a
+  start would have refused. With no record standing there is no charge of ours to
+  change and the request is refused: register 66 is then the owner's own setting.
+  A refusal at either end — no room on the site, or a write that did not land —
+  leaves the charge running at the power it had, with the record kept.
+
+- **The page's one button does both jobs.** With nothing recorded it starts a
+  charge; with a charge of ours running it changes the power, and the label says
+  which: "Change the charge to 7.5 kW". The power control appears only when the
+  device reports the two things a charge needs — the enable bit and a window —
+  because a record standing is not a charge running: the record is written before
+  the inverter is touched and kept when a write fails, and this installation's
+  resting state is its own charge bit set with the window empty. Asking for the
+  power the device already holds is not a press, and the line beside the handle
+  says so instead of writing the number that is already there.
+
 ## 1.4.3 — 11 September 2026
 
 The charge power becomes a slider that reaches the inverter's own maximum, and

@@ -1249,6 +1249,87 @@ async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict
     }
 
 
+class ChargePowerRequest(BaseModel):
+    """How hard a charge that is already running should run from now on."""
+
+    power_w: int = Field(default=GRID_CHARGE_DEFAULT_W, gt=0, le=GRID_CHARGE_MAX_W)
+
+
+@router.post("/charge/power", dependencies=[Depends(_require_write)])
+async def charge_power(request: Request, body: ChargePowerRequest) -> dict[str, Any]:
+    """Change the power of a charge this service started, and nothing else.
+
+    A charge is not one decision made at the start. The house's draw changes
+    under it — an oven, a car, a dryer — and the power the site could spare when
+    the charge began is not the power it can spare now. This moves register 66
+    and leaves the window, the enable bit and the recorded undo exactly as they
+    were: the charge still ends where the window said it would.
+
+    It re-decides the power against the site as it is *now*, through the same
+    rule the start uses, so raising the charge cannot cross a limit the start
+    would have refused. It writes only when a record stands: with no charge of
+    ours to adjust, register 66 is the owner's own setting and not ours to
+    change.
+    """
+    async with request.app.state.charge_lock:
+        return await _set_grid_charge_power(request, body)
+
+
+async def _set_grid_charge_power(request: Request, body: ChargePowerRequest) -> dict[str, Any]:
+    """The power change itself, with the lock already held by its caller."""
+    from pylxpweb.transports.exceptions import TransportError
+
+    setter = getattr(request.app.state.service.source, "set_grid_charge_power", None)
+    if setter is None:
+        raise HTTPException(
+            status_code=404, detail="this installation's driver cannot change a charge's power"
+        )
+    settings = SettingsStore(request.app.state.store)
+    try:
+        override = load_override(settings)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if override is None:
+        raise HTTPException(
+            status_code=409,
+            detail="no grid charge is recorded, so there is no charge of ours to change",
+        )
+    limits, _plan, refusal = _charge_limits(request.app.state.store)
+    if limits is None:
+        raise HTTPException(status_code=409, detail=refusal)
+    decision = decide_charge_power(body.power_w, limits)
+    if decision.power_w is None:
+        # The charge keeps running at the power it has. A refusal here changes
+        # nothing rather than stopping a charge the owner did not ask to stop.
+        raise HTTPException(status_code=409, detail=decision.reason)
+    try:
+        applied = await setter(power_w=decision.power_w)
+    except (ChargeWriteRefusedError, TransportError, OSError) as exc:
+        # The record is kept: the charge is still running and still needs its
+        # undo, and the failure only says the new number did not land.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"the charge power write failed: {exc}; the recorded configuration is kept "
+                "and the charge is still running at the power it had"
+            ),
+        ) from exc
+    # The record's own request is replaced, so the page and the record say what
+    # was last asked for. The window and the saved configuration do not move.
+    save_override(
+        settings,
+        ChargeOverride(saved=override.saved, until=override.until, requested_w=body.power_w),
+    )
+    logger.info("grid charge power set to %d W", decision.power_w)
+    return {
+        "applied": _charge_config_json(applied),
+        "power_w": decision.power_w,
+        "requested_w": body.power_w,
+        "reason": decision.reason,
+        "until": override.until.isoformat(),
+    }
+
+
 @router.post("/charge/stop", dependencies=[Depends(_require_write)])
 async def charge_stop(request: Request) -> dict[str, Any]:
     """Write the recorded configuration back, and forget it only once that worked.
