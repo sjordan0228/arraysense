@@ -2115,6 +2115,43 @@ class Eg4LuxPowerSource:
         _refuse_a_read_back_that_did_not_land(applied, parameters, "restore")
         return applied
 
+    async def set_grid_charge_power(self, *, power_w: int) -> ChargeConfig:
+        """Change the power of a charge that is already running, and nothing else.
+
+        One register, register 66, written in one call — the same hardware rule
+        the start and the restore obey, and the reason this is not "start again
+        with a different number": starting again would rewrite the window the
+        charge is running inside and re-record the configuration to undo, so a
+        charge whose window moved every time somebody nudged the power would have
+        no end anybody could predict.
+
+        Nothing here decides whether the power is allowed. That is
+        ``decide_charge_power`` against the site limit and the house's draw, and
+        it belongs to the caller that can refuse before the device is touched.
+        What this refuses is a number the register cannot carry, and a write the
+        inverter did not take.
+        """
+        command = power_w // POWER_COMMAND_WATTS
+        # Rounded down, never up, for the reason start_grid_charge gives: a
+        # charge must not run stronger than the number that was decided.
+        if command < 1 or command > 150:
+            raise ValueError(
+                f"{power_w} W is not a whole hundred-watt command between 100 W and 15000 W"
+            )
+        writer = cast(_ChargeWriter, self._transport)
+        parameters = {AC_CHARGE_POWER_REGISTER: command}
+        if not await writer.write_parameters(parameters):
+            raise ChargeWriteRefusedError(
+                "the inverter did not acknowledge the charge write to register "
+                f"{AC_CHARGE_POWER_REGISTER}"
+            )
+        applied = await self.read_charge_config()
+        # An acknowledged write is not a write that landed, and the owner is
+        # watching a charge that is running: the read-back is what says whether
+        # the number on the page is the number on the device.
+        _refuse_a_read_back_that_did_not_land(applied, parameters, "charge power")
+        return applied
+
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.
 

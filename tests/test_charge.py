@@ -614,6 +614,53 @@ async def test_a_restore_that_did_not_land_is_refused_rather_than_reported() -> 
     assert transport.registers[21] & (1 << 7)  # the charge is still enabled
 
 
+async def test_changing_the_power_moves_one_register_and_nothing_else() -> None:
+    # A charge is not one decision made at the start: the house changes under it.
+    # Changing the power writes register 66 alone, so the window the charge is
+    # running inside and the enable bit stay where the start put them — a charge
+    # whose window moved every time somebody nudged the power would have no end
+    # anybody could predict.
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    before = dict(transport.registers)
+    transport.writes.clear()
+    applied = await driver.set_grid_charge_power(power_w=7500)
+    assert len(transport.writes) == 1
+    assert transport.writes[0] == {66: 75}
+    assert applied.power_w == 7500
+    # Everything the charge left standing is still standing.
+    after = dict(transport.registers)
+    others = {a: v for a, v in after.items() if a != 66}
+    assert others == {a: v for a, v in before.items() if a != 66}
+    assert after[66] != before[66]
+
+
+async def test_changing_the_power_refuses_a_number_the_register_cannot_carry() -> None:
+    # The driver's bound is the register's own: a hundred-watt command between
+    # one and a hundred and fifty. What a *site* may charge at is
+    # decide_charge_power's business, and the API refuses 15 kW long before this.
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    transport.writes.clear()
+    for refused in (0, 99, 15100):
+        with pytest.raises(ValueError):
+            await driver.set_grid_charge_power(power_w=refused)
+    assert transport.writes == []
+
+
+async def test_a_power_change_the_inverter_did_not_take_is_refused() -> None:
+    # The owner is watching a charge that is running, so the number on the page
+    # has to be the number on the device: an acknowledged write that did not land
+    # raises rather than reporting the power that was asked for.
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    transport.ignores = {66}
+    with pytest.raises(ChargeWriteRefusedError) as refused:
+        await driver.set_grid_charge_power(power_w=7500)
+    assert "read back" in str(refused.value)
+    assert transport.registers[66] == 30  # still the charge's own 3 kW
+
+
 async def test_a_restore_writes_one_register_per_call_too() -> None:
     # The stop path meets the same hardware as the start: a restore sent as one
     # nine-register write is ignored by this inverter, which would leave a
