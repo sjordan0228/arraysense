@@ -310,15 +310,6 @@ async function fetchEfficiency(period, cursor) {
 // Drawing.
 // ---------------------------------------------------------------------------
 
-// A PR as a percentage with its tolerance — '88% ±3%', never '0.8794'.
-function prStr(pr, tolerancePct) {
-  if (pr === null || pr === undefined) return DASH;
-  const pct = Math.round(pr * 100);
-  const tol = tolerancePct === null || tolerancePct === undefined
-    ? '' : ` ±${Math.round(tolerancePct)}%`;
-  return `${pct}%${tol}`;
-}
-
 function prNum(pr) {
   if (pr === null || pr === undefined) return DASH;
   return `${Math.round(pr * 100)}%`;

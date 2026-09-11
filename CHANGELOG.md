@@ -2,6 +2,40 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.5 — 11 September 2026
+
+The settings page is a set of tabs again, and the check that would have caught it
+is in the suite.
+
+### Fixed
+
+- **The settings page had not been tabbed since v1.3.0.** A commit on 2026-08-30
+  meant to delete a paragraph of prose and deleted the two calls that drew the
+  tab bar and selected the initial tab with it, leaving the comment that
+  described them behind. Both functions were called from nowhere else, so no tab
+  bar was built and no group was hidden: every setting sat on one long page, in
+  every release from v1.3.0 to v1.4.4. Nothing threw and no console error
+  appeared, which is why it read as a regression rather than a broken page. The
+  calls are back.
+
+- **A function a page declares is now required to be called by that page.**
+  `tests/test_web_page_wiring.py` reads the web assets and fails on a declared
+  function nothing calls, or an id a page looks up that the page never defines —
+  the two shapes a mis-scoped deletion leaves behind. It is scoped per file
+  deliberately: a tree-wide count let another page's `drawTabs()` mask this one.
+
+- **Two functions that really were dead.** `chargeStartVisible` in the Overnight
+  page, unused since the charge button learned to change a running charge's
+  power, with tests still asserting it; and `prStr` in the Efficiency page, a
+  percentage formatter nothing has ever called. Both removed.
+
+### Changed
+
+- **The panels-editor slice is marked rather than implied.** It ended at an empty
+  function kept alive only to be searched for, which read as dead code to
+  everything except its test. It is now the page's own `>>> panels-editor` /
+  `<<< panels-editor` markers, so the boundary is visible in the file.
+
 ## 1.4.4 — 11 September 2026
 
 The power of a charge can be changed while it runs, which is the answer the
