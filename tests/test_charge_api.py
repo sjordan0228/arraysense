@@ -208,6 +208,70 @@ def _assembled(
     return app, store, settings
 
 
+# --- the preview the power slider reads -------------------------------------------
+
+
+def test_the_plan_says_what_a_request_would_actually_run_at(tmp_path: Path) -> None:
+    """A charge power is a request. The page shows a handle that reaches the
+    inverter's maximum, and the site limit, the house and the reserve come off
+    whatever is chosen — so the preview says both numbers, with the numbers
+    behind the decision, before anything is written."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        body = client.get("/api/charge/plan", params={"power_w": 10000}).json()
+        assert body["requested_w"] == 10000
+        # A 12000 W site limit, 5000 W of house, 1000 W held back.
+        assert body["effective_w"] == 6000
+        assert body["site_limit_w"] == 12000
+        assert body["house_load_w"] == 5000
+        assert body["margin_w"] == 1000
+        assert "6000" in body["reason"]
+        # The handle's own ends come from here, so the range on screen is the
+        # range the server enforces: the driver's floor and the inverter's AC
+        # charge maximum.
+        assert body["min_w"] == 1000
+        assert body["max_w"] == 12000
+        # Read-only, and it asks the inverter nothing, which is what lets it
+        # answer every time the handle moves.
+        assert src.reads == 0
+        assert src.start_calls == []
+
+
+def test_the_plan_and_the_start_decide_the_same_power(tmp_path: Path) -> None:
+    """One rule, not two. A preview that promised a power the start then refused
+    would be worse than no preview, so the plan is compared with what the start
+    actually sent."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, _settings):
+        plan = client.get("/api/charge/plan", params={"power_w": 10000}).json()
+        started = client.post("/api/charge/start", json={"power_w": 10000})
+        assert started.status_code == 200
+        assert src.start_calls[0]["power_w"] == plan["effective_w"]
+
+
+def test_the_plan_refuses_to_size_a_charge_without_a_live_reading(tmp_path: Path) -> None:
+    """The preview meets the same refusals the start does, in the same words: an
+    installation with no site limit, or a house nobody is measuring, has no power
+    to offer. The page shows that rather than a button."""
+    source = ChargeSource()
+    with _rig(tmp_path, source, limit=None) as (client, _src, _store, _settings):
+        unbounded = client.get("/api/charge/plan", params={"power_w": 3000}).json()
+        assert unbounded["effective_w"] is None
+        assert "no site limit" in unbounded["reason"]
+        assert unbounded["site_limit_w"] is None
+    unmeasured = ChargeSource()
+    # Its own directory: the settings live in the database file, and a second
+    # rig on the same path would inherit the first one's site limit.
+    alone = tmp_path / "unmeasured"
+    alone.mkdir()
+    with _rig(alone, unmeasured, load_w=None) as (client, src, _store, _settings):
+        body = client.get("/api/charge/plan", params={"power_w": 3000}).json()
+        assert body["effective_w"] is None
+        assert "not being measured" in body["reason"]
+        assert body["house_load_w"] is None
+        assert src.reads == 0
+
+
 # --- refusals before anything reaches the inverter -------------------------------
 
 

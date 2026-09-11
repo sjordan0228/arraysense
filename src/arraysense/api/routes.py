@@ -60,7 +60,9 @@ from arraysense.calibration import (
 from arraysense.charge import (
     CHARGE_LOAD_FRESHNESS,
     GRID_CHARGE_DEFAULT_W,
+    GRID_CHARGE_MARGIN_W,
     GRID_CHARGE_MAX_W,
+    GRID_CHARGE_MIN_W,
     ChargeConfig,
     ChargeLimits,
     ChargeWriteRefusedError,
@@ -1025,6 +1027,100 @@ async def charge(request: Request) -> dict[str, Any]:
     return body
 
 
+def _charge_limits(store: SqliteStore) -> tuple[ChargeLimits | None, dict[str, Any], str]:
+    """The limits a charge would be decided against, or why there are none.
+
+    One function because the start and the page's own preview have to agree: a
+    preview that offers a power the start then refuses is worse than no preview
+    at all, and two copies of "the site limit minus the house minus the margin"
+    are two limits the day one of them moves.
+
+    Returns the limits, the numbers the page prints beside them, and the reason
+    a charge cannot be decided at all — the last of which is empty when it can.
+    Reads the settings and the newest house-load row and asks the inverter
+    nothing, which is what lets the preview answer while a slider is moving.
+    """
+    settings = SettingsStore(store)
+    raw_limit = settings.get(INVERTER_LIMIT_KEY)
+    limit = raw_limit if isinstance(raw_limit, int) else 0
+    # The house's draw has to be measured *now*, not merely known. The site
+    # limit caps the charge, not the charge plus the house, so a charge sized
+    # against a stale or absent reading can put more on the site than the site
+    # was limited to. Gaps are walked past: a row with no load in it is not a
+    # reading of the load, however recent it is.
+    row = store.latest(["load_power_w"], include_gaps=False)
+    stamp = row.get("timestamp") if row is not None else None
+    raw_load = row.get("load_power_w") if row is not None else None
+    plan: dict[str, Any] = {
+        "site_limit_w": limit if limit > 0 else None,
+        "house_load_w": None,
+        "load_read_at": stamp.isoformat() if isinstance(stamp, datetime) else None,
+        "margin_w": GRID_CHARGE_MARGIN_W,
+        "max_w": GRID_CHARGE_MAX_W,
+        "min_w": GRID_CHARGE_MIN_W,
+    }
+    if limit <= 0:
+        # No site limit means no bound, and an unbounded charge is not a thing
+        # this service starts on a guess: the limit is the only number that says
+        # what the installation was built to carry. The key is named because the
+        # fix is to set it.
+        return (
+            None,
+            plan,
+            (
+                "no site limit is configured, so a charge cannot be bounded; "
+                f"set {INVERTER_LIMIT_KEY} first"
+            ),
+        )
+    if (
+        not isinstance(stamp, datetime)
+        or datetime.now(tz=UTC) - stamp > CHARGE_LOAD_FRESHNESS
+        or not isinstance(raw_load, (int, float))
+    ):
+        return (
+            None,
+            plan,
+            (
+                "the house's load is not being measured right now, so a charge cannot be "
+                "sized against it; the newest reading is "
+                + (stamp.isoformat() if isinstance(stamp, datetime) else "missing")
+            ),
+        )
+    load = int(raw_load)
+    plan["house_load_w"] = load
+    return ChargeLimits(site_limit_w=limit, house_load_w=load), plan, ""
+
+
+@router.get("/charge/plan")
+def charge_plan(
+    request: Request,
+    power_w: int = Query(default=GRID_CHARGE_DEFAULT_W, gt=0, le=GRID_CHARGE_MAX_W),
+) -> dict[str, Any]:
+    """What a charge at this power would actually run at, before anything is written.
+
+    The charge power an owner picks is a request: the site limit, the house's
+    draw and the reserve come off it, so 12 kW chosen while the house is drawing
+    5 kW runs at 6 kW. A control that only says what was asked for would report
+    the charge it promised rather than the charge it started, which is the
+    mistake this page has already made once — so the panel asks this before the
+    press and says what the number will be.
+
+    Read-only, and it touches no device: the whole answer comes from the site
+    limit, the newest house-load row and the same ``decide_charge_power`` the
+    start calls.
+    """
+    limits, plan, refusal = _charge_limits(request.app.state.store)
+    plan["requested_w"] = power_w
+    if limits is None:
+        plan["effective_w"] = None
+        plan["reason"] = refusal
+        return plan
+    decision = decide_charge_power(power_w, limits)
+    plan["effective_w"] = decision.power_w
+    plan["reason"] = decision.reason
+    return plan
+
+
 class ChargeStartRequest(BaseModel):
     """How hard to charge, and for how long."""
 
@@ -1066,46 +1162,12 @@ async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict
             status_code=404, detail="this installation's driver cannot start a grid charge"
         )
     settings = SettingsStore(request.app.state.store)
-    raw_limit = settings.get(INVERTER_LIMIT_KEY)
-    limit = raw_limit if isinstance(raw_limit, int) else 0
-    if limit <= 0:
-        # No site limit means no bound, and an unbounded charge is not a
-        # thing this endpoint starts on a guess: the limit is the only
-        # number that says what the installation was built to carry, and
-        # this installation has already outrun an unbounded charge once.
-        # The key is named in the detail because the fix is to set it.
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "no site limit is configured, so a charge cannot be bounded; "
-                f"set {INVERTER_LIMIT_KEY} first"
-            ),
-        )
-    # The house's draw has to be measured *now*, not merely known. The site
-    # limit caps the charge, not the charge plus the house, so a charge sized
-    # against a stale or absent reading can put more on the site than the site
-    # was limited to. Gaps are walked past: a row with no load in it is not a
-    # reading of the load, however recent it is.
-    row = request.app.state.store.latest(["load_power_w"], include_gaps=False)
-    stamp = row.get("timestamp") if row is not None else None
-    raw_load = row.get("load_power_w") if row is not None else None
-    if (
-        not isinstance(stamp, datetime)
-        or datetime.now(tz=UTC) - stamp > CHARGE_LOAD_FRESHNESS
-        or not isinstance(raw_load, (int, float))
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "the house's load is not being measured right now, so a charge cannot be "
-                "sized against it; the newest reading is "
-                + (stamp.isoformat() if isinstance(stamp, datetime) else "missing")
-            ),
-        )
-    load = int(raw_load)
-    decision = decide_charge_power(
-        body.power_w, ChargeLimits(site_limit_w=limit, house_load_w=load)
-    )
+    limits, _plan, refusal = _charge_limits(request.app.state.store)
+    if limits is None:
+        # The reason already names the number that is missing, and the fix is to
+        # set it, so it is passed through rather than rewritten here.
+        raise HTTPException(status_code=409, detail=refusal)
+    decision = decide_charge_power(body.power_w, limits)
     if decision.power_w is None:
         # The reason already carries the numbers, so it is passed through
         # rather than rewritten here; the endpoint only says no.
