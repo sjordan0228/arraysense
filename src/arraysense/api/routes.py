@@ -1113,7 +1113,14 @@ async def charge_start(request: Request, body: ChargeStartRequest) -> dict[str, 
             status_code=502,
             detail=f"the charge configuration could not be read: {exc}",
         ) from exc
-    now = datetime.now(tz=UTC)
+    # The window is written into the inverter as clock times, and the inverter
+    # reads that schedule in the installation's own zone, so the instant the
+    # window is cut from has to be in that zone too. Cut from UTC, the first
+    # live attempt on this installation packed 03:39-13:39 for a press at 22:40
+    # local: a charge that would have started five hours late, and only the
+    # write failing kept it from being scheduled. The record's own `until` is
+    # still a real instant, so the page and the API can compare it anywhere.
+    now = datetime.now(tz=_request_zone(request.app.state.store, None))
     until = now + timedelta(minutes=body.duration_min)
     # The record is written before the inverter is touched. A write can
     # fail half-done with some registers already changed, and this record —

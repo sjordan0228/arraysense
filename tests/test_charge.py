@@ -13,6 +13,7 @@ writes into the inverter.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from pylxpweb.transports.exceptions import TransportError
@@ -415,6 +416,20 @@ def _write_setup(
     return _driver(transport), transport
 
 
+def _written(transport: _WriteTransport, address: int) -> int:
+    """The value one register was written with, out of the per-register writes.
+
+    Every write the driver makes carries a single address, because this
+    inverter answers a single-register write and ignores a batched one — so a
+    test asking what went to register 66 has to look through the writes rather
+    than index one dictionary that held them all.
+    """
+    for chunk in transport.writes:
+        if address in chunk:
+            return chunk[address]
+    raise AssertionError(f"register {address} was never written: {transport.writes}")
+
+
 async def test_a_start_saves_what_the_inverter_held_before_it_wrote() -> None:
     driver, _ = _write_setup()
     change = await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
@@ -429,20 +444,34 @@ async def test_a_start_saves_what_the_inverter_held_before_it_wrote() -> None:
     assert change.until == _NOON + timedelta(minutes=90)
 
 
-async def test_a_start_writes_the_power_the_target_and_the_whole_window_family_in_one_call() -> (
-    None
-):
+async def test_every_register_is_written_on_its_own() -> None:
+    # One register per write, because this inverter answers a single-register
+    # write and ignores a batched one: on 2026-09-10 the write to register 21
+    # came back echoed and the eight-register write covering 66-73 went
+    # unanswered after three retries, which is what made the first live attempt
+    # fail with the inverter untouched.
     driver, transport = _write_setup()
     await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
-    assert len(transport.writes) == 1
-    assert set(transport.writes[0]) == {21, 66, 67, 68, 69, 70, 71, 72, 73}
+    assert len(transport.writes) == 9
+    assert all(len(chunk) == 1 for chunk in transport.writes)
+    assert {addr for chunk in transport.writes for addr in chunk} == {
+        21,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73,
+    }
 
 
 async def test_the_enable_bit_is_added_without_disturbing_the_other_bits() -> None:
     seed = {**_SEED, 21: 0x0055}  # bit 7 clear, five other bits set
     driver, transport = _write_setup(seed)
     await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
-    written = transport.writes[0][21]
+    written = _written(transport, 21)
     assert written == 0x0055 | 0x0080
     assert written & 0x007F == 0x0055  # bit 7 is the only one that changed
 
@@ -451,27 +480,42 @@ async def test_an_inverter_already_enabled_keeps_its_enable_register_verbatim() 
     seed = {**_SEED, 21: 0x67D5}  # this installation's real register 21
     driver, transport = _write_setup(seed)
     await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
-    assert transport.writes[0][21] == 0x67D5
+    assert _written(transport, 21) == 0x67D5
 
 
 async def test_a_window_crossing_midnight_uses_two_periods_and_clears_the_third() -> None:
     driver, transport = _write_setup()
     start = datetime(2026, 8, 6, 22, 0, tzinfo=UTC)
     await driver.start_grid_charge(power_w=3000, duration_min=480, now=start)
-    write = transport.writes[0]
     # 22:00 to 23:59, then 00:00 to the end; the unused third pair is cleared.
-    assert write[68] == _packed(22, 0)
-    assert write[69] == _packed(23, 59)
-    assert write[70] == _packed(0, 0)
-    assert write[71] == _packed(6, 0)
-    assert write[72] == 0
-    assert write[73] == 0
+    assert _written(transport, 68) == _packed(22, 0)
+    assert _written(transport, 69) == _packed(23, 59)
+    assert _written(transport, 70) == _packed(0, 0)
+    assert _written(transport, 71) == _packed(6, 0)
+    assert _written(transport, 72) == 0
+    assert _written(transport, 73) == 0
+
+
+async def test_the_window_carries_the_clock_of_the_zone_it_was_given() -> None:
+    # The window registers hold clock times, not instants, so the zone of the
+    # ``now`` handed in is what reaches the device: 22:40 on the installation's
+    # own clock has to pack as 22:40. The first live attempt handed this method
+    # the same moment in UTC and the inverter was told 03:40, which is a charge
+    # window at the wrong hour rather than a long one.
+    driver, transport = _write_setup()
+    start = datetime(2026, 9, 10, 22, 40, tzinfo=ZoneInfo("America/Chicago"))
+    await driver.start_grid_charge(power_w=3000, duration_min=600, now=start)
+    assert start.astimezone(UTC).hour == 3  # the same moment on the UTC clock
+    assert _written(transport, 68) == _packed(22, 40)
+    assert _written(transport, 69) == _packed(23, 59)
+    assert _written(transport, 70) == _packed(0, 0)
+    assert _written(transport, 71) == _packed(8, 40)
 
 
 async def test_the_power_rounds_down_to_the_hundred_watt_unit() -> None:
     driver, transport = _write_setup()
     await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
-    assert transport.writes[0][66] == 30  # not 31: never stronger than decided
+    assert _written(transport, 66) == 30  # not 31: never stronger than decided
 
 
 async def test_a_power_that_cannot_be_expressed_is_refused() -> None:
@@ -506,6 +550,19 @@ async def test_a_restore_puts_the_saved_registers_back_verbatim() -> None:
     assert transport.registers != original  # the charge changed the map
     await driver.restore_grid_charge(change.saved)
     assert transport.registers == original
+
+
+async def test_a_restore_writes_one_register_per_call_too() -> None:
+    # The stop path meets the same hardware as the start: a restore sent as one
+    # nine-register write is ignored by this inverter, which would leave a
+    # charge running with nothing that can end it.
+    driver, transport = _write_setup()
+    change = await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    transport.writes.clear()
+    await driver.restore_grid_charge(change.saved)
+    assert len(transport.writes) == 9
+    assert all(len(chunk) == 1 for chunk in transport.writes)
+    assert _written(transport, 66) == 12  # the saved power, not the charge's
 
 
 async def test_a_restore_without_the_registers_it_needs_is_refused() -> None:

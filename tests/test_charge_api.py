@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -29,7 +30,12 @@ from arraysense.charge_override import load_override
 from arraysense.collector.service import CollectorService
 from arraysense.config import Config
 from arraysense.models import Sample
-from arraysense.settings import CHARGE_OVERRIDE_KEY, INVERTER_LIMIT_KEY, SettingsStore
+from arraysense.settings import (
+    CHARGE_OVERRIDE_KEY,
+    INVERTER_LIMIT_KEY,
+    SETTING_TIMEZONE,
+    SettingsStore,
+)
 from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
@@ -98,7 +104,7 @@ class ChargeSource:
     ) -> GridChargeChange:
         if self.probe is not None:
             self.probe()
-        self.start_calls.append({"power_w": power_w, "duration_min": duration_min})
+        self.start_calls.append({"power_w": power_w, "duration_min": duration_min, "now": now})
         saved = await self.read_charge_config()
         start = now if now is not None else datetime.now(tz=UTC)
         until = start + timedelta(minutes=duration_min)
@@ -205,10 +211,30 @@ def test_start_bounds_the_power_to_what_the_site_has_left(tmp_path: Path) -> Non
     with _rig(tmp_path, source) as (client, src, _store, _settings):
         response = client.post("/api/charge/start", json={"power_w": 10000})
         assert response.status_code == 200
-        assert src.start_calls == [{"power_w": 6000, "duration_min": 600}]
+        asked = [(call["power_w"], call["duration_min"]) for call in src.start_calls]
+        assert asked == [(6000, 600)]
         body = response.json()
         assert body["power_w"] == 6000
         assert body["requested_w"] == 10000
+
+
+def test_the_window_is_cut_on_the_installation_clock(tmp_path: Path) -> None:
+    """The window registers hold clock times, and the inverter reads them in
+    the installation's own zone. Cut from UTC instead, a press at 22:40 local
+    on the reference installation packed 03:39-13:39 into registers 68 and 69,
+    which is a window at the wrong hour of the day rather than a long one.
+    """
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        settings.set(SETTING_TIMEZONE, "America/Chicago")
+        response = client.post("/api/charge/start", json={})
+        assert response.status_code == 200
+        assert len(src.start_calls) == 1
+        sent = src.start_calls[0]["now"]
+        assert sent is not None
+        site = ZoneInfo("America/Chicago")
+        assert sent.utcoffset() == site.utcoffset(sent)
+        assert sent.utcoffset() != timedelta(0)
 
 
 # --- the record around the write --------------------------------------------------

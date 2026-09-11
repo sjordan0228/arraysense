@@ -1925,6 +1925,12 @@ class Eg4LuxPowerSource:
     ) -> GridChargeChange:
         """Start a grid charge and report what the inverter held and now holds.
 
+        ``now`` must be an instant in the zone the inverter's own clock keeps,
+        because the window is written into the device as clock times: the same
+        moment cut in UTC schedules the charge in the wrong part of the day.
+        Callers that hold a site zone pass it here; the UTC default suits a
+        caller that has none only in the sense that it is explicit about it.
+
         The read comes before the write, and the enable bit is read again
         immediately before it is written: a charge that cannot be put back is
         refused, and an undo needs what was there first.
@@ -1978,16 +1984,28 @@ class Eg4LuxPowerSource:
             AC_CHARGE_POWER_REGISTER: command,
             AC_CHARGE_STOP_SOC_REGISTER: target_soc_pct,
         }
-        # The window registers are one family: a single-register write on a
-        # packed-time pair does not round-trip, so all six travel in the same
-        # write as the enable and power registers.
+        # The window registers are one family, but they travel as six writes
+        # rather than one, for the reason the write below gives.
         for index, window in enumerate(padded):
             start = AC_CHARGE_WINDOW_START_REGISTER + 2 * index
             parameters[start] = pack_time(window.start_hour, window.start_minute)
             parameters[start + 1] = pack_time(window.end_hour, window.end_minute)
         writer = cast(_ChargeWriter, self._transport)
-        if not await writer.write_parameters(parameters):
-            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge write")
+        # One register per call, deliberately. The transport groups consecutive
+        # addresses into a single multi-register write, and this inverter
+        # answers a single-register write while ignoring a batched one: measured
+        # 2026-09-10 against the reference installation, the write to register 21
+        # came back echoed and the eight-register write covering 66-73 went
+        # unanswered after three retries, surfacing as a refusal on an inverter
+        # that had not changed. Nine small writes cost milliseconds on a 19200
+        # baud link and are the form this hardware takes; the price is that a
+        # failure can land halfway, and the record the caller keeps before
+        # calling this is what covers that.
+        for address in sorted(parameters):
+            if not await writer.write_parameters({address: parameters[address]}):
+                raise ChargeWriteRefusedError(
+                    f"the inverter did not acknowledge the charge write to register {address}"
+                )
         applied = await self.read_charge_config()
         return GridChargeChange(saved=saved, applied=applied, until=end)
 
@@ -2009,8 +2027,14 @@ class Eg4LuxPowerSource:
         # unchanged register is a risk with no purpose.
         parameters = {addr: saved.registers[addr] for addr in _CHARGE_WRITE_ADDRESSES}
         writer = cast(_ChargeWriter, self._transport)
-        if not await writer.write_parameters(parameters):
-            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge restore")
+        # One register per call, for the reason start_grid_charge gives: this
+        # inverter answers a single-register write and ignores a batched one,
+        # and a restore that arrives as one eight-register write never lands.
+        for address in sorted(parameters):
+            if not await writer.write_parameters({address: parameters[address]}):
+                raise ChargeWriteRefusedError(
+                    f"the inverter did not acknowledge the charge restore to register {address}"
+                )
         return await self.read_charge_config()
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
