@@ -25,12 +25,15 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from arraysense.charge import ChargeConfig, decode_charge_config
+from arraysense.charge import CHARGE_RESTORE_ADDRESSES, ChargeConfig, decode_charge_config
 from arraysense.settings import CHARGE_OVERRIDE_KEY, SettingsStore
 
 # A record missing any one of these describes no charge, so it is not stored
 # and must not be read: the registers and their read time rebuild the undo,
-# the window and the power say what was started and on whose authority.
+# the window and the power say what was started and on whose authority. The
+# registers themselves are checked against CHARGE_RESTORE_ADDRESSES as well,
+# because a stored configuration that cannot be written back whole is not an
+# undo either.
 _REQUIRED_FIELDS = ("registers", "read_at", "until", "requested_w")
 
 
@@ -119,6 +122,15 @@ def decode_override(text: str) -> ChargeOverride | None:
     requested = parsed["requested_w"]
     if not isinstance(requested, int) or isinstance(requested, bool):
         raise ValueError("the stored charge override's requested_w is not an integer")
+    # A record is an undo, so it has to hold every register an undo writes. One
+    # that decoded without them would read as a usable record — the page would
+    # offer a stop that the driver must then refuse, over a control that cannot
+    # work. Half a configuration is damage, and it is reported as damage.
+    incomplete = [address for address in CHARGE_RESTORE_ADDRESSES if address not in values]
+    if incomplete:
+        raise ValueError(
+            f"the stored charge override is missing the registers a restore writes: {incomplete}"
+        )
     read_at = _moment(parsed, "read_at")
     until = _moment(parsed, "until")
     # The countdown is left None rather than guessed at: it decodes to the

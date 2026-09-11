@@ -64,6 +64,70 @@ def _call(fn: str, *args: object) -> Any:
     return json.loads(result.stdout.strip())
 
 
+def _wiring() -> str:
+    """The page's charge wiring: everything after the slice, up to the script end.
+
+    The handlers cannot live in the slice — they touch the DOM and the network,
+    which is exactly what the slice is kept free of — so they are extracted on
+    their own for the one test that has to press the button rather than call a
+    rule.
+    """
+    text = PAGE.read_text()
+    start = text.index(_END) + len(_END)
+    end = text.index("</script>", start)
+    assert start < end, "the charge-panel markers sit after the page's last script"
+    return text[start:end]
+
+
+# document and fetch are the minimum the wiring touches: id-keyed boxes that
+# record what was written to them and keep the listeners bound to them, and a
+# fetch that hands back queued answers in order and notices what the page looked
+# like at the moment each request went out.
+_HARNESS = """
+// The page's own escape helper, verbatim from common.js, so the plan request
+// that the page fires on load cannot reject on a missing name and take the
+// process down with it before the press this test is about.
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g,
+  (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const boxes = {};
+const element = (id) => (boxes[id] ??= {
+  id,
+  textContent: '',
+  innerHTML: '',
+  hidden: false,
+  disabled: false,
+  value: id === 'chargePower' ? '3000' : '',
+  listeners: {},
+  addEventListener(type, fn) { this.listeners[type] = fn; },
+});
+const document = { getElementById: element };
+const calls = [];
+const during = [];
+const queued = JSON.parse(JSON.stringify(RESPONSES));
+globalThis.fetch = async (url, options) => {
+  const target = String(url);
+  const method = (options && options.method) || 'GET';
+  calls.push(method + ' ' + target);
+  let answer = { status: 200, body: {} };
+  if (target === '/api/charge/start') {
+    answer = queued.start.shift();
+    // What the panel said while the write was in flight: this is the reading
+    // the whole test exists for, and it cannot be taken afterwards.
+    during.push({
+      method,
+      disabled: element('chargeGo').disabled,
+      button: element('chargeGo').textContent,
+      status: element('chargeStatus').textContent,
+    });
+  } else if (target === '/api/charge') {
+    answer = queued.charge.shift();
+  }
+  return { ok: answer.status === 200, status: answer.status, json: async () => answer.body };
+};
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+"""
+
+
 def _override(
     recorded: bool = False,
     readable: bool = False,
@@ -192,11 +256,30 @@ def test_a_running_charge_reports_its_power_and_the_time_its_window_closes() -> 
     """The line says what the inverter is doing and until when, both read from
     the response. A charge at 3 kW whose window ends at 23:45 says exactly
     that, and does not also say no charge is running."""
-    cfg = _charge(override=_override(True, True, True, UNTIL, 3000))
+    cfg = _charge(ac_charge_enabled=True, override=_override(True, True, True, UNTIL, 3000))
     line = _call("chargeStatusLine", cfg, NOW_MS)
     assert "3 kW" in line
     assert "23:45" in line
     assert "No grid charge" not in line
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_record_alone_is_not_reported_as_a_charge() -> None:
+    """The record is written before the inverter is touched and kept when a
+    write fails, so an active record with the device answering "AC charging
+    off" is a charge that did not start — which is exactly the state the first
+    live press left behind. The page says that rather than describing a charge
+    the device is not running, and a device that never answered the question
+    gets a sentence that does not answer it either."""
+    recorded = _override(True, True, True, UNTIL, 3000)
+    off = _call("chargeStatusLine", _charge(ac_charge_enabled=False, override=recorded), NOW_MS)
+    assert "Charging from the grid" not in off
+    assert "reports AC charging off" in off
+    assert "23:45" in off
+    silent = _call("chargeStatusLine", _charge(ac_charge_enabled=None, override=recorded), NOW_MS)
+    assert "Charging from the grid" not in silent
+    assert "has not said whether it is charging" in silent
+    assert "3 kW" in silent
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -237,6 +320,111 @@ def test_a_field_the_device_did_not_report_is_not_shown_as_zero() -> None:
     reported = _call("chargeConfigLine", _charge())
     assert "3 kW" in reported
     assert "100%" in reported
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_press_is_announced_while_it_is_in_flight() -> None:
+    """A write to the inverter takes about a second and a half, and the first
+    live attempt showed what an unannounced press costs: the owner pressed, the
+    request went out, the inverter did not answer, and nothing on screen had
+    said the press was taken at all. The line says which way the press is going
+    and is not the resting label, so the button visibly changes under the
+    press."""
+    start = _call("chargeBusyLine", "start")
+    stop = _call("chargeBusyLine", "stop")
+    assert start == "Starting the charge…"
+    assert stop == "Stopping the charge…"
+    # Each press has its own words: one line for both would tell the owner
+    # something is happening and not which thing.
+    assert start != stop
+    assert start != _call("chargeActionLabel", 3000)
+    assert stop != start
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
+    """The two failures of the first live press, together, in the order the
+    owner met them. The press has to say it was taken while the write is out,
+    and the panel has to be re-read afterwards whether the write worked or not:
+    a refused start still leaves a record, so a page that keeps offering the
+    start it had is offering a button the API can only refuse."""
+    assert NODE is not None
+    refused = {
+        "charge": [
+            {"status": 200, "body": _charge()},
+            # What the server holds after a refused write: the record is kept,
+            # because the inverter may have taken part of the write.
+            {"status": 200, "body": _charge(override=_override(True, True, True, UNTIL, 3000))},
+        ],
+        "start": [{"status": 409, "body": {"detail": "the inverter did not answer the write"}}],
+    }
+    driver = """
+(async () => {
+  await settle();
+  const before = {
+    calls: calls.slice(),
+    startHidden: element('chargeGo').hidden,
+    stopHidden: element('chargeStop').hidden,
+  };
+  await startCharge();
+  await settle();
+  console.log(JSON.stringify({
+    before,
+    during,
+    calls,
+    after: {
+      startHidden: element('chargeGo').hidden,
+      stopHidden: element('chargeStop').hidden,
+      startDisabled: element('chargeGo').disabled,
+      status: element('chargeStatus').textContent,
+      why: element('chargeWhy').textContent,
+      whyHidden: element('chargeWhy').hidden,
+    },
+  }));
+})();
+"""
+    script = (
+        # The queued answers are bound first: the harness copies them as it is
+        # evaluated, so a RESPONSES declared afterwards is a temporal dead zone
+        # rather than a stub.
+        "const RESPONSES = "
+        + json.dumps(refused)
+        + ";\n"
+        + _HARNESS
+        + "\n"
+        + _slice()
+        + "\n"
+        + _wiring()
+        + "\n"
+        + driver
+    )
+    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
+    out = json.loads(result.stdout.strip())
+
+    # The panel starts on the healthy shape: a start to offer, no stop.
+    assert out["before"]["startHidden"] is False
+    assert out["before"]["stopHidden"] is True
+
+    # The press announces itself on the way out, and it is taken out of the
+    # owner's hands while it is out.
+    assert [press["button"] for press in out["during"]] == ["Starting the charge…"]
+    assert [press["status"] for press in out["during"]] == ["Starting the charge…"]
+    assert [press["disabled"] for press in out["during"]] == [True]
+
+    # And the panel is re-read after it: the refusal is named, the button is
+    # handed back, and the control on offer is now the stop the record calls
+    # for rather than the start that was just refused.
+    assert out["calls"].count("GET /api/charge") == 2
+    assert out["calls"][-1] == "GET /api/charge"
+    assert out["after"]["startHidden"] is True
+    assert out["after"]["stopHidden"] is False
+    assert out["after"]["startDisabled"] is False
+    assert out["after"]["why"] == "the inverter did not answer the write"
+    assert out["after"]["whyHidden"] is False
+    # And the status line is the truth about what the refusal left: a record
+    # standing over an inverter that reports it is not charging, rather than the
+    # "Charging from the grid" the page used to print for any active record.
+    assert "reports AC charging off" in out["after"]["status"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

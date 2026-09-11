@@ -48,7 +48,7 @@ and is kept, labelled at its mapping so it is not mistaken for a second opinion.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Protocol, cast
@@ -68,6 +68,7 @@ from arraysense.charge import (
     AC_CHARGE_TYPE_REGISTER,
     AC_CHARGE_WINDOW_PERIODS,
     AC_CHARGE_WINDOW_START_REGISTER,
+    CHARGE_RESTORE_ADDRESSES,
     GRID_CHARGE_TARGET_SOC_PCT,
     POWER_COMMAND_WATTS,
     ChargeConfig,
@@ -1391,16 +1392,61 @@ class _ChargeWriter(Protocol):
 
 # The nine registers a charge write overwrites: the enable bit, the two charge
 # settings, and the three-period window schedule. An address is written only
-# when the read captured it, so this is also what a restore must put back.
-_CHARGE_WRITE_ADDRESSES: tuple[int, ...] = (
-    AC_CHARGE_ENABLE_REGISTER,
-    AC_CHARGE_POWER_REGISTER,
-    AC_CHARGE_STOP_SOC_REGISTER,
-    *range(
-        AC_CHARGE_WINDOW_START_REGISTER,
-        AC_CHARGE_WINDOW_START_REGISTER + 2 * AC_CHARGE_WINDOW_PERIODS,
-    ),
-)
+# when the read captured it, so this is also what a restore must put back. The
+# list itself lives in charge.py beside the addresses, because the stored record
+# has to judge a saved configuration by the same nine.
+_CHARGE_WRITE_ADDRESSES: tuple[int, ...] = CHARGE_RESTORE_ADDRESSES
+
+
+def _without_enable(parameters: Mapping[int, int]) -> list[int]:
+    """The written addresses other than the enable register, in a fixed order."""
+    return sorted(address for address in parameters if address != AC_CHARGE_ENABLE_REGISTER)
+
+
+def _start_write_order(parameters: Mapping[int, int]) -> list[int]:
+    """A charge write's addresses, with the enable register last.
+
+    Turning AC charge on is what lets a charge begin. Until the power, the stop
+    setting and the window have been written, the device still holds whatever it
+    held before this charge — on the reference installation a 10 kW command and
+    a schedule nobody chose here — so the bit that starts a charge goes last,
+    once nothing else is left to write.
+    """
+    return [*_without_enable(parameters), AC_CHARGE_ENABLE_REGISTER]
+
+
+def _restore_write_order(parameters: Mapping[int, int]) -> list[int]:
+    """A restore's addresses, with the enable register first.
+
+    A restore is an undo, and the first thing an undo has to do is stop: putting
+    the saved enable bit back is what ends a charge this service started, and
+    the registers written after it describe an older charge.
+    """
+    return [AC_CHARGE_ENABLE_REGISTER, *_without_enable(parameters)]
+
+
+def _refuse_a_read_back_that_did_not_land(
+    applied: ChargeConfig, written: Mapping[int, int], what: str
+) -> None:
+    """Raise unless every register written reads back as it was written.
+
+    An acknowledged write is not a write that landed: this inverter's transport
+    once answered a write and left the register unchanged, and a charge is the
+    wrong place to find that out from the battery. For a start the cost of not
+    checking is a charge running at a power or over a window nobody decided; for
+    a restore it is worse, because the caller clears its only copy of what the
+    inverter held once this returns. Either way the refusal keeps the caller's
+    record, and a stop can put the registers back.
+    """
+    wrong = {
+        address: {"written": value, "read_back": applied.registers.get(address)}
+        for address, value in written.items()
+        if applied.registers.get(address) != value
+    }
+    if wrong:
+        raise ChargeWriteRefusedError(
+            f"the inverter read back a different {what} than it was written: {wrong}"
+        )
 
 
 class Eg4LuxPowerSource:
@@ -1925,6 +1971,19 @@ class Eg4LuxPowerSource:
     ) -> GridChargeChange:
         """Start a grid charge and report what the inverter held and now holds.
 
+        ``now`` must be an instant in the zone the inverter's own clock keeps,
+        because the window is written into the device as clock times: the same
+        moment cut in UTC schedules the charge in the wrong part of the day.
+        Callers that hold a site zone pass it here; the UTC default suits a
+        caller that has none only in the sense that it is explicit about it.
+
+        The window is a wall-clock window on both sides of the wire, so a
+        daylight-saving transition inside it makes the elapsed time an hour
+        shorter or longer than the minutes asked for. That is what the device's
+        own schedule does with the same registers, and matching it is the point:
+        the alternative would pack times the device reads differently from the
+        way this arithmetic meant them.
+
         The read comes before the write, and the enable bit is read again
         immediately before it is written: a charge that cannot be put back is
         refused, and an undo needs what was there first.
@@ -1978,17 +2037,43 @@ class Eg4LuxPowerSource:
             AC_CHARGE_POWER_REGISTER: command,
             AC_CHARGE_STOP_SOC_REGISTER: target_soc_pct,
         }
-        # The window registers are one family: a single-register write on a
-        # packed-time pair does not round-trip, so all six travel in the same
-        # write as the enable and power registers.
+        # The window registers are one family, but they travel as six writes
+        # rather than one, for the reason the write below gives.
         for index, window in enumerate(padded):
             start = AC_CHARGE_WINDOW_START_REGISTER + 2 * index
             parameters[start] = pack_time(window.start_hour, window.start_minute)
             parameters[start + 1] = pack_time(window.end_hour, window.end_minute)
         writer = cast(_ChargeWriter, self._transport)
-        if not await writer.write_parameters(parameters):
-            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge write")
+        # One register per call, deliberately. The transport groups consecutive
+        # addresses into a single multi-register write, and this inverter
+        # answers a single-register write while ignoring a batched one: measured
+        # 2026-09-10 against the reference installation, the write to register 21
+        # came back echoed and the eight-register write covering 66-73 went
+        # unanswered after three retries, surfacing as a refusal on an inverter
+        # that had not changed. Nine small writes cost milliseconds on a 19200
+        # baud link and are the form this hardware takes; the price is that a
+        # failure can land halfway, and the record the caller keeps before
+        # calling this is what covers that.
+        #
+        # The enable register goes last. Turning AC charge on is what lets a
+        # charge begin, and until the power, the stop setting and the window
+        # have landed the device still holds what it held before — 10 kW on the
+        # reference installation. Written first, that bit would put the
+        # inverter's old command and old schedule in charge of the battery for
+        # as long as the remaining writes take; written last, the only thing
+        # that can start is the charge that was decided here.
+        for address in _start_write_order(parameters):
+            if not await writer.write_parameters({address: parameters[address]}):
+                raise ChargeWriteRefusedError(
+                    f"the inverter did not acknowledge the charge write to register {address}"
+                )
         applied = await self.read_charge_config()
+        # An acknowledged write is not a write that landed. This inverter once
+        # took a write on register 66 and kept its old value, and a charge is
+        # the wrong place to learn that from the battery: every register this
+        # method set has to read back as it was set. A mismatch is refused, so
+        # the caller's record stays and a stop can still put the registers back.
+        _refuse_a_read_back_that_did_not_land(applied, parameters, "charge")
         return GridChargeChange(saved=saved, applied=applied, until=end)
 
     async def restore_grid_charge(self, saved: ChargeConfig) -> ChargeConfig:
@@ -2009,9 +2094,26 @@ class Eg4LuxPowerSource:
         # unchanged register is a risk with no purpose.
         parameters = {addr: saved.registers[addr] for addr in _CHARGE_WRITE_ADDRESSES}
         writer = cast(_ChargeWriter, self._transport)
-        if not await writer.write_parameters(parameters):
-            raise ChargeWriteRefusedError("the inverter did not acknowledge the charge restore")
-        return await self.read_charge_config()
+        # One register per call, for the reason start_grid_charge gives: this
+        # inverter answers a single-register write and ignores a batched one,
+        # and a restore that arrives as one eight-register write never lands.
+        #
+        # The enable register goes first here, the opposite of a start: putting
+        # back the bit that was saved is what stops a charge this service
+        # started, and it should stop before the registers that describe an
+        # older charge are written back around it.
+        for address in _restore_write_order(parameters):
+            if not await writer.write_parameters({address: parameters[address]}):
+                raise ChargeWriteRefusedError(
+                    f"the inverter did not acknowledge the charge restore to register {address}"
+                )
+        applied = await self.read_charge_config()
+        # The caller clears its record once this returns, so a restore that only
+        # looked like one must not return: an inverter still holding the charge's
+        # settings with the saved copy thrown away has nothing left to put it
+        # back. Every register is compared with what was written.
+        _refuse_a_read_back_that_did_not_land(applied, parameters, "restore")
+        return applied
 
     async def _read_energy(self, now: datetime) -> dict[str, float]:
         """Return the inverter's kWh counters, refreshing them when they are due.
