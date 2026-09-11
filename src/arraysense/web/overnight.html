@@ -56,6 +56,15 @@
   .cctl select,.cctl button{font:inherit;font-size:12px;padding:6px 10px;
     border-radius:7px;background:var(--tint);color:var(--ink);
     border:1px solid var(--panel-b)}
+  /* The power is a slider from the installation's floor to the inverter's own
+     AC charge maximum, and what it is set to is printed beside it: a handle
+     with no number on it is a control nobody can read back. */
+  .cctl input[type=range]{flex:1;min-width:110px;accent-color:var(--amber);
+    background:transparent;border:0;padding:0}
+  .cnow{font-size:12px;color:var(--ink2);font-variant-numeric:tabular-nums;
+    min-width:54px;text-align:right}
+  .cplan{margin:0;font-size:11px;color:var(--ink3)}
+  .cplan[hidden]{display:none}
   /* A press in flight has to look like one. The label changes with it, but a
      label alone is easy to miss on a button the eye has already left, so the
      whole control dims until the answer comes back. */
@@ -92,12 +101,15 @@
       <p class="ccfg" id="chargeConfig"></p>
       <div class="cctl" id="chargeCtl" hidden>
         <label class="clabel" for="chargePower">Charge power</label>
-        <select id="chargePower">
-          <option value="2000">2 kW</option>
-          <option value="3000" selected>3 kW</option>
-          <option value="5000">5 kW</option>
-        </select>
+        <!-- The handle runs from the driver's floor to the inverter's own AC
+             charge maximum, and the wiring re-reads both from the API so the
+             range cannot drift from the numbers the server enforces. The
+             attributes here are the fallback for the first paint only. -->
+        <input type="range" id="chargePower" min="1" max="12" step="0.1" value="3"
+               aria-describedby="chargePowerNote">
+        <output class="cnow" id="chargePowerOut" for="chargePower">3 kW</output>
       </div>
+      <p class="cplan" id="chargePowerNote" hidden></p>
       <div class="cctl">
         <button type="button" id="chargeGo" hidden>Charge to full from grid at 3 kW</button>
         <button type="button" id="chargeStop" hidden>Stop and put the inverter back</button>
@@ -256,8 +268,20 @@ const chargeKw = (w) => (typeof w !== 'number' || !isFinite(w) ? ''
   : (Number.isInteger(w / 1000) ? String(w / 1000) : (w / 1000).toFixed(1)) + ' kW');
 
 // The page prints clock times, not timestamps, for the reason given at the top
-// of this script. The API's window edge arrives as a full timestamp.
-const chargeClock = (iso) => (typeof iso === 'string' ? iso.slice(11, 16) : '');
+// of this script. The API's window edge arrives as a full timestamp, and it is
+// an instant: it is rendered in the reader's own clock rather than in whatever
+// offset the server happened to write it with. Slicing the characters of the
+// string instead printed 13:39 for a window that ends at 08:39 here, because the
+// record behind it had been written with a UTC offset — and a page that prints
+// one clock for the window and another for the wall clock beside it is worse
+// than one that prints none.
+const chargeClock = (iso) => {
+  if (typeof iso !== 'string' || iso === '') return '';
+  const at = new Date(iso);
+  if (isNaN(at.getTime())) return '';
+  const two = (n) => (n < 10 ? '0' + n : String(n));
+  return two(at.getHours()) + ':' + two(at.getMinutes());
+};
 
 function chargePanelVisible(charge) {
   return typeof charge === 'object' && charge !== null && !Array.isArray(charge);
@@ -353,6 +377,45 @@ function chargeActionLabel(powerW) {
   return 'Charge to full from grid' + (at ? ' at ' + at : '');
 }
 
+// The slider works in kilowatts and the API takes watts. One conversion, in one
+// place, because the label, the preview and the request have to mean the same
+// number by the time anything compares them. A tenth of a kilowatt is the
+// device's own hundred-watt unit, so the value that leaves here is the value the
+// inverter is written with rather than a rounding of it.
+const chargeSliderWatts = (value) => {
+  const kw = Number(value);
+  return isFinite(kw) && kw > 0 ? Math.round(kw * 10) * 100 : 0;
+};
+
+// What the chosen power will actually run at, which is not always what was
+// chosen: the site limit, the house's draw and the reserve come off it, so 12 kW
+// asked for while the house draws 5 kW runs at 6 kW. The page has already once
+// reported the charge it promised rather than the charge it started, so the
+// numbers behind the decision are printed here, before the press.
+function chargePlanLine(plan) {
+  if (!chargePanelVisible(plan)) return '';
+  if (plan.effective_w === null || plan.effective_w === undefined) {
+    const reason = typeof plan.reason === 'string' && plan.reason !== ''
+      ? plan.reason : 'the reason was not reported.';
+    return 'A charge cannot start now: ' + reason;
+  }
+  const at = chargeKw(plan.effective_w);
+  const asked = chargeKw(plan.requested_w);
+  const parts = [];
+  const limit = chargeKw(plan.site_limit_w);
+  const house = chargeKw(plan.house_load_w);
+  const margin = chargeKw(plan.margin_w);
+  if (limit) parts.push('site limit ' + limit);
+  if (house) parts.push('house ' + house);
+  if (margin) parts.push(margin + ' held back');
+  const why = parts.length ? ' (' + parts.join(', ') + ')' : '';
+  if (!at) return 'The charge power was not reported.';
+  if (asked && plan.effective_w !== plan.requested_w) {
+    return asked + ' selected; the charge will run at ' + at + why + '.';
+  }
+  return 'Runs at ' + at + why + '.';
+}
+
 // What the panel says while a press is in flight, in the status line and on the
 // button itself. A write to the inverter takes about a second and a half, and
 // the first live attempt showed what an unannounced press costs: the request
@@ -406,12 +469,49 @@ async function loadCharge() {
   // there is no start to choose a power for, and a handle above no action is a
   // knob that does nothing, so the row leaves with the button.
   pick.hidden = !goOn;
-  go.textContent = chargeActionLabel(Number(document.getElementById('chargePower').value));
   stop.hidden = !chargeStopVisible(charge);
+  // The chosen power, its label and what it will actually run at all come from
+  // this one call, so they cannot disagree with each other or with the server.
+  if (goOn) await refreshChargePlan();
 }
 
 async function refreshCharge() {
   await loadCharge();
+}
+
+// What the slider is set to, what pressing would run at, and whether it can run
+// at all. Its own request rather than part of the panel's read, because it is
+// asked again every time the handle moves and it costs no device access: the
+// answer is the site limit and the newest house-load row.
+async function refreshChargePlan() {
+  const slider = document.getElementById('chargePower');
+  const watts = chargeSliderWatts(slider.value);
+  const note = document.getElementById('chargePowerNote');
+  document.getElementById('chargePowerOut').textContent = chargeKw(watts) || '—';
+  document.getElementById('chargeGo').textContent = chargeActionLabel(watts);
+  let plan = null;
+  try {
+    const r = await fetch('/api/charge/plan?power_w=' + encodeURIComponent(watts));
+    if (r.ok) plan = await r.json();
+  } catch (err) {
+    plan = null;
+  }
+  note.textContent = chargePlanLine(plan);
+  note.hidden = note.textContent === '';
+  // The handle's ends come from the API's own bounds, so the range on screen is
+  // the range the server enforces — the inverter's AC charge maximum at the top
+  // and the driver's floor at the bottom — rather than a copy of them here.
+  if (plan && typeof plan.max_w === 'number' && plan.max_w > 0) {
+    slider.max = String(plan.max_w / 1000);
+  }
+  if (plan && typeof plan.min_w === 'number' && plan.min_w > 0) {
+    slider.min = String(plan.min_w / 1000);
+  }
+  // A power that cannot start is not a button to press. The range runs to the
+  // inverter's maximum and the site does not always have that much left, so the
+  // refusal is shown here instead of being discovered after the press.
+  document.getElementById('chargeGo').disabled = !(plan && plan.effective_w !== null
+    && plan.effective_w !== undefined);
 }
 
 async function startCharge() {
@@ -435,7 +535,11 @@ async function startCharge() {
     const r = await fetch('/api/charge/start', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({power_w: Number(document.getElementById('chargePower').value)}),
+      // The slider's kilowatts, converted in the one place that does it, so the
+      // power that is sent is the power the label promised.
+      body: JSON.stringify({
+        power_w: chargeSliderWatts(document.getElementById('chargePower').value),
+      }),
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) {
@@ -487,10 +591,12 @@ async function stopCharge() {
 
 document.getElementById('chargeGo').addEventListener('click', startCharge);
 document.getElementById('chargeStop').addEventListener('click', stopCharge);
-// The label moves with the handle that chooses the power, or the button would
-// still promise 3 kW under a choice of 5 kW and stop being checkable.
-document.getElementById('chargePower').addEventListener('change', (event) => {
-  document.getElementById('chargeGo').textContent = chargeActionLabel(Number(event.target.value));
+// The label, the number beside the handle and the power the charge would run at
+// all follow the handle. It is answered on `input` so the numbers move with the
+// drag rather than only when it is let go, and the request is the cheap one that
+// asks the inverter nothing.
+document.getElementById('chargePower').addEventListener('input', () => {
+  refreshChargePlan();
 });
 
 loadCharge();

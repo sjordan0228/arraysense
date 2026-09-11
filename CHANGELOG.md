@@ -2,6 +2,42 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.3 — 11 September 2026
+
+The charge power becomes a slider that reaches the inverter's own maximum, and
+the page says what the chosen power will actually run at before it is pressed.
+
+### Added
+
+- **A charge power slider, 1 kW to 12 kW.** The dropdown offered 2, 3 or 5 kW,
+  which is a guess at what somebody might want rather than the range the
+  hardware has. The inverter's own AC Charge Power setting is 12 kW, and the
+  register read agrees: register 101 holds the 250 A battery charge current
+  limit the device enforces, about 12.3 kW at a 49 V pack and 14.1 kW at the
+  56.5 V top of charge, while the BMS allows 560 A and register 66's own
+  encoding tops out at 15 kW. The handle runs from the driver's 1 kW floor to
+  that 12 kW in the device's hundred-watt steps, so every value on it is a power
+  the inverter can be written with. Its ends come from the API rather than from
+  the markup, so the range on screen is the range the server enforces.
+
+- **`GET /api/charge/plan?power_w=` — what a charge would actually run at.** A
+  chosen power is a request: the site limit, the house's draw and the 1 kW
+  reserve come off it, so 12 kW selected while the house draws 5 kW runs at
+  6 kW. The panel now prints both numbers with the arithmetic behind them, and a
+  power that cannot start disables the button and shows the reason beside the
+  handle. The preview is a read that touches no device — the site limit and the
+  newest house-load row are the whole answer — and it calls the same
+  `decide_charge_power` the start calls, so a preview cannot promise a power the
+  start then refuses. The start's own limit and load checks moved into the same
+  helper, which is what keeps the two refusals the same sentence.
+
+### Fixed
+
+- **The window's closing time was printed in the offset it was stored with.**
+  The window edge is an instant and the page sliced the clock characters out of
+  its text, so a record written with a UTC offset printed 13:39 for a window
+  that ends at 08:39 here. It is now rendered in the reader's own clock.
+
 ## 1.4.2 — 11 September 2026
 
 One line on the Overnight page, fixed the moment the release above was deployed
