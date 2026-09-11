@@ -287,12 +287,6 @@ function chargePanelVisible(charge) {
   return typeof charge === 'object' && charge !== null && !Array.isArray(charge);
 }
 
-function chargeStartVisible(charge) {
-  if (!chargePanelVisible(charge)) return false;
-  const o = charge.override || {};
-  return !o.recorded;
-}
-
 function chargeStopVisible(charge) {
   if (!chargePanelVisible(charge)) return false;
   const o = charge.override || {};

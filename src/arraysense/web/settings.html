@@ -686,6 +686,9 @@ function render() {
   dirtyCheck();
 
   // Build the tab bar and select the initial tab. Done after the form is
+  // populated so drawTabs can tell which tabs have content.
+  drawTabs();
+  selectTab(wantedTab());
 }
 
 // ---------------------------------------------------------------------------
@@ -1485,6 +1488,7 @@ function mountBandEditor(spec) {
 // second parser that disagrees is the bug this shape exists to prevent.
 // ---------------------------------------------------------------------------
 
+// >>> panels-editor
 const PANELS_KEY = 'panels.strings';
 
 // Defaults the server applies, mirrored from panels.py::_FLOAT_DEFAULTS and
@@ -1568,9 +1572,7 @@ function splitStringLine(line) {
   return row;
 }
 
-// Terminal marker for the node-test extraction harness. This empty function
-// is the stable end-of-slice sentinel and is never called.
-function panelsEditorEnd() {}
+// <<< panels-editor
 
 // A warning shown on the string row when a generic panel type was chosen
 // instead of entering every electrical figure by hand. The wording names
