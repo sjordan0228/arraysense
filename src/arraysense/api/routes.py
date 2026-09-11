@@ -1035,6 +1035,20 @@ class ChargeStartRequest(BaseModel):
 async def charge_start(request: Request, body: ChargeStartRequest) -> dict[str, Any]:
     """Start a bounded grid charge, keeping the record that makes it undoable.
 
+    The whole transaction runs under ``app.state.charge_lock``: reading the
+    record, reading the inverter, writing the record and writing nine registers
+    are separated by awaits, and two starts interleaved can both decide that no
+    charge is recorded. The second would then save a configuration the first had
+    already changed, which is an undo that restores the charge instead of the
+    inverter's own settings.
+    """
+    async with request.app.state.charge_lock:
+        return await _start_grid_charge(request, body)
+
+
+async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict[str, Any]:
+    """The start itself, with the lock already held by its caller.
+
     The bound comes from the site limit and the house's current draw, not
     from the request: what was asked for is held to what the installation
     has left. The configuration the inverter held is recorded before the
@@ -1160,6 +1174,17 @@ async def charge_start(request: Request, body: ChargeStartRequest) -> dict[str, 
 @router.post("/charge/stop", dependencies=[Depends(_require_write)])
 async def charge_stop(request: Request) -> dict[str, Any]:
     """Write the recorded configuration back, and forget it only once that worked.
+
+    Under the same lock as a start, for the same reason: a stop that clears the
+    record while a start is halfway through writing registers would leave a
+    charge running with nothing left that describes how to end it.
+    """
+    async with request.app.state.charge_lock:
+        return await _stop_grid_charge(request)
+
+
+async def _stop_grid_charge(request: Request) -> dict[str, Any]:
+    """The stop itself, with the lock already held by its caller.
 
     The record is the answer to what the inverter held before the charge.
     A restore that failed is exactly the moment it is still needed, so

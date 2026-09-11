@@ -291,8 +291,22 @@ function chargeStatusLine(charge, nowMs) {
   const until = chargeClock(o.until);
   if (o.recorded === true && o.active === true) {
     const at = chargeKw(charge.power_w);
-    return 'Charging from the grid' + (at ? ' at ' + at : '')
-      + (until ? ' until ' + until : '') + '.';
+    const window = until ? ' until ' + until : '';
+    // The record is written before the inverter is touched and kept when a write
+    // fails, so an active record is not the same fact as a charge the device is
+    // running: the first live press answered 502 with a record standing and the
+    // inverter untouched. Only a device that reports AC charging on is described
+    // as charging, and a device that has not answered the question gets a
+    // sentence that does not answer it either.
+    if (charge.ac_charge_enabled === true) {
+      return 'Charging from the grid' + (at ? ' at ' + at : '') + window + '.';
+    }
+    if (charge.ac_charge_enabled === false) {
+      return 'A charge is recorded' + window + ', but the inverter reports AC charging off, '
+        + 'so it is not charging. Stopping puts the inverter back the way it was.';
+    }
+    return 'A charge is recorded' + (at ? ' at ' + at : '') + window
+      + '. The inverter has not said whether it is charging.';
   }
   if (o.recorded === true) {
     // A window that ran out is not a charge that stopped: the override stays

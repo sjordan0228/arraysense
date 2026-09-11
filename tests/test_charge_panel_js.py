@@ -256,11 +256,30 @@ def test_a_running_charge_reports_its_power_and_the_time_its_window_closes() -> 
     """The line says what the inverter is doing and until when, both read from
     the response. A charge at 3 kW whose window ends at 23:45 says exactly
     that, and does not also say no charge is running."""
-    cfg = _charge(override=_override(True, True, True, UNTIL, 3000))
+    cfg = _charge(ac_charge_enabled=True, override=_override(True, True, True, UNTIL, 3000))
     line = _call("chargeStatusLine", cfg, NOW_MS)
     assert "3 kW" in line
     assert "23:45" in line
     assert "No grid charge" not in line
+
+
+@pytest.mark.skipif(NODE is None, reason="node not installed")
+def test_a_record_alone_is_not_reported_as_a_charge() -> None:
+    """The record is written before the inverter is touched and kept when a
+    write fails, so an active record with the device answering "AC charging
+    off" is a charge that did not start — which is exactly the state the first
+    live press left behind. The page says that rather than describing a charge
+    the device is not running, and a device that never answered the question
+    gets a sentence that does not answer it either."""
+    recorded = _override(True, True, True, UNTIL, 3000)
+    off = _call("chargeStatusLine", _charge(ac_charge_enabled=False, override=recorded), NOW_MS)
+    assert "Charging from the grid" not in off
+    assert "reports AC charging off" in off
+    assert "23:45" in off
+    silent = _call("chargeStatusLine", _charge(ac_charge_enabled=None, override=recorded), NOW_MS)
+    assert "Charging from the grid" not in silent
+    assert "has not said whether it is charging" in silent
+    assert "3 kW" in silent
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -402,7 +421,10 @@ def test_a_refused_press_announces_itself_and_re_reads_the_panel() -> None:
     assert out["after"]["startDisabled"] is False
     assert out["after"]["why"] == "the inverter did not answer the write"
     assert out["after"]["whyHidden"] is False
-    assert "Charging from the grid" in out["after"]["status"]
+    # And the status line is the truth about what the refusal left: a record
+    # standing over an inverter that reports it is not charging, rather than the
+    # "Charging from the grid" the page used to print for any active record.
+    assert "reports AC charging off" in out["after"]["status"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")

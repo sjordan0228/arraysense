@@ -33,6 +33,22 @@ POWER_COMMAND_WATTS = 100
 SOC_LIMIT_NEVER_STOP = 101
 SCHEDULE_TYPES = {0: "time", 1: "soc_voltage", 2: "time_and_soc_voltage"}
 
+# The registers a charge writes, and therefore the ones an undo has to put back.
+# One list, because two would drift: a restore that wrote a different set from
+# the one the start changed is a change with no undo, and a stored record that
+# is missing any of these is not an undo either — it is a partial copy that
+# would leave the inverter half restored. Both the driver and the stored record
+# read the list from here.
+CHARGE_RESTORE_ADDRESSES: tuple[int, ...] = (
+    AC_CHARGE_ENABLE_REGISTER,
+    AC_CHARGE_POWER_REGISTER,
+    AC_CHARGE_STOP_SOC_REGISTER,
+    *range(
+        AC_CHARGE_WINDOW_START_REGISTER,
+        AC_CHARGE_WINDOW_START_REGISTER + 2 * AC_CHARGE_WINDOW_PERIODS,
+    ),
+)
+
 
 @dataclass(frozen=True)
 class ChargeWindow:

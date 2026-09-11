@@ -389,6 +389,11 @@ class _WriteTransport:
         self.reads: list[tuple[int, int]] = []
         self.writes: list[dict[int, int]] = []
         self.accepts_writes = True
+        # Addresses this fake answers and then leaves alone. That is not a
+        # hypothetical: the first batched write this installation was sent came
+        # back acknowledged by the transport and the register kept its old
+        # value, which is the failure a read-back comparison exists to catch.
+        self.ignores: set[int] = set()
         self.read_error: Exception | None = None
 
     async def read_parameters(self, start_address: int, count: int) -> dict[int, int]:
@@ -405,7 +410,9 @@ class _WriteTransport:
         self.writes.append(dict(parameters))
         if not self.accepts_writes:
             return False
-        self.registers.update(parameters)
+        for address, value in parameters.items():
+            if address not in self.ignores:
+                self.registers[address] = value
         return True
 
 
@@ -550,6 +557,61 @@ async def test_a_restore_puts_the_saved_registers_back_verbatim() -> None:
     assert transport.registers != original  # the charge changed the map
     await driver.restore_grid_charge(change.saved)
     assert transport.registers == original
+
+
+async def test_the_start_enables_the_charge_only_once_everything_else_landed() -> None:
+    # The enable bit is what lets a charge begin, and until the power, the stop
+    # setting and the window have been written the device still holds what it
+    # held before: 10 kW and the owner's own schedule on this installation.
+    # Written first, the enable bit would put that old command in charge of the
+    # battery for as long as the remaining writes take.
+    driver, transport = _write_setup()
+    await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
+    order = [next(iter(chunk)) for chunk in transport.writes]
+    assert order[-1] == 21
+    assert set(order[:-1]) == {66, 67, 68, 69, 70, 71, 72, 73}
+
+
+async def test_the_restore_ends_the_charge_before_it_writes_anything_else() -> None:
+    # A restore is an undo, so its first write is the one that stops a charge
+    # this service started — the saved enable bit — rather than a register that
+    # only describes how an older charge was configured. Today's addresses put
+    # 21 first whether or not the order is chosen, so this pins the intent
+    # rather than reproducing an old fault: a later reordering must not push the
+    # register that ends the charge to the back of the queue.
+    driver, transport = _write_setup()
+    change = await driver.start_grid_charge(power_w=3050, duration_min=90, now=_NOON)
+    transport.writes.clear()
+    await driver.restore_grid_charge(change.saved)
+    order = [next(iter(chunk)) for chunk in transport.writes]
+    assert order[0] == 21
+    assert set(order[1:]) == {66, 67, 68, 69, 70, 71, 72, 73}
+
+
+async def test_a_write_the_inverter_acknowledges_but_ignores_is_refused() -> None:
+    # The transport can answer a write and leave the register alone, which is
+    # what the batched write did on the live installation. Trusting the answer
+    # would report a charge running at a power nobody chose, so the registers
+    # are read back and compared with what was written.
+    driver, transport = _write_setup()
+    transport.ignores = {66}
+    with pytest.raises(ChargeWriteRefusedError) as refused:
+        await driver.start_grid_charge(power_w=3000, duration_min=60, now=_NOON)
+    assert "read back" in str(refused.value)
+    assert "66" in str(refused.value)
+    assert transport.registers[66] == 12  # the old command, still in force
+
+
+async def test_a_restore_that_did_not_land_is_refused_rather_than_reported() -> None:
+    # The caller clears its record the moment a restore returns, so a restore
+    # that only looked like one must not return: an inverter still holding the
+    # charge with the saved copy discarded has nothing left to put it back.
+    driver, transport = _write_setup()
+    change = await driver.start_grid_charge(power_w=3050, duration_min=60, now=_NOON)
+    transport.ignores = {21}
+    with pytest.raises(ChargeWriteRefusedError):
+        await driver.restore_grid_charge(change.saved)
+    assert transport.registers[21] & (1 << 7)  # the charge is still enabled
 
 
 async def test_a_restore_writes_one_register_per_call_too() -> None:

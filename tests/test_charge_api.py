@@ -9,7 +9,8 @@ the refusal paths are the safety story here, not an afterthought.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+import asyncio
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 
 from arraysense.api.app import create_app
 from arraysense.charge import (
@@ -79,6 +81,7 @@ class ChargeSource:
         fail_start: Exception | None = None,
         fail_restore: Exception | None = None,
         probe: Callable[[], None] | None = None,
+        read_gate: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.registers = dict(ORIGINAL_REGISTERS)
         self.start_calls: list[dict[str, Any]] = []
@@ -86,8 +89,17 @@ class ChargeSource:
         self.fail_start = fail_start
         self.fail_restore = fail_restore
         self.probe = probe
+        # An awaitable run in place of the first read of the configuration, which
+        # is the window a second charge request has to be kept out of. The gate is
+        # how a test holds one request inside the transaction while another
+        # arrives.
+        self.read_gate = read_gate
+        self.reads = 0
 
     async def read_charge_config(self) -> ChargeConfig:
+        self.reads += 1
+        if self.read_gate is not None and self.reads == 1:
+            await self.read_gate()
         return decode_charge_config(
             self.registers,
             quick_charge_remaining_s=None,
@@ -149,6 +161,27 @@ def _rig(
     planning layer was written against. Tests that need a different house or
     no limit at all say so here rather than editing the store afterwards.
     """
+    app, store, settings = _assembled(tmp_path, source, load_w=load_w, limit=limit)
+    try:
+        with TestClient(app) as client:
+            yield client, source, store, settings
+    finally:
+        store.close()
+
+
+def _assembled(
+    tmp_path: Path,
+    source: Any,
+    *,
+    load_w: float | None = 5000.0,
+    limit: int | None = 12000,
+) -> tuple[Any, SqliteStore, SettingsStore]:
+    """The app itself, for a test that has to drive it two requests at a time.
+
+    TestClient serializes its calls, so a test about what happens when two
+    charge requests overlap cannot use it: it needs the ASGI app and an async
+    client, which is what this returns.
+    """
     store = SqliteStore(str(tmp_path / "charge.db"), device=TEST_DEVICE)
     if load_w is not None:
         store.append(Sample(timestamp=T0, readings={"load_power_w": load_w}))
@@ -164,11 +197,7 @@ def _rig(
     settings = SettingsStore(store)
     if limit is not None:
         settings.set(INVERTER_LIMIT_KEY, limit)
-    try:
-        with TestClient(app) as client:
-            yield client, source, store, settings
-    finally:
-        store.close()
+    return app, store, settings
 
 
 # --- refusals before anything reaches the inverter -------------------------------
@@ -235,6 +264,59 @@ def test_the_window_is_cut_on_the_installation_clock(tmp_path: Path) -> None:
         site = ZoneInfo("America/Chicago")
         assert sent.utcoffset() == site.utcoffset(sent)
         assert sent.utcoffset() != timedelta(0)
+
+
+async def test_two_starts_at_once_leave_one_charge_and_one_usable_record(tmp_path: Path) -> None:
+    """A start is a transaction over the device and the record, and it awaits
+    throughout. Two of them overlapping can both read "no charge recorded", and
+    the second would then save a configuration the first had already changed —
+    an undo that restores the charge instead of the inverter's own settings. The
+    page's disabled button covers one tab; this covers the API."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    # The first start is held inside its read of the inverter, which is the
+    # window two overlapping starts have to be kept out of.
+    reading = asyncio.Event()
+
+    async def hold_the_first_read() -> None:
+        reading.set()
+        await asyncio.sleep(0.2)
+
+    source.read_gate = hold_the_first_read
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        first = asyncio.create_task(client.post("/api/charge/start", json={}))
+        await reading.wait()
+        second = await client.post("/api/charge/start", json={})
+        first_response = await first
+
+    assert first_response.status_code == 200
+    assert second.status_code == 409
+    assert "already running" in second.json()["detail"]
+    # One charge ran, and the record that stands is the configuration read
+    # before it — not the charge's own settings, which is what a second start
+    # racing the first would have saved.
+    assert len(source.start_calls) == 1
+    record = load_override(settings)
+    assert record is not None
+    assert record.saved.registers == dict(ORIGINAL_REGISTERS)
+    store.close()
+
+
+async def test_a_restore_the_inverter_did_not_take_keeps_the_record(tmp_path: Path) -> None:
+    """The record is cleared only by a restore that landed. The driver compares
+    the read-back, so a stop that left the inverter charged answers 502 and the
+    record stays — which is the only thing that can try again."""
+    source = ChargeSource()
+    with _rig(tmp_path, source) as (client, src, _store, settings):
+        assert client.post("/api/charge/start", json={}).status_code == 200
+        src.fail_restore = ChargeWriteRefusedError(
+            "the inverter read back a different restore than it was written: {21: (2, 130)}"
+        )
+        stopped = client.post("/api/charge/stop")
+        assert stopped.status_code == 502
+        assert "kept" in stopped.json()["detail"]
+        assert settings.get(CHARGE_OVERRIDE_KEY) != ""
 
 
 # --- the record around the write --------------------------------------------------

@@ -8,6 +8,7 @@ or a real config file.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -287,6 +288,15 @@ def create_app(
     # they would share sessions, so a login to one would unlock the others.
     app.state.sessions = Sessions()
     app.state.throttle = LoginThrottle()
+    # One charge at a time, per process. Starting and stopping a grid charge is
+    # a transaction over the device and the stored record — read the record,
+    # read the inverter, write the record, write nine registers, read back — and
+    # the request is awaited throughout. Two of them interleaved can both decide
+    # no charge is recorded, and the second then saves a configuration the first
+    # had already changed, which is an undo that puts the charge back instead of
+    # the inverter's own settings. The page's disabled button covers one tab and
+    # no API client at all, so the serialization lives here.
+    app.state.charge_lock = asyncio.Lock()
     app.include_router(router)
     install_text_guard(app)
 
