@@ -2,6 +2,70 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.1 — 11 September 2026
+
+The charge button's first live press failed on the inverter with nothing on the
+page to say the press had been taken. Both are fixed, and an independent review
+of the whole charge path found six more things worth fixing before the feature
+was trusted with a battery again.
+
+### Fixed
+
+- **The charge write was rejected by the inverter.** The transport groups
+  consecutive register addresses into one multi-register write, and this
+  inverter answers a single-register write and ignores a batched one: the start
+  sent registers 66-73 as one eight-register write, it went unanswered after
+  three retries, and the endpoint answered 502 on an inverter that had not
+  changed. Every register now travels in its own call, on the start and on the
+  restore, and the read-back afterwards is compared with what was written — an
+  acknowledged write that did not land is refused rather than reported as a
+  charge.
+
+- **The window was cut from UTC.** The window registers hold clock times, and
+  the inverter reads them in the installation's own zone. A press at 22:40 local
+  was written to the device as 03:39-13:39: a charge scheduled for the wrong
+  part of the day. The start now cuts its window from the site zone.
+
+- **A press said nothing while it was in flight,** and the panel was not re-read
+  after a refusal, so a press that had been recorded on the server still showed
+  the start button it had. The press is announced on the button and the status
+  line and taken out of the owner's hands while it is out, and the panel is
+  re-read whether the write worked or not.
+
+- **The enable bit was written first,** in address order, so a start turned AC
+  charge on while the device still held its previous power command and schedule
+  — 10 kW on the reference installation. A start now writes it last; a restore
+  writes it first, because the first thing an undo has to do is stop.
+
+- **Start and stop were an unlocked check-then-act sequence.** Two overlapping
+  starts could both decide no charge was recorded, and the second would save a
+  configuration the first had already changed. Both now run under one lock.
+
+- **A stored record missing one of the nine registers it has to write back read
+  as usable,** so the page offered a stop the driver must refuse. A record now
+  has to hold all nine, and the list is shared from `charge.py` so the driver
+  and the record cannot drift apart.
+
+- **A house-load reading that was absent or stale authorized a charge up to the
+  site ceiling** on top of whatever the house was drawing, which is more than
+  the site was limited to. The reading has to be recent, or the start is refused
+  with 409 naming the newest reading there is.
+
+- **The status line called an active record a running charge.** The record is
+  written before the inverter is touched and kept when a write fails, so with
+  the device reporting AC charging off the line now says the record stands and
+  the inverter is not charging.
+
+### Added
+
+- **A recorded charge whose window has closed is ended by the service itself.**
+  A device schedule has no date in it, so the window written for one charge
+  opens again the next night at the same hour: left alone, one press would have
+  charged the battery every night afterwards with nobody asking. The expiry
+  holds the same lock a press holds, does nothing while the window is open,
+  writes the record's own saved configuration back through the reviewed stop
+  path, and keeps the record if the inverter cannot be put back.
+
 ## 1.4.0 — 11 September 2026
 
 The dashboard can charge the battery from the grid, because the warning that

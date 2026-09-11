@@ -30,10 +30,24 @@ from arraysense.store.sqlite_store import SqliteStore
 from conftest import TEST_DEVICE
 
 # The registers one read answered: charge enable with bit 7 set (26581), a
-# 3 kW command at 100 W per unit, two packed window pairs, and a start
-# voltage. Deliberately more than the known charge addresses — a restore
-# writes the whole read back, not a reconstruction.
-REGISTERS = {21: 26581, 66: 30, 68: 1310, 69: 1410, 120: 1, 158: 460}
+# 3 kW command at 100 W per unit, the charge's stop setting, both window pairs
+# of a two-period schedule with the third pair clear, and a start voltage.
+# Deliberately more than the nine a restore writes — a record keeps the whole
+# read, not a reconstruction — and deliberately all nine, because a record that
+# cannot be written back whole is damage rather than an undo.
+REGISTERS = {
+    21: 26581,
+    66: 30,
+    67: 100,
+    68: 1310,
+    69: 1410,
+    70: 0,
+    71: 0,
+    72: 0,
+    73: 0,
+    120: 1,
+    158: 460,
+}
 READ_AT = datetime(2026, 9, 10, 18, 0, tzinfo=UTC)
 UNTIL = datetime(2026, 9, 10, 18, 20, tzinfo=UTC)
 
@@ -121,6 +135,23 @@ def test_a_record_missing_its_registers_is_reported() -> None:
         decode_override(text)
 
 
+def test_a_record_missing_one_of_the_registers_a_restore_writes_is_reported() -> None:
+    # The record is an undo, so one that cannot be written back whole is damage
+    # rather than a usable record. Read as usable, it would put a stop on the
+    # page that the driver must refuse — and the stop would answer 500 over a
+    # control that cannot work.
+    partial = {address: value for address, value in REGISTERS.items() if address != 72}
+    payload = {
+        "registers": {str(address): value for address, value in partial.items()},
+        "read_at": READ_AT.isoformat(),
+        "until": UNTIL.isoformat(),
+        "requested_w": 3000,
+    }
+    with pytest.raises(ValueError) as damaged:
+        decode_override(json.dumps(payload))
+    assert "72" in str(damaged.value)
+
+
 def test_the_payload_is_json_with_string_register_keys() -> None:
     override = _override()
     text = encode_override(override)
@@ -149,7 +180,11 @@ def test_saving_twice_replaces_the_record(tmp_path: Path) -> None:
     store = _store(tmp_path)
     settings = SettingsStore(store)
     second = ChargeOverride(
-        saved=decode_charge_config({21: 0, 66: 12}, quick_charge_remaining_s=None, read_at=READ_AT),
+        saved=decode_charge_config(
+            {**REGISTERS, 21: 0, 66: 12},
+            quick_charge_remaining_s=None,
+            read_at=READ_AT,
+        ),
         until=UNTIL + timedelta(minutes=10),
         requested_w=1200,
     )

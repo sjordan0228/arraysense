@@ -56,6 +56,10 @@
   .cctl select,.cctl button{font:inherit;font-size:12px;padding:6px 10px;
     border-radius:7px;background:var(--tint);color:var(--ink);
     border:1px solid var(--panel-b)}
+  /* A press in flight has to look like one. The label changes with it, but a
+     label alone is easy to miss on a button the eye has already left, so the
+     whole control dims until the answer comes back. */
+  .cctl button:disabled{opacity:.6;cursor:default}
   .cwhy{margin:0;font-size:11px;color:var(--warn)}
   .cwhy[hidden]{display:none}
 </style>
@@ -287,8 +291,22 @@ function chargeStatusLine(charge, nowMs) {
   const until = chargeClock(o.until);
   if (o.recorded === true && o.active === true) {
     const at = chargeKw(charge.power_w);
-    return 'Charging from the grid' + (at ? ' at ' + at : '')
-      + (until ? ' until ' + until : '') + '.';
+    const window = until ? ' until ' + until : '';
+    // The record is written before the inverter is touched and kept when a write
+    // fails, so an active record is not the same fact as a charge the device is
+    // running: the first live press answered 502 with a record standing and the
+    // inverter untouched. Only a device that reports AC charging on is described
+    // as charging, and a device that has not answered the question gets a
+    // sentence that does not answer it either.
+    if (charge.ac_charge_enabled === true) {
+      return 'Charging from the grid' + (at ? ' at ' + at : '') + window + '.';
+    }
+    if (charge.ac_charge_enabled === false) {
+      return 'A charge is recorded' + window + ', but the inverter reports AC charging off, '
+        + 'so it is not charging. Stopping puts the inverter back the way it was.';
+    }
+    return 'A charge is recorded' + (at ? ' at ' + at : '') + window
+      + '. The inverter has not said whether it is charging.';
   }
   if (o.recorded === true) {
     // A window that ran out is not a charge that stopped: the override stays
@@ -326,6 +344,15 @@ function chargeConfigLine(charge) {
 function chargeActionLabel(powerW) {
   const at = chargeKw(powerW);
   return 'Charge to full from grid' + (at ? ' at ' + at : '');
+}
+
+// What the panel says while a press is in flight, in the status line and on the
+// button itself. A write to the inverter takes about a second and a half, and
+// the first live attempt showed what an unannounced press costs: the request
+// went out, the inverter did not answer it, and nothing on screen had said the
+// press had been taken at all.
+function chargeBusyLine(action) {
+  return action === 'stop' ? 'Stopping the charge…' : 'Starting the charge…';
 }
 
 // The refusal paragraph is the only thing telling the owner that nothing
@@ -383,9 +410,16 @@ async function refreshCharge() {
 async function startCharge() {
   const why = document.getElementById('chargeWhy');
   const go = document.getElementById('chargeGo');
+  const status = document.getElementById('chargeStatus');
   why.textContent = '';
   why.hidden = true;
+  // The press is announced before the request is sent. A write to the inverter
+  // takes about a second and a half, and a control that looks identical while
+  // it works is one that reads as a press which did not register — which is
+  // exactly how the first live attempt looked.
   go.disabled = true;
+  go.textContent = chargeBusyLine('start');
+  status.textContent = chargeBusyLine('start');
   try {
     // No duration is sent. The server holds the window at 600 minutes and the
     // stop-at-full setting ends the charge as soon as the bank fills, so the
@@ -397,29 +431,32 @@ async function startCharge() {
       body: JSON.stringify({power_w: Number(document.getElementById('chargePower').value)}),
     });
     const body = await r.json().catch(() => ({}));
-    // A refusal leaves the panel as it was: the state on screen is still the
-    // last true one, and re-reading would only replace it with the same
-    // answer. What changes is the sentence naming the reason.
     if (!r.ok) {
       why.textContent = chargeRefusalText(body);
       why.hidden = false;
-      return;
     }
-    await refreshCharge();
   } catch (err) {
     why.textContent = 'This service did not answer.';
     why.hidden = false;
   } finally {
     go.disabled = false;
+    // Re-read whether it worked or not. A refused start still changed the
+    // server: the configuration is recorded before the write is attempted and
+    // that record is kept when the write fails, so the panel has to show the
+    // stop it now calls for rather than the start it had.
+    await refreshCharge();
   }
 }
 
 async function stopCharge() {
   const why = document.getElementById('chargeWhy');
   const stop = document.getElementById('chargeStop');
+  const status = document.getElementById('chargeStatus');
   why.textContent = '';
   why.hidden = true;
   stop.disabled = true;
+  stop.textContent = chargeBusyLine('stop');
+  status.textContent = chargeBusyLine('stop');
   try {
     // No body and no settings resent. Stopping writes back the configuration
     // read before the charge started, so anything this page sent alongside the
@@ -429,14 +466,15 @@ async function stopCharge() {
     if (!r.ok) {
       why.textContent = chargeRefusalText(body);
       why.hidden = false;
-      return;
     }
-    await refreshCharge();
   } catch (err) {
     why.textContent = 'This service did not answer.';
     why.hidden = false;
   } finally {
     stop.disabled = false;
+    // The button's own label comes back from the re-read, which knows whether
+    // the record still stands or the charge is now simply off.
+    await refreshCharge();
   }
 }
 
