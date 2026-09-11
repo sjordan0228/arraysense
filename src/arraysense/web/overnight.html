@@ -34,6 +34,30 @@
   .guidance li{margin:3px 0}
   .assumptions{font-size:11px;color:var(--ink3);line-height:1.7}
   .assumptions li{margin:2px 0}
+  /* The charge control is one object with two lines of state above it, not two
+     more paragraphs and a loose row of controls. The lines are ink2 and ink3
+     because they report the device rather than the plan. The amber edge marks
+     it as the one place on this page that writes to the inverter. */
+  .charge{display:flex;flex-direction:column;gap:8px;padding:10px 12px;
+    border-left:3px solid var(--amber);background:var(--tint);
+    border-radius:0 8px 8px 0}
+  /* display:flex beats the browser's own [hidden] rule, so hidden has to be
+     given back or the panel is on screen on every installation that has
+     nothing to charge — which is what the 404 from /api/charge means. */
+  .charge[hidden]{display:none}
+  .cstat{margin:0;font-size:12px;color:var(--ink2)}
+  .ccfg{margin:0;font-size:11px;color:var(--ink3)}
+  .cctl{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .cctl[hidden]{display:none}
+  .clabel{font-size:11px;color:var(--ink3)}
+  /* Both buttons are tint with ink text. A charge and a stop are not a good
+     thing and a bad thing, and colour that says otherwise is colour somebody
+     learns to ignore; the sentence inside each button is what carries it. */
+  .cctl select,.cctl button{font:inherit;font-size:12px;padding:6px 10px;
+    border-radius:7px;background:var(--tint);color:var(--ink);
+    border:1px solid var(--panel-b)}
+  .cwhy{margin:0;font-size:11px;color:var(--warn)}
+  .cwhy[hidden]{display:none}
 </style>
 <link id="appearance-sheet" rel="stylesheet" href="/theme-glass.css">
 <script>applyStoredAppearance();</script>
@@ -53,6 +77,29 @@
   <section class="p plan" id="planSec">
     <h2>Overnight plan</h2>
     <p id="planNote">Loading…</p>
+    <!-- The grid charge sits here, under the line that says the state of
+         charge cannot be trusted, because that is the sentence that makes the
+         owner want to fix it. It is hidden until /api/charge answers 200: an
+         installation whose driver cannot report charge configuration gets no
+         panel at all, because an empty one reads as a device that was asked
+         and had nothing to say, which is a different claim than the 404. -->
+    <section class="charge" id="chargePanel" hidden>
+      <p class="cstat" id="chargeStatus"></p>
+      <p class="ccfg" id="chargeConfig"></p>
+      <div class="cctl" id="chargeCtl" hidden>
+        <label class="clabel" for="chargePower">Charge power</label>
+        <select id="chargePower">
+          <option value="2000">2 kW</option>
+          <option value="3000" selected>3 kW</option>
+          <option value="5000">5 kW</option>
+        </select>
+      </div>
+      <div class="cctl">
+        <button type="button" id="chargeGo" hidden>Charge to full from grid at 3 kW</button>
+        <button type="button" id="chargeStop" hidden>Stop and put the inverter back</button>
+      </div>
+      <p class="cwhy" id="chargeWhy" hidden></p>
+    </section>
     <div class="guidance"><ul id="guidanceBox"></ul></div>
     <div class="chart" id="planChartWrap" role="img"
       aria-label="Projected battery state of charge through the night"></div>
@@ -185,6 +232,223 @@ function drawPlan(data) {
   document.getElementById('scenRows').innerHTML = scenarioRows(data);
 }
 // <<< overnight-page
+
+// >>> charge-panel
+// The charge control's rules, kept apart from the wiring below so they can run
+// under node (tests/test_charge_panel_js.py). Nothing here decides whether a
+// charge is allowed: that is settled in charge.py from the site limit and the
+// house's current draw, and a limit compared in two places is two limits the
+// day one of them moves. What these do is say what is true and what pressing
+// a button would do.
+//
+// A field the device did not report never prints as a zero or as "off". The
+// chart above already draws a dash for an unmeasured reading for this exact
+// reason: 0 kW and "off" are both states somebody could act on, and the
+// inverter never said either one.
+
+// One place words a power, because the status line and the button describe the
+// same kilowatts and must not read differently about them.
+const chargeKw = (w) => (typeof w !== 'number' || !isFinite(w) ? ''
+  : (Number.isInteger(w / 1000) ? String(w / 1000) : (w / 1000).toFixed(1)) + ' kW');
+
+// The page prints clock times, not timestamps, for the reason given at the top
+// of this script. The API's window edge arrives as a full timestamp.
+const chargeClock = (iso) => (typeof iso === 'string' ? iso.slice(11, 16) : '');
+
+function chargePanelVisible(charge) {
+  return typeof charge === 'object' && charge !== null && !Array.isArray(charge);
+}
+
+function chargeStartVisible(charge) {
+  if (!chargePanelVisible(charge)) return false;
+  const o = charge.override || {};
+  return !o.recorded;
+}
+
+function chargeStopVisible(charge) {
+  if (!chargePanelVisible(charge)) return false;
+  const o = charge.override || {};
+  return o.recorded === true && o.readable === true;
+}
+
+function chargeStatusLine(charge, nowMs) {
+  if (!chargePanelVisible(charge)) return '';
+  const o = charge.override || {};
+  // An unreadable record gets a warning instead of buttons. A charge may be
+  // running on a record this service cannot decode, and the damaged record is
+  // the only description of how to undo it — so the page says to look at the
+  // inverter rather than offering a stop that has nothing to write back, or a
+  // start that would stack a second override on the first.
+  if (o.recorded === true && o.readable !== true) {
+    return 'A charge this service started cannot be read back, so the inverter '
+      + 'may still be holding it. Check the charge settings on the inverter '
+      + 'before starting another charge.';
+  }
+  const until = chargeClock(o.until);
+  if (o.recorded === true && o.active === true) {
+    const at = chargeKw(charge.power_w);
+    return 'Charging from the grid' + (at ? ' at ' + at : '')
+      + (until ? ' until ' + until : '') + '.';
+  }
+  if (o.recorded === true) {
+    // A window that ran out is not a charge that stopped: the override stays
+    // on the inverter until the owner clears it, which is the whole reason the
+    // stop button is still offered here.
+    return 'The charge window closed' + (until ? ' at ' + until : '')
+      + '. Stopping puts the inverter back the way it was.';
+  }
+  return 'No grid charge is running.';
+}
+
+function chargeConfigLine(charge) {
+  if (!chargePanelVisible(charge)) return '';
+  const MISSING = 'not reported';
+  const ac = charge.ac_charge_enabled === true ? 'AC charging is on'
+    : charge.ac_charge_enabled === false ? 'AC charging is off'
+      : 'AC charging ' + MISSING;
+  const power = chargeKw(charge.power_w) || ('power ' + MISSING);
+  const stop = typeof charge.stop_soc_pct === 'number' && isFinite(charge.stop_soc_pct)
+    ? 'stops at ' + charge.stop_soc_pct + '%' : 'stop state of charge ' + MISSING;
+  // A window that was never set is a different fact from no windows at all,
+  // so an absent list says so rather than counting zero of them.
+  const windows = Array.isArray(charge.windows)
+    ? charge.windows.filter((w) => w && w.is_set === true).length
+    : null;
+  const windowText = windows === null ? 'time windows ' + MISSING
+    : windows === 0 ? 'no time window set'
+      : windows + (windows === 1 ? ' time window set' : ' time windows set');
+  return [ac, power, stop, windowText].join(' · ');
+}
+
+// The label is a promise about the press, never a report of the device. A
+// button labelled with the current state is a coin toss every time; one
+// labelled with the action can be checked against what actually happened.
+function chargeActionLabel(powerW) {
+  const at = chargeKw(powerW);
+  return 'Charge to full from grid' + (at ? ' at ' + at : '');
+}
+
+// The refusal paragraph is the only thing telling the owner that nothing
+// happened and why, so it always says something. The server's own words come
+// first; an object or an empty string is not a reason, and rendering one is
+// how a page ends up printing [object Object] over a real refusal.
+function chargeRefusalText(payload) {
+  const detail = (payload !== null && typeof payload === 'object') ? payload.detail : null;
+  return (typeof detail === 'string' && detail !== '') ? detail
+    : 'That charge request was refused.';
+}
+// <<< charge-panel
+
+// The wiring reads, writes what the owner pressed, and re-reads. It runs
+// nothing by itself: no timer and no page load starts a charge, because those
+// are the two ways a service comes to be charging a battery unasked.
+
+async function loadCharge() {
+  let charge = null;
+  try {
+    const r = await fetch('/api/charge');
+    // Only a 200 is a configuration. The 404 means the driver cannot report
+    // charge configuration and a 401 or 500 is a refusal, so drawing anything
+    // from those bodies would turn an error into device state; the panel stays
+    // hidden, which is the true thing to say about them.
+    if (r.ok) charge = await r.json();
+  } catch (err) {
+    charge = null;
+  }
+  const panel = document.getElementById('chargePanel');
+  if (!chargePanelVisible(charge)) { panel.hidden = true; return; }
+  const pick = document.getElementById('chargeCtl');
+  const go = document.getElementById('chargeGo');
+  const stop = document.getElementById('chargeStop');
+  panel.hidden = false;
+  document.getElementById('chargeStatus').textContent = chargeStatusLine(charge, Date.now());
+  document.getElementById('chargeConfig').textContent = chargeConfigLine(charge);
+  // A control the API would only refuse is not rendered. A second start is
+  // refused while a record stands, and a stop has nothing to restore without
+  // a readable one, so both come from the record rather than from a default.
+  const goOn = chargeStartVisible(charge);
+  go.hidden = !goOn;
+  // The power picker only exists with a button to spend it on. Under a record
+  // there is no start to choose a power for, and a handle above no action is a
+  // knob that does nothing, so the row leaves with the button.
+  pick.hidden = !goOn;
+  go.textContent = chargeActionLabel(Number(document.getElementById('chargePower').value));
+  stop.hidden = !chargeStopVisible(charge);
+}
+
+async function refreshCharge() {
+  await loadCharge();
+}
+
+async function startCharge() {
+  const why = document.getElementById('chargeWhy');
+  const go = document.getElementById('chargeGo');
+  why.textContent = '';
+  why.hidden = true;
+  go.disabled = true;
+  try {
+    // No duration is sent. The server holds the window at 600 minutes and the
+    // stop-at-full setting ends the charge as soon as the bank fills, so the
+    // window is only the outer bound and the one thing this page chooses is
+    // how hard to charge.
+    const r = await fetch('/api/charge/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({power_w: Number(document.getElementById('chargePower').value)}),
+    });
+    const body = await r.json().catch(() => ({}));
+    // A refusal leaves the panel as it was: the state on screen is still the
+    // last true one, and re-reading would only replace it with the same
+    // answer. What changes is the sentence naming the reason.
+    if (!r.ok) {
+      why.textContent = chargeRefusalText(body);
+      why.hidden = false;
+      return;
+    }
+    await refreshCharge();
+  } catch (err) {
+    why.textContent = 'This service did not answer.';
+    why.hidden = false;
+  } finally {
+    go.disabled = false;
+  }
+}
+
+async function stopCharge() {
+  const why = document.getElementById('chargeWhy');
+  const stop = document.getElementById('chargeStop');
+  why.textContent = '';
+  why.hidden = true;
+  stop.disabled = true;
+  try {
+    // No body and no settings resent. Stopping writes back the configuration
+    // read before the charge started, so anything this page sent alongside the
+    // press would be a guess at the inverter's own previous state.
+    const r = await fetch('/api/charge/stop', {method: 'POST'});
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      why.textContent = chargeRefusalText(body);
+      why.hidden = false;
+      return;
+    }
+    await refreshCharge();
+  } catch (err) {
+    why.textContent = 'This service did not answer.';
+    why.hidden = false;
+  } finally {
+    stop.disabled = false;
+  }
+}
+
+document.getElementById('chargeGo').addEventListener('click', startCharge);
+document.getElementById('chargeStop').addEventListener('click', stopCharge);
+// The label moves with the handle that chooses the power, or the button would
+// still promise 3 kW under a choice of 5 kW and stop being checkable.
+document.getElementById('chargePower').addEventListener('change', (event) => {
+  document.getElementById('chargeGo').textContent = chargeActionLabel(Number(event.target.value));
+});
+
+loadCharge();
 
 (async () => {
   try {
