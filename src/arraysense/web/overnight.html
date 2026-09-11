@@ -256,8 +256,20 @@ const chargeKw = (w) => (typeof w !== 'number' || !isFinite(w) ? ''
   : (Number.isInteger(w / 1000) ? String(w / 1000) : (w / 1000).toFixed(1)) + ' kW');
 
 // The page prints clock times, not timestamps, for the reason given at the top
-// of this script. The API's window edge arrives as a full timestamp.
-const chargeClock = (iso) => (typeof iso === 'string' ? iso.slice(11, 16) : '');
+// of this script. The API's window edge arrives as a full timestamp, and it is
+// an instant: it is rendered in the reader's own clock rather than in whatever
+// offset the server happened to write it with. Slicing the characters of the
+// string instead printed 13:39 for a window that ends at 08:39 here, because the
+// record behind it had been written with a UTC offset — and a page that prints
+// one clock for the window and another for the wall clock beside it is worse
+// than one that prints none.
+const chargeClock = (iso) => {
+  if (typeof iso !== 'string' || iso === '') return '';
+  const at = new Date(iso);
+  if (isNaN(at.getTime())) return '';
+  const two = (n) => (n < 10 ? '0' + n : String(n));
+  return two(at.getHours()) + ':' + two(at.getMinutes());
+};
 
 function chargePanelVisible(charge) {
   return typeof charge === 'object' && charge !== null && !Array.isArray(charge);

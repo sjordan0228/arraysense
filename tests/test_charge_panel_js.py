@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,9 +34,17 @@ _END = "// <<< charge-panel"
 # two window branches can be told apart here at all.
 NOW_MS = 1_757_500_000_000
 
-# One window edge used by both window tests: 23:45 in the response's own clock
-# convention, the same slice(11, 16) the rest of the page prints.
+# One window edge used by both window tests, as the API sends it: an instant
+# with an offset. The page prints it in the reader's own clock, and the node
+# slice runs in this machine's zone, so the tests ask a helper what that clock
+# is rather than hardcoding one a UTC host would disagree with.
 UNTIL = "2026-09-10T23:45:00+00:00"
+
+
+def _local_clock(iso: str) -> str:
+    """The HH:MM the page prints for one instant, in this machine's own zone."""
+    return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
+
 
 # The page's own fallback for a refusal whose body said nothing usable. It has
 # to be a sentence: an empty paragraph tells the owner nothing happened and not
@@ -254,12 +263,12 @@ def test_no_buttons_are_offered_when_the_record_cannot_be_read() -> None:
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_a_running_charge_reports_its_power_and_the_time_its_window_closes() -> None:
     """The line says what the inverter is doing and until when, both read from
-    the response. A charge at 3 kW whose window ends at 23:45 says exactly
-    that, and does not also say no charge is running."""
+    the response. A charge at 3 kW whose window ends at the reported instant
+    says exactly that, and does not also say no charge is running."""
     cfg = _charge(ac_charge_enabled=True, override=_override(True, True, True, UNTIL, 3000))
     line = _call("chargeStatusLine", cfg, NOW_MS)
     assert "3 kW" in line
-    assert "23:45" in line
+    assert _local_clock(UNTIL) in line
     assert "No grid charge" not in line
 
 
@@ -275,7 +284,7 @@ def test_a_record_alone_is_not_reported_as_a_charge() -> None:
     off = _call("chargeStatusLine", _charge(ac_charge_enabled=False, override=recorded), NOW_MS)
     assert "Charging from the grid" not in off
     assert "reports AC charging off" in off
-    assert "23:45" in off
+    assert _local_clock(UNTIL) in off
     silent = _call("chargeStatusLine", _charge(ac_charge_enabled=None, override=recorded), NOW_MS)
     assert "Charging from the grid" not in silent
     assert "has not said whether it is charging" in silent
@@ -295,7 +304,7 @@ def test_a_record_alone_is_not_reported_as_a_charge() -> None:
     )
     assert "Charging from the grid" not in idle
     assert "holds no charge window" in idle
-    assert "23:45" in idle
+    assert _local_clock(UNTIL) in idle
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
@@ -305,7 +314,7 @@ def test_a_closed_window_says_so_and_still_offers_the_stop() -> None:
     closed and the stop stays offered."""
     cfg = _charge(override=_override(True, True, False, UNTIL, 3000))
     line = _call("chargeStatusLine", cfg, NOW_MS)
-    assert "23:45" in line
+    assert _local_clock(UNTIL) in line
     assert "closed" in line
     assert "back the way it was" in line
     assert _call("chargeStopVisible", cfg) is True
