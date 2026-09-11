@@ -149,6 +149,10 @@ INVERTER_LIMIT_KEY = "emporia.inverter_limit_w"
 # survive a restart, because an owner who set a rate by hand ten minutes ago
 # should not have the module take the wheel back because the process bounced.
 CHARGE_OVERRIDE_UNTIL_KEY = "emporia.charge_override_until"
+# What the inverter held before a grid charge was started, so the charge can
+# be undone after a restart. Written by the service, never chosen: see
+# arraysense.charge_override for what the value holds.
+CHARGE_OVERRIDE_KEY = "charge.override"
 # The house-draw warning. Not an Emporia setting: the threshold is compared
 # against the inverter's own load figure, so it works on an installation that
 # has never heard of Emporia — which only supplies the names of the culprits.
@@ -1221,6 +1225,18 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "Set by the service when you change the charge rate yourself, so "
             "the override survives a restart. Leave it alone — it is not a "
             "setting to choose."
+        ),
+    ),
+    SettingSpec(
+        key=CHARGE_OVERRIDE_KEY,
+        kind="str",
+        default="",
+        max_length=4000,
+        label="Charge override record",
+        help=(
+            "Written by the service while a grid charge it started is "
+            "running, so the charge can be undone after a restart. Leave it "
+            "alone — it is not a setting to choose."
         ),
     ),
     SettingSpec(
