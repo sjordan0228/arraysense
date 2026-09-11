@@ -292,18 +292,25 @@ function chargeStatusLine(charge, nowMs) {
   if (o.recorded === true && o.active === true) {
     const at = chargeKw(charge.power_w);
     const window = until ? ' until ' + until : '';
-    // The record is written before the inverter is touched and kept when a write
-    // fails, so an active record is not the same fact as a charge the device is
-    // running: the first live press answered 502 with a record standing and the
-    // inverter untouched. Only a device that reports AC charging on is described
-    // as charging, and a device that has not answered the question gets a
-    // sentence that does not answer it either.
-    if (charge.ac_charge_enabled === true) {
-      return 'Charging from the grid' + (at ? ' at ' + at : '') + window + '.';
-    }
+    // A charge needs two things on the device, not one: the enable bit and a
+    // window to charge in. The bit alone is not a charge — on this installation
+    // the owner's own AC-charge bit is set with its window empty, which is a
+    // device that is not charging at all. The record is written before the
+    // inverter is touched and kept when a write fails, which is the other way an
+    // active record comes to stand over a device that is doing nothing.
+    const windows = Array.isArray(charge.windows)
+      ? charge.windows.filter((w) => w && w.is_set === true).length
+      : null;
     if (charge.ac_charge_enabled === false) {
       return 'A charge is recorded' + window + ', but the inverter reports AC charging off, '
         + 'so it is not charging. Stopping puts the inverter back the way it was.';
+    }
+    if (windows === 0) {
+      return 'A charge is recorded' + window + ', but the inverter holds no charge window, '
+        + 'so nothing is charging. Stopping puts the inverter back the way it was.';
+    }
+    if (charge.ac_charge_enabled === true) {
+      return 'Charging from the grid' + (at ? ' at ' + at : '') + window + '.';
     }
     return 'A charge is recorded' + (at ? ' at ' + at : '') + window
       + '. The inverter has not said whether it is charging.';

@@ -280,6 +280,22 @@ def test_a_record_alone_is_not_reported_as_a_charge() -> None:
     assert "Charging from the grid" not in silent
     assert "has not said whether it is charging" in silent
     assert "3 kW" in silent
+    # The enable bit is not a charge on its own. This installation's resting
+    # state is exactly this: the owner's own AC-charge bit is set and its window
+    # is empty, so a line reading the bit alone would announce a 10 kW charge
+    # that is not happening.
+    idle = _call(
+        "chargeStatusLine",
+        _charge(
+            ac_charge_enabled=True,
+            windows=0,
+            override=_override(True, True, True, UNTIL, 3000),
+        ),
+        NOW_MS,
+    )
+    assert "Charging from the grid" not in idle
+    assert "holds no charge window" in idle
+    assert "23:45" in idle
 
 
 @pytest.mark.skipif(NODE is None, reason="node not installed")
