@@ -219,26 +219,38 @@ function drawPlan(data) {
   });
   if (reserve !== null) {
     const floor = xs.map(() => reserve);
+    // A dash pattern and not a function. The vendored build hands a series'
+    // dash straight to the canvas's setLineDash, which takes a pattern of
+    // numbers: a function there throws inside the draw pass, after the axes
+    // are painted, and the floor is the series that never lands -- measured
+    // on production 2026-09-12, where this line drew nothing at all. The
+    // other pages' chart specs pass a pattern for the same reason.
     series.push({label: 'reserve', show: true, stroke: 'var(--ink3)',
-      width: 1, dash: () => true, points: {show: false}, data: floor});
+      width: 1, dash: [6, 4], points: {show: false}, data: floor});
     columns.push(floor);
   }
 
   const wrap = document.getElementById('planChartWrap');
   if (wrap && typeof uPlot !== 'undefined' && xs.length > 1) {
+    // The data is the constructor's second argument and the element is its
+    // third. The vendored build takes whatever it is handed second as its
+    // columns and only falls back to `opts.data`, so an element passed there
+    // is read as a column of columns and the constructor throws on it: the
+    // whole plan section would stay empty, rows and guidance included,
+    // because the throw lands before any of them is written. common.js's
+    // paint() passes all three for the same reason.
     const plot = new uPlot({
       width: wrap.clientWidth || 600,
       height: 260,
       scales: {x: {time: true}, y: {min: 0, max: 100}},
       series: series,
-      data: columns,
       axes: [
         {values: (u, splits) => splits.map((t) =>
           new Date(t * 1000).toLocaleTimeString(undefined,
             {hour: '2-digit', minute: '2-digit'}))},
         {size: 34, values: (u, splits) => splits.map((v) => v.toFixed(0) + '%')},
       ],
-    }, wrap);
+    }, columns, wrap);
     void plot;
   }
 
@@ -709,16 +721,32 @@ document.getElementById('chargePower').addEventListener('input', () => {
 
 loadCharge();
 
-(async () => {
+// The two faults this page can hit are different faults and get different
+// sentences. One catch around both of them said "the plan endpoint did not
+// answer" for a chart that could not be built either, and that is a sentence
+// that sends a reader to the service for a fault that is on the page -- it
+// cost exactly that on 2026-09-12, when the drawing threw and the endpoint
+// was answering correctly the whole time.
+async function loadPlan() {
+  const note = document.getElementById('planNote');
+  let plan;
   try {
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const r = await fetch('/api/overnight?tz=' + encodeURIComponent(zone));
-    drawPlan(await r.json());
+    plan = await r.json();
   } catch (err) {
-    document.getElementById('planNote').innerHTML =
-      'The plan endpoint did not answer: ' + esc(String(err));
+    note.innerHTML = 'The plan endpoint did not answer: ' + esc(String(err));
+    return;
   }
-})();
+  try {
+    drawPlan(plan);
+  } catch (err) {
+    note.innerHTML = 'The plan answered, and the page could not draw it: '
+      + esc(String(err));
+  }
+}
+
+loadPlan();
 </script>
 </body>
 </html>
