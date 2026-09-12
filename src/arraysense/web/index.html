@@ -54,7 +54,11 @@
   .mode{display:flex;align-items:center;gap:9px;margin-bottom:12px;font-size:14px}
   .mode b{font-weight:500}
   .mode span:last-child{opacity:.72}
-  .mode .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--muted)}
+  /* The dot carries no tint in the modes that are none of the three below, and
+     a token nothing declares is not a colour: this read --muted, which no sheet
+     declares, so in exactly those modes the dot was drawn with no background at
+     all. ink3 is the dimmest ink the palette does define. */
+  .mode .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--ink3)}
   /* Colour repeats the flow the words already name, so it is never the only
      carrier — the palette is CVD-validated and the label stands without it. */
   .mode.pv .dot{background:var(--pv)}
