@@ -2,6 +2,35 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.6 — 11 September 2026
+
+A charge ends when the battery is full, instead of keeping the house on the grid
+until the window closes.
+
+### Fixed
+
+- **A finished charge kept the site on the grid.** The window written into the
+  inverter is a permission, not a plan: the stop setting ends the *charging* at
+  the target, but the window stays open, and inside an open window the inverter
+  holds the bank at the target and serves the house from the grid rather than the
+  battery. On the reference installation a charge that reached 100% at 19:24
+  would have held the site on the grid until the window closed at 01:00 — a full
+  battery sitting idle while the house bought every kilowatt it used.
+
+  The override now ends when the charge finishes. `finish_recorded_charge` runs
+  on the app's own timer beside the window's own expiry, and puts the inverter
+  back once the battery has held the record's target for `CHARGE_SETTLE` (ten
+  minutes) without dipping below it. The settling window is read out of the store
+  rather than remembered in the process, so it survives a restart; every reading
+  in it counts, so one dip restarts it; and a window whose newest reading is
+  older than the freshness rule answers no rather than ending a charge on a stale
+  number. The record now carries the target it is charging to, defaulted to the
+  shipped 100% for records written before the field existed.
+
+  The window bound stays as the backstop for a charge that never gets there, and
+  both endings share one restore path — the same reviewed undo, with only the log
+  sentence differing.
+
 ## 1.4.5 — 11 September 2026
 
 The settings page is a set of tabs again, and the check that would have caught it
