@@ -19,6 +19,7 @@ from arraysense.calibration import (
     WARNING_AFTER_DAYS,
     assess,
     bank_recalibrated_at,
+    charge_completed_at,
     full_charge_windows,
     last_full_charge,
     packs_recalibrated,
@@ -628,3 +629,82 @@ def test_a_reading_whose_clock_cannot_be_compared_is_dropped_not_raised() -> Non
     ]
     assert last_full_charge(_short_charge(), packs) == NOW + timedelta(minutes=17)
     assert bank_recalibrated_at([naive], NOW) is None
+
+
+def test_a_charge_is_credited_when_the_counters_cross_long_before_the_absorb() -> None:
+    """The reference bank on 11 September 2026, which the fifteen-minute lookback
+    could not see.
+
+    This bank ends its charge on state of charge, so its counters cross to full
+    while the charger is still pushing amps: pack 1 around 18:20, pack 2 around
+    18:45, pack 3 around 19:10, pack 4 at 19:20. Its terminal voltage only entered
+    the absorb band at 19:57, by which time every pack had read 99% or better for
+    half an hour. A lookback of fifteen minutes found no below-full reading for
+    any pack, so a completed charge was credited to nobody and the page went on
+    saying the bank had not reached full for 34 days.
+    """
+    base = datetime(2026, 9, 11, 18, 0, tzinfo=UTC)
+    packs = [
+        ("Battery_ID_01", 18),
+        ("Battery_ID_02", 45),
+        ("Battery_ID_03", 70),
+        ("Battery_ID_04", 80),
+    ]
+    rows: list[dict[str, Any]] = []
+    # Below full before each pack's own crossing, at or above it afterwards.
+    for serial, crossing_minute in packs:
+        for minute in range(0, 130, 5):
+            rows.append(
+                {
+                    "timestamp": base + timedelta(minutes=minute),
+                    "serial": serial,
+                    "soc_pct": 95.0 if minute < crossing_minute else 99.0,
+                }
+            )
+    window_start = base + timedelta(minutes=117)  # 19:57, the absorb band opening
+    window_end = base + timedelta(minutes=127)  # 20:07
+    nearby = [
+        row
+        for row in rows
+        if window_start - PACK_RESET_LAG <= row["timestamp"] <= window_end + PACK_RESET_LAG
+    ]
+    completed = charge_completed_at(
+        window_start,
+        window_end,
+        nearby,
+        expected=[serial for serial, _ in packs],
+    )
+    assert completed is not None, "a charge the packs completed was credited to nobody"
+
+
+def test_counters_pegged_at_full_still_do_not_prove_a_charge() -> None:
+    """The property the lookback must not spend: a bank whose counters have been
+    reading full for days has no transition inside any lookback, so an absorb
+    touch cannot be credited as a completed charge on its behalf."""
+    base = datetime(2026, 9, 11, 12, 0, tzinfo=UTC)
+    rows: list[dict[str, Any]] = []
+    for serial in ("Battery_ID_01", "Battery_ID_02", "Battery_ID_03", "Battery_ID_04"):
+        for minute in range(0, 400, 5):
+            rows.append(
+                {  # pegged at full the whole time: drift, not a charge
+                    "timestamp": base + timedelta(minutes=minute),
+                    "serial": serial,
+                    "soc_pct": 100.0,
+                }
+            )
+    window_start = base + timedelta(minutes=300)
+    window_end = base + timedelta(minutes=310)
+    nearby = [
+        row
+        for row in rows
+        if window_start - PACK_RESET_LAG <= row["timestamp"] <= window_end + PACK_RESET_LAG
+    ]
+    assert (
+        charge_completed_at(
+            window_start,
+            window_end,
+            nearby,
+            expected=["Battery_ID_01", "Battery_ID_02", "Battery_ID_03", "Battery_ID_04"],
+        )
+        is None
+    )

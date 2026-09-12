@@ -2,6 +2,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.10 — 11 September 2026
+
+A charge to 100% is credited as the full charge it is, so the calibration warning
+stops asking for one that has already happened.
+
+### Fixed
+
+- **A completed charge was credited to nobody, so the drift warning stayed up.**
+  The page tells the owner to charge to 100% when the packs' state of charge has
+  drifted, and on 11 September 2026 they did — the packs went from nine points
+  apart to one. The page went on saying "34 days since the bank last reached
+  full". Two checks decide that, and this bank satisfies neither: the first wants
+  an absorb window of twenty minutes at the charge reference, and a bank that ends
+  its charge on state of charge merely touches its voltage reference (its window
+  was ten minutes); the second wants evidence that every pack was below full
+  inside fifteen minutes of that window, and this bank's counters cross while the
+  charger is still pushing amps — pack 1 around 18:20, pack 2 around 18:45, pack 3
+  around 19:10, pack 4 at 19:20, with the voltage window opening at 19:57, by
+  which time all four had read 99% or better for half an hour. The lookback is now
+  two hours: far enough to reach the slowest crossing, and still far too short for
+  drift to fake, since this hardware opens ten points in a fortnight and a counter
+  pegged at full by drift has no below-full reading inside two hours at all.
+
 ## 1.4.9 — 11 September 2026
 
 A finished charge is now recognised by what the battery is taking, rather than by
