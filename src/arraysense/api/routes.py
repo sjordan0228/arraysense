@@ -52,6 +52,8 @@ from arraysense.auth import (
 )
 from arraysense.calibration import (
     CORROBORATING_ABSORB,
+    DEFAULT_CHARGE_REFERENCE_V,
+    FULL_CHARGE_MARGIN_V,
     PACK_RESET_LAG,
     assess,
     charge_completed_at,
@@ -277,6 +279,22 @@ _CALIBRATION_TIER = "minute"
 # search, and the slice keeps the newest — which is the one that decides the
 # answer.
 _MAX_WINDOWS_EXAMINED = 40
+
+# How stale the remembered calibration answer may be before it is recomputed
+# even though the tail check says nothing happened. A charge can only be
+# detected from rows that carry it, and a store that wrote no rows at all is
+# exactly when a remembered answer should not be trusted to still be true.
+CALIBRATION_MEMO_MAX_AGE = timedelta(hours=6)
+
+
+@dataclass(frozen=True)
+class _CalibrationMemo:
+    """The last answer ``/api/calibration`` gave and what it covered."""
+
+    last_full: datetime | None
+    covered_through: datetime
+    packs: tuple[str, ...]
+
 
 # How far before a costed period to start reading its counters. The first
 # interval needs an earlier reading to be measured *from*; without one it
@@ -1600,23 +1618,18 @@ def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[di
     return rows
 
 
-@router.get("/calibration")
-def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
-    """How far the per-pack state-of-charge estimates have drifted from the truth.
+def _search_last_full_charge(
+    store: SqliteStore, now: datetime, known: list[str]
+) -> datetime | None:
+    """The wide search: read the whole calibration range and find the last full charge.
 
-    Each pack counts amp-hours to estimate its charge and cannot correct itself
-    until it charges fully, so the useful question is not what the packs say
-    but how long it has been since anything forced them to agree with reality.
-
-    The answer separates two conditions that look alike on a dashboard and are
-    not alike at all. Packs that disagree on percentage while agreeing on
-    voltage have drifting counters and healthy batteries. Packs that disagree
-    on voltage have a hardware fault, because parallel packs are physically
-    forced to the same voltage.
+    This is the expensive body — sixty days of the minute tier, the window pass
+    over it, and a module read per candidate window. It is what the dashboard's
+    sixty-second poll used to pay every time. Callers should reach it through
+    the memo in ``calibration`` and run it only when the tail check says
+    something new could be a charge, or the memo cannot be trusted.
     """
-    now = datetime.now(tz=UTC)
     start = now - timedelta(days=CALIBRATION_SEARCH_DAYS)
-
     history = store.query(
         # battery_current_a is not decoration: full_charge_windows rejects a
         # window still pushing charge current, and without the column that
@@ -1626,12 +1639,6 @@ def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
         now,
         tier=_CALIBRATION_TIER,
     )
-    latest = store.latest_modules(["soc_pct", "voltage_v", "cycle_count"])
-    # Every pack the bank is known to contain has to have reached full, not
-    # merely every pack that happened to be talking at the time. A CAN dropout
-    # during a charge would otherwise reset the drift clock for the whole bank
-    # on behalf of a pack that never recalibrated.
-    known = [str(row["serial"]) for row in latest if row.get("serial")]
 
     # A one-minute hold rather than twenty. What separates a charge from a
     # voltage excursion here is the packs, not the clock: the reference
@@ -1659,6 +1666,90 @@ def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
         if reset is not None:
             last_full = reset
             break
+    return last_full
+
+
+def _full_charge_in_the_tail(store: SqliteStore, since: datetime, until: datetime) -> bool:
+    """Whether any recent row could belong to a full-charge window.
+
+    One narrow read of the minute tier over the span the memo has not covered,
+    widened at the near end by ``PACK_RESET_LAG``, asking whether any row sits
+    at or above the charge reference. The judgement mirrors
+    ``calibration._charge_reference``: the row's own BMS reference where it
+    reported one, the default reference otherwise.
+
+    This is a deliberate superset of ``full_charge_windows``. Rows that a real
+    window would reject — a brief excursion, a gap, a window still under
+    current — all answer yes here. A false yes costs one wide search; a false
+    no would hide a completed charge, which is the one failure the memo is
+    not allowed to have.
+
+    The predicate is applied in Python over the tail rows because the store
+    exposes no public way to run a filtered query: the alternative would be
+    reaching into the read view's private connection for a ``LIMIT 1``. The
+    tail is hours of rows against the wide search's sixty days.
+    """
+    rows = store.query(
+        ["battery_voltage_v", "bms_charge_voltage_ref_v"],
+        since,
+        until,
+        tier=_CALIBRATION_TIER,
+    )
+    for row in rows:
+        volts = row["battery_voltage_v"]
+        if not isinstance(volts, int | float):
+            continue
+        ref = row["bms_charge_voltage_ref_v"]
+        if not isinstance(ref, int | float):
+            ref = DEFAULT_CHARGE_REFERENCE_V
+        if volts >= float(ref) - FULL_CHARGE_MARGIN_V:
+            return True
+    return False
+
+
+@router.get("/calibration")
+def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
+    """How far the per-pack state-of-charge estimates have drifted from the truth.
+
+    Each pack counts amp-hours to estimate its charge and cannot correct itself
+    until it charges fully, so the useful question is not what the packs say
+    but how long it has been since anything forced them to agree with reality.
+
+    The answer separates two conditions that look alike on a dashboard and are
+    not alike at all. Packs that disagree on percentage while agreeing on
+    voltage have drifting counters and healthy batteries. Packs that disagree
+    on voltage have a hardware fault, because parallel packs are physically
+    forced to the same voltage.
+
+    The dashboard polls this every sixty seconds, and the answer it gets can be
+    the previous one: a completed full charge is the only event that moves it,
+    and ``_full_charge_in_the_tail`` is what detects one happening since the
+    answer was given. A changed pack set moves the answer without any new
+    charge — a pack the memo never saw has never been seen to reach full — so
+    the memo is reused only while the bank is made of the same packs, the
+    answer is within its allowed staleness, and the tail is quiet.
+    """
+    now = datetime.now(tz=UTC)
+
+    latest = store.latest_modules(["soc_pct", "voltage_v", "cycle_count"])
+    # Every pack the bank is known to contain has to have reached full, not
+    # merely every pack that happened to be talking at the time. A CAN dropout
+    # during a charge would otherwise reset the drift clock for the whole bank
+    # on behalf of a pack that never recalibrated.
+    known = [str(row["serial"]) for row in latest if row.get("serial")]
+
+    memo: _CalibrationMemo | None = getattr(request.app.state, "calibration_memo", None)
+    with request.app.state.calibration_lock:
+        if (
+            memo is not None
+            and tuple(known) == memo.packs
+            and now - memo.covered_through <= CALIBRATION_MEMO_MAX_AGE
+            and not _full_charge_in_the_tail(store, memo.covered_through - PACK_RESET_LAG, now)
+        ):
+            last_full = memo.last_full
+        else:
+            last_full = _search_last_full_charge(store, now, known)
+        request.app.state.calibration_memo = _CalibrationMemo(last_full, now, tuple(known))
 
     status = assess(
         now=now,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -368,6 +369,12 @@ def create_app(
     # the inverter's own settings. The page's disabled button covers one tab and
     # no API client at all, so the serialization lives here.
     app.state.charge_lock = asyncio.Lock()
+    # The last answer /api/calibration gave, so the dashboard's sixty-second
+    # poll does not rescan sixty days to repeat it. The lock is a plain
+    # threading.Lock because the handler is a plain def and FastAPI runs it in
+    # its threadpool, where two overlapping polls can reach the memo at once.
+    app.state.calibration_memo = None
+    app.state.calibration_lock = threading.Lock()
     app.include_router(router)
     install_text_guard(app)
 

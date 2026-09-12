@@ -958,6 +958,122 @@ def test_calibration_does_not_let_a_second_absorb_borrow_the_first_transition(
     assert body["severity"] == "none"
 
 
+def _record_query_starts(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    """Record the start bound of every ``SqliteStore.query`` call from now on.
+
+    The observable for the memo is the span of the reads the endpoint makes,
+    not their timing: a wide search is a minute-tier read starting about
+    ``CALIBRATION_SEARCH_DAYS`` back, and the incremental answer must not make
+    one unless something new could be a charge.
+    """
+    starts: list[datetime] = []
+    real_query = SqliteStore.query
+
+    def spy(
+        self: SqliteStore,
+        metrics: Any,
+        start: datetime,
+        end: datetime,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        starts.append(start)
+        return real_query(self, metrics, start, end, *args, **kwargs)
+
+    monkeypatch.setattr(SqliteStore, "query", spy)
+    return starts
+
+
+def test_a_second_calibration_call_does_not_rescan_sixty_days(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The dashboard polls this endpoint every sixty seconds. The second call
+    # must answer from what the first already found unless something happened
+    # since that could be a new charge, so no read of the second call may
+    # reach back further than a day.
+    now = datetime.now(tz=UTC)
+
+    def build(store: SqliteStore) -> None:
+        charged = now - timedelta(days=3)
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now, 53.0, {"A": 61.0, "B": 62.0})
+
+    starts = _record_query_starts(monkeypatch)
+    with _calibration_client(tmp_path, build) as c:
+        starts.clear()
+        first = c.get("/api/calibration")
+        assert first.status_code == 200
+        # The first call answers the whole question and must read wide to do it.
+        assert any(start < now - timedelta(days=30) for start in starts)
+        starts.clear()
+        second = c.get("/api/calibration")
+        assert second.status_code == 200
+        assert all(start > now - timedelta(days=1) for start in starts), [
+            str(start) for start in starts
+        ]
+
+
+def test_a_charge_after_the_first_call_is_credited_on_the_next_call(tmp_path: Path) -> None:
+    # The risk a memo introduces is hiding a charge that lands between two
+    # polls. A fresh completed charge appended after the first call must move
+    # the next call's answer, which is what the tail check exists to guarantee.
+    now = datetime.now(tz=UTC)
+
+    def build(store: SqliteStore) -> None:
+        # A bank that has never charged fully inside the search range.
+        for days in (5, 4, 3, 2, 1):
+            _bank(store, now - timedelta(days=days), 53.0, {"A": 61.0, "B": 62.0})
+        _bank(store, now, 53.0, {"A": 61.0, "B": 62.0})
+
+    with _calibration_client(tmp_path, build) as c:
+        first = c.get("/api/calibration").json()
+        assert first["last_full_charge"] is None
+        # A full charge over the forty-five minutes after that first call,
+        # then the bank seen discharging again below the reference.
+        charged = now - timedelta(minutes=45)
+        store = c.app.state.store
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now - timedelta(minutes=5), 53.0, {"A": 61.0, "B": 62.0})
+        lo = int((now - timedelta(days=61)).timestamp())
+        hi = int((now + timedelta(days=1)).timestamp())
+        rebuild_inverter_minute(store._conn, lo, hi)
+        second = c.get("/api/calibration").json()
+    assert second["last_full_charge"] is not None
+    assert second["severity"] == "none"
+
+
+def test_a_changed_pack_set_recomputes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The answer is a function of the packs the bank is known to hold. A pack
+    # that joins after the memo was written has never been seen to reach full,
+    # so a charged bank whose pack list changed must not answer from the older
+    # memo. The poll that adds the pack sits below the charge reference, so
+    # only the pack-set check can force the recompute here.
+    now = datetime.now(tz=UTC)
+
+    def build(store: SqliteStore) -> None:
+        charged = now - timedelta(days=3)
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now, 53.0, {"A": 61.0, "B": 62.0})
+
+    starts = _record_query_starts(monkeypatch)
+    with _calibration_client(tmp_path, build) as c:
+        c.get("/api/calibration")
+        assert any(start < now - timedelta(days=30) for start in starts)
+        starts.clear()
+        store = c.app.state.store
+        _bank(store, now - timedelta(minutes=1), 53.0, {"A": 61.0, "B": 62.0, "C": 55.0})
+        lo = int((now - timedelta(days=61)).timestamp())
+        hi = int((now + timedelta(days=1)).timestamp())
+        rebuild_inverter_minute(store._conn, lo, hi)
+        c.get("/api/calibration")
+    assert any(start < now - timedelta(days=30) for start in starts), [
+        str(start) for start in starts
+    ]
+
+
 # --- settings ----------------------------------------------------------------
 
 
@@ -1464,13 +1580,15 @@ def test_a_path_traversal_cannot_reach_the_configuration(client: Any) -> None:
 
 def test_the_calibration_endpoint_asks_for_the_current_it_needs(client: Any) -> None:
     # full_charge_windows rejects a window still pushing charge current. The
-    # endpoint was not requesting the column, so that safeguard was inert in
-    # production while passing every direct test of the function.
+    # wide search was not requesting the column, so that safeguard was inert
+    # in production while passing every direct test of the function. The wide
+    # search now lives behind the memo, so the grep guards the function that
+    # actually issues the read.
     import inspect
 
     from arraysense.api import routes
 
-    src = inspect.getsource(routes.calibration)
+    src = inspect.getsource(routes._search_last_full_charge)
     assert "battery_current_a" in src
 
 
