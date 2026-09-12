@@ -593,14 +593,14 @@ async def test_a_charge_that_reaches_its_target_is_ended_by_the_service(
         assert (await client.post("/api/charge/start", json={})).status_code == 200
     record = load_override(settings)
     assert record is not None
-    # Ten minutes of the battery sitting at the target, which is what settling
-    # means: the newest reading is now, and nothing in the window dipped.
+    # Ten minutes of a full battery that the grid has stopped delivering to: the
+    # state of charge sits at the target, and the AC-charge counter is flat.
     now = datetime.now(tz=UTC)
     for minutes_ago in (10, 6, 3, 0):
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": 100.0},
+                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is True
@@ -621,11 +621,62 @@ async def test_a_battery_that_dipped_below_the_target_keeps_the_charge_going(
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.post("/api/charge/start", json={})).status_code == 200
     now = datetime.now(tz=UTC)
-    for minutes_ago, soc in ((10, 100.0), (7, 99.0), (3, 100.0), (0, 100.0)):
+    for minutes_ago, soc in ((10, 100.0), (7, 96.0), (3, 100.0), (0, 100.0)):
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": soc},
+                readings={"battery_soc_pct": soc, "ac_charge_energy_today_kwh": 20.4},
+            )
+        )
+    assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
+    assert source.restore_calls == []
+    assert load_override(settings) is not None
+    store.close()
+
+
+async def test_a_pack_resting_a_point_under_its_target_counts_as_full(
+    tmp_path: Path,
+) -> None:
+    """A battery held at the top of charge reports the target and one under it by
+    turns while it balances — on the reference bank, 362 readings at 99% against
+    100 at 100% over one evening. Requiring the exact integer would keep the
+    override, and the grid, in place all night over a rounding."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post("/api/charge/start", json={})).status_code == 200
+    now = datetime.now(tz=UTC)
+    for minutes_ago, soc in ((10, 100.0), (7, 99.0), (3, 99.0), (0, 100.0)):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(minutes=minutes_ago),
+                readings={"battery_soc_pct": soc, "ac_charge_energy_today_kwh": 20.4},
+            )
+        )
+    assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is True
+    assert load_override(settings) is None
+    store.close()
+
+
+async def test_a_charge_still_delivering_is_not_finished_by_a_full_battery(
+    tmp_path: Path,
+) -> None:
+    """The state of charge is not the evidence — the device's own AC-charge
+    counter is. A pack reading full while the grid is still pushing into it is a
+    charge that is running, and ending it there would cut off a charge the owner
+    asked for."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post("/api/charge/start", json={})).status_code == 200
+    now = datetime.now(tz=UTC)
+    for minutes_ago, counter in ((10, 20.4), (6, 20.8), (3, 21.1), (0, 21.4)):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(minutes=minutes_ago),
+                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": counter},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
@@ -652,7 +703,7 @@ async def test_an_old_state_of_charge_is_not_evidence_of_a_finished_charge(
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": 100.0},
+                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
@@ -671,7 +722,12 @@ async def test_finishing_a_charge_keeps_the_record_when_the_inverter_cannot_be_p
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.post("/api/charge/start", json={})).status_code == 200
     now = datetime.now(tz=UTC)
-    store.append(Sample(timestamp=now, readings={"battery_soc_pct": 100.0}))
+    store.append(
+        Sample(
+            timestamp=now,
+            readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+        )
+    )
     source.fail_restore = ChargeWriteRefusedError(
         "the inverter read back a different restore than it was written"
     )
@@ -690,7 +746,16 @@ def test_the_running_service_ends_a_charge_once_the_battery_is_full(
     app, store, settings = _assembled(tmp_path, source)
     with TestClient(app) as client:
         assert client.post("/api/charge/start", json={}).status_code == 200
-        store.append(Sample(timestamp=datetime.now(tz=UTC), readings={"battery_soc_pct": 100.0}))
+        # Two readings, so the AC-charge counter can be seen not to have moved:
+        # one sample cannot tell a flat counter from a missing one.
+        now = datetime.now(tz=UTC)
+        for minutes_ago in (5, 0):
+            store.append(
+                Sample(
+                    timestamp=now - timedelta(minutes=minutes_ago),
+                    readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+                )
+            )
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and load_override(settings) is not None:
             time.sleep(0.05)

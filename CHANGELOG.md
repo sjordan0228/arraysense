@@ -2,6 +2,25 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.7 — 11 September 2026
+
+The rule that ends a finished charge now reads the device's own meter, because the
+state of charge on its own never satisfied it.
+
+### Fixed
+
+- **1.4.6's completion rule could not fire on this bank.** It asked the state of
+  charge to hold the target for ten minutes, and a pack held at the top of charge
+  reports 99% and 100% by turns while it balances — 362 readings at 99% against
+  100 at 100% across one evening on the reference bank — so the settling window
+  restarted on every dip and the grid would have carried the house to the window's
+  edge exactly as before. A charge is now recognised as finished by the inverter's
+  own AC-charge counter: a battery at the target with that counter flat is a charge
+  the grid has stopped feeding, while a battery at the target with the counter
+  still climbing is a charge that is running. Completion needs both, and the state
+  of charge is allowed `CHARGE_FULL_TOLERANCE_PCT` (one point) below the target so
+  that the pack's own top-of-charge jitter is not read as a decision.
+
 ## 1.4.6 — 11 September 2026
 
 A charge ends when the battery is full, instead of keeping the house on the grid
