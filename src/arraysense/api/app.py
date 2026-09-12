@@ -272,13 +272,22 @@ CHARGE_EXPIRY_INTERVAL = 60.0
 
 
 @asynccontextmanager
-async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Run the record's own expiry alongside the requests.
+async def charge_expiry(app: FastAPI) -> AsyncIterator[None]:
+    """Run the recorded charge's own endings for as long as the app is serving.
 
-    The collector already has a loop, but the expiry has to hold the same lock
-    the charge routes hold, and that lock belongs to the app. A task here also
-    means the expiry behaves the same whether or not the collector is running: a
-    service that is up and serving is exactly when a stale record needs ending.
+    Both endings — the battery reaching the target, and the window closing —
+    happen here, on the app's own timer rather than the collector's, because they
+    write through the same lock the charge routes hold and that lock belongs to
+    the app. A service that is up and serving is exactly when a stale record
+    needs ending.
+
+    Exported because the app has two entry points into its own lifecycle: the
+    lifespan this module builds, which is what the API tests drive, and the one
+    ``__main__`` installs, which is what the service actually runs — it starts the
+    collector, the weather poller and the Emporia module, and it *replaces* the
+    lifespan set here. Putting this in one of the two and not the other is how
+    v1.4.6 and v1.4.7 shipped with a rule that never ran: every test drove the
+    first lifespan while production ran the second.
     """
     task = asyncio.create_task(_expire_recorded_charges(app))
     try:
@@ -287,6 +296,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """The lifespan of the app as the tests build it: the charge's own endings."""
+    async with charge_expiry(app):
+        yield
 
 
 async def _expire_recorded_charges(app: FastAPI) -> None:

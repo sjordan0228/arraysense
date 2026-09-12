@@ -150,6 +150,105 @@ async def test_lifespan_stops_the_collector_on_the_way_out(tmp_path: Path) -> No
     assert not source.connected
 
 
+def test_the_production_lifespan_ends_a_finished_charge_by_itself(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The lifespan the service actually runs has to start the charge's own
+    endings.
+
+    There are two of them: the one create_app installs, which the API tests drive
+    through TestClient, and the one this module installs, which replaces it and
+    starts the collector, the weather poller and the Emporia module. v1.4.6 and
+    v1.4.7 shipped with the sweep in the first one only, so a finished charge kept
+    the site on the grid with every test green. This test drives the second.
+    """
+    import time
+    from datetime import UTC, datetime
+
+    from arraysense.charge_override import load_override
+    from arraysense.collector.source import FakeSource
+    from arraysense.models import Sample
+    from arraysense.settings import INVERTER_LIMIT_KEY, SettingsStore
+
+    class ChargingFake(FakeSource):
+        """The fake collector source, plus the three methods a charge needs.
+
+        A register map is all the endpoints ask of a driver, and the fake
+        installation is the right place to answer with one: the point of this test
+        is the lifespan, not the device.
+        """
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.registers = {21: 0x02, 66: 12, 67: 100, 68: 0, 69: 0, 70: 0, 71: 0, 72: 0, 73: 0}
+            self.restores = 0
+
+        async def read_charge_config(self) -> Any:
+            from arraysense.charge import decode_charge_config
+
+            return decode_charge_config(
+                self.registers, quick_charge_remaining_s=None, read_at=datetime.now(tz=UTC)
+            )
+
+        async def start_grid_charge(self, **kwargs: Any) -> Any:
+            from arraysense.charge import GridChargeChange
+
+            saved = await self.read_charge_config()
+            self.registers[21] |= 1 << 7
+            self.registers[66] = kwargs["power_w"] // 100
+            until = datetime.now(tz=UTC) + timedelta(minutes=kwargs["duration_min"])
+            return GridChargeChange(
+                saved=saved, applied=await self.read_charge_config(), until=until
+            )
+
+        async def restore_grid_charge(self, saved: Any) -> Any:
+            self.restores += 1
+            self.registers = dict(saved.registers)
+            return await self.read_charge_config()
+
+    from datetime import timedelta
+
+    from fastapi.testclient import TestClient
+
+    source = ChargingFake()
+    # The driver factory the entry point calls, so the service polls a fake that
+    # can also answer the charge endpoints.
+    monkeypatch.setattr("arraysense.drivers.create", lambda _config: source)
+    # The sweep reads the interval from its own module at every tick, so this is
+    # what makes the test's five seconds long enough for it.
+    monkeypatch.setattr("arraysense.api.app.CHARGE_EXPIRY_INTERVAL", 0.05)
+    app, store, _service = build_app(_config(tmp_path))
+    settings = SettingsStore(store)
+    # A start is refused without a site limit and without a live house reading,
+    # both of which this fresh database has none of.
+    settings.set(INVERTER_LIMIT_KEY, 12000)
+    store.append(Sample(timestamp=datetime.now(tz=UTC), readings={"load_power_w": 5000.0}))
+    try:
+        with TestClient(app) as client:
+            started = client.post("/api/charge/start", json={})
+            assert started.status_code == 200, started.text
+            # Four minutes of a full battery the grid has stopped feeding: the
+            # charge is over, and the service is the thing that has to notice.
+            now = datetime.now(tz=UTC)
+            for minutes_ago in (4, 2, 0):
+                store.append(
+                    Sample(
+                        timestamp=now - timedelta(minutes=minutes_ago),
+                        readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 4.0},
+                    )
+                )
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and load_override(settings) is not None:
+                time.sleep(0.05)
+            # Read before leaving the context: this lifespan closes the store on
+            # the way out, as the service's own shutdown does.
+            cleared = load_override(settings) is None
+        assert cleared, "the running service did not end the charge"
+        assert source.restores == 1
+    finally:
+        store.close()
+
+
 def _toml(tmp_path: Path, serial: str = "CE12345678") -> Path:
     """A minimal valid config pointing at a database in ``tmp_path``."""
     path = tmp_path / "config.toml"
