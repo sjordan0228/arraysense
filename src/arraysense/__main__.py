@@ -31,7 +31,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from arraysense import __version__, drivers
-from arraysense.api.app import create_app
+from arraysense.api.app import charge_expiry, create_app
 from arraysense.auth import clear_password, password_is_set
 from arraysense.collector.service import CollectorService
 from arraysense.collector.weather import WeatherPoller
@@ -245,23 +245,27 @@ def build_app(config: Config) -> tuple[FastAPI, SqliteStore, CollectorService]:
         await emporia.start()
         await guard.start()
         watchdog = asyncio.create_task(_watch(service))
-        try:
-            yield
-        finally:
-            watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await watchdog
-            # Release the inverter's single client slot before the process
-            # goes away, or the next start finds it occupied — the dongle's one
-            # TCP slot, which the vendor's app also wants, or the serial port,
-            # which is opened exclusively.
-            # Before the collector, for no reason but symmetry with start:
-            # this poller holds nothing the inverter wants.
-            await guard.stop()
-            await emporia.stop()
-            await weather.stop()
-            await service.stop()
-            store.close()
+        # The charge's own endings run on this lifespan, not on the one
+        # create_app installs: assigning the context below replaces that one, so
+        # a task started there would never run in the service.
+        async with charge_expiry(app):
+            try:
+                yield
+            finally:
+                watchdog.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog
+                # Release the inverter's single client slot before the process
+                # goes away, or the next start finds it occupied — the dongle's one
+                # TCP slot, which the vendor's app also wants, or the serial port,
+                # which is opened exclusively.
+                # Before the collector, for no reason but symmetry with start:
+                # this poller holds nothing the inverter wants.
+                await guard.stop()
+                await emporia.stop()
+                await weather.stop()
+                await service.stop()
+                store.close()
 
     app.router.lifespan_context = lifespan
     return app, store, service
