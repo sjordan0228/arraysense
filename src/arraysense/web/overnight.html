@@ -36,10 +36,13 @@
   .assumptions li{margin:2px 0}
   /* The charge control is one object with two lines of state above it, not two
      more paragraphs and a loose row of controls. The lines are ink2 and ink3
-     because they report the device rather than the plan. The amber edge marks
-     it as the one place on this page that writes to the inverter. */
+     because they report the device rather than the plan. The accent edge marks
+     it as the one place on this page that writes to the inverter, and it goes
+     through --accent rather than a page-local token: a token nothing defines
+     falls back to nothing, so the border and the slider's accent were both
+     being dropped in silence until this was measured in a browser. */
   .charge{display:flex;flex-direction:column;gap:8px;padding:10px 12px;
-    border-left:3px solid var(--amber);background:var(--tint);
+    border-left:3px solid var(--accent);background:var(--tint);
     border-radius:0 8px 8px 0}
   /* display:flex beats the browser's own [hidden] rule, so hidden has to be
      given back or the panel is on screen on every installation that has
@@ -59,7 +62,7 @@
   /* The power is a slider from the installation's floor to the inverter's own
      AC charge maximum, and what it is set to is printed beside it: a handle
      with no number on it is a control nobody can read back. */
-  .cctl input[type=range]{flex:1;min-width:110px;accent-color:var(--amber);
+  .cctl input[type=range]{flex:1;min-width:110px;accent-color:var(--accent);
     background:transparent;border:0;padding:0}
   .cnow{font-size:12px;color:var(--ink2);font-variant-numeric:tabular-nums;
     min-width:54px;text-align:right}
@@ -120,9 +123,9 @@
     <div class="chart" id="planChartWrap" role="img"
       aria-label="Projected battery state of charge through the night"></div>
     <div class="chartlegend">
-      <span><i style="background:var(--amber)"></i>typical night</span>
-      <span><i style="background:var(--green)"></i>essential loads</span>
-      <span><i style="background:var(--red)"></i>with a scheduled load</span>
+      <span><i style="background:var(--pv)"></i>typical night</span>
+      <span><i style="background:var(--batt)"></i>essential loads</span>
+      <span><i style="background:var(--grid)"></i>with a scheduled load</span>
       <span><i style="background:var(--ink3)"></i>reserve floor</span>
     </div>
     <table class="scen">
@@ -142,6 +145,18 @@ drawNav('overnight');
 // bug the issue names: the page shows both edges when there is a spread, and
 // says so when there is nothing to project on. The three scenario names are
 // the API's own keys so legend, rows and response read alike.
+
+// The colour each scenario is drawn in, as the token to read rather than the
+// colour itself. A canvas cannot parse a custom property, so the value has to
+// be resolved through ink() at draw time -- which is also what lets the theme
+// change the chart with it. The three are the palette's own measured-apart
+// series hues and not hues invented here, and the legend markup below names
+// the same tokens so the two are two readings of one decision.
+const SCENARIO_INK = {
+  typical: '--pv',
+  essential: '--batt',
+  scheduled: '--grid',
+};
 
 // One row per scenario the response answered. An unanswered scenario is a
 // null and gets no row: a line and a number for a night nobody projected is
@@ -212,33 +227,58 @@ function drawPlan(data) {
   // Each series carries its own column as data as well as riding in the
   // chart-wide array, because it is the handle that lets a reader (here and
   // in the seam test) see what height was actually drawn, series by series.
+  // The colour comes through ink(), which reads the token out of the
+  // stylesheet and hands the canvas a real colour: a canvas cannot parse
+  // `var(--x)` and drops the assignment without a word, which is how this
+  // chart drew four black lines under a legend promising three hues. These
+  // are three of the palette's measured-apart series hues rather than hues
+  // invented here, and the legend below names the same tokens so the two
+  // cannot drift apart.
   lines.forEach((n) => {
     const column = valuesOf(n);
-    series.push({label: n, stroke: 'var(--ink2)', data: column});
+    series.push({label: n, stroke: () => ink(SCENARIO_INK[n]), data: column});
     columns.push(column);
   });
   if (reserve !== null) {
     const floor = xs.map(() => reserve);
-    series.push({label: 'reserve', show: true, stroke: 'var(--ink3)',
-      width: 1, dash: () => true, points: {show: false}, data: floor});
+    // A dash pattern and not a function. The vendored build hands a series'
+    // dash straight to the canvas's setLineDash, which takes a pattern of
+    // numbers: a function there throws inside the draw pass, after the axes
+    // are painted, and the floor is the series that never lands -- measured
+    // on production 2026-09-12, where this line drew nothing at all. The
+    // other pages' chart specs pass a pattern for the same reason.
+    series.push({label: 'reserve', show: true, stroke: () => ink('--ink3'),
+      width: 1, dash: [6, 4], points: {show: false}, data: floor});
     columns.push(floor);
   }
 
   const wrap = document.getElementById('planChartWrap');
   if (wrap && typeof uPlot !== 'undefined' && xs.length > 1) {
+    // The data is the constructor's second argument and the element is its
+    // third. The vendored build takes whatever it is handed second as its
+    // columns and only falls back to `opts.data`, so an element passed there
+    // is read as a column of columns and the constructor throws on it. The
+    // throw lands after the state-of-charge line is written and before the
+    // table, the guidance and the assumptions are: on production 2026-09-12
+    // the reader got the error sentence in place of the state of charge and
+    // nothing else in the projection at all. common.js's paint() passes all
+    // three arguments for the same reason.
     const plot = new uPlot({
       width: wrap.clientWidth || 600,
       height: 260,
       scales: {x: {time: true}, y: {min: 0, max: 100}},
       series: series,
-      data: columns,
+      // The axes come from the shared factory for the same reason the colours
+      // go through ink(): uPlot's own defaults are black, so on this panel the
+      // gridlines and the tick labels were being drawn in a colour nobody
+      // chose and could not be read. The factory also puts every axis on the
+      // theme's own ink and gridline tokens, which is what lets a change of
+      // look reach them.
       axes: [
-        {values: (u, splits) => splits.map((t) =>
-          new Date(t * 1000).toLocaleTimeString(undefined,
-            {hour: '2-digit', minute: '2-digit'}))},
-        {size: 34, values: (u, splits) => splits.map((v) => v.toFixed(0) + '%')},
+        timeAxis(),
+        axis({size: 34, values: (u, splits) => splits.map((v) => v.toFixed(0) + '%')}),
       ],
-    }, wrap);
+    }, columns, wrap);
     void plot;
   }
 
@@ -709,16 +749,32 @@ document.getElementById('chargePower').addEventListener('input', () => {
 
 loadCharge();
 
-(async () => {
+// The two faults this page can hit are different faults and get different
+// sentences. One catch around both of them said "the plan endpoint did not
+// answer" for a chart that could not be built either, and that is a sentence
+// that sends a reader to the service for a fault that is on the page -- it
+// cost exactly that on 2026-09-12, when the drawing threw and the endpoint
+// was answering correctly the whole time.
+async function loadPlan() {
+  const note = document.getElementById('planNote');
+  let plan;
   try {
     const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const r = await fetch('/api/overnight?tz=' + encodeURIComponent(zone));
-    drawPlan(await r.json());
+    plan = await r.json();
   } catch (err) {
-    document.getElementById('planNote').innerHTML =
-      'The plan endpoint did not answer: ' + esc(String(err));
+    note.innerHTML = 'The plan endpoint did not answer: ' + esc(String(err));
+    return;
   }
-})();
+  try {
+    drawPlan(plan);
+  } catch (err) {
+    note.innerHTML = 'The plan answered, and the page could not draw it: '
+      + esc(String(err));
+  }
+}
+
+loadPlan();
 </script>
 </body>
 </html>
