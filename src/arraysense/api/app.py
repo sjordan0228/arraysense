@@ -19,7 +19,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
 from arraysense import __version__
-from arraysense.api.routes import expire_recorded_charge, router
+from arraysense.api.routes import (
+    expire_recorded_charge,
+    finish_recorded_charge,
+    router,
+)
 from arraysense.auth import LoginThrottle, Sessions
 from arraysense.collector.service import CollectorService
 from arraysense.config import Config
@@ -290,6 +294,13 @@ async def _expire_recorded_charges(app: FastAPI) -> None:
     while True:
         await asyncio.sleep(CHARGE_EXPIRY_INTERVAL)
         try:
+            # Two ways a charge of ours ends by itself, and the ordinary one
+            # first: the battery reaching the target is the charge finishing,
+            # and the window closing is the backstop for one that never got
+            # there.
+            await finish_recorded_charge(
+                app.state.store, app.state.service.source, app.state.charge_lock
+            )
             await expire_recorded_charge(
                 app.state.store, app.state.service.source, app.state.charge_lock
             )

@@ -25,7 +25,12 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
-from arraysense.charge import CHARGE_RESTORE_ADDRESSES, ChargeConfig, decode_charge_config
+from arraysense.charge import (
+    CHARGE_RESTORE_ADDRESSES,
+    GRID_CHARGE_TARGET_SOC_PCT,
+    ChargeConfig,
+    decode_charge_config,
+)
 from arraysense.settings import CHARGE_OVERRIDE_KEY, SettingsStore
 
 # A record missing any one of these describes no charge, so it is not stored
@@ -44,6 +49,9 @@ class ChargeOverride:
     saved: ChargeConfig
     until: datetime
     requested_w: int
+    # What the charge is charging to. A record written before this field existed
+    # reads as the shipped target, which is what every start before it wrote.
+    target_soc_pct: int = GRID_CHARGE_TARGET_SOC_PCT
 
 
 def encode_override(override: ChargeOverride) -> str:
@@ -60,6 +68,7 @@ def encode_override(override: ChargeOverride) -> str:
         "read_at": override.saved.read_at.isoformat(),
         "until": override.until.isoformat(),
         "requested_w": override.requested_w,
+        "target_soc_pct": override.target_soc_pct,
     }
     return json.dumps(payload)
 
@@ -122,6 +131,12 @@ def decode_override(text: str) -> ChargeOverride | None:
     requested = parsed["requested_w"]
     if not isinstance(requested, int) or isinstance(requested, bool):
         raise ValueError("the stored charge override's requested_w is not an integer")
+    # Written since the completion rule existed, and defaulted when absent: a
+    # record from before it was charging to the shipped target, so that is what
+    # it reads as rather than as a charge with no target at all.
+    target = parsed.get("target_soc_pct", GRID_CHARGE_TARGET_SOC_PCT)
+    if not isinstance(target, int) or isinstance(target, bool) or not 0 < target <= 101:
+        raise ValueError("the stored charge override's target_soc_pct is not a stop setting")
     # A record is an undo, so it has to hold every register an undo writes. One
     # that decoded without them would read as a usable record — the page would
     # offer a stop that the driver must then refuse, over a control that cannot
@@ -137,7 +152,7 @@ def decode_override(text: str) -> ChargeOverride | None:
     # same absence every stored record means, and a restored inverter is
     # written back, not restarted mid-count.
     saved = decode_charge_config(values, quick_charge_remaining_s=None, read_at=read_at)
-    return ChargeOverride(saved=saved, until=until, requested_w=requested)
+    return ChargeOverride(saved=saved, until=until, requested_w=requested, target_soc_pct=target)
 
 
 def save_override(settings: SettingsStore, override: ChargeOverride) -> None:

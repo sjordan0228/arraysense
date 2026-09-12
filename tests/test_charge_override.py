@@ -157,7 +157,7 @@ def test_the_payload_is_json_with_string_register_keys() -> None:
     text = encode_override(override)
     assert decode_override(text) == override
     payload = json.loads(text)
-    assert set(payload) == {"registers", "read_at", "until", "requested_w"}
+    assert set(payload) == {"registers", "read_at", "until", "requested_w", "target_soc_pct"}
     assert all(isinstance(key, str) for key in payload["registers"])
 
 
@@ -166,6 +166,32 @@ def test_the_decoded_configuration_carries_the_raw_registers_a_restore_needs() -
     assert decoded is not None
     assert decoded.saved.registers == REGISTERS
     assert decoded.saved.read_at == READ_AT
+
+
+def test_the_record_carries_the_target_it_is_charging_to() -> None:
+    """The sweep that ends a finished charge has to know what finished means, and
+    it reads the answer out of the record rather than asking the device every
+    minute."""
+    decoded = decode_override(encode_override(_override()))
+    assert decoded is not None
+    assert decoded.target_soc_pct == 100
+
+
+def test_a_record_from_before_the_target_existed_reads_as_the_shipped_target() -> None:
+    """Every charge written before that field was stored was charging to the
+    shipped target, so a record without it is not a charge with no target."""
+    override = _override()
+    payload = json.loads(encode_override(override))
+    del payload["target_soc_pct"]
+    decoded = decode_override(json.dumps(payload))
+    assert decoded is not None
+    assert decoded.target_soc_pct == 100
+    # And a target the device would not accept is damage, like the rest of the
+    # record: 0 is not a stop setting, and neither is 102.
+    for refused in (0, 102, "100"):
+        payload["target_soc_pct"] = refused
+        with pytest.raises(ValueError):
+            decode_override(json.dumps(payload))
 
 
 def test_an_override_is_active_until_its_window_closes() -> None:
