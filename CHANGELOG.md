@@ -2,6 +2,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.8 — 11 September 2026
+
+The rule that ends a finished charge now runs in the service, not only under the
+tests.
+
+### Fixed
+
+- **1.4.6 and 1.4.7 shipped with a completion rule that could not fire.** The
+  sweep was started in the lifespan `create_app` installs, and `__main__`
+  replaces that lifespan with its own — the one that starts the collector, the
+  weather poller and the Emporia module. Every test therefore drove a lifespan
+  production never runs. On the reference installation a charge finished at 19:58
+  and the site was still on the grid at 20:55 with the battery full and the BMS
+  refusing charge. `charge_expiry` is now a context manager that both lifespans
+  enter, so there is one place the sweep is started rather than two that can
+  disagree.
+
+- **A test drives the lifespan the service actually uses.** It builds the app the
+  way the entry point does, starts a charge through the API against a fake that
+  can answer the charge endpoints, gives the store a full battery the grid has
+  stopped feeding, and requires the running service to end the charge. Removing
+  the sweep from that lifespan makes it fail — the check that was missing.
+
 ## 1.4.7 — 11 September 2026
 
 The rule that ends a finished charge now reads the device's own meter, because the
