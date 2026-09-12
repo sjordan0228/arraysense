@@ -58,6 +58,7 @@ from arraysense.calibration import (
     full_charge_windows,
 )
 from arraysense.charge import (
+    CHARGE_FULL_TOLERANCE_PCT,
     CHARGE_LOAD_FRESHNESS,
     CHARGE_SETTLE,
     GRID_CHARGE_DEFAULT_W,
@@ -1484,33 +1485,44 @@ def _loaded(settings: SettingsStore) -> ChargeOverride | None:
         return None
 
 
-def _settled_at_target(store: SqliteStore, target_soc_pct: int, now: datetime) -> bool:
-    """Whether the battery has held the target for the whole settling window.
+def _charge_is_finished(store: SqliteStore, target_soc_pct: int, now: datetime) -> bool:
+    """Whether the charge is over: the battery is full and the grid has stopped.
 
-    Read out of the store rather than remembered in this process: the answer has
-    to survive a restart, and a service that came up an hour after the charge
-    finished should still see a bank that has been full since.
+    Two things have to hold across the settling window, and the second is the one
+    that makes this honest — a full battery on its own is not a finished charge.
+    The device stops *charging* at the target and then holds the bank there, so
+    what says the charge is over is that the grid has stopped delivering to it:
 
-    Every reading in the window counts, so one dip below the target starts the
-    window again — the point is a charge that has finished settling, not a
-    reading that touched the number once. Rows with no state of charge in them
-    are gaps and are skipped; a window of nothing but gaps is not evidence, so it
-    answers no.
+    * the state of charge has stayed at the target, give or take the point of
+      jitter a pack shows while it balances at the top, and
+    * the inverter's own AC-charge counter has not moved, which is the device
+      reporting that no charge has been delivered from the grid in this window.
+
+    Read out of the store rather than remembered in this process, so the answer
+    survives a restart: a service that came up an hour after the charge finished
+    should still see a bank that has been full and idle since. Rows with no state
+    of charge in them are gaps and are skipped; a window of nothing but gaps is
+    not evidence, so it answers no, as does a window whose newest reading is older
+    than the freshness rule.
     """
     start = now - CHARGE_SETTLE
-    rows = store.query(["battery_soc_pct"], start, now, tier="full")
-    seen = 0
+    rows = store.query(["battery_soc_pct", "ac_charge_energy_today_kwh"], start, now, tier="full")
+    floor = target_soc_pct - CHARGE_FULL_TOLERANCE_PCT
+    socs: list[float] = []
+    delivered: list[float] = []
     for row in rows:
-        reported = row.get("timestamp")
         soc = row.get("battery_soc_pct")
-        if not isinstance(reported, datetime) or not isinstance(soc, (int, float)):
-            continue
-        seen += 1
-        if float(soc) < target_soc_pct:
-            return False
-    # At least one reading, and the newest of them recent enough to be describing
-    # the battery now rather than the battery ten minutes ago.
-    if not seen or not rows:
+        if isinstance(soc, (int, float)) and not isinstance(soc, bool):
+            socs.append(float(soc))
+        counter = row.get("ac_charge_energy_today_kwh")
+        if isinstance(counter, (int, float)) and not isinstance(counter, bool):
+            delivered.append(float(counter))
+    if not socs or min(socs) < floor:
+        return False
+    # A counter that has not moved over the whole window is the device saying it
+    # delivered nothing; one that moved says the charge is still running, whatever
+    # the state of charge is doing.
+    if len(delivered) < 2 or max(delivered) > min(delivered):
         return False
     newest = rows[-1].get("timestamp")
     if not isinstance(newest, datetime):
@@ -1546,7 +1558,7 @@ async def finish_recorded_charge(
         if override is None:
             return False
         moment = now if now is not None else datetime.now(tz=UTC)
-        if not _settled_at_target(store, override.target_soc_pct, moment):
+        if not _charge_is_finished(store, override.target_soc_pct, moment):
             return False
         return await _put_the_inverter_back(
             settings, source, f"the battery reached {override.target_soc_pct}%"

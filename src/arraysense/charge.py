@@ -171,6 +171,13 @@ CHARGE_LOAD_FRESHNESS = timedelta(minutes=5)
 # override has to be released rather than waited out: this is the settling time
 # the owner asked for, not the hours the window allowed.
 CHARGE_SETTLE = timedelta(minutes=10)
+# How far below the target a pack may read and still count as full. A battery
+# held at the top of charge reports the target and one point under it by turns
+# while it balances — measured on the reference bank over one evening, 362
+# readings at 99% against 100 at 100% — so requiring the exact integer would
+# leave the override in place all night over a rounding, which is the complaint
+# this rule exists to answer.
+CHARGE_FULL_TOLERANCE_PCT = 1
 
 
 @dataclass(frozen=True)
