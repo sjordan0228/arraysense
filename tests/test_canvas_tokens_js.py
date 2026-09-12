@@ -23,6 +23,14 @@ Both guards take their declarations as an argument, so each is driven twice: onc
 over the real sheets, and once over synthetic declarations that state the
 outcome directly. A guard only ever run against a tree that already passes it
 cannot show that it would catch anything.
+
+Two more ways the same misunderstanding reaches a canvas live here, both found
+on the Overnight page on 2026-09-12. The first is handing the variable itself
+over as text -- ``stroke: 'var(--ink2)'`` -- which no canvas parses whatever the
+token says, and which drew four black lines under a legend promising three
+colours. The second is a token nothing declares at all: ``--amber`` there, which
+its own page's legend, its charge control's border and its slider's accent all
+read, and which resolves to nothing in each of them without a word.
 """
 
 from __future__ import annotations
@@ -49,6 +57,26 @@ _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _HEX = re.compile(r"^#([0-9a-f]{3,8})$")
 _FUNCTIONAL = re.compile(r"^[a-z-]+\((.*)\)$", re.DOTALL)
 
+# A custom property handed over as text rather than as the colour it names, as
+# the value of something a canvas reads. The receiver is what makes it a defect:
+# CSS writes var() bare and the browser's own style engine resolves it, so the
+# SVG and DOM style text in this repo (`style="stroke:${col}"`, `hub: 'var(--ink3)'`)
+# is not what this looks at. A canvas is not a style engine and drops it.
+_RAW_TOKEN = re.compile(
+    r"""(?<!\.style\.)\b(stroke|strokeStyle|fill|fillStyle|shadowColor)\s*[:=]\s*"""
+    r"""['"`]\s*var\(\s*(--[a-z0-9-]+)\s*\)\s*['"`]"""
+)
+
+# var(--x) with nothing after the name but the closing bracket has no fallback,
+# and is a reference to a token that has to exist. var(--x, inherit) states its
+# own answer and is somebody else's business.
+_VAR_REFERENCE = re.compile(r"var\(\s*(--[a-z0-9-]+)\s*([,)])")
+
+# Whether a token is declared anywhere, which is a looser question than the
+# declaration scan above answers: a declaration may be the last one in its block
+# and close on `}` with no semicolon, as costs.html's --spendcols does.
+_DECLARED_ANYWHERE = re.compile(r"(--[a-z0-9-]+)\s*:")
+
 
 def _sources() -> list[Path]:
     """Every file that may either read a token into a canvas or define one."""
@@ -69,6 +97,62 @@ def _tokens_read_into_a_canvas() -> dict[str, list[str]]:
         for name in _INK_READ.findall(text):
             found.setdefault(name, []).append(path.name)
     return found
+
+
+# (token, filename, how it was referenced), for the two ways a source can name
+# a token it needs a value from.
+Reference = tuple[str, str, str]
+
+
+def _references_to_a_token() -> list[Reference]:
+    """Every token a source needs a value from, with nothing to fall back on.
+
+    ``ink('--x')`` is a reference: the value comes back from the stylesheet and
+    an undeclared token resolves to nothing. ``var(--x)`` is one too, unless it
+    states its own fallback, in which case a missing token is answered by the
+    source itself and this is not the guard's business.
+    """
+    out: list[Reference] = []
+    for path in _sources():
+        text = _without_comments(path.read_text(encoding="utf-8"))
+        for name in _INK_READ.findall(text):
+            out.append((name, path.name, "ink()"))
+        for name, following in _VAR_REFERENCE.findall(text):
+            if following == ")":
+                out.append((name, path.name, "var()"))
+    return out
+
+
+def _declared_names() -> set[str]:
+    """Every custom property any web source declares, with its comments gone."""
+    return {
+        name
+        for text in _source_texts().values()
+        for name in _DECLARED_ANYWHERE.findall(_without_comments(text))
+    }
+
+
+def raw_token_offences(sources: dict[str, str]) -> list[str]:
+    """Every custom property handed to a canvas as text instead of as a colour."""
+    return [
+        f"{where} sets {receiver} to 'var({name})': whatever reads it gets the "
+        "text of a variable, and a canvas drops it without a word"
+        for where, text in sorted(sources.items())
+        for receiver, name in _RAW_TOKEN.findall(_without_comments(text))
+    ]
+
+
+def undefined_token_offences(references: list[Reference], declared: set[str]) -> list[str]:
+    """Every token a source needs a value from that nothing declares."""
+    return [
+        f"{where} reads {name} through {how}, and no web source declares it"
+        for name, where, how in references
+        if name not in declared
+    ]
+
+
+def _source_texts() -> dict[str, str]:
+    return {path.name: path.read_text(encoding="utf-8") for path in _sources()}
 
 
 def _declarations() -> list[Declaration]:
@@ -241,3 +325,88 @@ def test_the_scans_find_the_tokens_these_rules_were_written_for() -> None:
     # And the scan does see light-dark() where it genuinely is, or it would have
     # nothing to catch: the Glass sheet uses it widely on tokens no canvas reads.
     assert any("light-dark(" in value for _, value in glass)
+
+
+def test_no_source_hands_a_canvas_the_text_of_a_custom_property() -> None:
+    """A canvas handed the text of a variable drops the assignment in silence.
+
+    Measured in Chrome on 2026-09-12: with ``--ink2`` declared as ``#c8cbd9``,
+    ``ctx.strokeStyle = 'var(--ink2)'`` left the stroke at the colour the canvas
+    already held, while the literal ``#c8cbd9`` took. The Overnight page's plan
+    chart was built that way and painted every series black.
+    """
+    assert not raw_token_offences(_source_texts())
+
+
+def test_the_raw_token_guard_catches_the_text_of_a_variable() -> None:
+    """Driven over both directions, since a guard that refuses everything passes too."""
+    for offending in (
+        "stroke: 'var(--ink2)'",
+        'fill: "var(--ink2)"',
+        "stroke: `var(--ink2)`",
+        "series.push({stroke: 'var(--pv)', data: column});",
+        "ctx.fillStyle = 'var(--batt)';",
+        "ctx.shadowColor = 'var(--ink3)';",
+    ):
+        caught = raw_token_offences({"a-page.html": offending})
+        assert caught, f"{offending} hands a variable to a canvas and passed"
+
+    for clean in (
+        # CSS writes var() bare, in a stylesheet, in a style attribute, and in
+        # style text a script builds -- the browser resolves all three.
+        ".charge{border-left:3px solid var(--accent)}",
+        '<i style="background:var(--pv)"></i>',
+        'inner += `<path style="stroke:${n.col}"/>`;',
+        "const hub = o.hub || 'var(--ink3)';",
+        # The resolved colour is the whole point.
+        "series.push({stroke: () => ink('--pv')});",
+        "const ink = {stroke: '#c8cbd9'};",
+        # Even through the CSSOM, where a variable is a value like any other.
+        "el.style.fill = 'var(--pv)';",
+        # A comment may quote the fault while explaining it.
+        "// 'var(--ink2)' is the shape that drew four black lines",
+        "/* stroke: 'var(--ink2)' was here before 2026-09-12 */",
+    ):
+        assert not raw_token_offences({"a-page.html": clean}), f"{clean} was refused"
+
+
+def test_every_token_a_source_needs_is_declared_somewhere() -> None:
+    """A token nothing declares resolves to nothing, and nothing is not a colour.
+
+    The Overnight page read ``--amber`` in three places -- its legend swatches,
+    its charge control's edge and its power slider's accent -- and no sheet
+    declared it, so all three were dropped without a word from any of them.
+    """
+    assert not undefined_token_offences(_references_to_a_token(), _declared_names())
+
+
+def test_the_undefined_token_guard_catches_a_token_nothing_declares() -> None:
+    declared = {"--pv", "--ink3"}
+    assert undefined_token_offences([("--amber", "overnight.html", "var()")], declared)
+    assert undefined_token_offences([("--amber", "overnight.html", "ink()")], declared)
+    assert not undefined_token_offences([("--pv", "overnight.html", "ink()")], declared)
+    assert not undefined_token_offences([("--ink3", "overnight.html", "var()")], declared)
+
+
+def test_a_fallback_of_its_own_is_not_a_reference_to_check() -> None:
+    """``var(--muted, inherit)`` answers for itself, and is not this guard's business.
+
+    It is in the tree: common.js spells it that way, and a guard that refused it
+    would be refusing the one form that cannot fail. The bare ``var(--muted)``
+    that index.html used to hold is the other form, and it was a fault: nothing
+    declares the token, so the dashboard's status dot had no background at all in
+    the modes with no tint of their own.
+    """
+    references = _references_to_a_token()
+    assert not any(name == "--muted" for name, _, how in references if how == "var()"), (
+        "a var() with a fallback was read as a reference"
+    )
+    assert undefined_token_offences([("--muted", "common.js", "var()")], set())
+    # The scan does see var() references, or the guard above has nothing to hold.
+    assert any(how == "var()" for _, _, how in references)
+    assert any(how == "ink()" for _, _, how in references)
+    # And the fallback spelling this is about is in the tree, or the test would
+    # be passing over a form nobody writes.
+    assert any("var(--muted,inherit)" in text for text in _source_texts().values()), (
+        "the fallback spelling this test is about is gone from the tree"
+    )
