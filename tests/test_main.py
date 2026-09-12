@@ -234,7 +234,7 @@ def test_the_production_lifespan_ends_a_finished_charge_by_itself(
                 store.append(
                     Sample(
                         timestamp=now - timedelta(minutes=minutes_ago),
-                        readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 4.0},
+                        readings={"battery_soc_pct": 100.0, "battery_power_w": 0.0},
                     )
                 )
             deadline = time.monotonic() + 5.0

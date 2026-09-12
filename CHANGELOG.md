@@ -2,6 +2,29 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.9 — 11 September 2026
+
+A finished charge is now recognised by what the battery is taking, rather than by
+the device counter's shadow of it.
+
+### Fixed
+
+- **A slow top-off could be called finished early.** The completion rule read the
+  inverter's AC-charge counter, which moves in 0.1 kWh steps: at a low charge rate
+  it reads flat for minutes while the pack is still absorbing. On the reference
+  bank the counter stopped at 19:58:19 while the battery went on taking 1.8 kW,
+  then 0.7, then 0.5, and reached zero only at 20:01:19 — a three-minute taper that
+  the settling window happened to cover, and a longer one would have been cut off.
+  The rule now reads the battery's own power: the state of charge has to hold at
+  the target *and* the battery must have taken no charge across the whole settling
+  window. Only charging counts against it, so a battery serving the house — with
+  the override doing nothing — releases the record too.
+
+- **The state-of-charge guard stays tolerant of one point, deliberately.** It is
+  not the trigger and never was: it exists so that a charge which stalled halfway
+  is not called finished, while a pack held at the top reads 99% and 100% by turns
+  while it balances and an exact number would never be met.
+
 ## 1.4.8 — 11 September 2026
 
 The rule that ends a finished charge now runs in the service, not only under the
