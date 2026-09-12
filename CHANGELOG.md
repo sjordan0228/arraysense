@@ -2,6 +2,49 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.12 — 12 September 2026
+
+The dashboard's once-a-minute poll stops re-reading sixty days of history, which
+removes the event-loop stalls issue #63 has tracked since the beginning.
+
+### Fixed
+
+- **`/api/calibration` cost 1792 ms a call and stalled every other response while
+  it ran.** The dashboard asks for it once a minute, and every call read the whole
+  sixty-day search window — 86,427 rows of the minute tier on the reference
+  installation — ran the full-charge window pass over all of them, and then read
+  packs for each candidate window. Probed from the Pi with a loopback watcher
+  running alongside: a **1792.7 ms** call, against a worst concurrent response of
+  **271.1 ms**, in five once-a-minute bursts of nine or ten slow requests each,
+  worst 176.6 ms. Every other endpoint that client fires in the same burst is
+  12–60 ms. The endpoint's own docstring had blamed the rollup pass for the freeze;
+  the pass is a second, smaller source — a stall at 13:38:40.14 against that pass's
+  log line at 13:38:40.128 — and is not part of this release.
+- **The endpoint is now incremental.** It remembers its last answer, and how far
+  the search has been carried, on `app.state`. A completed full charge is the only
+  thing that moves the answer, so each poll asks one narrow question instead:
+  whether any row at the charge reference sits in the tail the memory has not
+  covered, widened at the near end by `PACK_RESET_LAG`. Only a yes, a changed pack
+  set, a memory older than six hours, or no memory at all re-runs the wide search.
+  On a production-shaped tier of 86,400 minute rows the sixty-second poll falls
+  from **116.9 ms to 1.1 ms**, with the payload unchanged either side.
+- **A charge can age out of the search window while the memory is still fresh.**
+  A charge remembered inside the sixty days can fall outside them during the
+  memory's six-hour lease, and the payload would then report a timestamp the search
+  could not have found while still claiming `searched_days: 60`. That state now
+  answers what a fresh search answers — no full charge found — without paying for
+  a rescan. Forcing the wide search instead was rejected deliberately: a bank that
+  has not charged in sixty days is the state the drift warning exists for, and it
+  would rescan every sixty seconds.
+
+### Added
+
+- Tests for the memo's four clauses, each verified by mutation: the charge that
+  lands between two polls, the changed pack set, the steady-state poll that must
+  not rescan, the window clamp, and the tail scan's completeness — the last after
+  mutation testing showed a check that inspects only the first row of the tail
+  passed the original three.
+
 ## 1.4.11 — 12 September 2026
 
 The Overnight page's projection draws, and it draws in the theme. The plan chart
