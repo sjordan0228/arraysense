@@ -1074,6 +1074,97 @@ def test_a_changed_pack_set_recomputes(tmp_path: Path, monkeypatch: pytest.Monke
     ]
 
 
+def test_a_memo_whose_charge_has_aged_out_of_the_window_reports_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The memo is reused for up to six hours, and inside that lease a charge it
+    # remembers can fall out of the search window. The wide search physically
+    # cannot read a row older than the window, so today's base answer for this
+    # state is "no full charge found"; reusing the older timestamp reports a
+    # charge the payload simultaneously claims to have searched past. The
+    # endpoint reads the clock itself, so the test moves the clock.
+    now = datetime.now(tz=UTC)
+    clock = {"now": now}
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return clock["now"] if tz is None else clock["now"].astimezone(tz)
+
+    from arraysense.api import routes
+
+    def build(store: SqliteStore) -> None:
+        # A completed charge just inside the sixty-day window, and the bank
+        # seen discharging below the reference now.
+        charged = now - timedelta(days=59, hours=23)
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now, 53.0, {"A": 61.0, "B": 62.0})
+
+    starts = _record_query_starts(monkeypatch)
+    with _calibration_client(tmp_path, build) as c:
+        starts.clear()
+        first = c.get("/api/calibration").json()
+        # The wide search sees the charge while it is still in the window, and
+        # the memo writes it down.
+        assert first["last_full_charge"] is not None
+        # The clock is only moved for the second call: the router resolves
+        # every endpoint's annotations lazily against this module's globals,
+        # so replacing them before the first request would fail on a
+        # sibling endpoint rather than on this behaviour.
+        monkeypatch.setattr(routes, "datetime", Clock)
+        clock["now"] = now + timedelta(hours=2)
+        starts.clear()
+        second = c.get("/api/calibration").json()
+    assert second["last_full_charge"] is None
+    # And the answer changed to "not found" without paying for a rescan: no
+    # read on this call reaches back to the wide window.
+    assert all(start > now - timedelta(days=1) for start in starts), [
+        str(start) for start in starts
+    ]
+
+
+def test_the_tail_check_scans_the_whole_tail_not_just_one_row(tmp_path: Path) -> None:
+    # What the memo relies on is the tail check's completeness: a charge is
+    # noticed because every row the memo has not covered was looked at, not
+    # because one convenient row happened to be there. Place the charge in the
+    # middle of the tail with below-reference rows on both sides of it in time,
+    # so neither the first nor the last row of the read can answer for it.
+    now = datetime.now(tz=UTC)
+
+    def build(store: SqliteStore) -> None:
+        # An older completed charge, so the first call has something to
+        # remember, and the newest poll sits below the reference.
+        charged = now - timedelta(days=3)
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now, 53.0, {"A": 61.0, "B": 62.0})
+
+    with _calibration_client(tmp_path, build) as c:
+        first = c.get("/api/calibration").json()
+        assert first["last_full_charge"] is not None
+        store = c.app.state.store
+        # A new charge written after that call, its rows inside the tail the
+        # next call will read: the tail spans covered_through minus
+        # PACK_RESET_LAG to now, and this charge sits between two below-
+        # reference polls, one before it in time and one after, so the scan
+        # has to walk past a "no" at each end to reach the "yes" in the
+        # middle.
+        _bank(store, now - timedelta(minutes=100), 53.0, {"A": 61.0, "B": 62.0})
+        charged = now - timedelta(minutes=70)
+        for minute in range(0, 31, 2):
+            _bank(store, charged + timedelta(minutes=minute), 55.9, {"A": 100.0, "B": 100.0})
+        _bank(store, now - timedelta(minutes=10), 53.0, {"A": 61.0, "B": 62.0})
+        lo = int((now - timedelta(days=61)).timestamp())
+        hi = int((now + timedelta(days=1)).timestamp())
+        rebuild_inverter_minute(store._conn, lo, hi)
+        second = c.get("/api/calibration").json()
+    assert second["last_full_charge"] is not None
+    # The newer charge is the one credited, not the three-day-old memo.
+    assert second["days_since"] < 1.0
+    assert second["severity"] == "none"
+
+
 # --- settings ----------------------------------------------------------------
 
 

@@ -1747,6 +1747,16 @@ def calibration(request: Request, store: _ReadStore) -> dict[str, Any]:
             and not _full_charge_in_the_tail(store, memo.covered_through - PACK_RESET_LAG, now)
         ):
             last_full = memo.last_full
+            # A charge can age out of the search window while the memo lease is
+            # still running, and the wide search cannot see a row older than
+            # that window. An answer the window cannot justify today is not
+            # reused: reporting the older timestamp would claim a charge the
+            # payload simultaneously says it searched past. Forcing a wide
+            # search instead would make a bank that has not charged in sixty
+            # days rescan sixty days on every poll, which is the cost the memo
+            # exists to remove.
+            if last_full is not None and now - last_full > timedelta(days=CALIBRATION_SEARCH_DAYS):
+                last_full = None
         else:
             last_full = _search_last_full_charge(store, now, known)
         request.app.state.calibration_memo = _CalibrationMemo(last_full, now, tuple(known))
