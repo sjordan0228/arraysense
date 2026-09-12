@@ -109,12 +109,26 @@ CORROBORATING_ABSORB = timedelta(minutes=1)
 # into the absorb and the fourth three minutes after the inverter's terminal
 # voltage had fallen back below the reference, so a search confined to the
 # voltage window misses the pack that completes the set. *Before*: how far back
-# the below-full evidence may be read, where the binding measurement is that the
-# slowest pack's last reading under 99% came 2 min 19 s before the absorb opened.
-# Fifteen minutes covers both with room for the round-robin slot rotation, while
-# staying far short of the hours between one charge and the next — and it is
-# capped at the previous absorb so one charge cannot vouch for the next.
-PACK_RESET_LAG = timedelta(minutes=15)
+# the below-full evidence may be read.
+#
+# Two hours, not fifteen minutes, and the reference bank on 11 September 2026 is
+# why. Its four counters crossed to full one after another — pack 1 around 18:20,
+# pack 2 around 18:45, pack 3 around 19:10, pack 4 at 19:20 — while the bank's
+# terminal voltage only entered the absorb band at 19:57, because this bank ends
+# its charge on state of charge and merely touches its voltage reference. By the
+# time the voltage window opened, every pack had been at or above 99% for half an
+# hour, so a fifteen-minute lookback found no below-full reading for any of them
+# and the charge was credited to nobody: the page went on saying "34 days since
+# the bank last reached full" after a charge that took the packs from nine points
+# apart to one.
+#
+# Two hours is still far too short for drift to fake. The ladder below is
+# calibrated on this hardware opening ten points in a fortnight — under a point a
+# day, so two hours of drift is about 0.08 of a point — and a counter pegged at
+# full by drift has no below-full reading inside two hours anyway, which is what
+# keeps the transition requirement meaning something. It is also capped at the
+# previous absorb, so one charge cannot vouch for the next.
+PACK_RESET_LAG = timedelta(hours=2)
 
 # Days since the last full charge, and what each means. Seven is early enough
 # to be useful and quiet enough to ignore. Fourteen is roughly where this
