@@ -2,6 +2,67 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.11 — 12 September 2026
+
+The Overnight page's projection draws, and it draws in the theme. The plan chart
+had never drawn in any release.
+
+### Fixed
+
+- **The plan section of the Overnight page stayed empty, under a sentence blaming
+  the wrong thing.** The chart was built as `new uPlot(opts, wrap)` — two
+  arguments — and the vendored uPlot 1.6.32 takes its data as the second argument
+  and the element as the third, so the element landed in the data slot and the
+  constructor threw reading a length off it. The state-of-charge line is written
+  before the throw and the table, chart, guidance and assumptions after it, so the
+  reader got "The plan endpoint did not answer: TypeError: Cannot read properties
+  of undefined (reading 'length')" in place of the state of charge and nothing else
+  at all — while the endpoint was answering correctly. It had been that way since
+  the page was written (#242, `3ba0ea9`), so the projection had never drawn; and it
+  only ever showed the error when the planner *succeeded*, because a refused
+  projection has no curve and the chart is skipped. The page now says which of the
+  two faults happened: a request that did not answer is not a page that could not
+  draw what answered.
+- **The reserve floor line was never painted.** Its dash was a function, and the
+  build hands a series' dash straight to the canvas's `setLineDash`, which takes a
+  pattern of numbers. That threw inside the draw pass, after the axes and the
+  scenario lines were already painted, so the one line the page's honesty rule is
+  about — the floor, held at the response's own `min_soc_pct` — was the series
+  that never landed.
+- **The chart drew four black lines.** Every series was told
+  `stroke: 'var(--ink2)'`, and a canvas cannot parse a custom property: it drops
+  the assignment and keeps whatever colour it already held. Measured in Chrome,
+  with `--ink2` declared as `#c8cbd9`, the assignment left the stroke untouched
+  while the literal `#c8cbd9` took. The series now take their colour through the
+  shared `ink()`, which is what the rest of the site's charts do, from three of the
+  palette's own measured-apart hues: `--pv` for the typical night, `--batt` for
+  essential loads, `--grid` for the scheduled load, `--ink3` for the reserve floor.
+- **The axes and gridlines were black on a dark panel.** uPlot's defaults are
+  black, and 96627 of the chart's inked pixels were exactly that: every tick label
+  and every gridline, in a colour nobody chose. They now come from `common.js`'s
+  shared axis factory, as every other chart on the site does.
+- **Four tokens pages read that no stylesheet declares, each of which drew
+  nothing.** The Overnight page's legend named `--amber`, `--green` and `--red`, so
+  three of its four swatches were transparent; the charge control's accent edge and
+  its power slider's accent read `--amber` as well, so neither was drawn; and the
+  dashboard's status dot read `--muted`, so in the modes with no tint of their own
+  the dot had no background. A token nothing declares is not a colour: it falls
+  back to nothing, in silence. The Overnight page now reads `--pv`, `--batt`,
+  `--grid`, `--ink3` and `--accent`; the dashboard's dot reads `--ink3`.
+
+### Added
+
+- `tests/test_overnight_page_js.py` boots the whole page under node, which is where
+  this fault lived: below the marker slice the earlier tests covered. It holds the
+  chart's argument order, the dash pattern, the resolved colours, the theme'd axes,
+  the legend's agreement with the chart's own colour table, and the two sentences
+  for the two faults.
+- `tests/test_canvas_tokens_js.py` gains two rules: no source hands a canvas the
+  text of a custom property, and no source needs a value from a token nothing
+  declares. Both are driven over the real tree and over synthetic sources written
+  to be caught, including the forms that must not be: CSS, style attributes and
+  style text a script builds all resolve `var()` themselves.
+
 ## 1.4.10 — 11 September 2026
 
 A charge to 100% is credited as the full charge it is, so the calibration warning
