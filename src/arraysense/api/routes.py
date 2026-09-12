@@ -59,10 +59,12 @@ from arraysense.calibration import (
 )
 from arraysense.charge import (
     CHARGE_LOAD_FRESHNESS,
+    CHARGE_SETTLE,
     GRID_CHARGE_DEFAULT_W,
     GRID_CHARGE_MARGIN_W,
     GRID_CHARGE_MAX_W,
     GRID_CHARGE_MIN_W,
+    GRID_CHARGE_TARGET_SOC_PCT,
     ChargeConfig,
     ChargeLimits,
     ChargeWriteRefusedError,
@@ -1218,7 +1220,15 @@ async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict
     # fail half-done with some registers already changed, and this record —
     # the configuration read above — is how a stop puts them back; a
     # failure that cleared it instead would strand the change.
-    save_override(settings, ChargeOverride(saved=before, until=until, requested_w=body.power_w))
+    save_override(
+        settings,
+        ChargeOverride(
+            saved=before,
+            until=until,
+            requested_w=body.power_w,
+            target_soc_pct=GRID_CHARGE_TARGET_SOC_PCT,
+        ),
+    )
     try:
         change = await starter(power_w=decision.power_w, duration_min=body.duration_min, now=now)
     except (ChargeWriteRefusedError, TransportError, OSError) as exc:
@@ -1236,7 +1246,12 @@ async def _start_grid_charge(request: Request, body: ChargeStartRequest) -> dict
     # The driver read the registers back after the write, so its copy of
     # what the inverter held is the authoritative undo; the record is
     # rewritten from it, and it may differ from the pre-write read.
-    record = ChargeOverride(saved=change.saved, until=change.until, requested_w=body.power_w)
+    record = ChargeOverride(
+        saved=change.saved,
+        until=change.until,
+        requested_w=body.power_w,
+        target_soc_pct=GRID_CHARGE_TARGET_SOC_PCT,
+    )
     save_override(settings, record)
     logger.info("grid charge started at %d W for %d min", decision.power_w, body.duration_min)
     return {
@@ -1318,7 +1333,12 @@ async def _set_grid_charge_power(request: Request, body: ChargePowerRequest) -> 
     # was last asked for. The window and the saved configuration do not move.
     save_override(
         settings,
-        ChargeOverride(saved=override.saved, until=override.until, requested_w=body.power_w),
+        ChargeOverride(
+            saved=override.saved,
+            until=override.until,
+            requested_w=body.power_w,
+            target_soc_pct=override.target_soc_pct,
+        ),
     )
     logger.info("grid charge power set to %d W", decision.power_w)
     return {
@@ -1382,6 +1402,45 @@ async def _stop_grid_charge(request: Request) -> dict[str, Any]:
     return {"applied": _charge_config_json(restored), "restored": True}
 
 
+async def _put_the_inverter_back(settings: SettingsStore, source: object, why: str) -> bool:
+    """Restore the recorded configuration and forget it, or keep it and say why.
+
+    One path for both ways a charge ends by itself — the window closing and the
+    battery reaching the target — because the write is the same reviewed undo
+    either way, and the only thing that differs is the sentence in the log. A
+    restore that fails keeps the record: a charge still running with the saved
+    copy discarded has nothing left to put it back.
+    """
+    from pylxpweb.transports.exceptions import TransportError
+
+    restorer = getattr(source, "restore_grid_charge", None)
+    if restorer is None:
+        return False
+    try:
+        override = load_override(settings)
+    except ValueError as exc:
+        # An unreadable record is not an absent one: something may be charging
+        # on it, and the damaged record is the only description of how to stop
+        # that. It is reported and left alone.
+        logger.warning("the recorded charge cannot be read back: %s", exc)
+        return False
+    if override is None:
+        return False
+    try:
+        await restorer(override.saved)
+    except (ChargeWriteRefusedError, TransportError, OSError) as exc:
+        logger.warning(
+            "the recorded charge is over (%s) but the inverter could not be put back: %s; "
+            "the record is kept",
+            why,
+            exc,
+        )
+        return False
+    clear_override(settings)
+    logger.info("the recorded charge is over: %s; the inverter was put back", why)
+    return True
+
+
 async def expire_recorded_charge(
     store: SqliteStore,
     source: object,
@@ -1397,47 +1456,101 @@ async def expire_recorded_charge(
     charge the battery again the following night without anybody pressing
     anything — which is not what a button that starts one charge promises.
 
-    So this is the stop the owner would otherwise have to press, taken at the
-    moment the record itself says the charge is over. It is not a second writer
-    with an opinion: it does nothing unless this service has a record, does
-    nothing while that record's window is still open, and keeps the record when
-    the inverter cannot be put back so the next attempt and the stop button both
-    still have it. It holds the same lock the start and the stop hold, so it
-    cannot interleave with a press.
+    This is the backstop, not the usual ending: a charge that reaches its target
+    ends through ``finish_recorded_charge`` below, which is the ordinary way one
+    finishes. What is left for this path is the charge that never got there — a
+    bank that could not take the full charge, or a service that was down when it
+    did.
 
-    Returns whether the inverter was put back.
+    It holds the same lock the start and the stop hold, so it cannot interleave
+    with a press. Returns whether the inverter was put back.
     """
-    from pylxpweb.transports.exceptions import TransportError
-
-    restorer = getattr(source, "restore_grid_charge", None)
-    if restorer is None:
-        return False
     settings = SettingsStore(store)
     async with lock:
-        try:
-            override = load_override(settings)
-        except ValueError as exc:
-            # An unreadable record is not an absent one: something may be
-            # charging on it, and the damaged record is the only description of
-            # how to stop that. It is reported and left alone.
-            logger.warning("the recorded charge cannot be read back: %s", exc)
-            return False
+        override = _loaded(settings)
         if override is None:
             return False
         if override_is_active(override, now if now is not None else datetime.now(tz=UTC)):
             return False
-        try:
-            await restorer(override.saved)
-        except (ChargeWriteRefusedError, TransportError, OSError) as exc:
-            logger.warning(
-                "the recorded charge's window has closed but the inverter could not be "
-                "put back: %s; the record is kept",
-                exc,
-            )
+        return await _put_the_inverter_back(settings, source, "its window closed")
+
+
+def _loaded(settings: SettingsStore) -> ChargeOverride | None:
+    """The record, or None when there is none to act on."""
+    try:
+        return load_override(settings)
+    except ValueError as exc:
+        logger.warning("the recorded charge cannot be read back: %s", exc)
+        return None
+
+
+def _settled_at_target(store: SqliteStore, target_soc_pct: int, now: datetime) -> bool:
+    """Whether the battery has held the target for the whole settling window.
+
+    Read out of the store rather than remembered in this process: the answer has
+    to survive a restart, and a service that came up an hour after the charge
+    finished should still see a bank that has been full since.
+
+    Every reading in the window counts, so one dip below the target starts the
+    window again — the point is a charge that has finished settling, not a
+    reading that touched the number once. Rows with no state of charge in them
+    are gaps and are skipped; a window of nothing but gaps is not evidence, so it
+    answers no.
+    """
+    start = now - CHARGE_SETTLE
+    rows = store.query(["battery_soc_pct"], start, now, tier="full")
+    seen = 0
+    for row in rows:
+        reported = row.get("timestamp")
+        soc = row.get("battery_soc_pct")
+        if not isinstance(reported, datetime) or not isinstance(soc, (int, float)):
+            continue
+        seen += 1
+        if float(soc) < target_soc_pct:
             return False
-        clear_override(settings)
-    logger.info("the recorded charge's window closed; the inverter was put back")
-    return True
+    # At least one reading, and the newest of them recent enough to be describing
+    # the battery now rather than the battery ten minutes ago.
+    if not seen or not rows:
+        return False
+    newest = rows[-1].get("timestamp")
+    if not isinstance(newest, datetime):
+        return False
+    return (now - newest) <= CHARGE_LOAD_FRESHNESS
+
+
+async def finish_recorded_charge(
+    store: SqliteStore,
+    source: object,
+    lock: asyncio.Lock,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Put the inverter back when the battery has reached the charge's target.
+
+    The window written into the inverter is a permission, not a plan: it says
+    "charging may happen between these clock times", and the stop setting says
+    "and not past this state of charge". So a charge that reaches 100% stops
+    *charging* and keeps the window — and inside an open window the inverter
+    holds the bank at the target and serves the house from the grid instead of
+    the battery. That is the state this ends: the credit the owner wanted was a
+    full battery, not a grid-tied evening.
+
+    The charge counts as finished once the battery has held the target for
+    ``CHARGE_SETTLE`` without dipping below it. Keeps the record, and writes
+    nothing, when the restore fails or when the store cannot say. Returns whether
+    the inverter was put back.
+    """
+    settings = SettingsStore(store)
+    async with lock:
+        override = _loaded(settings)
+        if override is None:
+            return False
+        moment = now if now is not None else datetime.now(tz=UTC)
+        if not _settled_at_target(store, override.target_soc_pct, moment):
+            return False
+        return await _put_the_inverter_back(
+            settings, source, f"the battery reached {override.target_soc_pct}%"
+        )
 
 
 def _packs_during(store: SqliteStore, start: datetime, end: datetime) -> list[dict[str, Any]]:

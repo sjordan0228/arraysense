@@ -165,6 +165,12 @@ GRID_CHARGE_TARGET_SOC_PCT = 100  # what a charge-to-full charges to
 # the house, so sizing against a reading that old can put more on the site than
 # the site was limited to.
 CHARGE_LOAD_FRESHNESS = timedelta(minutes=5)
+# How long the battery has to hold the charge's target before the charge counts
+# as finished. The device stops *charging* at the target, but it holds the bank
+# there and serves the house from the grid while the window is open, so the
+# override has to be released rather than waited out: this is the settling time
+# the owner asked for, not the hours the window allowed.
+CHARGE_SETTLE = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
