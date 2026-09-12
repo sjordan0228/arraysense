@@ -600,7 +600,7 @@ async def test_a_charge_that_reaches_its_target_is_ended_by_the_service(
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+                readings={"battery_soc_pct": 100.0, "battery_power_w": 0.0},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is True
@@ -625,7 +625,7 @@ async def test_a_battery_that_dipped_below_the_target_keeps_the_charge_going(
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": soc, "ac_charge_energy_today_kwh": 20.4},
+                readings={"battery_soc_pct": soc, "battery_power_w": 0.0},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
@@ -651,7 +651,7 @@ async def test_a_pack_resting_a_point_under_its_target_counts_as_full(
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": soc, "ac_charge_energy_today_kwh": 20.4},
+                readings={"battery_soc_pct": soc, "battery_power_w": 0.0},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is True
@@ -659,29 +659,59 @@ async def test_a_pack_resting_a_point_under_its_target_counts_as_full(
     store.close()
 
 
-async def test_a_charge_still_delivering_is_not_finished_by_a_full_battery(
+async def test_a_pack_still_absorbing_charge_is_not_finished(
     tmp_path: Path,
 ) -> None:
-    """The state of charge is not the evidence — the device's own AC-charge
-    counter is. A pack reading full while the grid is still pushing into it is a
-    charge that is running, and ending it there would cut off a charge the owner
-    asked for."""
+    """A full-looking battery that is still taking power is a charge that is
+    running, and ending it there would cut off what the owner asked for.
+
+    This is the reference bank's own taper: the device's AC-charge counter reads
+    flat from 19:58:19 while the battery goes on taking 1.8 kW, then 0.7, then
+    0.5, and only reaches zero at 20:01:19. A rule watching that counter would
+    call the charge finished three minutes early; a rule watching the battery
+    does not. The state of charge here is 100% throughout, which is why the
+    state of charge alone cannot be the trigger either.
+    """
     source = ChargeSource()
     app, store, settings = _assembled(tmp_path, source)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         assert (await client.post("/api/charge/start", json={})).status_code == 200
     now = datetime.now(tz=UTC)
-    for minutes_ago, counter in ((10, 20.4), (6, 20.8), (3, 21.1), (0, 21.4)):
+    for minutes_ago, power in ((10, 1822.0), (6, 681.0), (3, 523.0), (0, 372.0)):
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": counter},
+                readings={"battery_soc_pct": 100.0, "battery_power_w": power},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
     assert source.restore_calls == []
     assert load_override(settings) is not None
+    store.close()
+
+
+async def test_a_pack_serving_the_house_is_not_a_pack_being_charged(
+    tmp_path: Path,
+) -> None:
+    """The battery discharging while a record stands is not a charge in progress
+    either: the override is doing nothing, so the record goes and the owner gets
+    their button back."""
+    source = ChargeSource()
+    app, store, settings = _assembled(tmp_path, source)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.post("/api/charge/start", json={})).status_code == 200
+    now = datetime.now(tz=UTC)
+    for minutes_ago in (10, 5, 0):
+        store.append(
+            Sample(
+                timestamp=now - timedelta(minutes=minutes_ago),
+                readings={"battery_soc_pct": 100.0, "battery_power_w": -1400.0},
+            )
+        )
+    assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is True
+    assert load_override(settings) is None
     store.close()
 
 
@@ -703,7 +733,7 @@ async def test_an_old_state_of_charge_is_not_evidence_of_a_finished_charge(
         store.append(
             Sample(
                 timestamp=now - timedelta(minutes=minutes_ago),
-                readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+                readings={"battery_soc_pct": 100.0, "battery_power_w": 0.0},
             )
         )
     assert await finish_recorded_charge(store, source, app.state.charge_lock, now=now) is False
@@ -725,7 +755,7 @@ async def test_finishing_a_charge_keeps_the_record_when_the_inverter_cannot_be_p
     store.append(
         Sample(
             timestamp=now,
-            readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+            readings={"battery_soc_pct": 100.0, "battery_power_w": 0.0},
         )
     )
     source.fail_restore = ChargeWriteRefusedError(
@@ -753,7 +783,7 @@ def test_the_running_service_ends_a_charge_once_the_battery_is_full(
             store.append(
                 Sample(
                     timestamp=now - timedelta(minutes=minutes_ago),
-                    readings={"battery_soc_pct": 100.0, "ac_charge_energy_today_kwh": 20.4},
+                    readings={"battery_soc_pct": 100.0, "battery_power_w": 0.0},
                 )
             )
         deadline = time.monotonic() + 5.0

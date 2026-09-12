@@ -178,6 +178,14 @@ CHARGE_SETTLE = timedelta(minutes=10)
 # leave the override in place all night over a rounding, which is the complaint
 # this rule exists to answer.
 CHARGE_FULL_TOLERANCE_PCT = 1
+# How much power the battery may still be taking and count as finished, in watts.
+# The device's own AC-charge counter moves in 0.1 kWh steps, which at a low charge
+# rate is flat for minutes while the pack is still absorbing: measured on the
+# reference bank, the counter stopped at 19:58:19 while the battery went on taking
+# 1.8 kW, then 0.7 kW, then 0.5 kW, and only reached zero at 20:01:19. A rule
+# reading that counter would call a long, slow top-off finished. This reads the
+# battery's own power instead, which is the thing itself rather than its shadow.
+CHARGE_IDLE_TOLERANCE_W = 200
 
 
 @dataclass(frozen=True)

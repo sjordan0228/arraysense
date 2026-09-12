@@ -59,6 +59,7 @@ from arraysense.calibration import (
 )
 from arraysense.charge import (
     CHARGE_FULL_TOLERANCE_PCT,
+    CHARGE_IDLE_TOLERANCE_W,
     CHARGE_LOAD_FRESHNESS,
     CHARGE_SETTLE,
     GRID_CHARGE_DEFAULT_W,
@@ -1486,43 +1487,48 @@ def _loaded(settings: SettingsStore) -> ChargeOverride | None:
 
 
 def _charge_is_finished(store: SqliteStore, target_soc_pct: int, now: datetime) -> bool:
-    """Whether the charge is over: the battery is full and the grid has stopped.
+    """Whether the charge is over: the battery is full and has stopped taking power.
 
-    Two things have to hold across the settling window, and the second is the one
-    that makes this honest — a full battery on its own is not a finished charge.
-    The device stops *charging* at the target and then holds the bank there, so
-    what says the charge is over is that the grid has stopped delivering to it:
+    Two measurements have to hold across the settling window, and the second is
+    the one that decides:
 
     * the state of charge has stayed at the target, give or take the point of
-      jitter a pack shows while it balances at the top, and
-    * the inverter's own AC-charge counter has not moved, which is the device
-      reporting that no charge has been delivered from the grid in this window.
+      jitter a pack shows while it balances at the top — this is the guard that
+      stops a charge that stalled halfway from being called finished, and it is
+      deliberately tolerant, because a pack held at the top reads 99 and 100 by
+      turns and an exact number would never be met;
+    * the battery itself has taken essentially no power for the whole window,
+      which is the charge being over rather than paused.
+
+    The battery's own power, not the device's AC-charge counter: that counter
+    moves in 0.1 kWh steps, so at a low charge rate it reads flat for minutes
+    while the pack is still absorbing — measured on the reference bank, it
+    stopped at 19:58:19 while the battery went on taking 1.8 kW, then 0.7, then
+    0.5, and reached zero only at 20:01:19. A long slow top-off would have been
+    cut short by a rule reading the counter.
 
     Read out of the store rather than remembered in this process, so the answer
-    survives a restart: a service that came up an hour after the charge finished
-    should still see a bank that has been full and idle since. Rows with no state
-    of charge in them are gaps and are skipped; a window of nothing but gaps is
-    not evidence, so it answers no, as does a window whose newest reading is older
-    than the freshness rule.
+    survives a restart. Rows with no state of charge in them are gaps and are
+    skipped; a window with no readings is not evidence, so it answers no, as does
+    a window whose newest reading is older than the freshness rule.
     """
     start = now - CHARGE_SETTLE
-    rows = store.query(["battery_soc_pct", "ac_charge_energy_today_kwh"], start, now, tier="full")
+    rows = store.query(["battery_soc_pct", "battery_power_w"], start, now, tier="full")
     floor = target_soc_pct - CHARGE_FULL_TOLERANCE_PCT
     socs: list[float] = []
-    delivered: list[float] = []
+    powers: list[float] = []
     for row in rows:
         soc = row.get("battery_soc_pct")
         if isinstance(soc, (int, float)) and not isinstance(soc, bool):
             socs.append(float(soc))
-        counter = row.get("ac_charge_energy_today_kwh")
-        if isinstance(counter, (int, float)) and not isinstance(counter, bool):
-            delivered.append(float(counter))
+        power = row.get("battery_power_w")
+        if isinstance(power, (int, float)) and not isinstance(power, bool):
+            powers.append(float(power))
     if not socs or min(socs) < floor:
         return False
-    # A counter that has not moved over the whole window is the device saying it
-    # delivered nothing; one that moved says the charge is still running, whatever
-    # the state of charge is doing.
-    if len(delivered) < 2 or max(delivered) > min(delivered):
+    # Only charge counts against it: a battery serving the house is not a battery
+    # being charged, and the override is doing nothing while it happens.
+    if not powers or max(powers) > CHARGE_IDLE_TOLERANCE_W:
         return False
     newest = rows[-1].get("timestamp")
     if not isinstance(newest, datetime):
