@@ -38,6 +38,7 @@ from arraysense.settings import (
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
+    FULL_POWER_UNTIL_KEY,
     HIGH_USAGE_WATTS_KEY,
     SettingsStore,
 )
@@ -181,6 +182,28 @@ def client_without_emporia(tmp_path: Path) -> Any:
     with TestClient(app) as c:
         yield c
     store.close()
+
+
+def _ready_charger(app: Any, rate: int = 6) -> Any:
+    """Put a charger the routes can read and write in front of the poller."""
+    poller = app.state.emporia
+    poller.client = _StubCharger()
+    poller.charger = ChargerState(
+        device_gid=900001,
+        rate_a=rate,
+        max_rate_a=48,
+        on=True,
+        status="Standby",
+        message="Ready",
+        conflicts=(),
+        plugged_in=True,
+        connected=True,
+        offline_since=None,
+        fault=None,
+    )
+    poller._charger_record = {"deviceGid": 900001, "chargingRate": rate}
+    poller._id_token = "id-1"
+    return poller
 
 
 # --- circuit history ------------------------------------------------------
@@ -1193,6 +1216,135 @@ def test_setting_a_rate_clamps_it_audits_it_and_starts_the_override(tmp_path: Pa
     store.close()
 
 
+def test_full_power_holds_reports_its_window_and_can_be_resumed(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGE_CEILING_KEY, 32)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    _ready_charger(app)
+    started = int(datetime.now(tz=UTC).timestamp())
+
+    with TestClient(app) as c:
+        body = c.post("/api/emporia/charger/full-power", json={"minutes": 480}).json()
+        until = body["until"]
+        assert isinstance(until, int)
+        assert until >= started + 479 * 60
+        assert settings.get(FULL_POWER_UNTIL_KEY) == until
+        assert settings.get(CHARGE_OVERRIDE_UNTIL_KEY) == 0
+
+        page = c.get("/api/emporia/charger").json()["charger"]
+        assert page["full_power_until"] == until
+        assert page["ceiling_a"] == 48, "full power lifts the owner's 32 A ceiling"
+
+        cleared = c.post("/api/emporia/charger/full-power", json={"minutes": 0}).json()
+        assert cleared == {"ok": True, "until": None}
+        assert settings.get(FULL_POWER_UNTIL_KEY) == 0
+        page = c.get("/api/emporia/charger").json()["charger"]
+        assert page["full_power_until"] is None
+        assert page["ceiling_a"] == 32, "and resume puts it back"
+    store.close()
+
+
+def test_full_power_lifts_the_ceiling_so_48_can_be_set(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGE_CEILING_KEY, 32)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    settings.set(FULL_POWER_UNTIL_KEY, int(datetime.now(tz=UTC).timestamp()) + 3600)
+    poller = _ready_charger(app)
+
+    with TestClient(app) as c:
+        body = c.post("/api/emporia/charger/rate", json={"amps": 48}).json()
+
+    assert body["rate_a"] == 48
+    assert body["refused"] is None
+    assert poller.client.writes == [48]
+    assert settings.get(CHARGE_OVERRIDE_UNTIL_KEY) == 0, "the full-power window is the hold"
+    store.close()
+
+
+def test_without_full_power_the_ceiling_still_clamps_48(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGE_CEILING_KEY, 32)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    poller = _ready_charger(app)
+
+    with TestClient(app) as c:
+        body = c.post("/api/emporia/charger/rate", json={"amps": 48}).json()
+
+    assert body["rate_a"] == 32
+    assert "ceiling" in body["refused"]
+    assert poller.client.writes == [32]
+    assert settings.get(CHARGE_OVERRIDE_UNTIL_KEY) != 0
+    store.close()
+
+
+def test_resume_protection_clears_an_ordinary_override_too(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(datetime.now(tz=UTC).timestamp()) + 3600)
+    _ready_charger(app)
+
+    with TestClient(app) as c:
+        assert c.post("/api/emporia/charger/full-power", json={"minutes": 0}).status_code == 200
+
+    assert settings.get(FULL_POWER_UNTIL_KEY) == 0
+    assert settings.get(CHARGE_OVERRIDE_UNTIL_KEY) == 0, "resume means protection is back"
+    store.close()
+
+
+@pytest.mark.parametrize("minutes", [-1, 1441])
+def test_a_full_power_hold_outside_the_bounds_is_refused(tmp_path: Path, minutes: int) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "full")
+    _ready_charger(app)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/full-power", json={"minutes": minutes})
+
+    assert response.status_code == 400
+    assert "1 to 1440" in response.json()["detail"]
+    store.close()
+
+
+def test_full_power_needs_write_permission(client_with_password: TestClient) -> None:
+    response = client_with_password.post("/api/emporia/charger/full-power", json={"minutes": 120})
+    assert response.status_code in (401, 403)
+
+
+def test_a_disabled_module_refuses_full_power(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    SettingsStore(store).set(EMPORIA_ENABLED_KEY, False)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/full-power", json={"minutes": 120})
+
+    assert response.status_code == 409
+    store.close()
+
+
+def test_the_app_managing_the_charger_refuses_full_power(tmp_path: Path) -> None:
+    app, store, _ = _app(tmp_path)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "app")
+    _ready_charger(app)
+
+    with TestClient(app) as c:
+        response = c.post("/api/emporia/charger/full-power", json={"minutes": 120})
+
+    assert response.status_code == 409
+    store.close()
+
+
 def test_a_write_that_emporia_refuses_is_audited_as_not_applied(tmp_path: Path) -> None:
     # The worst thing this could do is record a change that never happened: the
     # restore then believes the charger is at a rate it is not, and leaves it.
@@ -1337,6 +1489,22 @@ def test_the_charger_tab_appears_only_where_there_is_a_charger() -> None:
     assert "/api/emporia/charger" in entry.group(0)
     assert "body.charger" in entry.group(0), "it must gate on a charger existing, not on a setting"
     assert "body.enabled" in entry.group(0), "and on the module actually being switched on"
+
+
+def test_the_charger_page_offers_the_full_power_hold() -> None:
+    # The control has to be on the page that sets the rate, not buried in
+    # Settings: this is the owner saying "leave the limit off for a while", and
+    # the page already prints the limit it is turning off.
+    import arraysense
+
+    html = (Path(arraysense.__file__).parent / "web" / "charger.html").read_text()
+    assert "/api/emporia/charger/full-power" in html
+    assert 'id="fullPowerForm"' in html
+    assert 'id="fullPowerMinutes"' in html
+    assert 'id="fullPowerOff"' in html
+    assert "Resume protection" in html
+    assert "minutes: 0" in html, "resume posts the explicit clear, not a missing duration"
+    assert "Full power until" in html
 
 
 def _plugged_in_charger(app: Any) -> Any:

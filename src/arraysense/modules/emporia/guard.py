@@ -71,6 +71,9 @@ class PollerLike(Protocol):
     def override_until(self) -> datetime | None:
         """When the owner's manual override stops holding, or None."""
 
+    def full_power_until(self) -> datetime | None:
+        """When the owner's full-power hold stops, or None."""
+
     def write_rate(self, amps: int) -> ChargerState | None:
         """Command a charge rate and return the charger's confirmed state."""
 
@@ -401,11 +404,34 @@ class InverterGuard:
 
         reading = self.read(now)
         allowed = allowance(reading, limit_w=limit_w)
+        self._last_allowance = allowed
+
+        # The two ways the owner can tell this module to keep its hands off.
+        # Checked here rather than only inside decide(), because the plan is
+        # what the page prints: a cut that will not be applied still read as a
+        # cut, and the owner who asked for full power was told the guard was
+        # about to move a charger it was not going to touch. Full power is
+        # checked first because it is the more specific request.
+        full_power = self._poller.full_power_until()
+        if full_power is not None and full_power > now:
+            self._last_plan = GuardPlan(
+                amps=None,
+                kind="hold",
+                reason="full power: the inverter limit is not enforced",
+            )
+            return
+        override = self._poller.override_until()
+        if override is not None and override > now:
+            self._last_plan = GuardPlan(
+                amps=None,
+                kind="hold",
+                reason=f"override holds until {override.isoformat()}",
+            )
+            return
 
         settled = self._settled_until is None or now >= self._settled_until
         p = plan(allowed, rate_a=reading.rate_a, settled=settled)
 
-        self._last_allowance = allowed
         self._last_plan = p
 
         if p.amps is None:
@@ -421,6 +447,7 @@ class InverterGuard:
             limits=self._poller.limits(),
             now=now,
             override_until=self._poller.override_until(),
+            full_power_until=self._poller.full_power_until(),
         )
 
         if not verdict.apply:
