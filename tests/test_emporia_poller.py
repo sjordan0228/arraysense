@@ -512,7 +512,6 @@ async def test_a_full_power_window_that_is_not_a_time_holds_rather_than_crashing
     assert poller.state.status == "ok", "the tick finished rather than dying"
     assert client.writes == []
     store.close()
-    store.close()
 
 
 async def test_a_restore_records_itself_as_the_modules_own_work(tmp_path: Path) -> None:
