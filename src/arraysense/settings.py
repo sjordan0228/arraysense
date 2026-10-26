@@ -149,6 +149,11 @@ INVERTER_LIMIT_KEY = "emporia.inverter_limit_w"
 # survive a restart, because an owner who set a rate by hand ten minutes ago
 # should not have the module take the wheel back because the process bounced.
 CHARGE_OVERRIDE_UNTIL_KEY = "emporia.charge_override_until"
+# When the owner's full-power hold lapses, as a unix epoch. Set from the
+# Charger page rather than chosen here, and stored rather than remembered: a
+# restart in the middle of a charge must not re-arm the inverter limit on a
+# car the owner asked to leave alone.
+FULL_POWER_UNTIL_KEY = "emporia.full_power_until"
 # What the inverter held before a grid charge was started, so the charge can
 # be undone after a restart. Written by the service, never chosen: see
 # arraysense.charge_override for what the value holds.
@@ -1195,7 +1200,9 @@ SETTINGS: tuple[SettingSpec, ...] = (
         help=(
             "The most current the module will ever command. Your charger's own "
             "maximum still wins if it is lower — a command it cannot honour is "
-            "a command whose effect nobody can predict."
+            "a command whose effect nobody can predict. The Charger page's "
+            "full-power control lifts this to at least 48 A for the length of "
+            "its hold."
         ),
     ),
     SettingSpec(
@@ -1240,6 +1247,21 @@ SETTINGS: tuple[SettingSpec, ...] = (
         ),
     ),
     SettingSpec(
+        key=FULL_POWER_UNTIL_KEY,
+        kind="int",
+        default=0,
+        lower=0,
+        upper=253402300799,
+        label="Full power until (epoch)",
+        help=(
+            "Set from the Charger page when you ask for full power. While it "
+            "is in force the inverter-limit guard writes nothing to the "
+            "charger, and the rate may go up to 48 A even if your ceiling is "
+            "lower. Protection returns when the hold lapses. Leave it alone — "
+            "it is not a setting to choose."
+        ),
+    ),
+    SettingSpec(
         key=CHARGE_OVERRIDE_MINUTES_KEY,
         kind="int",
         default=120,
@@ -1269,7 +1291,8 @@ SETTINGS: tuple[SettingSpec, ...] = (
             "happens when the grid is carrying the house. Reaction takes about "
             "twenty to thirty seconds, not instant: the inverter row lands every "
             "~12 s, the guard ticks every 10 s, and the charger settles within "
-            "about 8 s of a write."
+            "about 8 s of a write. The Charger page's full-power control turns "
+            "this off for a chosen length of time without changing this setting."
         ),
     ),
     SettingSpec(

@@ -25,6 +25,7 @@ from arraysense.settings import (
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
+    FULL_POWER_UNTIL_KEY,
     SettingsStore,
 )
 from arraysense.store.sqlite_store import SqliteStore
@@ -447,6 +448,70 @@ async def test_an_override_that_is_not_a_time_holds_rather_than_crashing(tmp_pat
 
     assert poller.state.status == "ok", "the tick finished rather than dying"
     assert client.writes == []
+
+
+async def test_the_full_power_window_holds_the_restore_off(tmp_path: Path) -> None:
+    # The same restart-safety rule as the ordinary override, but for the longer
+    # request: a service that bounces in the middle of a full-power hold must
+    # not put back a rate the owner asked it to leave alone.
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    settings.set(FULL_POWER_UNTIL_KEY, int((NOW + timedelta(hours=2)).timestamp()))
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert client.writes == []
+    store.close()
+
+
+async def test_a_lapsed_full_power_window_no_longer_holds_the_restore_off(
+    tmp_path: Path,
+) -> None:
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    settings.set(FULL_POWER_UNTIL_KEY, int((NOW - timedelta(hours=2)).timestamp()))
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert client.writes == [32], "protection is back once the hold has passed"
+    store.close()
+
+
+async def test_a_full_power_window_that_is_not_a_time_holds_rather_than_crashing(
+    tmp_path: Path,
+) -> None:
+    client = ChargerClient()
+    poller, store, _ = _poller(tmp_path, client)
+    settings = SettingsStore(store)
+    settings.set(EMPORIA_ENABLED_KEY, True)
+    settings.set(CHARGER_AUTHORITY_KEY, "limited")
+    store._conn.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?)"
+        " ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        (FULL_POWER_UNTIL_KEY, "999999999999999999"),
+    )
+    store._conn.commit()
+    poller.audit.record_change(
+        900001, from_a=32, to_a=6, reason="test", applied=True, source=MODULE, now=NOW
+    )
+
+    await poller.tick(NOW)
+
+    assert poller.state.status == "ok", "the tick finished rather than dying"
+    assert client.writes == []
+    store.close()
     store.close()
 
 

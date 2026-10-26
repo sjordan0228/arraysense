@@ -25,6 +25,7 @@ from arraysense.modules.emporia.control import (
     Limits,
     clamp_rate,
     decide,
+    full_power_limits,
     restore_target,
 )
 
@@ -221,6 +222,73 @@ def test_zero_and_negative_requests_are_lifted_to_the_floor() -> None:
 
 def test_a_charger_that_did_not_report_its_rate_is_not_restored() -> None:
     assert restore_target(charger_rate_a=None, last_set_a=6, default_a=32) is None
+
+
+# --- full power ------------------------------------------------------------
+#
+# The owner asking for the charger's own maximum is not the same request as
+# setting a rate by hand. It has to lift the ceiling that would otherwise stop
+# at 32 A, and it has to stop the module writing for as long as it runs.
+
+
+def test_full_power_lifts_a_low_ceiling_to_48() -> None:
+    limits = full_power_limits(Limits(floor_a=6, ceiling_a=32, hardware_max_a=48))
+    assert limits.ceiling_a == 48
+    assert clamp_rate(48, limits) == (48, None)
+
+
+def test_full_power_still_never_crosses_the_hardware_maximum() -> None:
+    limits = full_power_limits(Limits(floor_a=6, ceiling_a=32, hardware_max_a=40))
+    assert clamp_rate(60, limits) == (40, "asked 60 A, held at the 40 A ceiling")
+
+
+def test_full_power_does_not_lower_a_ceiling_the_owner_set_higher() -> None:
+    limits = full_power_limits(Limits(floor_a=6, ceiling_a=50, hardware_max_a=48))
+    assert limits.ceiling_a == 50
+    assert clamp_rate(48, limits) == (48, None)
+
+
+def test_full_power_holds_the_module_even_under_full_authority() -> None:
+    got = decide(
+        48,
+        authority=FULL,
+        limits=full_power_limits(LIMITS),
+        now=NOW,
+        full_power_until=NOW + timedelta(hours=8),
+    )
+    assert got.apply is False
+    assert got.reason.startswith("full power")
+    assert got.rate_a == 48, "it still says what the owner asked for"
+
+
+def test_full_power_outranks_an_older_override_in_the_reason_it_gives() -> None:
+    got = decide(
+        20,
+        authority=FULL,
+        limits=LIMITS,
+        now=NOW,
+        override_until=NOW + timedelta(hours=1),
+        full_power_until=NOW + timedelta(hours=8),
+    )
+    assert got.apply is False
+    assert got.reason.startswith("full power")
+
+
+def test_a_lapsed_full_power_no_longer_holds() -> None:
+    got = decide(20, authority=FULL, limits=LIMITS, now=NOW, full_power_until=NOW)
+    assert got.apply is True
+
+
+def test_full_power_holds_a_stop_as_well_as_a_rate() -> None:
+    got = decide(
+        None,
+        authority=FULL,
+        limits=LIMITS,
+        now=NOW,
+        full_power_until=NOW + timedelta(hours=1),
+    )
+    assert got.apply is False
+    assert "full power" in got.reason
 
 
 def test_an_override_outranks_advisory_in_the_reason_it_gives() -> None:

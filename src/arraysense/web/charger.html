@@ -7,8 +7,6 @@
 <title>Charger · Solar ArraySense</title>
 <!-- No chart here, so uPlot is not loaded. The shared front end still is. -->
 <script src="/common.js"></script>
-<style>. -->
-<script src="/common.js"></script>
 <style>
   /* The list is read top-down to answer "what is drawing all that", so the
      watts column is the one the eye lands on: right-aligned, tabular, and the
@@ -41,6 +39,14 @@
   .state.unreachable .dot{background:var(--warn)}
   .state.reconnect_required .dot{background:var(--warn)}
   .state .detail{color:var(--ink3)}
+  /* A full-power hold is not a fault, but it is the one state on this page
+     where protection is deliberately off. The dot is the warning colour so
+     that it reads as "look here" rather than as another muted line. */
+  .state.fullpower .dot{background:var(--warn)}
+  .state button{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink2);
+    border-radius:8px;padding:6px 12px;font:inherit;font-size:12px;cursor:pointer}
+  .state button:hover:not(:disabled){background:var(--tint-3);color:var(--ink)}
+  .state button:disabled{opacity:.6;cursor:default}
   /* display:flex beats the browser's own [hidden] rule, exactly as it does for
      form.login below. Without this the guard line is on screen for ever —
      including on an installation that has never set an inverter limit, where
@@ -59,6 +65,11 @@
   form.login input{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
     border-radius:8px;padding:8px 10px;font:inherit;font-size:13px;min-width:210px}
   form.login input:focus{outline:2px solid var(--pv);outline-offset:1px;border-color:transparent}
+  /* The duration picker, dressed like the rest of this page's fields rather
+     than left as the browser's own control. */
+  form.login select{background:var(--tint);border:1px solid var(--panel-b);color:var(--ink);
+    border-radius:8px;padding:8px 10px;font:inherit;font-size:13px}
+  form.login select:focus{outline:2px solid var(--pv);outline-offset:1px;border-color:transparent}
   /* A slider rather than a number box, because amps here are a quantity you feel
      your way to rather than type. The stops mark the ones that mean something:
      the usual minimum a car accepts, and the common breaker sizes. The reading
@@ -107,6 +118,28 @@
       <span id="chargerRate">—</span></div>
     <p class="note err" id="chargerConflicts" hidden></p>
     <div class="state" id="guardState" hidden><span class="detail" id="guardDetail"></span></div>
+    <div class="state fullpower" id="fullPowerState" hidden>
+      <span class="dot"></span>
+      <span class="detail" id="fullPowerDetail"></span>
+      <button type="button" id="fullPowerOff">Resume protection</button>
+      <span class="err" id="fullPowerResumeErr"></span>
+    </div>
+    <form class="login" id="fullPowerForm" hidden>
+      <label for="fullPowerMinutes" class="muted">Full power for</label>
+      <select id="fullPowerMinutes">
+        <option value="60">1 hour</option>
+        <option value="120" selected>2 hours</option>
+        <option value="240">4 hours</option>
+        <option value="480">8 hours</option>
+        <option value="720">12 hours</option>
+      </select>
+      <button type="submit" id="fullPowerGo">Turn the inverter limit off</button>
+      <span class="err" id="fullPowerErr"></span>
+    </form>
+    <p class="note" id="fullPowerNote" hidden>While full power is on, the car may draw up
+      to 48 A: the inverter limit is not enforced, and your Never charge above setting is
+      lifted to at least 48 A for the length of the hold. Protection returns when the time
+      runs out, and you can put it back sooner with Resume protection.</p>
     <form class="login" id="rateForm">
       <label for="amps" class="muted">Set the rate</label>
       <input type="range" id="amps" min="6" max="48" step="1" list="ampstops">
@@ -155,6 +188,15 @@ async function loadCharger() {
   if (!body || !body.charger) { panel.hidden = true; return; }
   const c = body.charger;
   panel.hidden = false;
+  // One setting now, four positions. Anything above 'app' means this service
+  // has the charger — advisory still has it, it simply proposes. Read here
+  // because both the rate controls and the full-power control are gated on it.
+  const mine = c.authority !== 'app';
+  // The full-power hold is a server fact, not a page preference. `full_power_until`
+  // is present only while the server still considers the hold in force, so the
+  // page does not second-guess it with the browser's clock.
+  const fullUntil = numOrNull(c.full_power_until);
+  const fullActive = fullUntil !== null;
   // Plugged in is its own fact and not a rewording of the status: Emporia says
   // "Standby" both when nothing is attached and when an attached car is paused,
   // so the status line alone would tell somebody the cable was out while it was
@@ -177,7 +219,12 @@ async function loadCharger() {
   // recomputing anything in JavaScript.
   const guard = body.guard;
   const guardState = $('guardState');
-  if (guard === null || guard === undefined) {
+  // A "full power" plan can outlive the hold by one tick. Suppressing it here
+  // keeps the page from saying protection is off after the server has already
+  // said the hold lapsed.
+  const guardIsFullPower = guard !== null && guard !== undefined
+    && guard.kind === 'hold' && String(guard.reason || '').startsWith('full power');
+  if (guard === null || guard === undefined || fullActive || guardIsFullPower) {
     guardState.hidden = true;
   } else {
     guardState.hidden = false;
@@ -188,15 +235,26 @@ async function loadCharger() {
       : `${guard.reason} · ${numOrNull(guard.amps)} A`;
   }
 
+  // Full power is the owner's own request and has its own line, because the
+  // guard line above is hidden while it holds. The status line's ceiling has
+  // already been lifted by the server, so the rate form shows 6–48 A.
+  $('fullPowerState').hidden = !(mine && fullActive);
+  $('fullPowerForm').hidden = !mine || fullActive;
+  $('fullPowerNote').hidden = !mine || fullActive;
+  if (mine && fullActive) {
+    const when = new Date(fullUntil * 1000).toLocaleString([], {
+      month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    });
+    $('fullPowerDetail').textContent =
+      `Full power until ${when} — the inverter limit is not enforced.`;
+  }
+
   // A warning, never a block. It is the owner's charger and their account; what
   // they need is the name of the exact setting that will fight this one.
   // One sentence, and which one depends on who the owner said has the wheel.
   // The conflict only matters if this service is meant to be driving; while the
   // app has it, Emporia's own controllers being on is simply how it should be.
   const conflicts = c.conflicts || [];
-  // One setting now, four positions. Anything above 'app' means this service
-  // has the charger — advisory still has it, it simply proposes.
-  const mine = c.authority !== 'app';
   const warn = $('chargerConflicts');
   if (mine && conflicts.length) {
     warn.hidden = false;
@@ -283,6 +341,45 @@ $('powerGo').addEventListener('click', async () => {
     err.textContent = 'Could not reach this service.';
   }
   $('powerGo').disabled = false;
+});
+
+$('fullPowerForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const err = $('fullPowerErr');
+  err.textContent = '';
+  $('fullPowerGo').disabled = true;
+  try {
+    const r = await fetch('/api/emporia/charger/full-power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({minutes: Number($('fullPowerMinutes').value)}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) err.textContent = body.detail || 'That did not work.';
+    else await loadCharger();
+  } catch (e) {
+    err.textContent = 'Could not reach this service.';
+  }
+  $('fullPowerGo').disabled = false;
+});
+
+$('fullPowerOff').addEventListener('click', async () => {
+  const err = $('fullPowerResumeErr');
+  err.textContent = '';
+  $('fullPowerOff').disabled = true;
+  try {
+    const r = await fetch('/api/emporia/charger/full-power', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({minutes: 0}),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) err.textContent = body.detail || 'That did not work.';
+    else await loadCharger();
+  } catch (e) {
+    err.textContent = 'Could not reach this service.';
+  }
+  $('fullPowerOff').disabled = false;
 });
 
 $('rateForm').addEventListener('submit', async (event) => {

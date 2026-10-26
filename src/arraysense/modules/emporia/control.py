@@ -51,6 +51,11 @@ FULL = "full"
 
 CONTROL_LEVELS = (APP, ADVISORY, LIMITED, FULL)
 
+# The most current full power may reach, whatever the owner's ceiling says.
+# The Charger page's slider ends here too, so this is the number a person can
+# actually ask for. The charger's own maximum still wins when it is lower.
+FULL_POWER_CEILING_A = 48
+
 
 @dataclass(frozen=True)
 class Limits:
@@ -108,6 +113,25 @@ def clamp_rate(requested_a: int, limits: Limits) -> tuple[int, str | None]:
     return requested_a, None
 
 
+def full_power_limits(limits: Limits) -> Limits:
+    """The limits in force while the owner has asked for full power.
+
+    Full power is the owner saying the inverter limit should not hold the car
+    back, so the ceiling it lifts is the one that would otherwise clamp the
+    rate on the way to the 48 A they asked for. The charger's own maximum is
+    left alone: a command it cannot honour is a command whose effect nobody can
+    predict, the same rule ``clamp_rate`` states.
+
+    The floor follows the ceiling down inside ``clamp_rate``, so nothing extra
+    is needed here for a charger whose maximum is below the floor.
+    """
+    return Limits(
+        floor_a=limits.floor_a,
+        ceiling_a=max(limits.ceiling_a, FULL_POWER_CEILING_A),
+        hardware_max_a=limits.hardware_max_a,
+    )
+
+
 def decide(
     requested_a: int | None,
     *,
@@ -115,6 +139,7 @@ def decide(
     limits: Limits,
     now: datetime,
     override_until: datetime | None = None,
+    full_power_until: datetime | None = None,
 ) -> Decision:
     """Whether this module may command ``requested_a``, and what it would be.
 
@@ -131,6 +156,17 @@ def decide(
         return Decision(rate, False, "the Emporia app manages this charger")
 
     rate, refused = (None, None) if requested_a is None else clamp_rate(requested_a, limits)
+    # Checked before the ordinary override, because it is the more specific
+    # statement: "do not enforce the inverter limit until this time" is what
+    # the owner chose, and an older manual window should not decide how the
+    # history describes it.
+    if full_power_until is not None and full_power_until > now:
+        return Decision(
+            rate,
+            False,
+            f"full power holds until {full_power_until.isoformat()}",
+            refused,
+        )
     # Above the stop branch, not below it. The override was checked only on the
     # path that sets a rate, so under full authority a request to *stop* the
     # charger — the heavier of the two powers — went straight through a hold
