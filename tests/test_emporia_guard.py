@@ -431,6 +431,7 @@ class FakePoller:
         self.audit = FakeAudit()
         self.limits_value = Limits(floor_a=6, ceiling_a=32, hardware_max_a=48)
         self.override_until_value: datetime | None = None
+        self.full_power_until_value: datetime | None = None
         self.write_rate_result: FakeChargerState | None = None
         self.writes: list[int] = []
 
@@ -439,6 +440,9 @@ class FakePoller:
 
     def override_until(self) -> datetime | None:
         return self.override_until_value
+
+    def full_power_until(self) -> datetime | None:
+        return self.full_power_until_value
 
     def write_rate(self, amps: int) -> ChargerState | None:
         self.writes.append(amps)
@@ -684,6 +688,39 @@ async def test_a_manual_override_holds_the_guard_off(tmp_path: Path) -> None:
     await guard.tick(NOW)
 
     assert poller.writes == []
+    assert guard.last_plan is not None
+    assert guard.last_plan.kind == "hold"
+    assert "override holds" in guard.last_plan.reason
+
+
+# Test 29b: full power holds the guard off, and the page says so
+async def test_full_power_holds_the_guard_off(tmp_path: Path) -> None:
+    guard, store, poller = _make_guard(tmp_path, enabled=True, limit_w=_LIMIT_W)
+    _insert_inverter_sample(store, 13500.0, 0.0)
+    _insert_charger_circuit(poller, 900001, 8018)
+    poller.charger = FakeChargerState(rate_a=48)
+    poller.full_power_until_value = NOW + timedelta(hours=8)
+
+    await guard.tick(NOW)
+
+    assert poller.writes == []
+    assert guard.last_plan is not None
+    assert guard.last_plan.kind == "hold"
+    assert guard.last_plan.reason == "full power: the inverter limit is not enforced"
+    assert guard.last_allowance is not None, "the page can still say what the limit would allow"
+
+
+# Test 29c: the hold is a window, not a permanent switch
+async def test_a_lapsed_full_power_cuts_again(tmp_path: Path) -> None:
+    guard, store, poller = _make_guard(tmp_path, enabled=True, limit_w=_LIMIT_W)
+    _insert_inverter_sample(store, 13500.0, 0.0)
+    _insert_charger_circuit(poller, 900001, 8018)
+    poller.charger = FakeChargerState(rate_a=48)
+    poller.full_power_until_value = NOW - timedelta(minutes=1)
+
+    await guard.tick(NOW)
+
+    assert poller.writes == [22]
 
 
 # Test 30: the settle window blocks a second change

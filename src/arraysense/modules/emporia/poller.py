@@ -61,6 +61,7 @@ from arraysense.settings import (
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
+    FULL_POWER_UNTIL_KEY,
     SettingsStore,
     emporia_interval_seconds,
 )
@@ -202,6 +203,31 @@ class EmporiaPoller:
     def _interval(self) -> float:
         return float(emporia_interval_seconds(self._settings))
 
+    def _epoch_setting(self, key: str) -> datetime | None:
+        """One stored Unix second as an aware UTC instant, or None.
+
+        Settings are decoded on read but not clamped to their registered
+        bounds, so a database written by another build — or edited by hand —
+        can hand this a number ``fromtimestamp`` refuses. A second no clock can
+        represent is held rather than ignored: reading it as "no hold" would
+        fail open, towards writing to somebody's car. It would also have raised
+        out of the poller's own task, which catches store errors and nothing
+        else, and stopped the module for the life of the process with no
+        symptom anywhere.
+        """
+        value = self._settings.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            return None
+        try:
+            return datetime.fromtimestamp(value, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            logger.warning(
+                "%s holds %r, which is not a time; holding the charger rather than acting",
+                key,
+                value,
+            )
+            return datetime.max.replace(tzinfo=UTC)
+
     def override_until(self) -> datetime | None:
         """When the owner's hand stops holding the charger, or None if it is not.
 
@@ -210,28 +236,18 @@ class EmporiaPoller:
         is one. A naive datetime would compare against the wall clock of
         whichever machine this is, which is the class of mistake this project
         has already paid for once in the tariff bands.
-
-        A second no clock can represent is held rather than ignored. Settings
-        are decoded on read but not clamped to their registered bounds, so a
-        database written by another build — or edited by hand — can hand this a
-        number ``fromtimestamp`` refuses; and reading that as "no override"
-        would fail open, towards writing to somebody's car. It would also have
-        raised out of the poller's own task, which catches store errors and
-        nothing else, and stopped the module for the life of the process with
-        no symptom anywhere.
         """
-        value = self._settings.get(CHARGE_OVERRIDE_UNTIL_KEY)
-        if not isinstance(value, int) or isinstance(value, bool):
-            return None
-        try:
-            return datetime.fromtimestamp(value, tz=UTC)
-        except (OverflowError, OSError, ValueError):
-            logger.warning(
-                "%s holds %r, which is not a time; holding the charger rather than acting",
-                CHARGE_OVERRIDE_UNTIL_KEY,
-                value,
-            )
-            return datetime.max.replace(tzinfo=UTC)
+        return self._epoch_setting(CHARGE_OVERRIDE_UNTIL_KEY)
+
+    def full_power_until(self) -> datetime | None:
+        """When the owner's full-power request lapses, or None if it is not on.
+
+        Kept apart from ``override_until`` on purpose. Both stop the module
+        writing, but full power also lifts the owner's ceiling to 48 A so the
+        charger they asked for is reachable; an ordinary hand-set rate should
+        not quietly do that as well.
+        """
+        return self._epoch_setting(FULL_POWER_UNTIL_KEY)
 
     def limits(self) -> Limits:
         """The owner's floor and ceiling, and what the charger admits."""
@@ -331,6 +347,7 @@ class EmporiaPoller:
             limits=self.limits(),
             now=now,
             override_until=self.override_until(),
+            full_power_until=self.full_power_until(),
         )
         reason = f"restored to {verdict.rate_a} A on startup: {verdict.reason}"
         # A proposal that has not changed is not news. Under an authority that

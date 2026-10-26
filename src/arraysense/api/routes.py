@@ -125,20 +125,19 @@ from arraysense.modules.emporia.client import (
     EmporiaChallengeError,
     EmporiaUnreachableError,
 )
-from arraysense.modules.emporia.control import clamp_rate
+from arraysense.modules.emporia.control import clamp_rate, full_power_limits
 from arraysense.modules.emporia.guard import InverterGuard
 from arraysense.modules.emporia.poller import EmporiaPoller
 from arraysense.modules.emporia.repository import OWNER, CircuitRepository
 from arraysense.panels import StringSpec, parse_strings
 from arraysense.settings import (
     BACKUP_DIRECTORY_KEY,
-    CHARGE_CEILING_KEY,
-    CHARGE_FLOOR_KEY,
     CHARGE_OVERRIDE_KEY,
     CHARGE_OVERRIDE_MINUTES_KEY,
     CHARGE_OVERRIDE_UNTIL_KEY,
     CHARGER_AUTHORITY_KEY,
     EMPORIA_ENABLED_KEY,
+    FULL_POWER_UNTIL_KEY,
     HIGH_USAGE_WATTS_KEY,
     INVERTER_LIMIT_KEY,
     PANELS_STRINGS_KEY,
@@ -5039,6 +5038,13 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
     if poller is None or poller.charger is None or not enabled:
         return {"charger": None, "changes": [], "enabled": enabled, "guard": None}
     state = poller.charger
+    now = datetime.now(tz=UTC)
+    full_power = poller.full_power_until()
+    full_power_until: int | None = None
+    limits = poller.limits()
+    if full_power is not None and full_power > now:
+        limits = full_power_limits(limits)
+        full_power_until = int(full_power.timestamp())
     return {
         "enabled": enabled,
         "charger": {
@@ -5054,8 +5060,9 @@ async def emporia_charger(request: Request) -> dict[str, Any]:
             "offline_since": state.offline_since,
             "fault": state.fault,
             "authority": settings.get(CHARGER_AUTHORITY_KEY),
-            "floor_a": settings.get(CHARGE_FLOOR_KEY),
-            "ceiling_a": settings.get(CHARGE_CEILING_KEY),
+            "floor_a": limits.floor_a,
+            "ceiling_a": limits.ceiling_a,
+            "full_power_until": full_power_until,
         },
         "changes": [
             {
@@ -5104,8 +5111,11 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
     hardware maximum still hold, because those are about what the charger and
     the wiring can take rather than about who is asking.
 
-    It also starts the override window. Somebody who has just set a rate by hand
-    should not have it moved out from under them by the next automatic decision.
+    It also starts the override window, unless a full-power hold is already in
+    force. Somebody who has just set a rate by hand should not have it moved out
+    from under them by the next automatic decision; somebody who has asked for
+    full power has already done that, and opening a second, shorter window would
+    quietly shorten the hold they chose.
     """
     # The enable is asked first, and before the charger is looked for. A tick
     # clears the cached charger the moment the module is switched off, so asking
@@ -5126,8 +5136,13 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
             detail="the Emporia app manages this charger; change that in Settings first",
         )
     charger = poller.charger
-    rate, refused = clamp_rate(body.amps, poller.limits())
     now = datetime.now(tz=UTC)
+    full_power = poller.full_power_until()
+    full_power_active = full_power is not None and full_power > now
+    limits = poller.limits()
+    if full_power_active:
+        limits = full_power_limits(limits)
+    rate, refused = clamp_rate(body.amps, limits)
     # The window opens when the owner presses, not when Emporia answers. The
     # write below is a round trip to a cloud service, and the restore runs on
     # the poller's own clock — so opening it afterwards left a gap in which an
@@ -5135,9 +5150,15 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
     # changing, find no hold, and write over it. A failed write holds too: they
     # reached for the charger either way, and the conservative reading of that
     # is the one this module owes them.
-    minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
-    hold = int(minutes) if isinstance(minutes, int) else 120
-    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
+    #
+    # Under full power the hold is already there, and it is the one the owner
+    # chose. Setting a second window here would either shorten it (the usual
+    # two-hour override against an eight-hour hold) or leave a hold behind that
+    # outlives the full-power request, and neither is what the page promised.
+    if not full_power_active:
+        minutes = settings.get(CHARGE_OVERRIDE_MINUTES_KEY)
+        hold = int(minutes) if isinstance(minutes, int) else 120
+        settings.set(CHARGE_OVERRIDE_UNTIL_KEY, int(now.timestamp()) + hold * 60)
     try:
         confirmed = await asyncio.to_thread(poller.write_rate, rate)
     except EmporiaAuthExpiredError as exc:
@@ -5170,6 +5191,64 @@ async def emporia_set_rate(request: Request, body: ChargeRate) -> dict[str, Any]
         now=now,
     )
     return {"ok": True, "rate_a": rate, "refused": refused, "confirmed": took}
+
+
+class FullPowerRequest(BaseModel):
+    """How long the owner wants the inverter limit left off, in minutes.
+
+    Zero is the explicit "put protection back now"; it is a duration rather
+    than a boolean so the same route can do both without a second verb.
+    """
+
+    minutes: int
+
+
+# A day, because a hold that outlives the charging session is not protecting
+# anything and nobody watches a page for longer than that. The picker offers
+# less; this is the ceiling for a hand-written request.
+FULL_POWER_MAX_MINUTES = 1440
+
+
+@router.post("/emporia/charger/full-power", dependencies=[Depends(_require_write)])
+async def emporia_full_power(request: Request, body: FullPowerRequest) -> dict[str, Any]:
+    """Leave the inverter limit off for a chosen time, or put it back now.
+
+    This is the owner's own choice, so it is not an automatic decision and does
+    not go through ``decide``. While it is in force the guard writes nothing to
+    the charger, the startup restore leaves the rate alone, and the rate route
+    lifts the owner's ceiling to 48 A so the charger's own maximum is reachable.
+
+    Stored as an epoch rather than a flag so a restart cannot re-arm the limit
+    in the middle of a charge. ``minutes=0`` clears it and any ordinary manual
+    override with it: "resume protection" has to mean protection is back, not
+    that a window opened by an earlier Apply is still holding the guard off.
+    """
+    settings = SettingsStore(request.app.state.store)
+    _refuse_while_disabled(settings)
+    poller = _emporia(request)
+    if poller is None or poller.charger is None:
+        raise HTTPException(status_code=404, detail="no Emporia charger is being read")
+    if settings.get(CHARGER_AUTHORITY_KEY) == "app":
+        raise HTTPException(
+            status_code=409,
+            detail="the Emporia app manages this charger; change that in Settings first",
+        )
+    if body.minutes < 0 or body.minutes > FULL_POWER_MAX_MINUTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"full power holds for 1 to {FULL_POWER_MAX_MINUTES} minutes, or 0 to resume",
+        )
+    if body.minutes == 0:
+        settings.set(FULL_POWER_UNTIL_KEY, 0)
+        settings.set(CHARGE_OVERRIDE_UNTIL_KEY, 0)
+        return {"ok": True, "until": None}
+    until = int(datetime.now(tz=UTC).timestamp()) + body.minutes * 60
+    settings.set(FULL_POWER_UNTIL_KEY, until)
+    # The ordinary window is cleared rather than left behind. It would either
+    # outlive the full-power request (an Apply an hour ago, a one-hour hold) or
+    # be silently overwritten by it; neither end is the one the page promised.
+    settings.set(CHARGE_OVERRIDE_UNTIL_KEY, 0)
+    return {"ok": True, "until": until}
 
 
 class ChargerPower(BaseModel):
