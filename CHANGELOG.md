@@ -2,6 +2,40 @@ Versions follow [semantic versioning](https://semver.org). Until 1.0 the schema
 may change between minor versions, and any release that needs a database
 migration says so at the top of its entry.
 
+## 1.4.13 — 25 October 2026
+
+The Charger page gains a **full-power hold**: the owner picks a length of time
+and, for that window, the inverter-limit guard writes nothing to the charger and
+the rate may reach 48 A even when "Never charge above" is lower.
+
+### Added
+
+- **A full-power hold on the Charger page.** Pick 1, 2, 4, 8 or 12 hours — the
+  server accepts 0–1440 minutes — and for that window the guard leaves the
+  charger alone and the ceiling lifts to at least 48 A. The hold is stored as an
+  epoch (`emporia.full_power_until`) rather than a flag, so a restart in the
+  middle of a charge cannot re-arm the limit. When the time runs out protection
+  returns by itself; **Resume protection** ends the hold at once and also clears
+  any ordinary manual override, so it really means protection is back.
+- **The charger's own maximum still wins.** Full power lifts the owner's ceiling
+  but never the hardware maximum the charger reports, and a command it cannot
+  honour is refused exactly as before.
+- **The hold is refused while the module is switched off or while the Emporia
+  app owns the charger**, and it is bounded to a day: a hold that outlives the
+  charging session is not protecting anything.
+
+### Changed
+
+- **The guard line says what is holding it off.** While a manual override holds,
+  it now reads "override holds until …" rather than showing a cut that was never
+  going to be applied; while a full-power hold is active it reads "full power:
+  the inverter limit is not enforced".
+- **Setting a rate during a full-power hold does not open a second, shorter
+  override.** The owner has already said how long the hold lasts, and a two-hour
+  window opened on top would quietly shorten it.
+- **The Charger page's stray `<style>. -->` header and duplicated `common.js`
+  include are gone.**
+
 ## 1.4.12 — 12 September 2026
 
 The dashboard's once-a-minute poll stops re-reading sixty days of history, which
